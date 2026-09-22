@@ -56,18 +56,57 @@ describe("Windows release binary target", () => {
 	});
 });
 
-it("runs compiled bytecode containing dependency import.meta.resolve calls", async () => {
+/**
+ * Bytecode compilation is only observable in the artifact: Bun writes a JSC
+ * code cache keyed by a synthetic `$bunfs` source URL that renames the
+ * entrypoint to `.js`, and a bundle of the same graph without `bytecode: true`
+ * never contains that record. Comparing the two executables therefore proves
+ * real precompiled bytecode rather than merely a working ESM bundle. Only the
+ * basename is matched because the `$bunfs` prefix and separators differ on
+ * Windows.
+ */
+it("compiles dependency import.meta.resolve calls into runnable precompiled bytecode", async () => {
 	using temp = TempDir.createSync("@omp-bytecode-");
-	const entrypoint = temp.join("entry.ts");
-	const outfile = temp.join(process.platform === "win32" ? "probe.exe" : "probe");
-	await Bun.write(entrypoint, 'console.log(import.meta.resolve("node:fs"));\n');
+	const entryName = "bytecode-probe-entry";
+	const executableSuffix = process.platform === "win32" ? ".exe" : "";
+	const dependency = temp.join("bytecode-probe-dep.ts");
+	const entrypoint = temp.join(`${entryName}.ts`);
+	const outfile = temp.join(`probe${executableSuffix}`);
+	const plainOutfile = temp.join(`probe-without-bytecode${executableSuffix}`);
+	await Bun.write(dependency, 'export const resolved = import.meta.resolve("node:fs");\n');
+	await Bun.write(entrypoint, 'import { resolved } from "./bytecode-probe-dep.ts";\nconsole.log(resolved);\n');
+
 	await compileCodingAgent({
 		repoRoot: temp.path(),
 		entrypoint,
 		outfile,
 		transformersVersion: "unused",
 	});
+	// Same module graph minus `bytecode`. The fixture imports no external or
+	// legacy-Pi module, so the remaining compile options cannot account for the
+	// artifact difference measured below.
+	const plain = await Bun.build({
+		entrypoints: [entrypoint],
+		root: temp.path(),
+		format: "esm",
+		compile: {
+			outfile: plainOutfile,
+			autoloadBunfig: false,
+			autoloadDotenv: false,
+			autoloadTsconfig: false,
+			autoloadPackageJson: false,
+		},
+		throw: false,
+	});
+	expect(plain.success).toBe(true);
+
 	const result = await $`${outfile}`.quiet().nothrow();
 	expect(result.exitCode).toBe(0);
 	expect(result.text().trim()).toBe("node:fs");
+
+	const codeCacheRecord = Buffer.from(`${entryName}.js`);
+	const withBytecode = Buffer.from(await Bun.file(outfile).arrayBuffer());
+	const withoutBytecode = Buffer.from(await Bun.file(plainOutfile).arrayBuffer());
+	expect(withoutBytecode.includes(codeCacheRecord)).toBe(false);
+	expect(withBytecode.includes(codeCacheRecord)).toBe(true);
 }, 30_000);
