@@ -113,6 +113,70 @@ describe("withBridgeTimeoutPause", () => {
 		expect(ran).toBe(1);
 	});
 
+	it("propagates a throwing pause with the operation unrun and no resume", async () => {
+		const events: JsStatusEvent[] = [];
+		let operationRan = false;
+		// Per the atomic-sink contract a throwing pause mutated nothing, so no
+		// compensating resume may follow: an unmatched resume would decrement
+		// an outer pause depth this call does not own.
+		const throwingSink = (event: JsStatusEvent): void => {
+			events.push(event);
+			if (event.op === EVAL_TIMEOUT_PAUSE_OP) throw new Error("pause blew up");
+		};
+
+		await expect(
+			withBridgeTimeoutPause(throwingSink, async () => {
+				operationRan = true;
+				return "done";
+			}),
+		).rejects.toThrow("pause blew up");
+
+		expect(operationRan).toBe(false);
+		expect(events.map(event => event.op)).toEqual([EVAL_TIMEOUT_PAUSE_OP]);
+	});
+
+	it("never emits a compensating resume that could steal an outer pause depth", async () => {
+		let depth = 0;
+		let failInnerPause = false;
+		const events: JsStatusEvent[] = [];
+		const sink = (event: JsStatusEvent): void => {
+			events.push(event);
+			if (event.op === EVAL_TIMEOUT_PAUSE_OP) {
+				if (failInnerPause) throw new Error("inner pause blew up");
+				depth++;
+				return;
+			}
+			if (event.op === EVAL_TIMEOUT_RESUME_OP && depth > 0) depth--;
+		};
+
+		await withBridgeTimeoutPause(sink, async () => {
+			expect(depth).toBe(1);
+			failInnerPause = true;
+			await expect(withBridgeTimeoutPause(sink, async () => "inner")).rejects.toThrow("inner pause blew up");
+			// No compensating resume stole the outer level.
+			expect(depth).toBe(1);
+			expect(events.map(event => event.op)).toEqual([EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_PAUSE_OP]);
+		});
+		expect(depth).toBe(0);
+		expect(events.map(event => event.op)).toEqual([
+			EVAL_TIMEOUT_PAUSE_OP,
+			EVAL_TIMEOUT_PAUSE_OP,
+			EVAL_TIMEOUT_RESUME_OP,
+		]);
+	});
+
+	it("keeps the operation error when the resume sink throws", async () => {
+		const resumeSink = (event: JsStatusEvent): void => {
+			if (event.op === EVAL_TIMEOUT_RESUME_OP) throw new Error("resume blew up");
+		};
+
+		await expect(
+			withBridgeTimeoutPause(resumeSink, async () => {
+				throw new Error("operation blew up");
+			}),
+		).rejects.toThrow("operation blew up");
+	});
+
 	it("identifies timeout-control events as non-renderable status", () => {
 		expect(isEvalTimeoutControlEvent({ op: EVAL_TIMEOUT_PAUSE_OP })).toBe(true);
 		expect(isEvalTimeoutControlEvent({ op: EVAL_TIMEOUT_RESUME_OP })).toBe(true);
@@ -173,6 +237,71 @@ it("defers external aborts until an in-flight agent bridge call resumes", async 
 	const result = await resultPromise;
 	expect(result.cancelled).toBe(true);
 	expect(result.exitCode).toBeUndefined();
+});
+
+it("contains observer failures on the dedicated channel without corrupting nested pause depth", async () => {
+	// Regression: the production control sink fans out to generic status
+	// observers after applying the pause. A throwing observer must neither
+	// leak through the dedicated channel nor unbalance nesting: both bridge
+	// waits below run through the real abort shield, and the deferred abort
+	// is delivered only once the outermost pause resumes.
+	const abortController = new AbortController();
+	const host = captureHostTimeoutControl();
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const shieldedDuringBridge: boolean[] = [];
+	const kernel: GenericKernel<Record<string, string | null>> = {
+		async execute(_code, options) {
+			entered.resolve();
+			await release.promise;
+			await withBridgeTimeoutPause(
+				host.emit,
+				async () => {
+					await withBridgeTimeoutPause(
+						host.emit,
+						async () => {
+							abortController.abort(new Error("external interrupt"));
+							shieldedDuringBridge.push(options.signal?.aborted === true);
+						},
+						{ deferExternalAbort: true },
+					);
+					// The inner resume released only its own level.
+					shieldedDuringBridge.push(options.signal?.aborted === true);
+				},
+				{ deferExternalAbort: true },
+			);
+			// Fully resumed: the deferred abort is delivered now.
+			shieldedDuringBridge.push(options.signal?.aborted === true);
+			return { status: "ok", cancelled: false, timedOut: false };
+		},
+	};
+
+	const resultPromise = executeWithKernelBase({
+		kernel,
+		code: "agent('slow')",
+		options: {
+			signal: abortController.signal,
+			toolSession: makeToolSession(),
+			bridgeSessionId: `bridge-${crypto.randomUUID()}`,
+			onStatus: () => {
+				throw new Error("status observer blew up");
+			},
+		},
+		runIdPrefix: "test",
+		errorLogLabel: "test",
+		cancelledErrorClass: TestCancelledError,
+		buildKernelEnvPatch: () => ({}),
+		formatKernelTimeoutAnnotation: () => "kernel timed out",
+		formatTimeoutAnnotation: () => "timed out",
+	});
+
+	await entered.promise;
+	release.resolve();
+	const result = await resultPromise;
+	// The observer failure never surfaced: the cell ran to completion and the
+	// abort is still reported as a cancellation.
+	expect(result.cancelled).toBe(true);
+	expect(shieldedDuringBridge).toEqual([false, false, true]);
 });
 
 it("does not defer external aborts for a completion bridge call", async () => {

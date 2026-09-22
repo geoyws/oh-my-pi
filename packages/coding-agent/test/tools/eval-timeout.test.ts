@@ -8,11 +8,18 @@ import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EVAL_TIMEOUT_PAUSE_OP } from "@oh-my-pi/pi-coding-agent/eval/bridge-timeout";
 import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
+import { resetRegisteredArtifactDirsForTests } from "@oh-my-pi/pi-coding-agent/internal-urls/registry-helpers";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import * as taskDiscovery from "@oh-my-pi/pi-coding-agent/task/discovery";
+import * as taskExecutor from "@oh-my-pi/pi-coding-agent/task/executor";
+import { AgentOutputManager } from "@oh-my-pi/pi-coding-agent/task/output-manager";
+import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
 import * as toolTimeouts from "@oh-my-pi/pi-coding-agent/tools/tool-timeouts";
+import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 /** Mutable shape of the fake session so a tool can be wired in after construction. */
@@ -433,5 +440,110 @@ while (Date.now() < end) {}`,
 
 		expect(textOf(result)).toContain("timed out after 1 seconds");
 		expect(elapsedMs).toBeLessThan(15_000);
+	}, 60_000);
+
+	/**
+	 * Positive proof that a legitimate slow host bridge wait suspends the cell
+	 * deadline: a real `agent()` handle backed by a genuine managed async job,
+	 * waited on through the real `wait()` bridge for longer than the cell
+	 * timeout, still lets the cell succeed — and the deadline is re-armed
+	 * afterward, so a runaway compute cell still times out. Removing
+	 * `withBridgeTimeoutPause` (or breaking `onTimeoutControl` threading)
+	 * fails the first assertions; a missing resume fails the runaway one.
+	 */
+	it("suspends the cell deadline across a slower host bridge wait and resumes it afterward", async () => {
+		using tempDir = TempDir.createSync("@omp-eval-timeout-bridge-pause-");
+		const manager = new AsyncJobManager({});
+		const sessionFile = path.join(tempDir.path(), "session.jsonl");
+		const artifactsDir = sessionFile.slice(0, -6);
+		const session = {
+			...makeSession("eval-timeout-bridge-pause", {
+				agentId: "Main",
+				asyncJobManager: manager,
+				settings: Settings.isolated({
+					"async.enabled": false,
+					"task.isolation.enabled": false,
+					"task.enableLsp": true,
+					"eval.autoBackground.enabled": false,
+				}),
+			}),
+			getSessionFile: () => sessionFile,
+			getSessionSpawns: () => "*",
+			getArtifactsDir: () => artifactsDir,
+			agentOutputManager: new AgentOutputManager(() => artifactsDir),
+			getActiveModelString: () => "p/active",
+			getModelString: () => "p/fallback",
+		} as unknown as ToolSession;
+		vi.spyOn(taskDiscovery, "discoverAgents").mockResolvedValue({
+			agents: [
+				{
+					name: "task",
+					description: "Task agent",
+					systemPrompt: "Run the task.",
+					source: "bundled",
+					spawns: "*",
+					model: ["@task"],
+				} satisfies AgentDefinition,
+			],
+			projectAgentsDir: null,
+		});
+		// A genuinely slow delegate: the host works for 2.5s while the cell's
+		// own timeout is 1s, so only a suspended deadline lets the cell win.
+		// This delay must be real wall-clock time — fake timers cannot drive
+		// the isolated worker's watchdog, which is exactly what is under test.
+		vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => {
+			await Bun.sleep(2500);
+			return {
+				index: options.index,
+				id: options.id,
+				agent: options.agent.name,
+				agentSource: options.agent.source,
+				task: options.task,
+				assignment: options.assignment,
+				description: options.description,
+				exitCode: 0,
+				output: "slow-bridge-result",
+				stderr: "",
+				truncated: false,
+				durationMs: 2500,
+				tokens: 0,
+				requests: 0,
+			} satisfies SingleResult;
+		});
+		const tool = new EvalTool(session);
+		try {
+			// Cold-start the worker outside the measured window.
+			await tool.execute("seed", { language: "js", code: "globalThis.seeded = true;" });
+
+			const startedAt = Date.now();
+			const result = await tool.execute("call-slow-wait", {
+				language: "js",
+				code: `const handle = agent("slow delegated work");
+const [text] = await wait([handle]);
+print(text);`,
+				timeout: 1,
+			});
+			const elapsedMs = Date.now() - startedAt;
+
+			// The wait really did outlast the cell timeout: an unsuspended
+			// deadline would have killed this cell at 1s.
+			expect(elapsedMs).toBeGreaterThan(2000);
+			expect(textOf(result)).toContain("slow-bridge-result");
+			expect(textOf(result)).not.toContain("timed out");
+			expect(result.details?.cells?.[0]?.status).toBe("complete");
+
+			// The deadline resumes: a runaway compute cell still times out.
+			const runaway = await tool.execute("call-runaway-after-wait", {
+				language: "js",
+				code: "const end = Date.now() + 30_000; while (Date.now() < end) {}",
+				timeout: 1,
+			});
+			expect(textOf(runaway)).toContain("timed out after 1 seconds");
+		} finally {
+			manager.cancelAll();
+			await manager.dispose({ timeoutMs: 5_000 });
+			AgentRegistry.resetGlobalForTests();
+			resetRegisteredArtifactDirsForTests();
+		}
 	}, 60_000);
 });

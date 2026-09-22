@@ -819,9 +819,19 @@ async function handleToolCall(session: JsSession, msg: Extract<WorkerOutbound, {
 			},
 			// This process's own bridge lifecycle. Nothing the runtime can send
 			// reaches this channel, which is what makes it the deadline authority.
+			// Atomic-sink contract: the defer depth above is applied first and the
+			// observer fanout below is best-effort — a throwing status observer is
+			// logged and the applied state stands, so nesting stays balanced.
 			onTimeoutControl: (event: JsStatusEvent) => {
 				trackDeferPhase(pending, event);
-				pending.runState.onTimeoutControl?.(event);
+				try {
+					pending.runState.onTimeoutControl?.(event);
+				} catch (error) {
+					logger.warn("eval timeout control observer failed; keeping the applied pause/resume state", {
+						op: event.op,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
 			},
 		});
 		safeSend(session, { type: "tool-reply", id: msg.id, reply: { ok: true, value } });

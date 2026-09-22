@@ -9,17 +9,18 @@
  * back in control, the watchdog starts a fresh timeout window.
  *
  * Bridge helpers express that handoff with synthetic pause/resume status events
- * on the existing `emitStatus → onStatus` path. Consumers MUST treat these as
- * timeout-control events only: update the watchdog and drop them from rendered
- * or persisted cell output.
+ * on a dedicated host-only control channel ({@link EvalTimeoutControlSink}).
+ * Consumers MUST treat these as timeout-control events only: update the
+ * watchdog and drop them from rendered or persisted cell output.
  *
  * ## Pause authority is host-owned
  *
  * These events are *control* messages for the parent's deadline, so only the
- * parent may mint them. {@link withBridgeTimeoutPause} emits a pause and its
- * matching resume from the same host-side `try`/`finally`, which is what makes
- * a pause lifecycle-coupled to a real in-flight bridge call instead of to a
- * message an evaluated cell can send.
+ * parent may mint them. {@link withBridgeTimeoutPause} emits a pause before
+ * the operation and its matching resume once the operation settles — one
+ * pause site plus a resume on the operation-error path and a resume on the
+ * success path — which is what makes a pause lifecycle-coupled to a real
+ * in-flight bridge call instead of to a message an evaluated cell can send.
  *
  * The status *data* channel (`__omp_emit_status__` in JS, an
  * `application/x-omp-status` display bundle in Python) is reachable by
@@ -139,6 +140,16 @@ export interface BridgeTimeoutPauseOptions {
  * The sink is the dedicated control channel, never the generic `emitStatus`
  * one: reaching it is the authority, so an ordinary tool status event that
  * happens to carry the same `op` string can never move the deadline.
+ *
+ * Atomic-sink contract: production control sinks apply the pause (watchdog
+ * and abort shield) before fanning out to status observers, and observer
+ * fanout failures never escape the channel — the applied state stands and
+ * the failure is logged. A pause therefore either throws before mutating
+ * anything or succeeds with the pause held, so this wrapper pairs one pause
+ * with one resume and never emits a compensating resume: an unmatched
+ * resume would decrement an outer pause depth it does not own. A throwing
+ * resume likewise never masks the operation's own error; it only propagates
+ * when the operation itself succeeded.
  */
 export async function withBridgeTimeoutPause<T>(
 	onTimeoutControl: EvalTimeoutControlSink | undefined,
@@ -146,18 +157,33 @@ export async function withBridgeTimeoutPause<T>(
 	options?: BridgeTimeoutPauseOptions,
 ): Promise<T> {
 	if (!onTimeoutControl) return operation();
-	onTimeoutControl(
-		options?.deferExternalAbort
-			? { op: EVAL_TIMEOUT_PAUSE_OP, deferExternalAbort: true }
-			: { op: EVAL_TIMEOUT_PAUSE_OP },
-	);
+	const pause: JsStatusEvent = options?.deferExternalAbort
+		? { op: EVAL_TIMEOUT_PAUSE_OP, deferExternalAbort: true }
+		: { op: EVAL_TIMEOUT_PAUSE_OP };
+	const resume: JsStatusEvent = options?.deferExternalAbort
+		? { op: EVAL_TIMEOUT_RESUME_OP, deferExternalAbort: true }
+		: { op: EVAL_TIMEOUT_RESUME_OP };
+	// A throwing pause propagates with the operation unrun and no resume: per
+	// the atomic-sink contract nothing was mutated, and a compensating resume
+	// here would steal a depth level from an outer in-flight pause.
+	onTimeoutControl(pause);
+	let result: T;
 	try {
-		return await operation();
-	} finally {
-		onTimeoutControl(
-			options?.deferExternalAbort
-				? { op: EVAL_TIMEOUT_RESUME_OP, deferExternalAbort: true }
-				: { op: EVAL_TIMEOUT_RESUME_OP },
-		);
+		result = await operation();
+	} catch (operationError) {
+		try {
+			onTimeoutControl(resume);
+		} catch {
+			// The bridge call already failed: its error explains the failure,
+			// so the balancing failure is logged instead of masking it.
+			logger.warn("eval bridge timeout resume failed after an operation error; keeping the operation error", {
+				op: EVAL_TIMEOUT_RESUME_OP,
+			});
+		}
+		throw operationError;
 	}
+	// A throwing resume here propagates: the operation itself succeeded, so
+	// there is no operation error to protect.
+	onTimeoutControl(resume);
+	return result;
 }

@@ -1,4 +1,5 @@
 import { DEFAULT_MAX_BYTES, type OutputArtifactError, OutputSink } from "@oh-my-pi/pi-tui/tools/streaming-output";
+import { logger } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "../../tools";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../../tools/output-meta";
 import { isEvalTimeoutControlEvent } from "../bridge-timeout";
@@ -127,8 +128,19 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 					displayOutputs.push(output);
 				},
 				// Host-owned watchdog control: only this process's bridge wrapper
-				// can pause or resume the cell deadline.
-				onTimeoutControl: event => options.onStatus?.(event),
+				// can pause or resume the cell deadline. Observer fanout is
+				// best-effort so a throwing consumer cannot unwind the control
+				// channel; the applied pause/resume state stands.
+				onTimeoutControl: event => {
+					try {
+						options.onStatus?.(event);
+					} catch (error) {
+						logger.warn("eval timeout control observer failed; keeping the applied pause/resume state", {
+							op: event.op,
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
+				},
 			},
 		});
 		const summary = await outputSink.dump();

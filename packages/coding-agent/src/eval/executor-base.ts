@@ -235,6 +235,10 @@ function createBridgeAbortShield(source: AbortSignal | undefined): BridgeAbortSh
 		}
 		if (event.op !== EVAL_TIMEOUT_RESUME_OP || pauseDepth === 0) return;
 		pauseDepth--;
+		// A nested resume only releases its own level: the deferred abort is
+		// delivered once the outermost pause resumes, so an inner bridge
+		// return can never expose an outer critical phase to a mid-merge abort.
+		if (pauseDepth > 0) return;
 		if (shield.abortRequested && !controller.signal.aborted) controller.abort(abortReason);
 	};
 	shield.dispose = (): void => {
@@ -482,10 +486,22 @@ export async function executeWithKernelBase<
 	 * only this process's `withBridgeTimeoutPause` wrapper is handed it, so
 	 * nothing a runtime sends — and no tool status event that merely shares the
 	 * op string — can move the cell deadline or the abort shield's defer depth.
+	 *
+	 * Atomic-sink contract: the shield above is applied first and the observer
+	 * fanout below is best-effort. A throwing status observer must not unwind
+	 * this channel: the applied pause/resume state stands, the failure is
+	 * logged, and pause/resume pairing (including nested depths) stays intact.
 	 */
 	const handleTimeoutControl = (event: JsStatusEvent): void => {
 		abortShield.handleStatus?.(event);
-		options?.onStatus?.(event);
+		try {
+			options?.onStatus?.(event);
+		} catch (error) {
+			logger.warn("eval timeout control observer failed; keeping the applied pause/resume state", {
+				op: event.op,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 	};
 
 	/**
