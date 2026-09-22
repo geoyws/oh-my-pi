@@ -3,8 +3,8 @@
  *
  * Lives in its own module (importable without side effects) so that tests can
  * inspect the registered subcommands without triggering the side-effectful
- * top-level await in `cli.ts`. Adding a new subcommand here is enough to make
- * `runCli` route to it instead of forwarding the argv as a prompt to
+ * process entrypoint in `cli.ts`. Adding a new subcommand here is enough to
+ * make `runCli` route to it instead of forwarding the argv as a prompt to
  * `launch` — see #1496 for the original "args silently leak to the LLM"
  * regression that motivated the split.
  */
