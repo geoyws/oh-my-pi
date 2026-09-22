@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Upgraded the collaboration protocol to version 4. Guests using version 3 will now be rejected during the handshake with a protocol-mismatch error: a proto-3 guest has no handler for the new `provider_retry_wait_*` agent events ([#12785](https://github.com/can1357/oh-my-pi/pull/12785) by [@geoyws](https://github.com/geoyws)).
+
 ### Added
 
 - Added `provider_retry_wait_start` and `provider_retry_wait_end` to the collab `AgentEvent` union so a host can replicate a provider-internal retry backoff (and its countdown) to guests ([#12785](https://github.com/can1357/oh-my-pi/pull/12785) by [@geoyws](https://github.com/geoyws)).

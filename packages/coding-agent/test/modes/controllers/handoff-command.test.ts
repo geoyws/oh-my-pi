@@ -252,6 +252,68 @@ describe("/handoff command", () => {
 		expect(ensureLoadingAnimation).not.toHaveBeenCalled();
 	});
 
+	it("drops a dismounted provider-retry countdown so the working row is not left blank", async () => {
+		// The countdown now gates `ensureLoadingAnimation()` the same way the
+		// maintenance loaders do. Handoff cleanup disposes the status children, so
+		// a still-set reference would make the reconciler yield to a loader that is
+		// no longer mounted and the status row would stay empty mid-turn.
+		const statusContainer = createContainer();
+		const countdown = { stop: vi.fn() };
+		const freshWorkingLoader = { stop: vi.fn() };
+		let isStreaming = false;
+		let activeCountdown: { stop: () => void } | undefined;
+		let countdownAtEnsureCall: { stop: () => void } | undefined;
+		const ctx = {
+			sessionManager: {
+				getEntries: () => [{ type: "message" }, { type: "message" }],
+			},
+			session: {
+				get isStreaming() {
+					return isStreaming;
+				},
+				handoff: vi.fn(async () => ({ document: "## Goal\nContinue" })),
+			},
+			loadingAnimation: undefined,
+			autoCompactionLoader: undefined,
+			retryLoader: undefined,
+			get providerRetryLoader() {
+				return activeCountdown;
+			},
+			set providerRetryLoader(value: { stop: () => void } | undefined) {
+				activeCountdown = value;
+			},
+			statusContainer,
+			ui: { requestRender: vi.fn(), requestComponentRender: vi.fn() },
+			clearTransientSessionUi: vi.fn(() => {
+				statusContainer.disposeChildren();
+			}),
+			renderInitialMessages: vi.fn(async () => {
+				// A replicated provider backoff starts while handoff replay yields,
+				// then the handoff cleanup disposes the container underneath it.
+				isStreaming = true;
+				activeCountdown = countdown;
+			}),
+			ensureLoadingAnimation: vi.fn(() => {
+				countdownAtEnsureCall = activeCountdown;
+				statusContainer.addChild(freshWorkingLoader);
+			}),
+			statusLine: { invalidate: vi.fn() },
+			updateEditorBorderColor: vi.fn(),
+			reloadTodos: vi.fn(async () => undefined),
+			present: vi.fn(),
+			showStatus: vi.fn(),
+			showWarning: vi.fn(),
+			showError: vi.fn(),
+		} as unknown as InteractiveModeContext;
+		const controller = new CommandController(ctx);
+
+		await controller.handleHandoffCommand();
+
+		expect(countdown.stop).toHaveBeenCalledTimes(1);
+		expect(countdownAtEnsureCall).toBeUndefined();
+		expect(statusContainer.children).toEqual([freshWorkingLoader]);
+	});
+
 	it("surfaces a provider failure named AbortError as a real error, not a cancellation", async () => {
 		// Regression: the catch used to map any name==="AbortError" error to
 		// "Handoff cancelled". session.handoff() now normalizes genuine cancellations

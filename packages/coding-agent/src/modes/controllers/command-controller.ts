@@ -1717,7 +1717,7 @@ export class CommandController {
 		// A retry/compaction event may replace the handoff overlay while transcript
 		// replay yields. Preserve it only while it still owns the status row; a
 		// reference to a loader disposed earlier must not retain the handoff overlay.
-		const maintenanceLoader = this.ctx.autoCompactionLoader ?? this.ctx.retryLoader;
+		const maintenanceLoader = this.ctx.autoCompactionLoader ?? this.ctx.retryLoader ?? this.ctx.providerRetryLoader;
 		if (maintenanceLoader && this.ctx.statusContainer.children.includes(maintenanceLoader)) return;
 		this.ctx.statusContainer.disposeChildren();
 		// `disposeChildren()` disposed any working loader mounted by a delayed
@@ -1728,6 +1728,13 @@ export class CommandController {
 		if (this.ctx.loadingAnimation) {
 			this.ctx.loadingAnimation.stop();
 			this.ctx.loadingAnimation = undefined;
+		}
+		// Same for a provider-retry countdown the handoff outlived: leaving the
+		// reference set would make `ensureLoadingAnimation()` yield to a loader
+		// that is no longer mounted, so the status row would stay blank.
+		if (this.ctx.providerRetryLoader) {
+			this.ctx.providerRetryLoader.stop();
+			this.ctx.providerRetryLoader = undefined;
 		}
 		if (this.ctx.session.isStreaming) {
 			// A new turn won the race with handoff cleanup; mount a fresh, running

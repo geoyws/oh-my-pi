@@ -812,7 +812,16 @@ export class EventController {
 		// is awaiting, then the handler's own final requestRender schedules a
 		// second identical frame. Removing it lets the render cadence follow real
 		// state changes rather than event volume (issue #4353).
-		const run = this.#handlers[event.type] as (e: AgentSessionEvent) => Promise<void>;
+		const run = this.#handlers[event.type] as ((e: AgentSessionEvent) => Promise<void>) | undefined;
+		// A collab guest is fed events produced by the HOST's build. The hello
+		// handshake rejects a protocol mismatch, but a same-proto host may still
+		// carry a newer event type, and an unguarded table lookup would throw an
+		// unhandled TypeError and take the session down over a status-line
+		// nicety. Skipping the event only costs the display it would have driven.
+		if (!run) {
+			logger.debug("Ignoring session event with no handler", { type: event.type });
+			return;
+		}
 		await run(event);
 	}
 

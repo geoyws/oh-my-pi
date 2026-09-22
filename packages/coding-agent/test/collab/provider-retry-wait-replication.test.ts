@@ -341,4 +341,22 @@ describe("guest status during a replicated provider retry wait", () => {
 		expect(ctx.providerRetryLoader).toBeUndefined();
 		expect(visible(mode.statusContainer.render(120).join("\n"))).not.toContain("Provider retrying");
 	});
+
+	it("survives a replicated event type it has no handler for", async () => {
+		// A guest dispatches events produced by the HOST's build. The hello
+		// handshake rejects a proto mismatch, but a same-proto host carrying a
+		// newer event type must not crash the guest: an unguarded handler lookup
+		// threw a TypeError out of an unawaited handleEvent (unhandledRejection →
+		// fatal exit) over a status-line nicety.
+		const { mode, controller } = makeGuestUi();
+		const ctx = mode as unknown as InteractiveModeContext;
+
+		await controller.handleEvent({ type: "agent_start" });
+		await controller.handleEvent({ type: "from_a_newer_host" } as unknown as AgentSessionEvent);
+
+		// Still live and still rendering the turn it was given.
+		await controller.handleEvent(WAIT_START);
+		expect(ctx.providerRetryLoader).toBeDefined();
+		expect(visible(mode.statusContainer.render(120).join("\n"))).toContain("Provider retrying (2/10)");
+	});
 });

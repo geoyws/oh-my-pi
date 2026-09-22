@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Bumped `COLLAB_PROTO` to `4`: hosts now replicate `provider_retry_wait_start`/`provider_retry_wait_end` agent events. Old guests speaking proto v3 are rejected with the existing protocol-mismatch error. The browser guest ignores the two events (its event switch has a default branch); only the terminal guest renders their countdown ([#12785](https://github.com/can1357/oh-my-pi/pull/12785) by [@geoyws](https://github.com/geoyws)).
+
 ## [18.2.1] - 2026-09-15
 
 ### Fixed

@@ -410,8 +410,12 @@ export type WireFrame = GuestFrame | HostFrame;
  *   answered by the `ui-response` guest frame. Guests that predate the
  *   grammar would silently drop `ui-request` (asks hang forever on the
  *   host), so they must be rejected at hello.
+ * - `4`: hosts replicate `provider_retry_wait_start`/`provider_retry_wait_end`
+ *   agent events (a provider-internal retry backoff inside one turn). Guests
+ *   that predate them have no handler for the type, so they must be rejected
+ *   at hello rather than fed an event they cannot dispatch.
  */
-export const COLLAB_PROTO = 3;
+export const COLLAB_PROTO = 4;
 
 /** Parameter key used for intent tracing (e.g. prompt explanation/reasoning) */
 export const INTENT_FIELD = "i";
