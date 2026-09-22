@@ -22,7 +22,7 @@ import type { ChainJudge } from "../judgment";
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { ToolSession } from "../tools";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
-import { withBridgeTimeoutPause } from "./bridge-timeout";
+import { type EvalTimeoutControlSink, withBridgeTimeoutPause } from "./bridge-timeout";
 import { EVAL_HANDLE_CONCURRENCY, evalRequestSlots } from "./completion-bridge";
 import type { JsStatusEvent } from "./js/shared/types";
 import { type CellAnswer, parseQuestions, parseState, sessionJudge, toEvalJudgmentResult } from "./judgment-bridge";
@@ -65,6 +65,8 @@ export interface EvalJudgmentBatchBridgeOptions {
 	session: ToolSession;
 	signal?: AbortSignal;
 	emitStatus?: (event: JsStatusEvent) => void;
+	/** Dedicated host-owned channel for eval timeout pause/resume. */
+	onTimeoutControl?: EvalTimeoutControlSink;
 }
 
 export type EvalJudgmentBatchResult =
@@ -431,7 +433,7 @@ export async function runEvalJudgmentBatch(
 			const interval = setInterval(() => options.emitStatus?.(progressEvent(batch, "drain")), PROGRESS_INTERVAL_MS);
 			interval.unref?.();
 			try {
-				const items = await withBridgeTimeoutPause(options.emitStatus, () =>
+				const items = await withBridgeTimeoutPause(options.onTimeoutControl, () =>
 					batch.drain(timeoutMs, options.signal),
 				);
 				return { items };

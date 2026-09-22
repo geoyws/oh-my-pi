@@ -9,7 +9,12 @@ import type { ToolSession } from "../../tools";
 import { ToolAbortError } from "../../tools/tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { safeSend as safeSendIpc } from "../../utils/ipc";
-import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP } from "../bridge-timeout";
+import {
+	EVAL_TIMEOUT_PAUSE_OP,
+	EVAL_TIMEOUT_RESUME_OP,
+	rejectRuntimeTimeoutControl,
+	rejectTimeoutControlCollision,
+} from "../bridge-timeout";
 import { getEnabledEvalPreludes } from "../preludes";
 import {
 	attachSessionOwner,
@@ -44,6 +49,13 @@ export interface VmRunState {
 	signal?: AbortSignal;
 	onText?: (chunk: string) => void;
 	onDisplay?: (output: JsDisplayOutput) => void;
+	/**
+	 * Host-owned control channel for the cell watchdog. Only the parent-side
+	 * bridge wrapper writes to it, so the evaluated cell cannot pause its own
+	 * deadline through the status data channel it *can* reach
+	 * (`__omp_emit_status__` → {@link handleSessionMessage}).
+	 */
+	onTimeoutControl?: (event: JsStatusEvent) => void;
 }
 
 /** Isolated runtime transport used by the context manager and startup regression fixtures. */
@@ -53,6 +65,10 @@ export interface JsEvalWorkerHandle {
 	onMessage(handler: (msg: WorkerOutbound) => void): () => void;
 	onError(handler: (error: Error) => void): () => void;
 	close(): Promise<boolean>;
+	/**
+	 * SIGKILL the runtime. Bounded: it waits for the exit to be observed and
+	 * logs an unconfirmed kill instead of blocking on it.
+	 */
 	terminate(): Promise<void>;
 }
 
@@ -715,6 +731,11 @@ function handleSessionMessage(session: JsSession, msg: WorkerOutbound): void {
 		}
 		case "display": {
 			const pending = session.pending.get(msg.runId);
+			// Everything on this channel is runtime output, including whatever
+			// evaluated code passes to `__omp_emit_status__`. Timeout control is
+			// host-owned, so a forged pause/resume dies here instead of reaching
+			// the cell watchdog.
+			if (msg.output.type === "status" && rejectRuntimeTimeoutControl(msg.output.event, "JS eval")) return;
 			pending?.runState.onDisplay?.(msg.output);
 			return;
 		}
@@ -789,9 +810,18 @@ async function handleToolCall(session: JsSession, msg: Extract<WorkerOutbound, {
 			signal: ctrl.signal,
 			identity: msg.identity,
 			shadowCell: pending.shadowCell,
+			// Generic tool status: `op` is a tool name, so a name colliding with
+			// timeout control is not authority. Drop the collision and render the
+			// rest; real control arrives on `onTimeoutControl` below.
 			emitStatus: (event: JsStatusEvent) => {
-				trackDeferPhase(pending, event);
+				if (rejectTimeoutControlCollision(event, `JS eval tool ${JSON.stringify(msg.name)}`)) return;
 				pending.runState.onDisplay?.({ type: "status", event });
+			},
+			// This process's own bridge lifecycle. Nothing the runtime can send
+			// reaches this channel, which is what makes it the deadline authority.
+			onTimeoutControl: (event: JsStatusEvent) => {
+				trackDeferPhase(pending, event);
+				pending.runState.onTimeoutControl?.(event);
 			},
 		});
 		safeSend(session, { type: "tool-reply", id: msg.id, reply: { ok: true, value } });
@@ -1049,7 +1079,22 @@ function wrapBunWorker(worker: Worker): JsEvalWorkerHandle {
 			return await closed;
 		},
 		async terminate() {
-			worker.terminate();
+			// `Worker.terminate()` is fire-and-forget in Bun; the thread's real
+			// exit arrives as a `close` event. Confirm it under a bound so a
+			// caller is never told the runtime is gone without evidence.
+			const exited = Promise.withResolvers<boolean>();
+			const onClose = (): void => exited.resolve(true);
+			worker.addEventListener("close", onClose, { once: true });
+			const timeout = setTimeout(() => exited.resolve(false), WORKER_CLOSE_TIMEOUT_MS);
+			timeout.unref?.();
+			try {
+				worker.terminate();
+				const confirmed = await exited.promise;
+				if (!confirmed) logger.warn("JS eval worker thread did not confirm exit after terminate()");
+			} finally {
+				clearTimeout(timeout);
+				worker.removeEventListener("close", onClose);
+			}
 		},
 	};
 }

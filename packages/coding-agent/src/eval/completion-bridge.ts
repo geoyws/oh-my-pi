@@ -40,6 +40,7 @@ import {
 	resolveRetryFallbackChainKey,
 } from "../session/retry-fallback-chains";
 import { shouldDisableReasoning, toReasoningEffort } from "@oh-my-pi/pi-tui/thinking";
+import type { EvalTimeoutControlSink } from "./bridge-timeout";
 import type { JsStatusEvent } from "./js/shared/types";
 
 /** Synthetic bridge name reserved for the `completion()` helper across both runtimes. */
@@ -67,6 +68,8 @@ export interface EvalCompletionBridgeOptions {
 	session: ToolSession;
 	signal?: AbortSignal;
 	emitStatus?: (event: JsStatusEvent) => void;
+	/** Dedicated host-owned channel for eval timeout pause/resume. */
+	onTimeoutControl?: EvalTimeoutControlSink;
 }
 
 /** Terminal payload of a retained handle. */

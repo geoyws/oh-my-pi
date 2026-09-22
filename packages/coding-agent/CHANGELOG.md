@@ -20,6 +20,9 @@
 - Added support for buffered cloud transcription using OpenAI-compatible models
 - Added visual change detection capabilities for video processing using FFMPEG and SVG overlaying
 - Prevented LSP client from hanging when a request is aborted while waiting for a previous write
+- Fixed an eval cell being able to disarm its own timeout: a cell could emit the bridge's `timeout-pause` status event itself (`__omp_emit_status__` in JS, an `application/x-omp-status` display bundle in Python) and run unbounded. Pause authority is now carried by a dedicated host-only control channel rather than by the `op` string on the shared status path, so neither a runtime-emitted event nor an ordinary tool that happens to be *named* `timeout-pause` can suspend the deadline. Genuine `agent()`/`completion()`/`tool.*` waits are still exempt from the budget for as long as they take.
+- Fixed an eval cell timeout leaving the JS worker's own child processes running: terminating the worker now sweeps the process group it leads, so anything the timed-out cell spawned is reaped with it. Ordinary teardown already contained the Python kernel's group; the JS worker was the gap.
+- Eval runtime termination now waits a bounded window for the runtime's exit and logs the surviving pid when it cannot be confirmed, instead of reporting a kill it never observed.
 
 ## [18.2.7] - 2026-09-21
 

@@ -3,7 +3,7 @@ import { MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { ToolSession } from "../tools";
 import { ToolAbortError } from "../tools/tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
-import { withBridgeTimeoutPause } from "./bridge-timeout";
+import { type EvalTimeoutControlSink, withBridgeTimeoutPause } from "./bridge-timeout";
 import { getCompletionHandle, type CompletionHandleEntry } from "./completion-bridge";
 import type { JsStatusEvent } from "./js/shared/types";
 
@@ -35,6 +35,8 @@ interface EvalHandleBridgeOptions {
 	session: ToolSession;
 	signal?: AbortSignal;
 	emitStatus?: (event: JsStatusEvent) => void;
+	/** Dedicated host-owned channel for eval timeout pause/resume. */
+	onTimeoutControl?: EvalTimeoutControlSink;
 }
 
 type ResolvedHandle =
@@ -201,7 +203,7 @@ export async function runEvalWait(
 		if (progress) emittedProgress.set(handle.ref.id, progress);
 	};
 	return await withBridgeTimeoutPause(
-		options.emitStatus,
+		options.onTimeoutControl,
 		async () => {
 			for (const handle of resolved) emitLatestProgress(handle);
 			const interval = setInterval(() => {

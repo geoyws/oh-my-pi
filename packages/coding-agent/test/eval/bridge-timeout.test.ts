@@ -10,7 +10,6 @@ import {
 } from "../../src/eval/bridge-timeout";
 import { executeWithKernelBase, type GenericKernel } from "../../src/eval/executor-base";
 import type { JsStatusEvent } from "../../src/eval/js/shared/types";
-import type { KernelDisplayOutput } from "../../src/eval/py/display";
 import * as pyToolBridge from "../../src/eval/py/tool-bridge";
 import type { ToolSession } from "../../src/tools";
 
@@ -31,6 +30,28 @@ function makeToolSession(...tools: AgentTool[]): ToolSession {
 		getEvalSessionId: () => "bridge-timeout-eval-session",
 		getToolByName: name => tools.find(tool => tool.name === name),
 	};
+}
+
+/**
+ * Capture the host-side timeout-control sink the executor hands the tool bridge.
+ *
+ * Pause/resume are host bridge lifecycle, not runtime output and not generic
+ * tool status: they travel a dedicated channel precisely so neither a cell nor
+ * a tool named `timeout-pause` can reach them. A test modelling a real bridge
+ * phase must emit through that same host handle.
+ */
+function captureHostTimeoutControl(): { emit: (event: JsStatusEvent) => void } {
+	const register = pyToolBridge.registerPyToolBridge;
+	const handle = {
+		emit: (_event: JsStatusEvent): void => {
+			throw new Error("tool bridge was never registered");
+		},
+	};
+	vi.spyOn(pyToolBridge, "registerPyToolBridge").mockImplementation((sessionId, runId, entry) => {
+		handle.emit = event => entry.onTimeoutControl?.(event);
+		return register(sessionId, runId, entry);
+	});
+	return handle;
 }
 
 afterEach(() => {
@@ -111,6 +132,7 @@ class TestCancelledError extends Error {
 
 it("defers external aborts until an in-flight agent bridge call resumes", async () => {
 	const abortController = new AbortController();
+	const host = captureHostTimeoutControl();
 	const entered = Promise.withResolvers<void>();
 	const triggerAbort = Promise.withResolvers<void>();
 	const observed = Promise.withResolvers<boolean>();
@@ -119,17 +141,11 @@ it("defers external aborts until an in-flight agent bridge call resumes", async 
 		async execute(_code, options) {
 			entered.resolve();
 			await triggerAbort.promise;
-			options.onDisplay({
-				type: "status",
-				event: { op: EVAL_TIMEOUT_PAUSE_OP, deferExternalAbort: true },
-			} satisfies KernelDisplayOutput);
+			host.emit({ op: EVAL_TIMEOUT_PAUSE_OP, deferExternalAbort: true });
 			abortController.abort(new Error("external interrupt"));
 			observed.resolve(options.signal?.aborted ?? false);
 			await release.promise;
-			options.onDisplay({
-				type: "status",
-				event: { op: EVAL_TIMEOUT_RESUME_OP, deferExternalAbort: true },
-			} satisfies KernelDisplayOutput);
+			host.emit({ op: EVAL_TIMEOUT_RESUME_OP, deferExternalAbort: true });
 			return { status: "ok", cancelled: false, timedOut: false };
 		},
 	};
@@ -137,7 +153,11 @@ it("defers external aborts until an in-flight agent bridge call resumes", async 
 	const resultPromise = executeWithKernelBase({
 		kernel,
 		code: "agent('slow')",
-		options: { signal: abortController.signal },
+		options: {
+			signal: abortController.signal,
+			toolSession: makeToolSession(),
+			bridgeSessionId: `bridge-${crypto.randomUUID()}`,
+		},
 		runIdPrefix: "test",
 		errorLogLabel: "test",
 		cancelledErrorClass: TestCancelledError,
@@ -157,6 +177,7 @@ it("defers external aborts until an in-flight agent bridge call resumes", async 
 
 it("does not defer external aborts for a completion bridge call", async () => {
 	const abortController = new AbortController();
+	const host = captureHostTimeoutControl();
 	const entered = Promise.withResolvers<void>();
 	const triggerAbort = Promise.withResolvers<void>();
 	const observed = Promise.withResolvers<boolean>();
@@ -165,17 +186,11 @@ it("does not defer external aborts for a completion bridge call", async () => {
 		async execute(_code, options) {
 			entered.resolve();
 			await triggerAbort.promise;
-			options.onDisplay({
-				type: "status",
-				event: { op: EVAL_TIMEOUT_PAUSE_OP },
-			} satisfies KernelDisplayOutput);
+			host.emit({ op: EVAL_TIMEOUT_PAUSE_OP });
 			abortController.abort(new Error("external interrupt"));
 			observed.resolve(options.signal?.aborted ?? false);
 			await release.promise;
-			options.onDisplay({
-				type: "status",
-				event: { op: EVAL_TIMEOUT_RESUME_OP },
-			} satisfies KernelDisplayOutput);
+			host.emit({ op: EVAL_TIMEOUT_RESUME_OP });
 			return { status: "ok", cancelled: false, timedOut: false };
 		},
 	};
@@ -183,7 +198,11 @@ it("does not defer external aborts for a completion bridge call", async () => {
 	const resultPromise = executeWithKernelBase({
 		kernel,
 		code: "completion('slow')",
-		options: { signal: abortController.signal },
+		options: {
+			signal: abortController.signal,
+			toolSession: makeToolSession(),
+			bridgeSessionId: `bridge-${crypto.randomUUID()}`,
+		},
 		runIdPrefix: "test",
 		errorLogLabel: "test",
 		cancelledErrorClass: TestCancelledError,
@@ -210,27 +229,25 @@ it("hands the tool bridge the unshielded signal so a deferred phase still cancel
 	const observedKernelAbort = Promise.withResolvers<boolean>();
 	const release = Promise.withResolvers<void>();
 	let bridgeSignal: AbortSignal | undefined;
+	let hostEmit: (event: JsStatusEvent) => void = () => {
+		throw new Error("tool bridge was never registered");
+	};
 	const registerSpy = vi
 		.spyOn(pyToolBridge, "registerPyToolBridge")
 		.mockImplementation((_sessionId, _runId, entry) => {
 			bridgeSignal = entry.signal;
+			hostEmit = event => entry.onTimeoutControl?.(event);
 			return () => {};
 		});
 
 	const kernel: GenericKernel<Record<string, string | null>> = {
 		async execute(_code, options) {
 			entered.resolve();
-			options.onDisplay({
-				type: "status",
-				event: { op: EVAL_TIMEOUT_PAUSE_OP, deferExternalAbort: true },
-			} satisfies KernelDisplayOutput);
+			hostEmit({ op: EVAL_TIMEOUT_PAUSE_OP, deferExternalAbort: true });
 			abortController.abort(new Error("external interrupt"));
 			observedKernelAbort.resolve(options.signal?.aborted ?? false);
 			await release.promise;
-			options.onDisplay({
-				type: "status",
-				event: { op: EVAL_TIMEOUT_RESUME_OP, deferExternalAbort: true },
-			} satisfies KernelDisplayOutput);
+			hostEmit({ op: EVAL_TIMEOUT_RESUME_OP, deferExternalAbort: true });
 			return { status: "ok", cancelled: false, timedOut: false };
 		},
 	};
@@ -275,6 +292,7 @@ it("holds the cell open through a deferred phase while still aborting the tool a
 	// wait answers with the tool's real value once the phase releases.
 	const bridge = await pyToolBridge.ensurePyToolBridge();
 	const abortController = new AbortController();
+	const host = captureHostTimeoutControl();
 	const toolStarted = Promise.withResolvers<void>();
 	const toolSawAbort = Promise.withResolvers<void>();
 	const releaseTool = Promise.withResolvers<void>();
@@ -300,10 +318,7 @@ it("holds the cell open through a deferred phase while still aborting the tool a
 	let reply: { ok: boolean; value?: unknown; error?: string } | undefined;
 	const kernel: GenericKernel<Record<string, string | null>> = {
 		async execute(_code, options) {
-			options.onDisplay({
-				type: "status",
-				event: { op: EVAL_TIMEOUT_PAUSE_OP, deferExternalAbort: true },
-			} satisfies KernelDisplayOutput);
+			host.emit({ op: EVAL_TIMEOUT_PAUSE_OP, deferExternalAbort: true });
 			// Mirrors the Python prelude's blocking loopback call.
 			const pending = fetch(`${bridge.url}/v1/tool`, {
 				method: "POST",
@@ -318,10 +333,7 @@ it("holds the cell open through a deferred phase while still aborting the tool a
 
 			releaseTool.resolve();
 			reply = await pending;
-			options.onDisplay({
-				type: "status",
-				event: { op: EVAL_TIMEOUT_RESUME_OP, deferExternalAbort: true },
-			} satisfies KernelDisplayOutput);
+			host.emit({ op: EVAL_TIMEOUT_RESUME_OP, deferExternalAbort: true });
 			return { status: "ok", cancelled: false, timedOut: false };
 		},
 	};

@@ -183,7 +183,7 @@ export async function runEvalJudgment(
 	const questions = parseQuestions(args.questions);
 	const judge = sessionJudge(options, "judge");
 	const signal = options.signal;
-	return withBridgeTimeoutPause(options.emitStatus, async () => {
+	return withBridgeTimeoutPause(options.onTimeoutControl, async () => {
 		await evalRequestSlots.acquire(signal);
 		try {
 			return toEvalJudgmentResult(await judge.judge({ state, questions }, { signal }));

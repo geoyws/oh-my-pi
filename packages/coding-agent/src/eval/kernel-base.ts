@@ -1,5 +1,6 @@
 import { logger, Snowflake } from "@oh-my-pi/pi-utils";
 import type { Subprocess } from "bun";
+import { killProcessGroup } from "../subprocess/process-group";
 import { type KernelDisplayOutput, renderKernelDisplay } from "./py/display";
 import type { ShadowBarrier, ShadowControlNode, ShadowOperation } from "./speculation/types";
 
@@ -138,45 +139,6 @@ interface PendingExecution {
 export function getRemainingTimeMs(deadlineMs?: number): number | undefined {
 	if (deadlineMs === undefined) return undefined;
 	return Math.max(0, deadlineMs - Date.now());
-}
-
-/**
- * True when `pid` is safe to use as a process-group target for `kill(2)`.
- *
- * `process.kill(-pid, …)` is a group signal, and the degenerate targets are
- * catastrophic rather than merely useless: `-0` signals *our own* process group
- * (omp would kill itself along with the whole terminal job) and `-1` signals
- * every process the user is permitted to signal. Both must be rejected before
- * the negation is applied.
- */
-export function isSignalableProcessGroup(pid: number | undefined): pid is number {
-	return typeof pid === "number" && Number.isInteger(pid) && pid > 1;
-}
-
-/**
- * Signal the whole process group led by `pid`, returning true when a signal was
- * actually delivered.
- *
- * Kernels are spawned with `detached: true` on POSIX (see `shouldDetachKernel`),
- * so each runner calls `setsid()` and becomes the leader of its own session and
- * process group. Signalling only the direct PID therefore leaves anything the
- * runner itself spawned behind, and those orphans keep the kernel's pipes open
- * for the remainder of the omp process lifetime (#7714).
- *
- * Windows has no process groups, so this is a no-op there and callers keep
- * relying on the direct-PID kill.
- */
-export function killProcessGroup(pid: number | undefined, signal: NodeJS.Signals): boolean {
-	if (process.platform === "win32") return false;
-	if (!isSignalableProcessGroup(pid)) return false;
-	try {
-		process.kill(-pid, signal);
-		return true;
-	} catch {
-		// ESRCH: the group is already gone, which is the outcome we wanted anyway.
-		// EPERM: not ours to signal. Neither is worth failing a shutdown over.
-		return false;
-	}
 }
 
 export function createAbortError(name: "AbortError" | "TimeoutError", message: string): Error {

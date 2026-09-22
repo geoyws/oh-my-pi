@@ -9,6 +9,7 @@
  */
 import { logger, postmortem } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "../../tools";
+import type { EvalTimeoutControlSink } from "../bridge-timeout";
 import type { RuntimeCallIdentity } from "../js/shared/runtime";
 import { bridgeValueFromToolResult, callSessionTool, type JsStatusEvent } from "../js/tool-bridge";
 import type { EvalShadowCellSession } from "../speculation/cell-session";
@@ -30,6 +31,12 @@ export interface PyToolBridgeEntry {
 	shieldedSignal?: AbortSignal;
 	shadowCell?: EvalShadowCellSession;
 	emitStatus?: (event: JsStatusEvent) => void;
+	/**
+	 * Dedicated host-owned channel for eval timeout pause/resume. Separate from
+	 * {@link PyToolBridgeEntry.emitStatus}, which carries `{ op: <tool name> }`
+	 * events a tool name can collide with.
+	 */
+	onTimeoutControl?: EvalTimeoutControlSink;
 	abortRequested?: () => boolean;
 }
 
@@ -126,6 +133,7 @@ async function callSessionToolPromptOnAbort(
 		session: entry.toolSession,
 		signal: entry.signal,
 		emitStatus: entry.emitStatus,
+		onTimeoutControl: entry.onTimeoutControl,
 		defaultIntent: "py prelude",
 		identity,
 	});

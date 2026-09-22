@@ -3,7 +3,12 @@ import { Settings } from "../config/settings";
 import { type OutputArtifactError, OutputSink } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import type { ToolSession } from "../tools";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
-import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP, isEvalTimeoutControlEvent } from "./bridge-timeout";
+import {
+	EVAL_TIMEOUT_PAUSE_OP,
+	EVAL_TIMEOUT_RESUME_OP,
+	rejectRuntimeTimeoutControl,
+	rejectTimeoutControlCollision,
+} from "./bridge-timeout";
 import type { JsStatusEvent } from "./js/shared/types";
 import type { KernelDisplayOutput } from "./py/display";
 import { registerPyToolBridge } from "./py/tool-bridge";
@@ -472,17 +477,42 @@ export async function executeWithKernelBase<
 			: (timeoutSignal ?? options?.signal);
 	const abortShield = createBridgeAbortShield(abortSource);
 
+	/**
+	 * Host-owned watchdog control. Reaching this function *is* the authority:
+	 * only this process's `withBridgeTimeoutPause` wrapper is handed it, so
+	 * nothing a runtime sends — and no tool status event that merely shares the
+	 * op string — can move the cell deadline or the abort shield's defer depth.
+	 */
+	const handleTimeoutControl = (event: JsStatusEvent): void => {
+		abortShield.handleStatus?.(event);
+		options?.onStatus?.(event);
+	};
+
+	/**
+	 * Generic host status (tool progress, tool errors). Its `op` is a tool name,
+	 * so an op colliding with timeout control is a *name*, never authority: drop
+	 * the collision and leave the deadline armed.
+	 */
+	const emitHostStatus = (event: JsStatusEvent): void => {
+		if (rejectTimeoutControlCollision(event, `${errorLogLabel} tool status`)) return;
+		options?.onStatus?.(event);
+		displayOutputs.push({ type: "status", event });
+	};
+
+	/**
+	 * Kernel-originated display. Evaluated code can emit an
+	 * `application/x-omp-status` bundle, so a timeout pause/resume arriving here
+	 * is forged (or an echo) and is dropped: the deadline stays armed.
+	 */
 	const collectDisplay = (output: KernelDisplayOutput): void => {
 		if (output.type === "status") {
-			abortShield.handleStatus?.(output.event);
+			if (rejectRuntimeTimeoutControl(output.event, errorLogLabel)) return;
 			options?.onStatus?.(output.event);
-			if (isEvalTimeoutControlEvent(output.event)) return;
 		}
 		displayOutputs.push(output);
 	};
 
-	const emitStatus: (event: JsStatusEvent) => void =
-		options?.emitStatus ?? (event => collectDisplay({ type: "status", event }));
+	const emitStatus: (event: JsStatusEvent) => void = options?.emitStatus ?? emitHostStatus;
 	const runId = `${runIdPrefix}-${crypto.randomUUID()}`;
 	// Two aborts cross the bridge, and conflating them is what let a cancelled
 	// turn keep working. Delegated work (above all the subagents `agent()`
@@ -500,6 +530,7 @@ export async function executeWithKernelBase<
 					signal: options.signal,
 					shieldedSignal: abortShield.signal,
 					emitStatus,
+					onTimeoutControl: handleTimeoutControl,
 					shadowCell: getActiveEvalShadowCell(),
 					abortRequested: () => {
 						return abortShield.abortRequested;

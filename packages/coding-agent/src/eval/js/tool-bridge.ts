@@ -9,7 +9,7 @@ import { schemaDeclaresIntentField } from "../../utils/tool-schema";
 import { findEnabledEvalPrelude, invokeEvalPrelude } from "../preludes";
 import { EVAL_AGENT_BRIDGE_NAME, type EvalAgentHandleResult, runEvalAgent } from "../agent-bridge";
 import { EVAL_BUDGET_BRIDGE_NAME, type EvalBudgetResult, runEvalBudget } from "../budget-bridge";
-import { withBridgeTimeoutPause } from "../bridge-timeout";
+import { type EvalTimeoutControlSink, withBridgeTimeoutPause } from "../bridge-timeout";
 import { EVAL_COMPLETION_BRIDGE_NAME, type EvalCompletionHandleResult, runEvalCompletion } from "../completion-bridge";
 import {
 	EVAL_JUDGMENT_BATCH_BRIDGE_NAME,
@@ -38,6 +38,14 @@ export interface ToolBridgeOptions {
 	session: ToolSession;
 	signal?: AbortSignal;
 	emitStatus?: (event: JsStatusEvent) => void;
+	/**
+	 * Dedicated host-owned channel for eval timeout pause/resume. Kept apart
+	 * from {@link ToolBridgeOptions.emitStatus}: that sink carries
+	 * `{ op: <tool name> }` events, so a tool named `timeout-pause` would
+	 * otherwise read as deadline authority. Authority is the channel, not the
+	 * string.
+	 */
+	onTimeoutControl?: EvalTimeoutControlSink;
 	defaultIntent?: string;
 	identity?: RuntimeCallIdentity;
 	shadowCell?: EvalShadowCellSession;
@@ -215,7 +223,7 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 			// wait to Eval as well can kill its kernel during a first-use browser
 			// install or an explicitly longer navigation. Caller abort still flows
 			// through; only the runtime-work watchdog is paused.
-			const result = await withBridgeTimeoutPause(options.emitStatus, () =>
+			const result = await withBridgeTimeoutPause(options.onTimeoutControl, () =>
 				invokeEvalPrelude(request.name, request.parameters, {
 					session: options.session,
 					toolCallId,

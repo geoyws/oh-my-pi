@@ -16,6 +16,7 @@ import {
 } from "@oh-my-pi/pi-utils";
 import { stripGitRepoLocationEnv } from "@oh-my-pi/pi-utils/env";
 import type { Subprocess } from "bun";
+import { killProcessGroup } from "./process-group";
 
 /**
  * Shared lifecycle scaffolding for the ONNX inference subprocess clients
@@ -56,6 +57,11 @@ export interface WorkerHandle<Inbound, Outbound> {
 	send(message: Inbound): void;
 	onMessage(handler: (message: Outbound) => void): () => void;
 	onError(handler: (error: Error) => void): () => void;
+	/**
+	 * SIGKILL the worker, waiting a bounded window for its exit to be observed.
+	 * An unconfirmed kill is logged with the worker's pid rather than waited
+	 * out, so a survivor is always evidenced somewhere.
+	 */
 	terminate(): Promise<void>;
 }
 
@@ -90,6 +96,14 @@ export interface SpawnedSubprocess<Outbound> {
 	 * wall-clock timers.
 	 */
 	stderrDrained: Promise<void>;
+	/**
+	 * True when the child was spawned `detached` on a platform with process
+	 * groups, so it leads its own group and `terminate()` must sweep that group
+	 * rather than only the leader pid.
+	 */
+	leadsProcessGroup: boolean;
+	/** Human-readable worker name used in exit/termination diagnostics. */
+	exitLabel: string;
 }
 
 /**
@@ -325,7 +339,15 @@ export function createWorkerSubprocess<Outbound>(options: {
 	// path calls `terminate()` explicitly. Bun's test runner starves IPC for
 	// unref'd subprocesses, so keep it referenced only under tests.
 	if (!isBunTestRuntime() && options.unref !== false) proc.unref();
-	return { proc, inbound, errors, intentionalExit, stderrDrained: stderrDrained.promise };
+	return {
+		proc,
+		inbound,
+		errors,
+		intentionalExit,
+		stderrDrained: stderrDrained.promise,
+		leadsProcessGroup: options.detached === true && process.platform !== "win32",
+		exitLabel: options.exitLabel,
+	};
 }
 
 /**
@@ -441,6 +463,14 @@ async function drainStderrCapture(capture: StderrCapture, exitLabel: string, tai
 }
 
 /**
+ * How long {@link createWorkerHandle} waits for a SIGKILLed worker to actually
+ * be reaped before giving up and logging the termination as unconfirmed.
+ * SIGKILL is synchronous in the kernel; this only covers the parent noticing
+ * the exit, so it is short — an unconfirmed kill is reported, never waited out.
+ */
+const TERMINATE_CONFIRM_TIMEOUT_MS = 2_000;
+
+/**
  * Wrap a {@link SpawnedSubprocess} as a {@link WorkerHandle}. The `send`
  * strategy is injected so each client keeps its exact IPC-send behaviour (e.g.
  * `safeSend` vs an inline guarded `proc.send`). `terminate()` SIGKILLs: the
@@ -448,12 +478,25 @@ async function drainStderrCapture(capture: StderrCapture, exitLabel: string, tai
  * `onnxruntime-node`'s NAPI finalizer (it crashes Bun on Windows), so the OS
  * reclaims the model memory instead. The intentional-exit flag is flipped
  * *before* the kill so `onExit` can tell it apart from a native crash.
+ *
+ * A worker spawned `detached` leads its own process group, and killing the
+ * leader pid alone leaves everything *it* spawned running for the rest of the
+ * omp process lifetime. The group is therefore swept as well — but only while
+ * the child is demonstrably live: once it has been reaped the OS may recycle
+ * its pid, and `kill(-pid)` would then land on an unrelated group. The direct
+ * pid kill always runs too (it is the only path on Windows and for a child
+ * that never became a group leader, and it costs nothing when the group sweep
+ * already succeeded). Both are best-effort.
+ *
+ * The exit is then confirmed under {@link TERMINATE_CONFIRM_TIMEOUT_MS}; an
+ * unconfirmed kill is logged with the worker label and pid rather than waited
+ * out, mirroring `BaseKernel.shutdown()`.
  */
 export function createWorkerHandle<Inbound, Outbound>(
 	spawned: SpawnedSubprocess<Outbound>,
 	send: (message: Inbound) => void,
 ): WorkerHandle<Inbound, Outbound> {
-	const { proc, inbound, errors, intentionalExit } = spawned;
+	const { proc, inbound, errors, intentionalExit, leadsProcessGroup, exitLabel } = spawned;
 	return {
 		send,
 		onMessage(handler) {
@@ -466,13 +509,36 @@ export function createWorkerHandle<Inbound, Outbound>(
 		},
 		async terminate() {
 			intentionalExit.value = true;
+			const pid = proc.pid;
+			// Bun reports a reaped child through exitCode/signalCode; both null
+			// means it has not been reaped, so `-pid` still names its group.
+			const live = proc.exitCode === null && proc.signalCode === null;
+			if (leadsProcessGroup && live) killProcessGroup(pid, "SIGKILL");
 			try {
 				proc.kill("SIGKILL");
 			} catch {
 				// Already gone.
 			}
+			const confirmed = await waitForSubprocessExit(proc, TERMINATE_CONFIRM_TIMEOUT_MS);
+			if (!confirmed) {
+				// The caller may be about to tell a user their runtime is gone;
+				// record the survivor's pid so that claim is auditable.
+				logger.warn(`${exitLabel} did not confirm exit after SIGKILL`, { pid });
+			}
 		},
 	};
+}
+
+/** Resolve true when `proc` is reaped within `timeoutMs`, false on expiry. */
+async function waitForSubprocessExit(proc: Subprocess, timeoutMs: number): Promise<boolean> {
+	const expired = Promise.withResolvers<false>();
+	const timer = setTimeout(() => expired.resolve(false), Math.max(0, timeoutMs));
+	timer.unref?.();
+	try {
+		return await Promise.race([proc.exited.then(() => true), expired.promise]);
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 /**
@@ -510,6 +576,7 @@ export function createUnavailableWorker<
 			return () => {};
 		},
 		async terminate() {
+			// Nothing was ever spawned, so there is nothing left running.
 			listeners.clear();
 		},
 	};
