@@ -36,6 +36,8 @@ import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memor
 
 const WAIT_START: Extract<AgentSessionEvent, { type: "provider_retry_wait_start" }> = {
 	type: "provider_retry_wait_start",
+	waitId: 1,
+	role: "main",
 	delayMs: 4000,
 	model: "claude-sonnet-4-5",
 	provider: "anthropic",
@@ -46,6 +48,7 @@ const WAIT_START: Extract<AgentSessionEvent, { type: "provider_retry_wait_start"
 const WAIT_END: Extract<AgentSessionEvent, { type: "provider_retry_wait_end" }> = {
 	type: "provider_retry_wait_end",
 	aborted: false,
+	waitId: 1,
 };
 
 /** Rendered status rows carry SGR; compare against the visible text only. */
@@ -273,6 +276,10 @@ describe("guest status during a replicated provider retry wait", () => {
 		// Replicated events only reach a guest after its UI came up; the full
 		// `init()` train (slash commands, MCP, skills) is irrelevant here.
 		mode.isInitialized = true;
+		// Joined guest: the replica session never streams locally, so the host
+		// turn the controller is replaying (`agent_start` → `agent_end`) is this
+		// session's only notion of "a turn is running".
+		mode.collabGuest = {} as unknown as InteractiveModeContext["collabGuest"];
 		cleanups.push(async () => mode.stop());
 		return { mode, controller: new EventController(mode as unknown as InteractiveModeContext) };
 	}
@@ -281,7 +288,8 @@ describe("guest status during a replicated provider retry wait", () => {
 		const { mode, controller } = makeGuestUi();
 		const ctx = mode as unknown as InteractiveModeContext;
 
-		// Host reports streaming before the backoff: the guest shows "Working…".
+		// The host's turn starts and its state frame lands: the guest shows "Working…".
+		await controller.handleEvent({ type: "agent_start" });
 		reconcileGuestSnapshotHostState(ctx, true);
 		expect(ctx.loadingAnimation).toBeDefined();
 		expect(visible(mode.statusContainer.render(120).join("\n"))).toContain("Working");
@@ -318,6 +326,7 @@ describe("guest status during a replicated provider retry wait", () => {
 		const { mode, controller } = makeGuestUi();
 		const ctx = mode as unknown as InteractiveModeContext;
 
+		await controller.handleEvent({ type: "agent_start" });
 		await controller.handleEvent(WAIT_START);
 		expect(ctx.providerRetryLoader).toBeDefined();
 

@@ -203,6 +203,15 @@ export type AgentEvent =
 	 */
 	| {
 			type: "provider_retry_wait_start";
+			/** Correlation id pairing this start with its `_end`. Monotonic per session. */
+			waitId: number;
+			/**
+			 * Which stream role observed the backoff; only `main` waits render a
+			 * turn countdown. Mirrors the coding agent's
+			 * `ProviderRetryWaitStreamRole` — inlined because the wire contract
+			 * cannot depend on the agent package.
+			 */
+			role: "main" | "advisor" | "side";
 			delayMs: number;
 			model: string;
 			provider: string;
@@ -211,7 +220,7 @@ export type AgentEvent =
 			attempt?: number;
 			maxAttempts?: number;
 	  }
-	| { type: "provider_retry_wait_end"; aborted: boolean }
+	| { type: "provider_retry_wait_end"; aborted: boolean; waitId: number }
 	| { type: "thinking_level_changed"; thinkingLevel?: string };
 
 // ═══════════════════════════════════════════════════════════════════════════
