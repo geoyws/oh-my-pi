@@ -239,6 +239,14 @@ export interface InteractiveModeContext {
 	loadingAnimation: Loader | undefined;
 	autoCompactionLoader: Loader | undefined;
 	retryLoader: Loader | undefined;
+	/**
+	 * Countdown for a provider-internal retry backoff. Its own slot, never
+	 * `retryLoader`: a session-level retry overlay and this one must not clobber
+	 * each other. On the context rather than private to `EventController` so the
+	 * collab guest's periodic host-state reconcile can see that the status area
+	 * is already owned (a replicated wait outlives several `state` frames).
+	 */
+	providerRetryLoader: Loader | undefined;
 	unsubscribe?: () => void;
 	onInputCallback?: (input: SubmittedUserInput) => void;
 	optimisticUserMessageSignature: string | undefined;

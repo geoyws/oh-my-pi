@@ -261,6 +261,7 @@ export function createInteractiveModeContext(overrides: ContextOverrides = {}): 
 		loadingAnimation: undefined,
 		autoCompactionLoader: undefined,
 		retryLoader: undefined,
+		providerRetryLoader: undefined,
 		optimisticUserMessageSignature: undefined,
 		optimisticSkillMessagePending: false,
 		locallySubmittedUserSignatures: new Set<string>(),

@@ -9,6 +9,7 @@
 ### Fixed
 
 - Fixed provider-internal retry backoffs looking like a frozen turn: pi-ai's own stream retry waits — including the Anthropic HTTP client's 429/529 overload sleeps — now surface as `provider_retry_wait_start`/`provider_retry_wait_end` session events, a "Provider retrying (2/10) in …" status countdown that shows the retry position when the waiting loop reports one, and a structured log line. Retry delays, attempt counts, and abort behaviour are unchanged ([#12785](https://github.com/can1357/oh-my-pi/pull/12785) by [@geoyws](https://github.com/geoyws)).
+- Fixed collab guests sitting on a "Working…" overlay through a host's provider-internal retry backoff: `provider_retry_wait_start`/`provider_retry_wait_end` now replicate to guests, which render the same "Provider retrying (2/10) in …" countdown the host shows. A guest's status is driven by the host's periodic state frames, so "Working…" returns on the first one after the wait ends (within ~2s); an interrupted wait is retired by the next turn or by the host going idle ([#12785](https://github.com/can1357/oh-my-pi/pull/12785) by [@geoyws](https://github.com/geoyws)).
 
 ## [18.2.8] - 2026-09-21
 

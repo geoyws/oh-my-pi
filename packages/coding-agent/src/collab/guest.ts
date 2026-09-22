@@ -90,6 +90,12 @@ export interface GuestIdleReconcilerCtx {
 	statusLine: { markActivityEnd: () => void };
 	statusContainer: Pick<InteractiveModeContext["statusContainer"], "disposeChildren">;
 	loadingAnimation: { stop: () => void } | undefined;
+	/**
+	 * Replicated provider-retry countdown. Host-owned like the working loader:
+	 * an idle host means the wait it was counting is over, so a
+	 * `provider_retry_wait_end` lost to a reconnect must not leave it ticking.
+	 */
+	providerRetryLoader: { stop: () => void } | undefined;
 }
 
 /**
@@ -98,8 +104,9 @@ export interface GuestIdleReconcilerCtx {
  * dropped the event mid-stream. Reached via {@link reconcileGuestSnapshotHostState}
  * (the live `state`-frame and welcome/resync reconciler) when the host reports `isStreaming === false`:
  * folds the in-flight active-time window into the per-session meter (so
- * `time_spent` stops ticking) and stops the `Working…` loader if one is
- * still animating. No-op when the host is still streaming.
+ * `time_spent` stops ticking) and stops the `Working…` loader — or a
+ * replicated provider-retry countdown — if one is still animating. No-op when
+ * the host is still streaming.
  *
  * Exported for direct unit testing; mutates the loader field on `ctx` so
  * the same loader is not stopped twice on subsequent reconciliations.
@@ -110,6 +117,11 @@ export function reconcileGuestIdleHostState(ctx: GuestIdleReconcilerCtx, isStrea
 	if (ctx.loadingAnimation) {
 		ctx.loadingAnimation.stop();
 		ctx.loadingAnimation = undefined;
+		ctx.statusContainer.disposeChildren();
+	}
+	if (ctx.providerRetryLoader) {
+		ctx.providerRetryLoader.stop();
+		ctx.providerRetryLoader = undefined;
 		ctx.statusContainer.disposeChildren();
 	}
 }
@@ -127,6 +139,9 @@ export interface GuestSnapshotActivityReconcilerCtx extends GuestIdleReconcilerC
 	ensureLoadingAnimation: InteractiveModeContext["ensureLoadingAnimation"];
 	autoCompactionLoader: InteractiveModeContext["autoCompactionLoader"];
 	retryLoader: InteractiveModeContext["retryLoader"];
+	// `providerRetryLoader` is inherited: the host keeps reporting `isStreaming`
+	// throughout a backoff, so this reconciler runs several times inside one
+	// wait and must not trade the countdown for "Working…".
 }
 
 /** Status-area state which cannot outlive removal of its child components. */
@@ -134,6 +149,12 @@ export interface GuestTransientStatusCtx {
 	statusContainer: Pick<InteractiveModeContext["statusContainer"], "clear">;
 	autoCompactionLoader: InteractiveModeContext["autoCompactionLoader"];
 	retryLoader: InteractiveModeContext["retryLoader"];
+	/**
+	 * A replicated provider-retry countdown outlives the frames that clear the
+	 * area. Structurally typed like {@link GuestIdleReconcilerCtx}'s copy: only
+	 * `.stop()` is ever called, so a test double needs nothing else.
+	 */
+	providerRetryLoader: { stop: () => void } | undefined;
 }
 
 /** Stop and forget status-area loaders before detaching their components. */
@@ -146,13 +167,17 @@ export function clearGuestTransientStatus(ctx: GuestTransientStatusCtx): void {
 		ctx.retryLoader.stop();
 		ctx.retryLoader = undefined;
 	}
+	if (ctx.providerRetryLoader) {
+		ctx.providerRetryLoader.stop();
+		ctx.providerRetryLoader = undefined;
+	}
 	ctx.statusContainer.clear();
 }
 
 export function reconcileGuestSnapshotHostState(ctx: GuestSnapshotActivityReconcilerCtx, isStreaming: boolean): void {
 	if (isStreaming) {
 		ctx.statusLine.markActivityStart();
-		if (!ctx.autoCompactionLoader && !ctx.retryLoader) ctx.ensureLoadingAnimation();
+		if (!ctx.autoCompactionLoader && !ctx.retryLoader && !ctx.providerRetryLoader) ctx.ensureLoadingAnimation();
 		return;
 	}
 	reconcileGuestIdleHostState(ctx, false);

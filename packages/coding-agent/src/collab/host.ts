@@ -93,6 +93,8 @@ const WIRE_AGENT_EVENT_TYPES: Record<WireAgentEvent["type"], true> = {
 	auto_compaction_end: true,
 	auto_retry_start: true,
 	auto_retry_end: true,
+	provider_retry_wait_start: true,
+	provider_retry_wait_end: true,
 	thinking_level_changed: true,
 };
 

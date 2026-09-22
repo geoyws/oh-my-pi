@@ -816,6 +816,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	loadingAnimation: Loader | undefined = undefined;
 	autoCompactionLoader: Loader | undefined = undefined;
 	retryLoader: Loader | undefined = undefined;
+	providerRetryLoader: Loader | undefined = undefined;
 	#pendingWorkingMessage: string | undefined;
 	#retryHintRow: Text | undefined;
 	#workingMessageAccentCacheKey?: WorkingMessageAccentCacheKey;
@@ -1084,6 +1085,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.retryLoader) {
 			this.retryLoader.stop();
 			this.retryLoader = undefined;
+		}
+		if (this.providerRetryLoader) {
+			this.providerRetryLoader.stop();
+			this.providerRetryLoader = undefined;
 		}
 		this.statusContainer.disposeChildren();
 		this.pendingMessagesContainer.disposeChildren();
@@ -6056,7 +6061,11 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	ensureLoadingAnimation(): void {
-		if (this.autoCompactionLoader || this.retryLoader) return;
+		// Any loader that owns the status area wins: this one disposes the
+		// container's children, so an un-guarded call would silently drop a live
+		// overlay — the collab guest reconciles host activity every state frame,
+		// which lands repeatedly inside one provider-retry countdown.
+		if (this.autoCompactionLoader || this.retryLoader || this.providerRetryLoader) return;
 		if (!this.loadingAnimation) {
 			this.#clearWorkingMessageAccentCache();
 			this.statusContainer.disposeChildren();

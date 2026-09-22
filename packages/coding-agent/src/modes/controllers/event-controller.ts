@@ -173,10 +173,6 @@ export class EventController {
 	// mid-retry blip or the final settle — only the retry lifecycle events
 	// (never deferred) can tell them apart.
 	#retryPending = false;
-	// Countdown for a provider-internal retry backoff. Kept out of
-	// `ctx.retryLoader` so a session-level retry overlay and this one can never
-	// clobber each other's slot.
-	#providerRetryLoader: Loader | undefined;
 	#idleCompactionTimer?: NodeJS.Timeout;
 	#idleRecapTimer?: NodeJS.Timeout;
 	// In-flight ephemeral recap turn; aborted by #cancelIdleRecap when any
@@ -913,6 +909,16 @@ export class EventController {
 		if (this.ctx.retryLoader) {
 			this.ctx.retryLoader.stop();
 			this.ctx.retryLoader = undefined;
+			this.ctx.statusContainer.disposeChildren();
+		}
+		// A new turn can never be inside the previous turn's provider backoff. A
+		// `provider_retry_wait_end` dropped en route (a collab reconnect, a
+		// renderer exception) would otherwise pin the countdown — and, because
+		// `ensureLoadingAnimation` yields to it, suppress "Working…" for every
+		// later turn.
+		if (this.ctx.providerRetryLoader) {
+			this.ctx.providerRetryLoader.stop();
+			this.ctx.providerRetryLoader = undefined;
 			this.ctx.statusContainer.disposeChildren();
 		}
 		this.#cancelIdleCompaction();
@@ -2042,6 +2048,14 @@ export class EventController {
 			this.ctx.loadingAnimation = undefined;
 			this.ctx.statusContainer.disposeChildren();
 		}
+		// The turn is over, so any backoff it was sleeping in is over too: clear a
+		// countdown whose `provider_retry_wait_end` never arrived rather than leave
+		// it ticking over an idle session.
+		if (this.ctx.providerRetryLoader) {
+			this.ctx.providerRetryLoader.stop();
+			this.ctx.providerRetryLoader = undefined;
+			this.ctx.statusContainer.disposeChildren();
+		}
 		await this.ctx.flushPendingModelSwitch();
 		this.#sealAbandonedForegroundTools();
 		this.#approvalAttentionToolCallIds.clear();
@@ -2288,7 +2302,7 @@ export class EventController {
 		// A session-level retry/compaction overlay owns the status container and
 		// carries the more important message; leave it alone.
 		if (this.ctx.retryLoader || this.ctx.autoCompactionLoader) return;
-		this.#providerRetryLoader?.stop();
+		this.ctx.providerRetryLoader?.stop();
 		this.#stopWorkingLoader();
 		this.ctx.statusContainer.disposeChildren();
 		const waitStartMs = Date.now();
@@ -2298,7 +2312,7 @@ export class EventController {
 			event.attempt !== undefined && event.maxAttempts !== undefined
 				? ` (${event.attempt}/${event.maxAttempts})`
 				: "";
-		this.#providerRetryLoader = new Loader(
+		this.ctx.providerRetryLoader = new Loader(
 			this.ctx.ui,
 			spinner => theme.fg("warning", spinner),
 			text => theme.fg("muted", text),
@@ -2308,16 +2322,16 @@ export class EventController {
 			},
 			getSymbolTheme().spinnerFrames,
 		);
-		this.ctx.statusContainer.addChild(this.#providerRetryLoader);
+		this.ctx.statusContainer.addChild(this.ctx.providerRetryLoader);
 		this.ctx.ui.requestRender();
 	}
 
 	async #handleProviderRetryWaitEnd(
 		_event: Extract<AgentSessionEvent, { type: "provider_retry_wait_end" }>,
 	): Promise<void> {
-		if (!this.#providerRetryLoader) return;
-		this.#providerRetryLoader.stop();
-		this.#providerRetryLoader = undefined;
+		if (!this.ctx.providerRetryLoader) return;
+		this.ctx.providerRetryLoader.stop();
+		this.ctx.providerRetryLoader = undefined;
 		this.ctx.statusContainer.disposeChildren();
 		// The turn never ended: put "Working…" back so the stream keeps its
 		// indicator whether the retry succeeds or the wait was aborted.

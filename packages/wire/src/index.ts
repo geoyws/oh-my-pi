@@ -195,6 +195,23 @@ export type AgentEvent =
 	| { type: "auto_compaction_end"; aborted: boolean; willRetry: boolean; errorMessage?: string; skipped?: boolean }
 	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
+	/**
+	 * A provider-internal retry backoff is sleeping inside the SAME turn (the
+	 * provider re-issues the request itself). Distinct from `auto_retry_start`:
+	 * nothing was superseded, so a guest only swaps its status line for the
+	 * countdown instead of retracting the turn.
+	 */
+	| {
+			type: "provider_retry_wait_start";
+			delayMs: number;
+			model: string;
+			provider: string;
+			api: string;
+			/** Retry position, when the waiting retry loop tracks one. */
+			attempt?: number;
+			maxAttempts?: number;
+	  }
+	| { type: "provider_retry_wait_end"; aborted: boolean }
 	| { type: "thinking_level_changed"; thinkingLevel?: string };
 
 // ═══════════════════════════════════════════════════════════════════════════
