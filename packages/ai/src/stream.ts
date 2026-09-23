@@ -71,8 +71,9 @@ import { AssistantMessageEventStream } from "./utils/event-stream";
 import { isFoundryEnabled } from "./utils/foundry";
 import { applyGlyphCodec } from "./utils/glyph-codec";
 import { wrapLeakedThinkingStream } from "./utils/leaked-thinking-stream";
+import { ProviderRequestTelemetry } from "./utils/request-telemetry";
 import { withThinkingLoopGuard } from "./utils/thinking-loop";
-import { withTransportFetch } from "./utils/transport-fetch";
+import { isTransportFetchBuilt, withTransportFetch } from "./utils/transport-fetch";
 
 function isGoogleVertexAuthenticatedModel(model: Model<Api>): boolean {
 	return (
@@ -907,7 +908,44 @@ function withResolvedModelHeaders<TApi extends Api>(
 	return outer;
 }
 
+/**
+ * Open a `provider request start`/`attempt`/`end` telemetry record around one
+ * logical provider request and hand `run` an options bag whose transport fetch
+ * reports into it.
+ *
+ * Entered at the outermost pi-ai entry point only: a transport fetch that is
+ * already built means an outer call owns the record, so auth-retry replays,
+ * thinking-loop re-samples and `streamSimple`'s re-entry into `stream` stay one
+ * request with one id instead of minting a record each.
+ */
+function withProviderRequestTelemetry<TOptions extends object>(
+	model: Model<Api>,
+	options: TOptions | undefined,
+	run: (options: TOptions) => AssistantMessageEventStream,
+): AssistantMessageEventStream {
+	const given = (options ?? {}) as TOptions & { fetch?: FetchImpl; sessionId?: string };
+	if (isTransportFetchBuilt(given.fetch)) return run(given);
+	const telemetry = new ProviderRequestTelemetry(model, given.sessionId);
+	let stream: AssistantMessageEventStream;
+	try {
+		stream = run(withTransportFetch(model, given, telemetry));
+	} catch (error) {
+		telemetry.failed(error);
+		throw error;
+	}
+	telemetry.observe(stream);
+	return stream;
+}
+
 export function stream<TApi extends Api>(
+	model: Model<TApi>,
+	context: Context,
+	options?: OptionsForApi<TApi>,
+): AssistantMessageEventStream {
+	return withProviderRequestTelemetry(model, options, opts => streamResolved(model, context, opts));
+}
+
+function streamResolved<TApi extends Api>(
 	model: Model<TApi>,
 	context: Context,
 	options?: OptionsForApi<TApi>,
@@ -1524,6 +1562,14 @@ function forwardBedrockUserAgent(
 }
 
 function streamSimpleRequest<TApi extends Api>(
+	model: Model<TApi>,
+	context: Context,
+	options?: SimpleStreamOptions,
+): AssistantMessageEventStream {
+	return withProviderRequestTelemetry(model, options, opts => streamSimpleRequestDispatch(model, context, opts));
+}
+
+function streamSimpleRequestDispatch<TApi extends Api>(
 	model: Model<TApi>,
 	context: Context,
 	options?: SimpleStreamOptions,

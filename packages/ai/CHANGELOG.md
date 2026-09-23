@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Every provider request now logs `provider request start`, one `provider request attempt` per retried attempt, and `provider request end` under a shared `requestId`, carrying duration, time-to-first-byte/token, attempt count, bytes received, input/output/cache token counts and the failure class — so a hung or retry-storming request is diagnosable from the log file without a special build ([#12319](https://github.com/can1357/oh-my-pi/issues/12319)).
+
 ### Fixed
 
 - Fixed Claude Opus 5.5 ignoring a mid-session switch to high effort when the session started without an explicit effort; the change is now sent as a cache-preserving per-message effort control ([#12909](https://github.com/can1357/oh-my-pi/pull/12909) by [@h4vc](https://github.com/h4vc)).
