@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Changed
+
+- `warmHighlighter()` now also prepares TypeScript, TSX, JavaScript, bash, Python, Rust, and Markdown highlighting in the background, so their first highlight no longer blocks the caller ([#12908](https://github.com/can1357/oh-my-pi/pull/12908) by [@H4vC](https://github.com/H4vC)).
+
+## [18.2.9] - 2026-09-22
+
+### Fixed
+
+- Fixed stale workspace addons failing when first used; the error now identifies the addon and provides the command to rebuild native addons.
+- Fixed background bash jobs hanging indefinitely when output forwarding stalls.
+
 ## [18.2.7] - 2026-09-21
 
 ### Added
