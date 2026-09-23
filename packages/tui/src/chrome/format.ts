@@ -2,8 +2,9 @@ import { renderProgressBar } from "../components/progress-bar";
 import { shimmerText } from "../theme/shimmer";
 import { theme as currentTheme, type Theme } from "../theme/theme";
 
-/** Title-case a provider id for display (`openai-codex` → `Openai Codex`). */
+/** Brand names for provider ids in user-facing usage displays. */
 export function formatProviderName(provider: string): string {
+	if (provider === "anthropic") return "Claude";
 	return provider
 		.split(/[-_]/g)
 		.map(part => (part ? part[0].toUpperCase() + part.slice(1) : ""))

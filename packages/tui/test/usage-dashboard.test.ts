@@ -1,4 +1,5 @@
 import * as os from "node:os";
+import { stripVTControlCharacters } from "node:util";
 import { beforeAll, describe, expect, it } from "bun:test";
 import type { DailyActivityPoint } from "@oh-my-pi/pi-tui/overlays/usage-dashboard";
 import type { UsageReport } from "@oh-my-pi/pi-ai";
@@ -401,6 +402,30 @@ describe("UsageDashboardComponent", () => {
 		} finally {
 			component.dispose();
 		}
+	});
+	it("shows Claude alongside every other reporting provider in the overview", () => {
+		const now = Date.now();
+		const reports = [
+			report("anthropic", "primary@example.test", [limit("anthropic", "primary", "7d", "Weekly", 1, "exhausted")]),
+			report("anthropic", "secondary@example.test", [limit("anthropic", "secondary", "7d", "Weekly", 0.4, "ok")]),
+			...(["openai-codex", "zai", "kimi-code", "cursor"] as const).map(provider =>
+				report(provider, provider + "@example.test", [limit(provider, provider, "7d", "Weekly", 0.3, "ok")]),
+			),
+		];
+		const cards = buildProviderCards(reports, now);
+		expect(cards.find(card => card.provider === "anthropic")).toMatchObject({ name: "Claude", accounts: 2, idle: false, windows: [{ status: "warning" }] });
+		const component = new UsageDashboardComponent({
+			reports,
+			renderDetail: () => "",
+			loadActivity: async () => {},
+			requestRender: () => {},
+			onClose: () => {},
+		});
+		const overview = stripVTControlCharacters(component.render(120).join("\n"));
+		for (const brand of ["Claude", "Openai Codex", "Zai", "Kimi Code", "Cursor"]) {
+			expect(overview).toContain(brand);
+		}
+		component.dispose();
 	});
 	it("renders specific error reason when activity loading fails instead of generic DB read error", async () => {
 		const { promise: rendered, resolve: markRendered } = Promise.withResolvers<void>();
