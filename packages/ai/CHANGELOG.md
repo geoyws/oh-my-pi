@@ -18,6 +18,9 @@
 ### Changed
 
 - Improved Anthropic prompt caching for long conversations, reducing memory usage while selecting cache breakpoints.
+### Added
+
+- Every provider request now logs `provider request start`, one `provider request attempt` per retried attempt, and `provider request end` under a shared `requestId`, carrying duration, time-to-first-byte/token, attempt count, bytes received, input/output/cache token counts and the failure class — so a hung or retry-storming request is diagnosable from the log file without a special build ([#12319](https://github.com/can1357/oh-my-pi/issues/12319)).
 
 ### Fixed
 
