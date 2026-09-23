@@ -142,6 +142,34 @@ describe("provider request telemetry", () => {
 		expect(end.fields).toMatchObject({ outcome: "ok", attempts: 2 });
 	});
 
+	it("does not attribute an earlier HTTP status to a later transport failure", async () => {
+		const { lines } = captureTelemetry();
+		let calls = 0;
+		const fetchImpl = (async () => {
+			calls += 1;
+			if (calls === 1) {
+				return new Response(JSON.stringify({ error: { message: "invalid key", code: 401 } }), {
+					status: 401,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			throw new TypeError("fetch failed after auth retry");
+		}) as unknown as FetchImpl;
+
+		await drain(
+			streamSimple(model, context, {
+				apiKey: ({ lastChance }) => (lastChance ? "k2" : "k1"),
+				fetch: fetchImpl,
+			}),
+		);
+		await settle();
+
+		const end = lines.find(l => l.message === "provider request end")!;
+		expect(end.fields).toMatchObject({ outcome: "error", attempts: 2 });
+		expect(end.fields.status).toBeUndefined();
+		expect(String(end.fields.error)).toContain("fetch failed after auth retry");
+	});
+
 	it("reports a transport failure as outcome error with its class and text", async () => {
 		const { lines } = captureTelemetry();
 		const fetchImpl = (async () => {
