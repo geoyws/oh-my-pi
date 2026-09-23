@@ -240,7 +240,6 @@ describe("createAgentSession provider retry wait visibility", () => {
 			timestamp: Date.now(),
 		});
 
-		session.agent.getApiKey = () => "sk-ant-test";
 		let primaryCalls = 0;
 		let finishActiveMain: (() => void) | undefined;
 		session.agent.streamFn = () => {
@@ -283,6 +282,7 @@ describe("createAgentSession provider retry wait visibility", () => {
 			}
 		});
 		let activeMain: Promise<void> | undefined;
+		authStorage.keys.setRuntime("anthropic", "sk-ant-test");
 		try {
 			await session.prompt("finish one substantive turn");
 			for (let i = 0; i < 100 && captureFetchCalls === 0; i++) await Bun.sleep(1);
@@ -302,7 +302,12 @@ describe("createAgentSession provider retry wait visibility", () => {
 			for (let i = 0; i < 100 && activeMain && !finishActiveMain; i++) await Bun.sleep(1);
 			finishActiveMain?.();
 			await activeMain?.catch(() => {});
-			unsubscribe();
+			try {
+				await session.dispose();
+			} finally {
+				authStorage.keys.removeRuntime("anthropic");
+				unsubscribe();
+			}
 		}
 	});
 });
