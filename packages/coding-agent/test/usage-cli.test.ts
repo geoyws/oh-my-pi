@@ -538,10 +538,18 @@ describe("formatUsageBreakdown", () => {
 		};
 		const healthy = makeLimit({ id: "Weekly", usedFraction: 0.4, windowId: "7d", provider: "anthropic" });
 		const reports = [
-			{ ...makeReport("anthropic", "shared@example.test", [exhausted]), metadata: { email: "shared@example.test", orgName: "Primary profile", orgId: "primary" } },
-			{ ...makeReport("anthropic", "shared@example.test", [healthy]), metadata: { email: "shared@example.test", orgName: "Backup profile", orgId: "backup" } },
+			{
+				...makeReport("anthropic", "shared@example.test", [exhausted]),
+				metadata: { email: "shared@example.test", orgName: "Primary profile", orgId: "primary" },
+			},
+			{
+				...makeReport("anthropic", "shared@example.test", [healthy]),
+				metadata: { email: "shared@example.test", orgName: "Backup profile", orgId: "backup" },
+			},
 			...(["openai-codex", "zai", "kimi-code", "cursor"] as const).map(provider =>
-				makeReport(provider, provider + "@example.test", [makeLimit({ id: "Weekly", usedFraction: 0.3, windowId: "7d", provider })]),
+				makeReport(provider, provider + "@example.test", [
+					makeLimit({ id: "Weekly", usedFraction: 0.3, windowId: "7d", provider }),
+				]),
 			),
 		];
 		const text = stripVTControlCharacters(formatUsageBreakdown(reports, [], Date.now()));
