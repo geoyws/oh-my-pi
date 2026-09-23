@@ -107,6 +107,8 @@ export class ProviderRequestTelemetry {
 			previousErrorClass: errorClass(this.#lastAttemptError),
 			previousError: errorText(this.#lastAttemptError),
 		});
+		this.#status = undefined;
+		this.#lastAttemptError = undefined;
 	}
 
 	/** Records a transport-level failure so the next attempt boundary can name it. */
