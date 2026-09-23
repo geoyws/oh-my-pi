@@ -242,6 +242,7 @@ describe("createAgentSession provider retry wait visibility", () => {
 
 		let primaryCalls = 0;
 		let finishActiveMain: (() => void) | undefined;
+		const activeMainStreamStarted = Promise.withResolvers<void>();
 		session.agent.streamFn = () => {
 			const stream = new AssistantMessageEventStream();
 			const message = primaryMessage(++primaryCalls === 1 ? "first done" : "next done");
@@ -251,6 +252,7 @@ describe("createAgentSession provider retry wait visibility", () => {
 					stream.push({ type: "done", reason: "stop", message });
 				} else {
 					finishActiveMain = () => stream.push({ type: "done", reason: "stop", message });
+					activeMainStreamStarted.resolve();
 				}
 			});
 			return stream;
@@ -258,12 +260,14 @@ describe("createAgentSession provider retry wait visibility", () => {
 
 		let releaseCaptureRequest: (() => void) | undefined;
 		let captureFetchCalls = 0;
+		const captureFetchStarted = Promise.withResolvers<void>();
 		const captureRequestGate = new Promise<void>(resolve => {
 			releaseCaptureRequest = resolve;
 		});
 		const fetchMock: FetchImpl = async () => {
 			captureFetchCalls++;
 			if (captureFetchCalls === 1) {
+				captureFetchStarted.resolve();
 				await captureRequestGate;
 				return new Response('{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}', {
 					status: 529,
@@ -276,30 +280,38 @@ describe("createAgentSession provider retry wait visibility", () => {
 		mockSchedulerWaitWithClock();
 
 		const observed: Array<{ event: AgentSessionEvent; mainStreaming: boolean }> = [];
+		const firstAgentEnd = Promise.withResolvers<void>();
+		const secondAgentStart = Promise.withResolvers<void>();
+		const providerWaitStarted = Promise.withResolvers<void>();
+		let agentStarts = 0;
 		const unsubscribe = session.subscribe(event => {
+			if (event.type === "agent_start" && ++agentStarts === 2) secondAgentStart.resolve();
+			if (event.type === "agent_end") firstAgentEnd.resolve();
 			if (event.type === "provider_retry_wait_start") {
 				observed.push({ event, mainStreaming: session.isStreaming });
+				providerWaitStarted.resolve();
 			}
 		});
-		let activeMain: Promise<void> | undefined;
+		let activeMain: ReturnType<AgentSession["prompt"]> | undefined;
 		authStorage.keys.setRuntime("anthropic", "sk-ant-test");
 		try {
-			await session.prompt("finish one substantive turn");
-			for (let i = 0; i < 100 && captureFetchCalls === 0; i++) await Bun.sleep(1);
+			const firstPrompt = session.prompt("finish one substantive turn");
+			await firstAgentEnd.promise;
+			await firstPrompt;
+			await captureFetchStarted.promise;
 			expect(captureFetchCalls).toBe(1);
 
 			activeMain = session.prompt("start the next real turn");
-			for (let i = 0; i < 100 && !session.isStreaming; i++) await Bun.sleep(1);
+			await Promise.all([secondAgentStart.promise, activeMainStreamStarted.promise]);
 			expect(session.isStreaming).toBe(true);
 			releaseCaptureRequest?.();
-			for (let i = 0; i < 100 && observed.length === 0; i++) await Bun.sleep(1);
+			await providerWaitStarted.promise;
 
 			expect(observed).toHaveLength(1);
 			expect(observed[0]?.event).toMatchObject({ type: "provider_retry_wait_start", role: "side", waitId: 1 });
 			expect(observed[0]?.mainStreaming).toBe(true);
 		} finally {
 			releaseCaptureRequest?.();
-			for (let i = 0; i < 100 && activeMain && !finishActiveMain; i++) await Bun.sleep(1);
 			finishActiveMain?.();
 			await activeMain?.catch(() => {});
 			try {
