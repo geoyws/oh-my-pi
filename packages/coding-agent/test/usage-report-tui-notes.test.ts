@@ -173,6 +173,18 @@ describe("renderUsageReports (#3268 TUI aggregate)", () => {
 		expect(text).toContain("$123.45 used");
 		expect(text).toContain("2 accts");
 	});
+	it("keeps distinct Claude profiles and exhausted quota in the usage detail", () => {
+		const exhausted = { ...limit("Weekly", "7d", 7 * 24 * HOUR, 1), scope: { provider: "anthropic", windowId: "7d" }, status: "exhausted" as const };
+		const available = { ...limit("Weekly", "7d", 7 * 24 * HOUR, 0.4), scope: { provider: "anthropic", windowId: "7d" } };
+		const reports: UsageReport[] = [
+			{ ...report("anthropic", "shared@example.test", [exhausted]), metadata: { email: "shared@example.test", orgName: "Primary profile", orgId: "primary" } },
+			{ ...report("anthropic", "shared@example.test", [available]), metadata: { email: "shared@example.test", orgName: "Backup profile", orgId: "backup" } },
+		];
+		const text = stripVTControlCharacters(renderUsageReports(reports, theme, Date.now(), 120));
+		expect(text).toContain("Claude");
+		expect(text).toContain("shared@example.test (Primary profile): 100.00% used");
+		expect(text).toContain("shared@example.test (Backup profile): 40.00% used");
+	});
 });
 
 describe("renderUsageReports session marker (#5691 org-qualified identity)", () => {
