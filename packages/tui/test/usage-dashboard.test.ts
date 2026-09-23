@@ -356,7 +356,7 @@ describe("UsageDashboardComponent", () => {
 		const component = dashboard([report("anthropic", "a@test", [limit("anthropic", "a", "7d", label, 0.4, "ok")])]);
 		try {
 			const lines = component.render(24).map(line => Bun.stripANSI(line));
-			const first = lines.findIndex(line => line.includes("Claude"));
+			const first = lines.findIndex(line => line.includes("Extended Thinking"));
 			const bar = lines.findIndex(line => /[█░]/.test(line));
 			expect(bar - first).toBeLessThanOrEqual(2);
 			expect(
