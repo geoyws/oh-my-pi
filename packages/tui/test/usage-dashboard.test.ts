@@ -207,7 +207,12 @@ describe("UsageDashboardComponent", () => {
 			),
 		];
 		const cards = buildProviderCards(reports, now);
-		expect(cards.find(card => card.provider === "anthropic")).toMatchObject({ name: "Claude", accounts: 2, idle: false, windows: [{ status: "warning" }] });
+		expect(cards.find(card => card.provider === "anthropic")).toMatchObject({
+			name: "Claude",
+			accounts: 2,
+			idle: false,
+			windows: [{ status: "warning" }],
+		});
 		const component = new UsageDashboardComponent({
 			reports,
 			renderDetail: () => "",
