@@ -2155,7 +2155,7 @@ export class EventController {
 	 * for `viewSession`, so key the reconciler on that session, not the main one.
 	 */
 	#ensureWorkingLoaderWhileStreaming(): void {
-		if (!this.ctx.viewSession.isStreaming) return;
+		if (!this.#turnIsStreaming()) return;
 		if (this.ctx.autoCompactionLoader || this.ctx.retryLoader) return;
 		this.ctx.ensureLoadingAnimation();
 	}

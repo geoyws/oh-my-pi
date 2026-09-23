@@ -309,9 +309,6 @@ describe("guest status during a replicated provider retry wait", () => {
 
 		await controller.handleEvent(WAIT_END);
 		expect(ctx.providerRetryLoader).toBeUndefined();
-
-		// With the countdown gone the next reconcile restores the working row.
-		reconcileGuestSnapshotHostState(ctx, true);
 		expect(ctx.loadingAnimation).toBeDefined();
 		const restored = visible(mode.statusContainer.render(120).join("\n"));
 		expect(restored).toContain("Working");
