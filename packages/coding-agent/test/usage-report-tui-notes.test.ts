@@ -173,7 +173,7 @@ describe("renderUsageReports (#3268 TUI aggregate)", () => {
 		expect(text).toContain("$123.45 used");
 		expect(text).toContain("2 accts");
 	});
-	it("keeps distinct Claude profiles and exhausted quota in the usage detail", () => {
+	it("keeps distinct Claude profiles and aggregate quota in the usage detail", () => {
 		const exhausted = {
 			...limit("Weekly", "7d", 7 * 24 * HOUR, 1),
 			scope: { provider: "anthropic", windowId: "7d" },
@@ -195,8 +195,9 @@ describe("renderUsageReports (#3268 TUI aggregate)", () => {
 		];
 		const text = stripVTControlCharacters(renderUsageReports(reports, theme, Date.now(), 120));
 		expect(text).toContain("Claude");
-		expect(text).toContain("shared@example.test (Primary profile): 100.00% used");
-		expect(text).toContain("shared@example.test (Backup profile): 40.00% used");
+		expect(text).toContain("shared@example.test (Primary profile)");
+		expect(text).toContain("shared@example.test (Backup profile)");
+		expect(text).toContain("30% free");
 	});
 });
 
