@@ -186,7 +186,7 @@ beforeAll(async () => {
 	await initTheme(false);
 	installInMemoryRelay();
 	authStorage = createInMemoryAuthStorage();
-	authStorage.setRuntimeApiKey("anthropic", "test-key");
+	authStorage.keys.setRuntime("anthropic", "test-key");
 	modelRegistry = new ModelRegistry(authStorage);
 	const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
 	if (!bundled) throw new Error("expected bundled anthropic model");
