@@ -1504,6 +1504,36 @@ mod tests {
 	}
 
 	#[test]
+	fn linked_worktree_with_initialized_submodule_matches_git_diff() {
+		let dir = fixture();
+		let nested = fixture();
+		let deeper = fixture();
+		git(
+			nested.path(),
+			&[
+				"-c", "protocol.file.allow=always", "submodule", "add",
+				deeper.path().to_str().expect("deeper path"), "packages/aix-plugin-px",
+			],
+		);
+		git(nested.path(), &["commit", "-qam", "add recursive submodule"]);
+		let nested_path = nested.path().to_str().expect("nested path");
+		git(
+			dir.path(),
+			&["-c", "protocol.file.allow=always", "submodule", "add", nested_path, "packages/aix-root"],
+		);
+		git(dir.path(), &["commit", "-qam", "add nested repository"]);
+
+		let temp = tempfile::tempdir().expect("linked worktree parent");
+		let linked = temp.path().join("linked");
+		git(dir.path(), &["worktree", "add", "-q", linked.to_str().expect("linked path")]);
+		git(&linked, &["-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive"]);
+		fs::write(linked.join("file.txt"), "linked edit\n").expect("write linked edit");
+
+		let repo = GitRepo::discover(&linked).expect("discover").expect("linked repository");
+		let actual = repo.diff_text(&DiffOptions::default()).expect("linked worktree diff");
+		assert_eq!(actual, git(&linked, &["diff"]));
+	}
+	#[test]
 	fn diff_matches_git_for_worktree_text() {
 		let dir = fixture();
 		fs::write(dir.path().join("file.txt"), "one\nchanged\nthree\n").expect("write");
