@@ -933,6 +933,53 @@ describe("detachGitDir", () => {
 			}
 		},
 	);
+
+	// An ordinary checkout's copy keeps its own `.git/modules`, so its gitlinks
+	// need no rebind and must not inherit the rebind's pin refusal.
+	it.skipIf(process.platform !== "darwin")(
+		"isolates an ordinary checkout whose submodule is checked out off its recorded pin",
+		async () => {
+			const repo = await createGitRepo();
+			const child = await createGitRepo();
+			for (const dir of [repo, child]) {
+				await runGit(dir, ["config", "user.email", "src@example.com"]);
+				await runGit(dir, ["config", "user.name", "Source User"]);
+				await fs.writeFile(path.join(dir, "tracked.txt"), "base\n");
+				await runGit(dir, ["add", "tracked.txt"]);
+				await runGit(dir, ["commit", "-q", "-m", "base"]);
+			}
+			await runGit(repo, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", child, "sub"]);
+			await runGit(repo, ["commit", "-q", "-m", "pin sub"]);
+			const sub = path.join(repo, "sub");
+			await fs.writeFile(path.join(sub, "tracked.txt"), "moved\n");
+			await runGit(sub, ["commit", "-q", "-am", "move off pin"]);
+
+			vi.spyOn(natives, "isoResolve").mockResolvedValue({
+				kind: natives.IsoBackendKind.Apfs,
+				candidates: [natives.IsoBackendKind.Apfs],
+				fellBack: false,
+				reason: undefined,
+			});
+			const worktreeBase = await fs.mkdtemp(path.join(os.tmpdir(), "omp-detach-wtbase-"));
+			tempDirs.push(worktreeBase);
+			const originalWorktreeDir = process.env.OMP_WORKTREE_DIR;
+			delete process.env.OMP_WORKTREE_DIR;
+			setWorktreesDir(worktreeBase);
+			try {
+				const handle = await ensureIsolation(repo, "ordinary-off-pin");
+				try {
+					await captureIsolationBaseline(handle.mergedDir, repo);
+					expect(await runGit(handle.mergedDir, ["status", "--porcelain"])).toBe("M sub");
+				} finally {
+					await cleanupIsolation(handle);
+				}
+			} finally {
+				setWorktreesDir(undefined);
+				if (originalWorktreeDir === undefined) delete process.env.OMP_WORKTREE_DIR;
+				else process.env.OMP_WORKTREE_DIR = originalWorktreeDir;
+			}
+		},
+	);
 });
 
 describe("applyNestedPatches", () => {

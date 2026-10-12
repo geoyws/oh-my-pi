@@ -583,11 +583,12 @@ export async function ensureIsolation(
 			// parallel task branches. Detaching gives each isolation a private,
 			// frozen repo that still borrows the source object DB via alternates.
 			const detached = await vcs.detachGitDir(mergedDir, sourceCommonDir);
-			// Every backend exposes the source's submodule gitfiles at a new path,
-			// so their relative pointers no longer reach this isolation's private
-			// admin. Every initialized child needs private metadata before the
-			// native baseline walks gitlinks or an agent runs.
-			if (detached !== "no-git") await vcs.rebindCopiedSubmodules(repoRoot, mergedDir);
+			// A detached isolation was a linked worktree whose submodule gitfiles
+			// point into the source's `worktrees/<name>/modules`, now at a new
+			// relative depth. Every initialized child needs private metadata before
+			// the native baseline walks gitlinks or an agent runs. An "independent"
+			// copy already carries its own `.git/modules`, which its gitfiles reach.
+			if (detached === "detached") await vcs.rebindCopiedSubmodules(repoRoot, mergedDir);
 			return {
 				mergedDir,
 				backend: candidate,

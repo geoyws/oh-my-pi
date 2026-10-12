@@ -5,6 +5,9 @@
 #   ghp_-shaped tokens fed to credential-redaction tests.
 # - factory-droid-responses-ws-frames.jsonl lines 1, 2, 9 are a UUID-shaped
 #   prompt_cache_key in a recorded websocket fixture, not a credential.
+# Checked 2026-10-12 by @:geoyws/dotfiles/driver/executor from shape and test use
+# only, without printing values. The ghp_-shaped strings were NOT probed against
+# GitHub (third-party values), so "fake" is inferred, not measured.
 cde2fee500fb8f5c85c8c93a20453c7cd20a4232:packages/ai/test/factory-droid-gemini.test.ts:github-pat:265
 cde2fee500fb8f5c85c8c93a20453c7cd20a4232:packages/ai/test/factory-droid-gemini.test.ts:generic-api-key:265
 c4a2441d8f9195de810b3492be5bf5673cecf9c9:packages/coding-agent/test/acp-session-effects.test.ts:github-pat:15

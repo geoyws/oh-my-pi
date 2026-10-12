@@ -3154,12 +3154,13 @@ mod tests {
 		assert!(repo.worktree_prune().is_ok());
 		let _ = fs::remove_dir_all(linked);
 	}
-	#[test]
-	fn copied_recursive_submodules_get_private_git_metadata_without_touching_source() {
-		let tmp = tempfile::tempdir().unwrap();
-		let grand = tmp.path().join("grand");
-		let child = tmp.path().join("child");
-		let parent = tmp.path().join("parent");
+
+	/// Linked worktree of `parent -> packages/aix-root -> nested/grand`, the
+	/// pai-root shape; gitlinks are recursively initialized when `init`.
+	fn nested_linked_fixture(root: &Path, init: bool) -> PathBuf {
+		let grand = root.join("grand");
+		let child = root.join("child");
+		let parent = root.join("parent");
 		for repo in [&grand, &child, &parent] {
 			fs::create_dir_all(repo).unwrap();
 			git(repo, &["init", "-q", "-b", "main"]);
@@ -3170,34 +3171,105 @@ mod tests {
 			git(repo, &["add", "tracked"]);
 			git(repo, &["commit", "-qm", "seed"]);
 		}
-		git(&child, &[
-			"-c",
-			"protocol.file.allow=always",
-			"submodule",
-			"add",
-			grand.to_str().unwrap(),
-			"nested/grand",
-		]);
+		let allow = ["-c", "protocol.file.allow=always", "submodule", "add"];
+		git(&child, &[&allow[..], &[grand.to_str().unwrap(), "nested/grand"]].concat());
 		git(&child, &["commit", "-qam", "pin grandchild"]);
-		git(&parent, &[
-			"-c",
-			"protocol.file.allow=always",
-			"submodule",
-			"add",
-			child.to_str().unwrap(),
-			"packages/aix-root",
-		]);
+		git(&parent, &[&allow[..], &[child.to_str().unwrap(), "packages/aix-root"]].concat());
 		git(&parent, &["commit", "-qam", "pin child"]);
-		let linked = tmp.path().join("linked");
+		let linked = root.join("linked");
 		git(&parent, &["worktree", "add", "--detach", linked.to_str().unwrap(), "HEAD"]);
-		git(&linked, &[
-			"-c",
-			"protocol.file.allow=always",
-			"submodule",
-			"update",
-			"--init",
-			"--recursive",
-		]);
+		if init {
+			git(&linked, &[
+				"-c",
+				"protocol.file.allow=always",
+				"submodule",
+				"update",
+				"--init",
+				"--recursive",
+			]);
+		}
+		linked
+	}
+
+	/// Copy `linked` verbatim to a different depth, as a copy backend does, and
+	/// detach its top-level metadata.
+	fn copied_detached_isolation(root: &Path, linked: &Path) -> PathBuf {
+		// Real isolations live at a different depth than the source, so the
+		// copied relative child gitfiles resolve to no admin at all.
+		let isolated_parent = root.join("omp/wt/task");
+		fs::create_dir_all(&isolated_parent).unwrap();
+		let isolated = isolated_parent.join("m");
+		assert!(
+			Command::new("cp")
+				.args(["-Rp", linked.to_str().unwrap(), isolated.to_str().unwrap()])
+				.status()
+				.unwrap()
+				.success()
+		);
+		let common = GitRepo::require(linked).unwrap().info().common_dir.clone();
+		assert_eq!(detach_git_dir(&isolated, &common).unwrap(), DetachGitDirResult::Detached);
+		isolated
+	}
+
+	fn rebind_error(source: &Path, isolated: &Path) -> String {
+		match rebind_copied_submodules(source, isolated) {
+			Err(Error::Backend { message, .. }) => message,
+			other => panic!("expected a backend refusal, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn rebind_refuses_an_off_pin_submodule_before_writing_anything() {
+		let tmp = tempfile::tempdir().unwrap();
+		let linked = nested_linked_fixture(tmp.path(), true);
+		let source_grand = linked.join("packages/aix-root/nested/grand");
+		fs::write(source_grand.join("tracked"), "moved\n").unwrap();
+		git(&source_grand, &["commit", "-qam", "move grandchild off its pin"]);
+		let isolated = copied_detached_isolation(tmp.path(), &linked);
+		let child_pointer = fs::read(isolated.join("packages/aix-root/.git")).unwrap();
+		let grand_pointer = fs::read(isolated.join("packages/aix-root/nested/grand/.git")).unwrap();
+
+		let error = rebind_error(&linked, &isolated);
+		assert!(error.contains("off-pin submodule packages/aix-root/nested/grand"), "{error}");
+		// The parent child is on-pin and was snapshotted first, but every write
+		// waits until all gitlinks validate: both copied gitfiles are untouched.
+		assert_eq!(fs::read(isolated.join("packages/aix-root/.git")).unwrap(), child_pointer);
+		assert_eq!(
+			fs::read(isolated.join("packages/aix-root/nested/grand/.git")).unwrap(),
+			grand_pointer
+		);
+	}
+
+	#[test]
+	fn rebind_skips_uninitialized_gitlinks_but_refuses_a_copy_that_gained_an_admin() {
+		let tmp = tempfile::tempdir().unwrap();
+		let linked = nested_linked_fixture(tmp.path(), false);
+		let isolated = copied_detached_isolation(tmp.path(), &linked);
+		assert_eq!(rebind_copied_submodules(&linked, &isolated).unwrap(), 0);
+		assert!(git(&isolated, &["status", "--porcelain"]).is_empty());
+
+		fs::write(isolated.join("packages/aix-root/.git"), "gitdir: /elsewhere\n").unwrap();
+		let error = rebind_error(&linked, &isolated);
+		assert!(
+			error.contains("copied Git admin for uninitialized submodule packages/aix-root"),
+			"{error}"
+		);
+	}
+
+	#[test]
+	fn rebind_refuses_overlapping_source_and_isolation() {
+		let tmp = tempfile::tempdir().unwrap();
+		let linked = nested_linked_fixture(tmp.path(), true);
+		let inner = linked.join("packages");
+		assert!(rebind_error(&linked, &inner).contains("overlap"));
+		assert!(rebind_error(&inner, &linked).contains("overlap"));
+		assert!(rebind_error(&linked, &linked).contains("overlap"));
+	}
+
+	#[test]
+	fn copied_recursive_submodules_get_private_git_metadata_without_touching_source() {
+		let tmp = tempfile::tempdir().unwrap();
+		let linked = nested_linked_fixture(tmp.path(), true);
 		let source_child = linked.join("packages/aix-root");
 		let source_grand = source_child.join("nested/grand");
 		let source_admin = GitRepo::require(&source_child)
@@ -3209,20 +3281,7 @@ mod tests {
 		let source_pins = git(&linked, &["submodule", "status", "--recursive"]);
 		let source_index = fs::read(source_admin.join("index")).unwrap();
 		let source_pointer = fs::read(source_child.join(".git")).unwrap();
-		// Real isolations live at a different depth than the source, so the
-		// copied relative child gitfiles resolve to no admin at all.
-		let isolated_parent = tmp.path().join("omp/wt/task");
-		fs::create_dir_all(&isolated_parent).unwrap();
-		let isolated = isolated_parent.join("m");
-		assert!(
-			Command::new("cp")
-				.args(["-Rp", linked.to_str().unwrap(), isolated.to_str().unwrap()])
-				.status()
-				.unwrap()
-				.success()
-		);
-		let common = GitRepo::require(&linked).unwrap().info().common_dir.clone();
-		assert_eq!(detach_git_dir(&isolated, &common).unwrap(), DetachGitDirResult::Detached);
+		let isolated = copied_detached_isolation(tmp.path(), &linked);
 		assert!(
 			GitRepo::require(&isolated)
 				.unwrap()
