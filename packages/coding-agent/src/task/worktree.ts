@@ -69,13 +69,20 @@ export function getGitNoIndexNullPath(): string {
 	return GIT_NO_INDEX_NULL_PATH;
 }
 
-/** Find nested git repositories (non-submodule) under the given root. */
+/**
+ * Find every repository under `repoRoot` whose edits the root diff cannot
+ * carry: each initialized submodule at every depth (the root diff never
+ * renders a gitlink, let alone the submodule's files) plus every
+ * non-submodule nested repo. Paths are relative to `repoRoot`; a submodule
+ * always precedes the repos nested inside it.
+ */
 async function discoverNestedRepos(repoRoot: string): Promise<string[]> {
-	// Get submodule paths so we can exclude them
-	const submodulePaths = new Set(await vcs.requireGit(repoRoot).submodulePaths());
+	// Initialized submodules, recursively; uninitialized ones have no edits.
+	const submodules = await vcs.requireGit(repoRoot).submodulePaths();
+	const submodulePaths = new Set(submodules);
 
 	// Find all .git dirs/files that aren't the root or known submodules
-	const result: string[] = [];
+	const result: string[] = [...submodules];
 	async function walk(dir: string): Promise<void> {
 		let entries: Dirent[];
 		try {

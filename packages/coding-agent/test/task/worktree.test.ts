@@ -982,6 +982,80 @@ describe("detachGitDir", () => {
 	);
 });
 
+describe("captureDeltaPatch with initialized submodules", () => {
+	/** parent -> packages/aix-root -> packages/plugin, each initialized, the pai-root shape. */
+	async function makeTwoDepthSubmodules(): Promise<string> {
+		const repos: Record<string, string> = {};
+		for (const name of ["plugin", "aix", "parent"]) {
+			const repo = await createGitRepo();
+			await runGit(repo, ["config", "user.email", "src@example.com"]);
+			await runGit(repo, ["config", "user.name", "Source User"]);
+			await fs.writeFile(path.join(repo, "tracked.txt"), `${name}\n`);
+			await runGit(repo, ["add", "tracked.txt"]);
+			await runGit(repo, ["commit", "-q", "-m", name]);
+			repos[name] = repo;
+		}
+		const allowFile = ["-c", "protocol.file.allow=always"];
+		await runGit(repos.aix!, [...allowFile, "submodule", "add", "-q", repos.plugin!, "packages/plugin"]);
+		await runGit(repos.aix!, ["commit", "-q", "-m", "pin plugin"]);
+		await runGit(repos.parent!, [...allowFile, "submodule", "add", "-q", repos.aix!, "packages/aix-root"]);
+		await runGit(repos.parent!, ["commit", "-q", "-m", "pin aix"]);
+		await runGit(repos.parent!, [...allowFile, "submodule", "update", "-q", "--init", "--recursive"]);
+		for (const sub of ["packages/aix-root", "packages/aix-root/packages/plugin"]) {
+			await runGit(path.join(repos.parent!, sub), ["config", "user.email", "iso@example.com"]);
+			await runGit(path.join(repos.parent!, sub), ["config", "user.name", "Isolated User"]);
+		}
+		return repos.parent!;
+	}
+
+	it("returns uncommitted and committed edits inside submodules at every depth as nested patches", async () => {
+		const repo = await makeTwoDepthSubmodules();
+		const aix = path.join(repo, "packages/aix-root");
+		const plugin = path.join(aix, "packages/plugin");
+		const baseline = await captureBaseline(repo);
+		expect(baseline.nested.map(n => n.relativePath)).toEqual([
+			"packages/aix-root",
+			"packages/aix-root/packages/plugin",
+		]);
+
+		await fs.writeFile(path.join(plugin, "new.txt"), "plugin edit\n");
+		await fs.writeFile(path.join(plugin, "tracked.txt"), "plugin changed\n");
+		await fs.writeFile(path.join(aix, "committed.txt"), "aix commit\n");
+		await runGit(aix, ["add", "committed.txt"]);
+		await runGit(aix, ["commit", "-q", "-m", "commit inside the submodule"]);
+		await fs.writeFile(path.join(repo, "root.txt"), "root edit\n");
+
+		const { rootPatch, nestedPatches } = await captureDeltaPatch(repo, baseline);
+		const byPath = new Map(nestedPatches.map(p => [p.relativePath, p.patch]));
+		expect([...byPath.keys()].sort()).toEqual(["packages/aix-root", "packages/aix-root/packages/plugin"]);
+		expect(byPath.get("packages/aix-root/packages/plugin")).toContain("+plugin edit");
+		expect(byPath.get("packages/aix-root/packages/plugin")).toContain("+plugin changed");
+		expect(byPath.get("packages/aix-root")).toContain("+aix commit");
+		// Content travels once: no pointer moves to commits only the copy holds.
+		expect(byPath.get("packages/aix-root")).not.toContain("Subproject commit");
+		expect(rootPatch).toContain("+root edit");
+		expect(rootPatch).not.toContain("Subproject commit");
+
+		// Each nested patch replays on its submodule's recorded pin.
+		const aixPin = await runGit(repo, ["rev-parse", "HEAD:packages/aix-root"]);
+		await runGit(aix, ["reset", "-q", "--hard", aixPin]);
+		await runGit(plugin, ["checkout", "-q", "--", "."]);
+		await fs.rm(path.join(plugin, "new.txt"));
+		for (const { relativePath, patch } of nestedPatches) {
+			const dir = path.join(repo, relativePath);
+			const file = path.join(os.tmpdir(), `omp-nested-${Bun.hash(relativePath)}.patch`);
+			await fs.writeFile(file, patch.endsWith("\n") ? patch : `${patch}\n`);
+			try {
+				await runGit(dir, ["apply", file]);
+			} finally {
+				await fs.rm(file, { force: true });
+			}
+		}
+		expect(await fs.readFile(path.join(plugin, "new.txt"), "utf8")).toBe("plugin edit\n");
+		expect(await fs.readFile(path.join(aix, "committed.txt"), "utf8")).toBe("aix commit\n");
+	});
+});
+
 describe("applyNestedPatches", () => {
 	const nestedRel = "sub";
 	let fixtureParent: string;
