@@ -96,6 +96,11 @@ export function detachGitDir(worktreeRoot, sourceCommonDir, signal) {
 	return api().vcsDetachGitDir(worktreeRoot, sourceCommonDir, signal);
 }
 
+/** Rebind recursively initialized copied submodules to private Git metadata. */
+export function rebindCopiedSubmodules(sourceRoot, isolatedRoot, signal) {
+	return api().vcsRebindCopiedSubmodules(sourceRoot, isolatedRoot, signal);
+}
+
 /**
  * Run Git's checkout hook in a newly created linked worktree, using the same
  * null old HEAD and branch-switch flag as `git worktree add`.

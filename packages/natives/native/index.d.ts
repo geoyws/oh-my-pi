@@ -3754,6 +3754,12 @@ export interface VcsPushOptions {
   forceWithLease?: boolean
 }
 
+/**
+ * Privately materialize recursively initialized gitlinks after a copy backend
+ * clone.
+ */
+export declare function vcsRebindCopiedSubmodules(sourceRoot: string, isolatedRoot: string, signal?: unknown | undefined | null): Promise<number>
+
 /** Restore options. */
 export interface VcsRestoreOptions {
   source?: string

@@ -582,7 +582,12 @@ export async function ensureIsolation(
 			// task's git operations would mutate the parent checkout and stack
 			// parallel task branches. Detaching gives each isolation a private,
 			// frozen repo that still borrows the source object DB via alternates.
-			await vcs.detachGitDir(mergedDir, sourceCommonDir);
+			const detached = await vcs.detachGitDir(mergedDir, sourceCommonDir);
+			// Every backend exposes the source's submodule gitfiles at a new path,
+			// so their relative pointers no longer reach this isolation's private
+			// admin. Every initialized child needs private metadata before the
+			// native baseline walks gitlinks or an agent runs.
+			if (detached !== "no-git") await vcs.rebindCopiedSubmodules(repoRoot, mergedDir);
 			return {
 				mergedDir,
 				backend: candidate,

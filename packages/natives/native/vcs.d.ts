@@ -81,6 +81,13 @@ export declare function detachGitDir(
 	signal?: AbortSignal,
 ): Promise<"no-git" | "independent" | "detached">;
 
+/** Rebind recursively initialized copied submodules to private Git metadata. */
+export declare function rebindCopiedSubmodules(
+	sourceRoot: string,
+	isolatedRoot: string,
+	signal?: AbortSignal,
+): Promise<number>;
+
 /** Run Git's checkout hook in a new linked worktree and return its output and exit status. */
 export declare function runPostCheckoutHook(
 	worktreeRoot: string,

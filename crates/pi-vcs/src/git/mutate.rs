@@ -997,8 +997,126 @@ fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>> {
 	}
 }
 
+/// Metadata needed to turn a copied checkout into a private repository. All
+/// reads happen before changing an isolation, so source worktree administration
+/// is never opened through a copied (and potentially stale) .git pointer.
+struct PrivateGitSnapshot {
+	head:          Option<Vec<u8>>,
+	index:         Option<Vec<u8>>,
+	refs:          Vec<(String, gix::hash::ObjectId)>,
+	config_values: Vec<(String, String)>,
+	shared:        Vec<(String, Vec<u8>)>,
+	sparse:        Option<Vec<u8>>,
+	shallow:       Option<Vec<u8>>,
+	object_dirs:   Vec<PathBuf>,
+}
+
+fn snapshot_private_git(original: &GitRepo, source_common: &Path) -> Result<PrivateGitSnapshot> {
+	let repo = original.gix()?;
+	let common = fs::canonicalize(source_common)?;
+	let head = read_optional_file(&original.info().head_path)?;
+	let index = read_optional_file(&original.info().git_dir.join("index"))?;
+	let refs = snapshot_refs(&repo)?;
+	let config = repo.config_snapshot();
+	let mut config_values: Vec<(String, String)> = [
+		"user.name",
+		"user.email",
+		"core.fileMode",
+		"core.splitIndex",
+		"core.sparseCheckout",
+		"core.sparseCheckoutCone",
+	]
+	.into_iter()
+	.filter_map(|key| {
+		config
+			.string(key)
+			.map(|value| (key.to_owned(), value.to_str_lossy().into_owned()))
+	})
+	.collect();
+	// `git submodule` treats a gitlink as initialized only when the repository
+	// config registers it; keep the repo-local registrations so the private
+	// admin reports the same initialized pins as its source.
+	for section in config.sections_by_name("submodule").into_iter().flatten() {
+		if section.meta().source != gix::config::Source::Local {
+			continue;
+		}
+		let Some(name) = section.header().subsection_name() else {
+			continue;
+		};
+		let name = name.to_str_lossy();
+		for key in ["url", "active"] {
+			if let Some(value) = section.value(key) {
+				config_values
+					.push((format!("submodule.{name}.{key}"), value.to_str_lossy().into_owned()));
+			}
+		}
+	}
+	let shared = copy_named_files(&original.info().git_dir, "sharedindex.")?;
+	let sparse = read_optional_file(&original.info().git_dir.join("info/sparse-checkout"))?;
+	let shallow = read_optional_file(&common.join("shallow"))?;
+	let mut object_dirs = vec![common.join("objects")];
+	if let Ok(chained) = fs::read_to_string(common.join("objects/info/alternates")) {
+		for line in chained
+			.lines()
+			.map(str::trim)
+			.filter(|line| !line.is_empty())
+		{
+			let path = Path::new(line);
+			object_dirs.push(if path.is_absolute() {
+				path.to_owned()
+			} else {
+				common.join("objects").join(path)
+			});
+		}
+	}
+	Ok(PrivateGitSnapshot { head, index, refs, config_values, shared, sparse, shallow, object_dirs })
+}
+
+fn materialize_private_git(worktree_root: &Path, snapshot: PrivateGitSnapshot) -> Result<()> {
+	gix::init(worktree_root).map_err(|error| Error::backend("git init", error))?;
+	let git_entry = worktree_root.join(".git");
+	let objects_info = git_entry.join("objects/info");
+	fs::create_dir_all(&objects_info)?;
+	let alternate_text = snapshot
+		.object_dirs
+		.iter()
+		.map(|path| path.to_string_lossy())
+		.collect::<Vec<_>>()
+		.join("\n")
+		+ "\n";
+	fs::write(objects_info.join("alternates"), alternate_text)?;
+	for (name, id) in snapshot.refs {
+		write_loose_ref(&git_entry, &name, id)?;
+	}
+	if let Some(head) = snapshot.head {
+		fs::write(git_entry.join("HEAD"), head)?;
+	}
+	for (key, value) in snapshot.config_values {
+		set_config_file(&git_entry.join("config"), &key, &value)?;
+	}
+	if let Some(bytes) = snapshot.shallow {
+		fs::write(git_entry.join("shallow"), bytes)?;
+	}
+	if let Some(bytes) = snapshot.sparse {
+		fs::create_dir_all(git_entry.join("info"))?;
+		fs::write(git_entry.join("info/sparse-checkout"), bytes)?;
+	}
+	for (name, bytes) in snapshot.shared {
+		fs::write(git_entry.join(name), bytes)?;
+	}
+	if let Some(bytes) = snapshot.index {
+		fs::write(git_entry.join("index"), bytes)?;
+	} else if let Ok(detached) = GitRepo::require(worktree_root)
+		&& resolve_commit(&detached.gix()?, "HEAD").is_ok()
+	{
+		detached.read_tree("HEAD", None)?;
+	}
+	Ok(())
+}
+
 /// Sever a copied linked worktree from its source metadata without copying
-/// objects.
+/// objects. This root operation retains its existing registered-admin cleanup;
+/// submodule repair below must never remove a source admin directory.
 pub fn detach_git_dir(
 	worktree_root: &Path,
 	source_common_dir: &Path,
@@ -1017,29 +1135,7 @@ pub fn detach_git_dir(
 	if iso_common != source_common {
 		return Ok(DetachGitDirResult::Independent);
 	}
-	let repo = original.gix()?;
-	let head = read_optional_file(&original.info().head_path)?;
-	let index = read_optional_file(&original.info().git_dir.join("index"))?;
-	let refs = snapshot_refs(&repo)?;
-	let config_values = [
-		"user.name",
-		"user.email",
-		"core.fileMode",
-		"core.splitIndex",
-		"core.sparseCheckout",
-		"core.sparseCheckoutCone",
-	]
-	.into_iter()
-	.filter_map(|key| {
-		repo
-			.config_snapshot()
-			.string(key)
-			.map(|v| (key, v.to_str_lossy().into_owned()))
-	})
-	.collect::<Vec<_>>();
-	let shared = copy_named_files(&original.info().git_dir, "sharedindex.")?;
-	let sparse = read_optional_file(&original.info().git_dir.join("info/sparse-checkout"))?;
-	let shallow = read_optional_file(&source_common.join("shallow"))?;
+	let snapshot = snapshot_private_git(&original, &source_common)?;
 	let own_admin = if meta.is_file() {
 		registered_admin(&git_entry)?
 	} else {
@@ -1053,58 +1149,164 @@ pub fn detach_git_dir(
 	if let Some(admin) = own_admin {
 		fs::remove_dir_all(admin)?;
 	}
-	gix::init(worktree_root).map_err(|e| Error::backend("git init", e))?;
-	let objects_info = git_entry.join("objects/info");
-	fs::create_dir_all(&objects_info)?;
-	let mut alternates = vec![source_common.join("objects")];
-	if let Ok(chained) = fs::read_to_string(source_common.join("objects/info/alternates")) {
-		for line in chained
-			.lines()
-			.map(str::trim)
-			.filter(|line| !line.is_empty())
-		{
-			let path = Path::new(line);
-			alternates.push(if path.is_absolute() {
-				path.to_owned()
-			} else {
-				source_common.join("objects").join(path)
-			});
-		}
-	}
-	let alternate_text = alternates
-		.iter()
-		.map(|p| p.to_string_lossy())
-		.collect::<Vec<_>>()
-		.join("\n")
-		+ "\n";
-	fs::write(objects_info.join("alternates"), alternate_text)?;
-	for (name, id) in refs {
-		write_loose_ref(&git_entry, &name, id)?;
-	}
-	if let Some(head) = head {
-		fs::write(git_entry.join("HEAD"), head)?;
-	}
-	for (key, value) in config_values {
-		set_config_file(&git_entry.join("config"), key, &value)?;
-	}
-	if let Some(bytes) = shallow {
-		fs::write(git_entry.join("shallow"), bytes)?;
-	}
-	if let Some(bytes) = sparse {
-		fs::create_dir_all(git_entry.join("info"))?;
-		fs::write(git_entry.join("info/sparse-checkout"), bytes)?;
-	}
-	for (name, bytes) in shared {
-		fs::write(git_entry.join(name), bytes)?;
-	}
-	if let Some(bytes) = index {
-		fs::write(git_entry.join("index"), bytes)?;
-	} else if let Ok(detached) = GitRepo::require(worktree_root)
-		&& resolve_commit(&detached.gix()?, "HEAD").is_ok()
-	{
-		detached.read_tree("HEAD", None)?;
-	}
+	materialize_private_git(worktree_root, snapshot)?;
 	Ok(DetachGitDirResult::Detached)
+}
+
+struct CopiedSubmodule {
+	relative: PathBuf,
+	metadata: PrivateGitSnapshot,
+}
+
+fn collect_copied_submodules(
+	source_root: &Path,
+	isolated_root: &Path,
+	relative: &Path,
+	snapshots: &mut Vec<CopiedSubmodule>,
+) -> Result<()> {
+	let source_parent = source_root.join(relative);
+	let repo = GitRepo::require(&source_parent)?;
+	if fs::canonicalize(repo.root())? != source_parent {
+		return Err(Error::backend(
+			"git rebind copied submodules",
+			format!("source {} is not an independent repository", source_parent.display()),
+		));
+	}
+	let gix = repo.gix()?;
+	let index = load_index_or_head(&gix, "git rebind copied submodules")?;
+	for entry in index.entries() {
+		if !entry.mode.is_submodule() {
+			continue;
+		}
+		if entry.stage() != gix::index::entry::Stage::Unconflicted {
+			return Err(Error::backend(
+				"git rebind copied submodules",
+				"unmerged gitlink in source index",
+			));
+		}
+		let path = entry
+			.path(&index)
+			.to_str()
+			.map_err(|error| Error::backend("git rebind copied submodules", error))?;
+		let child = Path::new(path);
+		if path.is_empty()
+			|| path
+				.split('/')
+				.any(|part| part.is_empty() || part == "." || part == "..")
+			|| child.is_absolute()
+			|| !child
+				.components()
+				.all(|part| matches!(part, std::path::Component::Normal(_)))
+		{
+			return Err(Error::backend(
+				"git rebind copied submodules",
+				format!("invalid gitlink path {path}"),
+			));
+		}
+		let child_relative = relative.join(child);
+		let source_child = source_root.join(&child_relative);
+		let isolated_child = isolated_root.join(&child_relative);
+		if fs::canonicalize(&source_child)? != source_child
+			|| fs::canonicalize(&isolated_child)? != isolated_child
+		{
+			return Err(Error::backend(
+				"git rebind copied submodules",
+				format!("symlinked submodule path {}", child_relative.display()),
+			));
+		}
+		let source_git = source_child.join(".git");
+		let isolated_git = isolated_child.join(".git");
+		let optional_meta = |path: &Path| match fs::symlink_metadata(path) {
+			Ok(meta) => Ok(Some(meta)),
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+			Err(error) => Err(error),
+		};
+		let (source_meta, isolated_meta) =
+			match (optional_meta(&source_git)?, optional_meta(&isolated_git)?) {
+				(Some(source), Some(isolated)) => (source, isolated),
+				// Nothing in the isolation can reach a source admin: the gitlink was
+				// never initialized, or the backend (rcopy's `git worktree add`)
+				// checked it out empty.
+				(_, None) => continue,
+				(None, Some(_)) => {
+					return Err(Error::backend(
+						"git rebind copied submodules",
+						format!(
+							"copied Git admin for uninitialized submodule {}",
+							child_relative.display()
+						),
+					));
+				},
+			};
+		if source_meta.file_type().is_symlink()
+			|| isolated_meta.file_type().is_symlink()
+			|| !(source_meta.is_file() || source_meta.is_dir())
+			|| !(isolated_meta.is_file() || isolated_meta.is_dir())
+		{
+			return Err(Error::backend(
+				"git rebind copied submodules",
+				format!("invalid submodule Git admin {}", child_relative.display()),
+			));
+		}
+		let subrepo = GitRepo::require(&source_child)?;
+		if fs::canonicalize(subrepo.root())? != source_child {
+			return Err(Error::backend(
+				"git rebind copied submodules",
+				format!("uninitialized submodule {}", child_relative.display()),
+			));
+		}
+		let expected = entry.id.to_string();
+		if subrepo.head_sha()?.as_deref() != Some(expected.as_str()) {
+			return Err(Error::backend(
+				"git rebind copied submodules",
+				format!("off-pin submodule {}", child_relative.display()),
+			));
+		}
+		let metadata = snapshot_private_git(&subrepo, &subrepo.info().common_dir)?;
+		if metadata.head.is_none() {
+			return Err(Error::backend(
+				"git rebind copied submodules",
+				format!("missing submodule HEAD {}", child_relative.display()),
+			));
+		}
+		// Depth-first: an initialized grandchild must be private before its
+		// parent.
+		collect_copied_submodules(source_root, isolated_root, &child_relative, snapshots)?;
+		snapshots.push(CopiedSubmodule { relative: child_relative, metadata });
+	}
+	Ok(())
+}
+
+/// Give every initialized gitlink in a copied isolation its own HEAD, refs,
+/// index and object store alternates. Source administration is only read;
+/// destination gitfiles never get followed through their stale pointers.
+pub fn rebind_copied_submodules(source_root: &Path, isolated_root: &Path) -> Result<usize> {
+	let source = fs::canonicalize(source_root)?;
+	let isolated = fs::canonicalize(isolated_root)?;
+	if source == isolated
+		|| source.starts_with(&isolated)
+		|| isolated.starts_with(&source)
+		|| !fs::symlink_metadata(isolated_root)?.is_dir()
+	{
+		return Err(Error::backend(
+			"git rebind copied submodules",
+			"source and isolation overlap or are symlinks",
+		));
+	}
+	let mut snapshots = Vec::new();
+	collect_copied_submodules(&source, &isolated, Path::new(""), &mut snapshots)?;
+	let count = snapshots.len();
+	for snapshot in snapshots {
+		let destination = isolated.join(&snapshot.relative);
+		let git_entry = destination.join(".git");
+		if fs::symlink_metadata(&git_entry)?.is_dir() {
+			fs::remove_dir_all(&git_entry)?;
+		} else {
+			fs::remove_file(&git_entry)?;
+		}
+		materialize_private_git(&destination, snapshot.metadata)?;
+	}
+	Ok(count)
 }
 
 /// Author signature for an explicit [`CommitAuthor`]; a missing date means now.
@@ -2951,5 +3153,120 @@ mod tests {
 		);
 		assert!(repo.worktree_prune().is_ok());
 		let _ = fs::remove_dir_all(linked);
+	}
+	#[test]
+	fn copied_recursive_submodules_get_private_git_metadata_without_touching_source() {
+		let tmp = tempfile::tempdir().unwrap();
+		let grand = tmp.path().join("grand");
+		let child = tmp.path().join("child");
+		let parent = tmp.path().join("parent");
+		for repo in [&grand, &child, &parent] {
+			fs::create_dir_all(repo).unwrap();
+			git(repo, &["init", "-q", "-b", "main"]);
+			git(repo, &["config", "user.name", "Proof"]);
+			git(repo, &["config", "user.email", "proof.invalid"]);
+			git(repo, &["config", "core.hooksPath", "/dev/null"]);
+			fs::write(repo.join("tracked"), "unchanged\n").unwrap();
+			git(repo, &["add", "tracked"]);
+			git(repo, &["commit", "-qm", "seed"]);
+		}
+		git(&child, &[
+			"-c",
+			"protocol.file.allow=always",
+			"submodule",
+			"add",
+			grand.to_str().unwrap(),
+			"nested/grand",
+		]);
+		git(&child, &["commit", "-qam", "pin grandchild"]);
+		git(&parent, &[
+			"-c",
+			"protocol.file.allow=always",
+			"submodule",
+			"add",
+			child.to_str().unwrap(),
+			"packages/aix-root",
+		]);
+		git(&parent, &["commit", "-qam", "pin child"]);
+		let linked = tmp.path().join("linked");
+		git(&parent, &["worktree", "add", "--detach", linked.to_str().unwrap(), "HEAD"]);
+		git(&linked, &[
+			"-c",
+			"protocol.file.allow=always",
+			"submodule",
+			"update",
+			"--init",
+			"--recursive",
+		]);
+		let source_child = linked.join("packages/aix-root");
+		let source_grand = source_child.join("nested/grand");
+		let source_admin = GitRepo::require(&source_child)
+			.unwrap()
+			.info()
+			.git_dir
+			.clone();
+		let parent_head = git(&linked, &["rev-parse", "HEAD"]);
+		let source_pins = git(&linked, &["submodule", "status", "--recursive"]);
+		let source_index = fs::read(source_admin.join("index")).unwrap();
+		let source_pointer = fs::read(source_child.join(".git")).unwrap();
+		// Real isolations live at a different depth than the source, so the
+		// copied relative child gitfiles resolve to no admin at all.
+		let isolated_parent = tmp.path().join("omp/wt/task");
+		fs::create_dir_all(&isolated_parent).unwrap();
+		let isolated = isolated_parent.join("m");
+		assert!(
+			Command::new("cp")
+				.args(["-Rp", linked.to_str().unwrap(), isolated.to_str().unwrap()])
+				.status()
+				.unwrap()
+				.success()
+		);
+		let common = GitRepo::require(&linked).unwrap().info().common_dir.clone();
+		assert_eq!(detach_git_dir(&isolated, &common).unwrap(), DetachGitDirResult::Detached);
+		assert!(
+			GitRepo::require(&isolated)
+				.unwrap()
+				.diff_text(&crate::types::DiffOptions::default())
+				.is_err(),
+			"a stale copied child gitfile must fail native preflight before repair"
+		);
+		assert_eq!(rebind_copied_submodules(&linked, &isolated).unwrap(), 2);
+		let private_child = isolated.join("packages/aix-root");
+		let private_grand = private_child.join("nested/grand");
+		for directory in [&private_child, &private_grand] {
+			assert!(
+				directory.join(".git").is_dir(),
+				"private Git admin missing in {}",
+				directory.display()
+			);
+			assert!(git(directory, &["status", "--porcelain"]).is_empty());
+		}
+		assert!(
+			GitRepo::require(&isolated)
+				.unwrap()
+				.diff_text(&crate::types::DiffOptions::default())
+				.unwrap()
+				.is_empty()
+		);
+		assert!(git(&isolated, &["status", "--porcelain"]).is_empty());
+		// Same initialized pins as the source, not `-` (uninitialized) rows.
+		assert_eq!(git(&isolated, &["submodule", "status", "--recursive"]), source_pins);
+		fs::write(private_grand.join("tracked"), "isolated edit\n").unwrap();
+		// Task capture diffs each nested repository separately; the edit must
+		// be visible through the grandchild's own private metadata.
+		let grand_diff = GitRepo::require(&private_grand)
+			.unwrap()
+			.diff_text(&crate::types::DiffOptions::default())
+			.unwrap();
+		assert!(grand_diff.contains("+isolated edit"), "{grand_diff}");
+		assert_eq!(git(&isolated, &["status", "--porcelain"]), " M packages/aix-root");
+		assert_eq!(fs::read_to_string(source_grand.join("tracked")).unwrap(), "unchanged\n");
+		assert_eq!(git(&linked, &["rev-parse", "HEAD"]), parent_head);
+		assert_eq!(fs::read(source_admin.join("index")).unwrap(), source_index);
+		assert_eq!(fs::read(source_child.join(".git")).unwrap(), source_pointer);
+		assert_eq!(
+			git(&source_grand, &["rev-parse", "HEAD"]),
+			git(&private_grand, &["rev-parse", "HEAD"])
+		);
 	}
 }

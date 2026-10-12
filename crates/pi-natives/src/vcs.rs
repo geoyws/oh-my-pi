@@ -1427,6 +1427,27 @@ pub fn vcs_detach_git_dir(
 		)
 	})
 }
+
+/// Privately materialize recursively initialized gitlinks after a copy backend
+/// clone.
+#[napi]
+pub fn vcs_rebind_copied_submodules(
+	source_root: String,
+	isolated_root: String,
+	signal: Option<Unknown>,
+) -> Promise<u32> {
+	let ct = task::CancelToken::new(None, signal);
+	task::blocking_mapped("vcs.rebindCopiedSubmodules", ct, rich_error, canceled_error, move |ct| {
+		if ct.heartbeat().is_err() {
+			return Err(pi_vcs::Error::Canceled);
+		}
+		let count =
+			pi_vcs::git::rebind_copied_submodules(Path::new(&source_root), Path::new(&isolated_root))?;
+		u32::try_from(count)
+			.map_err(|_| pi_vcs::Error::backend("git rebind copied submodules", "too many submodules"))
+	})
+}
+
 /// Join patch fragments.
 #[napi]
 pub fn vcs_join_patches(parts: Vec<String>) -> String {

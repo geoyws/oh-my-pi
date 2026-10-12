@@ -6,6 +6,8 @@ import {
 	applyNestedPatches,
 	captureBaseline,
 	captureDeltaPatch,
+	captureIsolationBaseline,
+	cleanupIsolation,
 	cleanupTaskBranches,
 	commitToBranch,
 	ensureIsolation,
@@ -858,6 +860,79 @@ describe("detachGitDir", () => {
 			else process.env.OMP_WORKTREE_DIR = originalWorktreeDir;
 		}
 	});
+
+	// A block-cloning copy backend keeps the copied child gitfiles; rcopy's
+	// `git worktree add` checks gitlinks out empty and cannot show the leak.
+	it.skipIf(process.platform !== "darwin")(
+		"gives recursively initialized submodules private metadata in an APFS clone of a linked worktree",
+		async () => {
+			const { main, wt } = await makeLinkedWorktree();
+			// Two-depth gitlinks (parent -> aix -> plugin), the pai-root shape.
+			const repos: Record<string, string> = {};
+			for (const name of ["plugin", "aix"]) {
+				const repo = await fs.mkdtemp(path.join(os.tmpdir(), `omp-detach-${name}-`));
+				tempDirs.push(repo);
+				await initRepo(repo);
+				await runGit(repo, ["config", "user.email", "src@example.com"]);
+				await runGit(repo, ["config", "user.name", "Source User"]);
+				await fs.writeFile(path.join(repo, "tracked.txt"), `${name}\n`);
+				await runGit(repo, ["add", "tracked.txt"]);
+				await runGit(repo, ["commit", "-q", "-m", name]);
+				repos[name] = repo;
+			}
+			const allowFile = ["-c", "protocol.file.allow=always"];
+			await runGit(repos.aix!, [...allowFile, "submodule", "add", "-q", repos.plugin!, "packages/plugin"]);
+			await runGit(repos.aix!, ["commit", "-q", "-m", "pin plugin"]);
+			await runGit(main, [...allowFile, "submodule", "add", "-q", repos.aix!, "packages/aix-root"]);
+			await runGit(main, ["commit", "-q", "-m", "pin aix"]);
+			await runGit(wt, ["merge", "-q", "--ff-only", "main"]);
+			await runGit(wt, [...allowFile, "submodule", "update", "-q", "--init", "--recursive"]);
+			const sourceAix = path.join(wt, "packages/aix-root");
+			const sourceAdmin = await runGit(sourceAix, ["rev-parse", "--absolute-git-dir"]);
+			const sourceIndex = await fs.readFile(path.join(sourceAdmin, "index"));
+			const sourcePins = await runGit(wt, ["submodule", "status", "--recursive"]);
+
+			vi.spyOn(natives, "isoResolve").mockResolvedValue({
+				kind: natives.IsoBackendKind.Apfs,
+				candidates: [natives.IsoBackendKind.Apfs],
+				fellBack: false,
+				reason: undefined,
+			});
+			const worktreeBase = await fs.mkdtemp(path.join(os.tmpdir(), "omp-detach-wtbase-"));
+			tempDirs.push(worktreeBase);
+			const originalWorktreeDir = process.env.OMP_WORKTREE_DIR;
+			delete process.env.OMP_WORKTREE_DIR;
+			setWorktreesDir(worktreeBase);
+			try {
+				const handle = await ensureIsolation(wt, "nested-submodule-guard");
+				try {
+					const isoPlugin = path.join(handle.mergedDir, "packages/aix-root/packages/plugin");
+					for (const dir of [path.join(handle.mergedDir, "packages/aix-root"), isoPlugin]) {
+						expect((await fs.stat(path.join(dir, ".git"))).isDirectory()).toBe(true);
+					}
+					expect(await runGit(handle.mergedDir, ["submodule", "status", "--recursive"])).toBe(sourcePins);
+					// The baseline's native status walks every gitlink; stale copied
+					// gitfiles made it fail with "Could not determine status for
+					// submodule".
+					await captureIsolationBaseline(handle.mergedDir, wt);
+					await fs.writeFile(path.join(isoPlugin, "tracked.txt"), "isolated edit\n");
+					expect(await runGit(isoPlugin, ["diff"])).toContain("+isolated edit");
+					expect(await runGit(handle.mergedDir, ["status", "--porcelain"])).toBe("M packages/aix-root");
+				} finally {
+					await cleanupIsolation(handle);
+				}
+				// The source checkout and its nested admin are untouched.
+				expect(await fs.readFile(path.join(sourceAix, "packages/plugin/tracked.txt"), "utf8")).toBe("plugin\n");
+				expect(await fs.readFile(path.join(sourceAdmin, "index"))).toEqual(sourceIndex);
+				expect(await runGit(wt, ["submodule", "status", "--recursive"])).toBe(sourcePins);
+				expect(await runGit(wt, ["status", "--porcelain"])).toBe("");
+			} finally {
+				setWorktreesDir(undefined);
+				if (originalWorktreeDir === undefined) delete process.env.OMP_WORKTREE_DIR;
+				else process.env.OMP_WORKTREE_DIR = originalWorktreeDir;
+			}
+		},
+	);
 });
 
 describe("applyNestedPatches", () => {
