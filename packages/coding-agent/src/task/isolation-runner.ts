@@ -474,8 +474,8 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 		});
 		opts.onSubprocessResult?.(result);
 		// A successful result cannot be captured while deferred owner jobs or
-		// shutdown hooks may still write the worktree. Failed runs skip capture,
-		// so their cleanup remains asynchronous.
+		// shutdown hooks may still write the worktree. A failed run is captured
+		// as it stands below, so its cleanup remains asynchronous.
 		if (deferredCleanup && result.exitCode === 0) {
 			await deferredCleanup;
 		}
@@ -579,7 +579,31 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 				});
 			}
 		}
-		return rememberAgentArtifacts(result);
+		// A failed or cancelled child's edits are the only copy of its work once
+		// the workspace is torn down. Keep them as a recovery artifact; every
+		// merge path refuses to apply a result that did not succeed.
+		try {
+			const capture = await writeIsolationPatch(isolationDir, baseline, opts.artifactsDir, opts.agentId);
+			if (!capture.artifacts.hasRootChanges && capture.artifacts.nestedPatches.length === 0) {
+				await fs.rm(capture.artifacts.patchPath, { force: true });
+				return rememberAgentArtifacts(result);
+			}
+			handedOff = capture.fingerprint;
+			return rememberAgentArtifacts({ ...result, ...capture.artifacts });
+		} catch (patchErr) {
+			retainWorkspace = true;
+			const retained = await retainIsolationWorkspace(isolationDir, isolationBackend);
+			const captureError = renderIsolationError({
+				kind: "patch-capture-failed",
+				message: patchErr instanceof Error ? patchErr.message : String(patchErr),
+				retainedDir: retained.dir,
+				sidecarMissing: !retained.sidecarOk,
+			});
+			return rememberAgentArtifacts({
+				...result,
+				error: result.error ? `${result.error}\n${captureError}` : captureError,
+			});
+		}
 	} catch (err) {
 		return rememberAgentArtifacts(opts.buildFailureResult(err));
 	} finally {
