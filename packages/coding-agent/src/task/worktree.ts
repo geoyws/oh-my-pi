@@ -30,6 +30,22 @@ async function diffTreeOrEmpty(repo: VcsGitRepo, base: string, head: string): Pr
 	}
 }
 
+/**
+ * Diff two trees while capturing a task's changes. Unlike
+ * {@link diffTreeOrEmpty}, a render failure throws: an empty patch would read
+ * as "no changes" and the workspace holding them would be torn down. The
+ * native renderer refuses gitlink entries, so a committed submodule pin move
+ * lands here.
+ */
+async function diffTreeForCapture(repo: VcsGitRepo, repoDir: string, base: string, head: string): Promise<string> {
+	try {
+		return await repo.diffTree(base, head, true);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		throw new Error(`Cannot render the changes in ${repoDir}: ${message}`, { cause: error });
+	}
+}
+
 /** Baseline state for a single git repository. */
 export interface RepoBaseline {
 	repoRoot: string;
@@ -321,7 +337,9 @@ async function captureRepoDeltaPatch(repoDir: string, rb: RepoBaseline, objectRe
 	const currentUntracked = await repo.lsFiles(true, true);
 	const currentUntrackedPatch = await captureUntrackedPatch(repoDir, currentUntracked, repo);
 	const committedPatch =
-		currentHead && currentHead !== rb.headCommit ? await diffTreeOrEmpty(repo, rb.headCommit, currentHead) : "";
+		currentHead && currentHead !== rb.headCommit
+			? await diffTreeForCapture(repo, repoDir, rb.headCommit, currentHead)
+			: "";
 
 	const baselineTree = await writeSyntheticTree(objectRepoDir, rb.headCommit, [
 		rb.staged,
@@ -335,7 +353,7 @@ async function captureRepoDeltaPatch(repoDir: string, rb: RepoBaseline, objectRe
 		currentUntrackedPatch,
 	]);
 
-	return diffTreeOrEmpty(objectRepo, baselineTree, currentTree);
+	return diffTreeForCapture(objectRepo, repoDir, baselineTree, currentTree);
 }
 
 function unquoteGitDiffPath(rawPath: string): string {
@@ -387,7 +405,12 @@ export async function captureDeltaPatch(isolationDir: string, baseline: Worktree
 		} catch {
 			continue;
 		}
-		const patch = await captureRepoDeltaPatch(nestedDir, nb, nb.repoRoot);
+		// The isolation's own nested repo builds the synthetic trees: a submodule
+		// there has a private admin over the source objects, so nothing is
+		// written to the parent's admin, and the parent-side path (possibly
+		// spelled through a symlink its relative gitfile cannot resolve from)
+		// is never opened.
+		const patch = await captureRepoDeltaPatch(nestedDir, nb);
 		if (patch.trim()) nestedPatches.push({ relativePath, patch });
 	}
 

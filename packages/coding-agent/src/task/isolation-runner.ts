@@ -491,7 +491,7 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 					? { ...released.artifacts, branchName: released.branchName }
 					: {};
 			const error = releaseError ? (result.error ? `${result.error}\n${releaseError}` : releaseError) : result.error;
-			return rememberAgentArtifacts({ ...result, ...kept, error });
+			return rememberAgentArtifacts({ ...result, ...kept, error, isolationError: releaseError });
 		}
 		// A successful result cannot be captured while deferred owner jobs or
 		// shutdown hooks may still write the worktree. A failed run is captured
@@ -622,6 +622,7 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 			return rememberAgentArtifacts({
 				...result,
 				error: result.error ? `${result.error}\n${captureError}` : captureError,
+				isolationError: captureError,
 			});
 		}
 	} catch (err) {

@@ -843,13 +843,18 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 				requiresRecoveryArtifacts ||=
 					nestedPatchSummary.includes("<system-notification>") && (result.nestedPatches?.length ?? 0) > 0;
 			}
-		} else if (policy.isIsolated && isolationContext && result.exitCode === 0 && result.error && !result.aborted) {
-			// The agent finished but the runner could not capture, persist, or
-			// commit its changes. `result.error` names the recovery route (retained
-			// workspace, rescued branch); it is the parent's only way to find it.
+		} else if (
+			policy.isIsolated &&
+			isolationContext &&
+			(result.isolationError || (result.exitCode === 0 && result.error && !result.aborted))
+		) {
+			// The runner could not capture, persist, or commit the changes. The
+			// error names the recovery route (retained workspace, rescued branch);
+			// it is the parent's only way to find it, whether the child succeeded,
+			// failed or was cancelled.
 			mergeSummary = renderIsolationSummary({
 				kind: "capture-error",
-				error: result.error,
+				error: result.isolationError ?? result.error,
 				branchName: result.branchName,
 				rootPatchPath: result.hasRootChanges === false ? undefined : result.patchPath,
 				nestedPatchPaths: result.nestedPatchPaths ?? [],

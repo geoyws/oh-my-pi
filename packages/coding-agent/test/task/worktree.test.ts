@@ -891,6 +891,15 @@ describe("detachGitDir", () => {
 			const sourceAdmin = await runGit(sourceAix, ["rev-parse", "--absolute-git-dir"]);
 			const sourceIndex = await fs.readFile(path.join(sourceAdmin, "index"));
 			const sourcePins = await runGit(wt, ["submodule", "status", "--recursive"]);
+			// Every file under the source aix admin, which holds plugin's admin too.
+			const adminSnapshot = async () => {
+				const files = (await fs.readdir(sourceAdmin, { recursive: true, withFileTypes: true }))
+					.filter(entry => entry.isFile())
+					.map(entry => path.join(entry.parentPath, entry.name))
+					.sort();
+				return Promise.all(files.map(async file => `${file}:${Bun.hash(await fs.readFile(file))}`));
+			};
+			const adminBefore = await adminSnapshot();
 
 			vi.spyOn(natives, "isoResolve").mockResolvedValue({
 				kind: natives.IsoBackendKind.Apfs,
@@ -914,16 +923,21 @@ describe("detachGitDir", () => {
 					// The baseline's native status walks every gitlink; stale copied
 					// gitfiles made it fail with "Could not determine status for
 					// submodule".
-					await captureIsolationBaseline(handle.mergedDir, wt);
+					const baseline = await captureIsolationBaseline(handle.mergedDir, wt);
 					await fs.writeFile(path.join(isoPlugin, "tracked.txt"), "isolated edit\n");
 					expect(await runGit(isoPlugin, ["diff"])).toContain("+isolated edit");
 					expect(await runGit(handle.mergedDir, ["status", "--porcelain"])).toBe("M packages/aix-root");
+					// The leaf edit comes back as that submodule's own patch.
+					const delta = await captureDeltaPatch(handle.mergedDir, baseline);
+					expect(delta.nestedPatches.map(p => p.relativePath)).toEqual(["packages/aix-root/packages/plugin"]);
+					expect(delta.nestedPatches[0]!.patch).toContain("+isolated edit");
 				} finally {
 					await cleanupIsolation(handle);
 				}
 				// The source checkout and its nested admin are untouched.
 				expect(await fs.readFile(path.join(sourceAix, "packages/plugin/tracked.txt"), "utf8")).toBe("plugin\n");
 				expect(await fs.readFile(path.join(sourceAdmin, "index"))).toEqual(sourceIndex);
+				expect(await adminSnapshot()).toEqual(adminBefore);
 				expect(await runGit(wt, ["submodule", "status", "--recursive"])).toBe(sourcePins);
 				expect(await runGit(wt, ["status", "--porcelain"])).toBe("");
 			} finally {
@@ -1008,7 +1022,7 @@ describe("captureDeltaPatch with initialized submodules", () => {
 		return repos.parent!;
 	}
 
-	it("returns uncommitted and committed edits inside submodules at every depth as nested patches", async () => {
+	it("returns uncommitted edits at every depth and an intermediate submodule's own commit as nested patches", async () => {
 		const repo = await makeTwoDepthSubmodules();
 		const aix = path.join(repo, "packages/aix-root");
 		const plugin = path.join(aix, "packages/plugin");
@@ -1031,10 +1045,7 @@ describe("captureDeltaPatch with initialized submodules", () => {
 		expect(byPath.get("packages/aix-root/packages/plugin")).toContain("+plugin edit");
 		expect(byPath.get("packages/aix-root/packages/plugin")).toContain("+plugin changed");
 		expect(byPath.get("packages/aix-root")).toContain("+aix commit");
-		// Content travels once: no pointer moves to commits only the copy holds.
-		expect(byPath.get("packages/aix-root")).not.toContain("Subproject commit");
 		expect(rootPatch).toContain("+root edit");
-		expect(rootPatch).not.toContain("Subproject commit");
 
 		// Each nested patch replays on its submodule's recorded pin.
 		const aixPin = await runGit(repo, ["rev-parse", "HEAD:packages/aix-root"]);
@@ -1053,6 +1064,24 @@ describe("captureDeltaPatch with initialized submodules", () => {
 		}
 		expect(await fs.readFile(path.join(plugin, "new.txt"), "utf8")).toBe("plugin edit\n");
 		expect(await fs.readFile(path.join(aix, "committed.txt"), "utf8")).toBe("aix commit\n");
+	});
+
+	it("refuses to capture, instead of returning nothing, when an intermediate submodule commits a pin move", async () => {
+		const repo = await makeTwoDepthSubmodules();
+		const aix = path.join(repo, "packages/aix-root");
+		const plugin = path.join(aix, "packages/plugin");
+		const baseline = await captureBaseline(repo);
+		// The PX flow: commit the leaf, then record its new pin in the parent.
+		await fs.writeFile(path.join(plugin, "tracked.txt"), "plugin changed\n");
+		await runGit(plugin, ["commit", "-q", "-am", "leaf change"]);
+		await fs.writeFile(path.join(aix, "tracked.txt"), "aix changed\n");
+		await runGit(aix, ["add", "tracked.txt", "packages/plugin"]);
+		await runGit(aix, ["commit", "-q", "-m", "bump plugin pin"]);
+		// The native renderer cannot draw the gitlink; an empty patch here would
+		// read as "no changes" and the workspace holding the commit would go.
+		await expect(captureDeltaPatch(repo, baseline)).rejects.toThrow(
+			/Cannot render the changes in .*packages\/aix-root/,
+		);
 	});
 });
 

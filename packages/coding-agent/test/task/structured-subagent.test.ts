@@ -946,6 +946,31 @@ describe("structured subagent primitive", () => {
 		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
 	});
 
+	it("names the retained workspace of a cancelled apply=false child whose capture failed", async () => {
+		mockDiscovery();
+		vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({ repoRoot: "/tmp" } as never);
+		const isolationError = "Patch capture failed: boom. Isolation workspace retained at /wt/abc.retained-1/m.";
+		vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockImplementation(async () => ({
+			...result(),
+			exitCode: 1,
+			aborted: true,
+			abortReason: "Subagent runtime limit exceeded",
+			error: isolationError,
+			isolationError,
+		}));
+
+		const settled = await runStructuredSubagent(
+			request({
+				session: session({ isolationEnabled: true, isolationApply: false }),
+				isolation: { requested: true },
+			}),
+		);
+
+		expect(settled.mergeSummary).toContain("/wt/abc.retained-1/m");
+		expect(settled.mergeSummary).not.toContain("no changes captured");
+		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
+	});
+
 	it("defaults task isolation to auto-apply and lets config retain artifacts", async () => {
 		mockDiscovery();
 		const defaultPolicy = await resolveEffectiveSubagentPolicy(

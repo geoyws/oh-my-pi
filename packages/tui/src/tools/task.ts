@@ -2453,6 +2453,13 @@ export interface SingleResult {
 	/** Retains {@link AgentProgress.advisor} after the advised session is disposed. */
 	advisor?: boolean;
 	error?: string;
+	/**
+	 * Why the isolation runner could not capture or persist this run's changes,
+	 * naming the retained workspace that still holds them. Set on any outcome —
+	 * success, failure or cancellation — so the parent always sees the
+	 * recovery route; `error` alone also carries the child's own failure.
+	 */
+	isolationError?: string;
 	aborted?: boolean;
 	abortReason?: string;
 	/** Aggregated usage from the subprocess, accumulated incrementally from message_end events. */
