@@ -1115,8 +1115,10 @@ fn materialize_private_git(worktree_root: &Path, snapshot: PrivateGitSnapshot) -
 }
 
 /// Sever a copied linked worktree from its source metadata without copying
-/// objects. This root operation retains its existing registered-admin cleanup;
-/// submodule repair below must never remove a source admin directory.
+/// objects.
+///
+/// This root operation keeps its registered-admin cleanup; submodule repair
+/// below must never remove a source admin directory.
 pub fn detach_git_dir(
 	worktree_root: &Path,
 	source_common_dir: &Path,
@@ -1206,6 +1208,23 @@ fn collect_copied_submodules(
 		let child_relative = relative.join(child);
 		let source_child = source_root.join(&child_relative);
 		let isolated_child = isolated_root.join(&child_relative);
+		let optional_meta = |path: &Path| match fs::symlink_metadata(path) {
+			Ok(meta) => Ok(Some(meta)),
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+			Err(error) => Err(error),
+		};
+		// A gitlink outside the sparse cone, or whose directory is deleted as a
+		// pending change, has nothing in the isolation to rebind.
+		match (optional_meta(&source_child)?, optional_meta(&isolated_child)?) {
+			(_, None) => continue,
+			(None, Some(_)) => {
+				return Err(Error::backend(
+					"git rebind copied submodules",
+					format!("copied submodule {} has no source directory", child_relative.display()),
+				));
+			},
+			(Some(_), Some(_)) => {},
+		}
 		if fs::canonicalize(&source_child)? != source_child
 			|| fs::canonicalize(&isolated_child)? != isolated_child
 		{
@@ -1216,11 +1235,6 @@ fn collect_copied_submodules(
 		}
 		let source_git = source_child.join(".git");
 		let isolated_git = isolated_child.join(".git");
-		let optional_meta = |path: &Path| match fs::symlink_metadata(path) {
-			Ok(meta) => Ok(Some(meta)),
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-			Err(error) => Err(error),
-		};
 		let (source_meta, isolated_meta) =
 			match (optional_meta(&source_git)?, optional_meta(&isolated_git)?) {
 				(Some(source), Some(isolated)) => (source, isolated),
@@ -1277,9 +1291,11 @@ fn collect_copied_submodules(
 	Ok(())
 }
 
-/// Give every initialized gitlink in a copied isolation its own HEAD, refs,
-/// index and object store alternates. Source administration is only read;
-/// destination gitfiles never get followed through their stale pointers.
+/// Give every initialized gitlink in a copied isolation its own Git admin.
+///
+/// Each gets HEAD, refs, index and object store alternates. Source
+/// administration is only read; destination gitfiles are never followed
+/// through their stale pointers.
 pub fn rebind_copied_submodules(source_root: &Path, isolated_root: &Path) -> Result<usize> {
 	let source = fs::canonicalize(source_root)?;
 	let isolated = fs::canonicalize(isolated_root)?;
@@ -3252,6 +3268,26 @@ mod tests {
 		let error = rebind_error(&linked, &isolated);
 		assert!(
 			error.contains("copied Git admin for uninitialized submodule packages/aix-root"),
+			"{error}"
+		);
+	}
+
+	#[test]
+	fn rebind_skips_a_gitlink_whose_directory_is_absent() {
+		// Sparse checkouts and a deleted-submodule pending change leave a
+		// gitlink in the index with no directory on disk.
+		let tmp = tempfile::tempdir().unwrap();
+		let linked = nested_linked_fixture(tmp.path(), false);
+		fs::remove_dir(linked.join("packages/aix-root")).unwrap();
+		let isolated = copied_detached_isolation(tmp.path(), &linked);
+		assert_eq!(rebind_copied_submodules(&linked, &isolated).unwrap(), 0);
+
+		// A directory only the copy has is not something the source can vouch
+		// for.
+		fs::create_dir_all(isolated.join("packages/aix-root")).unwrap();
+		let error = rebind_error(&linked, &isolated);
+		assert!(
+			error.contains("copied submodule packages/aix-root has no source directory"),
 			"{error}"
 		);
 	}
