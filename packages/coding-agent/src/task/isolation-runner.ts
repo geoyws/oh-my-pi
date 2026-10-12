@@ -390,6 +390,8 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 	let baseReleasePromise: Promise<void> | undefined;
 	let cleanupPromise: Promise<void> | undefined;
 	let releasePromise: Promise<void> | undefined;
+	/** What a lifecycle release captured before it tore the workspace down. */
+	let released: { artifacts: IsolationPatchArtifacts; branchName?: string } | undefined;
 	const releaseBase = (): Promise<void> => {
 		baseReleasePromise ??= opts.baseOptions.onRelease?.() ?? Promise.resolve();
 		return baseReleasePromise;
@@ -424,6 +426,7 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 					);
 				}
 				const patchResult = capture.artifacts;
+				released = { artifacts: patchResult };
 				AgentRegistry.global().setHistory(opts.agentId, {
 					patchPath: patchResult.patchPath,
 					nestedPatchPaths: patchResult.nestedPatchPaths,
@@ -438,6 +441,7 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 					opts.description,
 					undefined,
 				);
+				released.branchName = commitResult?.branchName;
 				AgentRegistry.global().setHistory(opts.agentId, {
 					patchPath: patchResult.patchPath,
 					branchName: commitResult?.branchName,
@@ -473,6 +477,22 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 			onRelease: opts.baseOptions.keepAlive === false ? releaseBase : releaseIsolation,
 		});
 		opts.onSubprocessResult?.(result);
+		// An aborted kept-alive child is released by its lifecycle before
+		// runSubprocess returns: the release already captured the workspace,
+		// committed any change to `omp/task/<id>`, and tore the workspace down.
+		// Name what it kept; there is nothing left here to capture.
+		if (releasePromise) {
+			let releaseError: string | undefined;
+			await releasePromise.catch(error => {
+				releaseError = error instanceof Error ? error.message : String(error);
+			});
+			const kept =
+				released && (released.artifacts.hasRootChanges || released.artifacts.nestedPatches.length > 0)
+					? { ...released.artifacts, branchName: released.branchName }
+					: {};
+			const error = releaseError ? (result.error ? `${result.error}\n${releaseError}` : releaseError) : result.error;
+			return rememberAgentArtifacts({ ...result, ...kept, error });
+		}
 		// A successful result cannot be captured while deferred owner jobs or
 		// shutdown hooks may still write the worktree. A failed run is captured
 		// as it stands below, so its cleanup remains asynchronous.
