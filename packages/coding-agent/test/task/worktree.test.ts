@@ -861,6 +861,45 @@ describe("detachGitDir", () => {
 		}
 	});
 
+	// With `worktree.useRelativePaths`, rcopy's `git worktree add` writes a
+	// gitfile relative to the isolation itself; it already resolves there and
+	// must not be re-anchored on the source checkout.
+	it("keeps a relative gitfile that already resolves from the isolation (rcopy backend)", async () => {
+		const repo = await createGitRepo();
+		await runGit(repo, ["config", "user.email", "src@example.com"]);
+		await runGit(repo, ["config", "user.name", "Source User"]);
+		await runGit(repo, ["config", "worktree.useRelativePaths", "true"]);
+		await fs.writeFile(path.join(repo, "tracked.txt"), "base\n");
+		await runGit(repo, ["add", "tracked.txt"]);
+		await runGit(repo, ["commit", "-q", "-m", "base"]);
+		vi.spyOn(natives, "isoResolve").mockResolvedValue({
+			kind: natives.IsoBackendKind.Rcopy,
+			candidates: [natives.IsoBackendKind.Rcopy],
+			fellBack: false,
+			reason: undefined,
+		});
+		const worktreeBase = await fs.mkdtemp(path.join(os.tmpdir(), "omp-detach-wtbase-"));
+		tempDirs.push(worktreeBase);
+		const originalWorktreeDir = process.env.OMP_WORKTREE_DIR;
+		delete process.env.OMP_WORKTREE_DIR;
+		setWorktreesDir(worktreeBase);
+		try {
+			const handle = await ensureIsolation(repo, "relative-rcopy");
+			try {
+				await fs.writeFile(path.join(handle.mergedDir, "tracked.txt"), "task\n");
+				await runGit(handle.mergedDir, ["commit", "-q", "-am", "task"]);
+			} finally {
+				await cleanupIsolation(handle);
+			}
+			expect(await runGit(repo, ["log", "--format=%s"])).toBe("base");
+			expect(await runGit(repo, ["status", "--porcelain"])).toBe("");
+		} finally {
+			setWorktreesDir(undefined);
+			if (originalWorktreeDir === undefined) delete process.env.OMP_WORKTREE_DIR;
+			else process.env.OMP_WORKTREE_DIR = originalWorktreeDir;
+		}
+	});
+
 	// A block-cloning copy backend keeps the copied child gitfiles; rcopy's
 	// `git worktree add` checks gitlinks out empty and cannot show the leak.
 	it.skipIf(process.platform !== "darwin")(
