@@ -581,6 +581,24 @@ function getTaskIsolationSegment(repoRoot: string, id: string): string {
 	return `${TASK_ISOLATION_DIR_PREFIX}${digest}`;
 }
 
+/**
+ * Re-anchor a copied relative gitfile on the source checkout, the directory
+ * git resolved it from. Git joins a relative `gitdir:` to the gitfile's own
+ * directory and lets the OS walk `..` physically, so the source root is
+ * realpath'd first. Absolute gitfiles and `.git` directories are left alone.
+ */
+async function anchorCopiedGitfile(repoRoot: string, mergedDir: string): Promise<void> {
+	const gitEntry = path.join(mergedDir, ".git");
+	const stat = await fs.lstat(gitEntry).catch((err: NodeJS.ErrnoException) => {
+		if (err.code === "ENOENT") return null;
+		throw err;
+	});
+	if (!stat?.isFile()) return;
+	const match = /^gitdir:[ \t]*(.+?)\s*$/.exec((await fs.readFile(gitEntry, "utf8")).split("\n", 1)[0] ?? "");
+	if (!match || path.isAbsolute(match[1]!)) return;
+	await fs.writeFile(gitEntry, `gitdir: ${path.resolve(await fs.realpath(repoRoot), match[1]!)}\n`);
+}
+
 export async function ensureIsolation(
 	baseCwd: string,
 	id: string,
@@ -605,6 +623,10 @@ export async function ensureIsolation(
 		await writeIsolationOwner(baseDir, id);
 		try {
 			await natives.isoStart(candidate, repoRoot, mergedDir);
+			// A checkout that is itself a submodule carries a relative gitfile
+			// (`gitdir: ../.git/modules/<name>`) that resolves only from the
+			// source's location; copied verbatim it points at nothing.
+			await anchorCopiedGitfile(repoRoot, mergedDir);
 			// Sever the isolation's git metadata from the source checkout. Copy
 			// backends duplicate `repoRoot`'s `.git` verbatim — a linked-worktree
 			// pointer file (or the rcopy `git worktree add` registration) leaves

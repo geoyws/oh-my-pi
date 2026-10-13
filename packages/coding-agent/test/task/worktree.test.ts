@@ -994,6 +994,87 @@ describe("detachGitDir", () => {
 			}
 		},
 	);
+
+	// A session rooted in a checkout that is itself a submodule (the dotfiles
+	// shape) has a relative root gitfile, `gitdir: ../.git/modules/<name>`,
+	// which a copy cannot resolve: every isolated task failed at start with
+	// "not a repository: <wt>/m".
+	it.skipIf(process.platform !== "darwin")(
+		"isolates a checkout that is itself a submodule, with its own initialized submodule",
+		async () => {
+			const repos: Record<string, string> = {};
+			for (const name of ["super", "root", "leaf"]) {
+				const repo = await createGitRepo();
+				await runGit(repo, ["config", "user.email", "src@example.com"]);
+				await runGit(repo, ["config", "user.name", "Source User"]);
+				await fs.writeFile(path.join(repo, "tracked.txt"), `${name}\n`);
+				await runGit(repo, ["add", "tracked.txt"]);
+				await runGit(repo, ["commit", "-q", "-m", name]);
+				repos[name] = repo;
+			}
+			const allowFile = ["-c", "protocol.file.allow=always"];
+			await runGit(repos.root!, [...allowFile, "submodule", "add", "-q", repos.leaf!, "leaf"]);
+			await runGit(repos.root!, ["commit", "-q", "-m", "pin leaf"]);
+			await runGit(repos.super!, [...allowFile, "submodule", "add", "-q", repos.root!, "root"]);
+			await runGit(repos.super!, ["commit", "-q", "-m", "pin root"]);
+			await runGit(repos.super!, [...allowFile, "submodule", "update", "-q", "--init", "--recursive"]);
+			const source = path.join(repos.super!, "root");
+			expect((await fs.readFile(path.join(source, ".git"), "utf8")).trim()).toBe("gitdir: ../.git/modules/root");
+			const sourceAdmin = await runGit(source, ["rev-parse", "--absolute-git-dir"]);
+			// HEAD, refs, index and config; the object store is excluded because
+			// delta capture writes its synthetic trees there by design.
+			const adminSnapshot = async () => {
+				const files = (await fs.readdir(sourceAdmin, { recursive: true, withFileTypes: true }))
+					.filter(entry => entry.isFile())
+					.map(entry => path.join(entry.parentPath, entry.name))
+					.filter(file => !path.relative(sourceAdmin, file).startsWith(`objects${path.sep}`))
+					.sort();
+				return Promise.all(files.map(async file => `${file}:${Bun.hash(await fs.readFile(file))}`));
+			};
+			const adminBefore = await adminSnapshot();
+			const sourcePins = await runGit(source, ["submodule", "status", "--recursive"]);
+
+			vi.spyOn(natives, "isoResolve").mockResolvedValue({
+				kind: natives.IsoBackendKind.Apfs,
+				candidates: [natives.IsoBackendKind.Apfs],
+				fellBack: false,
+				reason: undefined,
+			});
+			const worktreeBase = await fs.mkdtemp(path.join(os.tmpdir(), "omp-detach-wtbase-"));
+			tempDirs.push(worktreeBase);
+			const originalWorktreeDir = process.env.OMP_WORKTREE_DIR;
+			delete process.env.OMP_WORKTREE_DIR;
+			setWorktreesDir(worktreeBase);
+			try {
+				const handle = await ensureIsolation(source, "submodule-root");
+				try {
+					for (const dir of [handle.mergedDir, path.join(handle.mergedDir, "leaf")]) {
+						expect((await fs.stat(path.join(dir, ".git"))).isDirectory()).toBe(true);
+					}
+					expect(await runGit(handle.mergedDir, ["submodule", "status", "--recursive"])).toBe(sourcePins);
+					const baseline = await captureIsolationBaseline(handle.mergedDir, source);
+					await fs.writeFile(path.join(handle.mergedDir, "tracked.txt"), "isolated root edit\n");
+					await fs.writeFile(path.join(handle.mergedDir, "leaf/tracked.txt"), "isolated leaf edit\n");
+					await runGit(handle.mergedDir, ["commit", "-q", "-am", "isolated commit"]);
+					const delta = await captureDeltaPatch(handle.mergedDir, baseline);
+					expect(delta.rootPatch).toContain("+isolated root edit");
+					expect(delta.nestedPatches.map(p => p.relativePath)).toEqual(["leaf"]);
+					expect(delta.nestedPatches[0]!.patch).toContain("+isolated leaf edit");
+				} finally {
+					await cleanupIsolation(handle);
+				}
+				// The source checkout, its HEAD and its admin are untouched.
+				expect(await fs.readFile(path.join(source, "tracked.txt"), "utf8")).toBe("root\n");
+				expect(await adminSnapshot()).toEqual(adminBefore);
+				expect(await runGit(source, ["status", "--porcelain"])).toBe("");
+				expect(await runGit(source, ["submodule", "status", "--recursive"])).toBe(sourcePins);
+			} finally {
+				setWorktreesDir(undefined);
+				if (originalWorktreeDir === undefined) delete process.env.OMP_WORKTREE_DIR;
+				else process.env.OMP_WORKTREE_DIR = originalWorktreeDir;
+			}
+		},
+	);
 });
 
 describe("captureDeltaPatch with initialized submodules", () => {
