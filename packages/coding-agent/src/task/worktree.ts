@@ -584,8 +584,10 @@ function getTaskIsolationSegment(repoRoot: string, id: string): string {
 /**
  * Re-anchor a copied relative gitfile on the source checkout, the directory
  * git resolved it from. Git joins a relative `gitdir:` to the gitfile's own
- * directory and lets the OS walk `..` physically, so the source root is
- * realpath'd first. Absolute gitfiles and `.git` directories are left alone.
+ * directory and lets the OS walk `..` physically, so both roots are
+ * realpath'd first. A pointer that already resolves from the isolation (rcopy's
+ * `git worktree add` under `worktree.useRelativePaths`), an absolute gitfile
+ * and a `.git` directory are left alone.
  */
 async function anchorCopiedGitfile(repoRoot: string, mergedDir: string): Promise<void> {
 	const gitEntry = path.join(mergedDir, ".git");
@@ -596,7 +598,16 @@ async function anchorCopiedGitfile(repoRoot: string, mergedDir: string): Promise
 	if (!stat?.isFile()) return;
 	const match = /^gitdir:[ \t]*(.+?)\s*$/.exec((await fs.readFile(gitEntry, "utf8")).split("\n", 1)[0] ?? "");
 	if (!match || path.isAbsolute(match[1]!)) return;
+	if (await isGitDir(path.resolve(await fs.realpath(mergedDir), match[1]!))) return;
 	await fs.writeFile(gitEntry, `gitdir: ${path.resolve(await fs.realpath(repoRoot), match[1]!)}\n`);
+}
+
+/** Git's own test for a usable admin directory: a `HEAD` file inside it. */
+async function isGitDir(dir: string): Promise<boolean> {
+	return fs.stat(path.join(dir, "HEAD")).then(
+		stat => stat.isFile(),
+		() => false,
+	);
 }
 
 /**
