@@ -5,6 +5,7 @@ use std::{
 	collections::{BTreeMap, BTreeSet},
 	ffi::OsStr,
 	fs,
+	io::Write,
 	path::{Path, PathBuf},
 	process::{Command, Stdio},
 };
@@ -1009,7 +1010,7 @@ struct PrivateGitSnapshot {
 	sparse:        Option<Vec<u8>>,
 	shallow:       Option<Vec<u8>>,
 	object_dirs:   Vec<PathBuf>,
-	git_crypt:     Option<PathBuf>,
+	git_crypt:     Vec<(PathBuf, Vec<u8>)>,
 }
 
 fn snapshot_private_git(original: &GitRepo, source_common: &Path) -> Result<PrivateGitSnapshot> {
@@ -1092,13 +1093,16 @@ fn snapshot_private_git(original: &GitRepo, source_common: &Path) -> Result<Priv
 			});
 		}
 	}
-	// git-crypt keeps its keys in `<git dir>/git-crypt`; the private admin
-	// reaches the source's by link, so no key material is copied.
-	let git_crypt = [original.info().git_dir.join("git-crypt"), common.join("git-crypt")]
+	// git-crypt keeps its keys in `<git dir>/git-crypt`. The private admin gets
+	// its own copy, owner-only: a link would let `git-crypt lock` run in the
+	// isolation delete the source's keys.
+	let git_crypt = match [original.info().git_dir.join("git-crypt"), common.join("git-crypt")]
 		.into_iter()
-		.find(|dir| dir.is_dir())
-		.map(fs::canonicalize)
-		.transpose()?;
+		.find(|dir| fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir()))
+	{
+		Some(dir) => read_tree_files(&dir)?,
+		None => Vec::new(),
+	};
 	Ok(PrivateGitSnapshot {
 		head,
 		index,
@@ -1144,8 +1148,8 @@ fn materialize_private_git(worktree_root: &Path, snapshot: PrivateGitSnapshot) -
 	for (name, bytes) in snapshot.shared {
 		fs::write(git_entry.join(name), bytes)?;
 	}
-	if let Some(dir) = snapshot.git_crypt {
-		link_dir(&dir, &git_entry.join("git-crypt"))?;
+	if !snapshot.git_crypt.is_empty() {
+		write_private_tree(&git_entry.join("git-crypt"), snapshot.git_crypt)?;
 	}
 	if let Some(bytes) = snapshot.index {
 		fs::write(git_entry.join("index"), bytes)?;
@@ -1891,12 +1895,50 @@ fn path_matches(path: &str, wanted: &str) -> bool {
 			.is_some_and(|r| r.starts_with('/'))
 }
 
-/// Point `link` at the directory `target` without copying its contents.
-fn link_dir(target: &Path, link: &Path) -> Result<()> {
+/// Every regular file under `dir`, relative to it, read up front. Symlinks are
+/// refused rather than followed.
+fn read_tree_files(dir: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>> {
+	let mut files = Vec::new();
+	let mut pending = vec![PathBuf::new()];
+	while let Some(relative) = pending.pop() {
+		for entry in fs::read_dir(dir.join(&relative))? {
+			let entry = entry?;
+			let child = relative.join(entry.file_name());
+			let kind = entry.file_type()?;
+			if kind.is_dir() {
+				pending.push(child);
+			} else if kind.is_file() {
+				files.push((child.clone(), fs::read(dir.join(&child))?));
+			} else {
+				return Err(Error::backend(
+					"git private admin",
+					format!("unsupported entry {}", dir.join(child).display()),
+				));
+			}
+		}
+	}
+	Ok(files)
+}
+
+/// Write `files` under a new owner-only directory `root`.
+fn write_private_tree(root: &Path, files: Vec<(PathBuf, Vec<u8>)>) -> Result<()> {
 	#[cfg(unix)]
-	std::os::unix::fs::symlink(target, link)?;
-	#[cfg(windows)]
-	std::os::windows::fs::symlink_dir(target, link)?;
+	use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+	for (relative, bytes) in files {
+		let path = root.join(relative);
+		if let Some(parent) = path.parent() {
+			let mut builder = fs::DirBuilder::new();
+			builder.recursive(true);
+			#[cfg(unix)]
+			builder.mode(0o700);
+			builder.create(parent)?;
+		}
+		let mut options = fs::OpenOptions::new();
+		options.write(true).create_new(true);
+		#[cfg(unix)]
+		options.mode(0o600);
+		options.open(&path)?.write_all(&bytes)?;
+	}
 	Ok(())
 }
 
@@ -3455,14 +3497,24 @@ mod tests {
 		] {
 			assert_eq!(git(&linked, &["config", "--local", key]), value);
 		}
-		let key_link = linked.join(".git/git-crypt");
-		assert!(
-			fs::symlink_metadata(&key_link)
+		// The key dir is the copy's own, owner-only: deleting it there (what
+		// `git-crypt lock` does) leaves the source's keys in place.
+		let keys = linked.join(".git/git-crypt");
+		assert!(fs::symlink_metadata(&keys).unwrap().is_dir());
+		assert_eq!(fs::read_to_string(keys.join("keys/default")).unwrap(), "not a real key\n");
+		{
+			use std::os::unix::fs::PermissionsExt;
+			let mode = fs::metadata(keys.join("keys/default"))
 				.unwrap()
-				.file_type()
-				.is_symlink()
+				.permissions()
+				.mode();
+			assert_eq!(mode & 0o077, 0);
+		}
+		fs::remove_dir_all(&keys).unwrap();
+		assert_eq!(
+			fs::read_to_string(common.join("git-crypt/keys/default")).unwrap(),
+			"not a real key\n"
 		);
-		assert_eq!(fs::read_link(&key_link).unwrap(), common.join("git-crypt"));
 		// Force a content comparison: the clean filter must turn the smudged
 		// worktree bytes back into the committed blob.
 		let file = fs::File::options()
