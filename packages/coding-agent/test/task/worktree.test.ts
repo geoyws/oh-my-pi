@@ -1075,6 +1075,86 @@ describe("detachGitDir", () => {
 			}
 		},
 	);
+
+	// A linked worktree kept inside the checkout (here under an ignored
+	// directory) is copied with its gitfile into the other repo's admin: the
+	// copy shared that tree's HEAD, index and refs, and its copied submodule
+	// gitfiles resolved to nothing, so the baseline failed with "Could not
+	// determine status for submodule".
+	it.skipIf(process.platform !== "darwin")(
+		"gives a linked worktree nested inside the checkout private metadata",
+		async () => {
+			const repo = await createGitRepo();
+			const other = await createGitRepo();
+			const child = await createGitRepo();
+			for (const dir of [repo, other, child]) {
+				await runGit(dir, ["config", "user.email", "src@example.com"]);
+				await runGit(dir, ["config", "user.name", "Source User"]);
+				await fs.writeFile(path.join(dir, "tracked.txt"), "base\n");
+				await runGit(dir, ["add", "tracked.txt"]);
+				await runGit(dir, ["commit", "-q", "-m", "base"]);
+			}
+			await fs.writeFile(path.join(repo, ".gitignore"), ".writer-worktrees/\n");
+			await runGit(repo, ["add", ".gitignore"]);
+			await runGit(repo, ["commit", "-q", "-m", "ignore nested trees"]);
+			const allowFile = ["-c", "protocol.file.allow=always"];
+			await runGit(other, [...allowFile, "submodule", "add", "-q", child, "sub"]);
+			await runGit(other, ["commit", "-q", "-m", "pin sub"]);
+			const nested = path.join(repo, ".writer-worktrees", "w");
+			await runGit(other, ["worktree", "add", "-q", "-b", "w", nested]);
+			await runGit(nested, [...allowFile, "submodule", "update", "-q", "--init"]);
+			const nestedHead = await runGit(nested, ["rev-parse", "HEAD"]);
+			const otherCommon = path.join(await fs.realpath(other), ".git");
+			// HEAD, refs, index and config; delta capture may add objects by design.
+			const adminSnapshot = async () => {
+				const files = (await fs.readdir(otherCommon, { recursive: true, withFileTypes: true }))
+					.filter(entry => entry.isFile())
+					.map(entry => path.join(entry.parentPath, entry.name))
+					.filter(file => !path.relative(otherCommon, file).split(path.sep).includes("objects"))
+					.sort();
+				return Promise.all(files.map(async file => `${file}:${Bun.hash(await fs.readFile(file))}`));
+			};
+			const adminBefore = await adminSnapshot();
+
+			vi.spyOn(natives, "isoResolve").mockResolvedValue({
+				kind: natives.IsoBackendKind.Apfs,
+				candidates: [natives.IsoBackendKind.Apfs],
+				fellBack: false,
+				reason: undefined,
+			});
+			const worktreeBase = await fs.mkdtemp(path.join(os.tmpdir(), "omp-detach-wtbase-"));
+			tempDirs.push(worktreeBase);
+			const originalWorktreeDir = process.env.OMP_WORKTREE_DIR;
+			delete process.env.OMP_WORKTREE_DIR;
+			setWorktreesDir(worktreeBase);
+			try {
+				const handle = await ensureIsolation(repo, "nested-linked-worktree");
+				try {
+					const isoNested = path.join(handle.mergedDir, ".writer-worktrees", "w");
+					for (const dir of [isoNested, path.join(isoNested, "sub")]) {
+						expect((await fs.stat(path.join(dir, ".git"))).isDirectory()).toBe(true);
+					}
+					const baseline = await captureIsolationBaseline(handle.mergedDir, repo);
+					await fs.writeFile(path.join(isoNested, "tracked.txt"), "isolated nested edit\n");
+					await runGit(isoNested, ["commit", "-q", "-am", "isolated commit"]);
+					const delta = await captureDeltaPatch(handle.mergedDir, baseline);
+					const nestedPatch = delta.nestedPatches.find(p => p.relativePath === path.join(".writer-worktrees", "w"));
+					expect(nestedPatch?.patch).toContain("+isolated nested edit");
+				} finally {
+					await cleanupIsolation(handle);
+				}
+				// The nested tree's branch, files and admin are untouched.
+				expect(await runGit(nested, ["rev-parse", "HEAD"])).toBe(nestedHead);
+				expect(await fs.readFile(path.join(nested, "tracked.txt"), "utf8")).toBe("base\n");
+				expect(await runGit(nested, ["status", "--porcelain"])).toBe("");
+				expect(await adminSnapshot()).toEqual(adminBefore);
+			} finally {
+				setWorktreesDir(undefined);
+				if (originalWorktreeDir === undefined) delete process.env.OMP_WORKTREE_DIR;
+				else process.env.OMP_WORKTREE_DIR = originalWorktreeDir;
+			}
+		},
+	);
 });
 
 describe("captureDeltaPatch with initialized submodules", () => {

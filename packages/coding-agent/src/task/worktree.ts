@@ -599,6 +599,49 @@ async function anchorCopiedGitfile(repoRoot: string, mergedDir: string): Promise
 	await fs.writeFile(gitEntry, `gitdir: ${path.resolve(await fs.realpath(repoRoot), match[1]!)}\n`);
 }
 
+/**
+ * Sever one copied repository from its source metadata. Copy backends
+ * duplicate `.git` verbatim — a linked-worktree pointer file (or the rcopy
+ * `git worktree add` registration) leaves the copy sharing the source's
+ * HEAD/index/ref namespace, so a task's git operations would mutate the
+ * source checkout and stack parallel task branches. Detaching gives the copy
+ * a private, frozen repo that still borrows the source object DB via
+ * alternates.
+ */
+async function detachCopiedRepo(sourceRoot: string, copyRoot: string, sourceCommonDir: string): Promise<void> {
+	// A checkout that is itself a submodule carries a relative gitfile
+	// (`gitdir: ../.git/modules/<name>`) that resolves only from the source's
+	// location; copied verbatim it points at nothing.
+	await anchorCopiedGitfile(sourceRoot, copyRoot);
+	const detached = await vcs.detachGitDir(copyRoot, sourceCommonDir);
+	// A detached copy was a linked worktree whose submodule gitfiles point into
+	// the source's `worktrees/<name>/modules`, now at a new relative depth.
+	// Every initialized child needs private metadata before the native baseline
+	// walks gitlinks or an agent runs. An "independent" copy already carries
+	// its own `.git/modules`, which its gitfiles reach.
+	if (detached === "detached") await vcs.rebindCopiedSubmodules(sourceRoot, copyRoot);
+}
+
+/**
+ * Detach every nested repository the copy reaches through a gitfile that is
+ * not one of its submodules — typically a linked worktree kept inside the
+ * checkout — so the copy never shares that tree's HEAD, index or refs.
+ */
+async function detachNestedGitfileRepos(repoRoot: string, mergedDir: string): Promise<void> {
+	const submodules = new Set(await vcs.requireGit(repoRoot).submodulePaths());
+	for (const relativePath of await discoverNestedRepos(repoRoot)) {
+		if (submodules.has(relativePath)) continue;
+		const copyRoot = path.join(mergedDir, relativePath);
+		const stat = await fs.lstat(path.join(copyRoot, ".git")).catch((err: NodeJS.ErrnoException) => {
+			if (err.code === "ENOENT") return null;
+			throw err;
+		});
+		if (!stat?.isFile()) continue;
+		const sourceRoot = path.join(repoRoot, relativePath);
+		await detachCopiedRepo(sourceRoot, copyRoot, vcs.requireGit(sourceRoot).info().commonDir);
+	}
+}
+
 export async function ensureIsolation(
 	baseCwd: string,
 	id: string,
@@ -623,24 +666,8 @@ export async function ensureIsolation(
 		await writeIsolationOwner(baseDir, id);
 		try {
 			await natives.isoStart(candidate, repoRoot, mergedDir);
-			// A checkout that is itself a submodule carries a relative gitfile
-			// (`gitdir: ../.git/modules/<name>`) that resolves only from the
-			// source's location; copied verbatim it points at nothing.
-			await anchorCopiedGitfile(repoRoot, mergedDir);
-			// Sever the isolation's git metadata from the source checkout. Copy
-			// backends duplicate `repoRoot`'s `.git` verbatim — a linked-worktree
-			// pointer file (or the rcopy `git worktree add` registration) leaves
-			// the isolation sharing the source's HEAD/index/ref namespace, so a
-			// task's git operations would mutate the parent checkout and stack
-			// parallel task branches. Detaching gives each isolation a private,
-			// frozen repo that still borrows the source object DB via alternates.
-			const detached = await vcs.detachGitDir(mergedDir, sourceCommonDir);
-			// A detached isolation was a linked worktree whose submodule gitfiles
-			// point into the source's `worktrees/<name>/modules`, now at a new
-			// relative depth. Every initialized child needs private metadata before
-			// the native baseline walks gitlinks or an agent runs. An "independent"
-			// copy already carries its own `.git/modules`, which its gitfiles reach.
-			if (detached === "detached") await vcs.rebindCopiedSubmodules(repoRoot, mergedDir);
+			await detachCopiedRepo(repoRoot, mergedDir, sourceCommonDir);
+			await detachNestedGitfileRepos(repoRoot, mergedDir);
 			return {
 				mergedDir,
 				backend: candidate,
