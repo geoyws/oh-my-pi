@@ -1009,6 +1009,7 @@ struct PrivateGitSnapshot {
 	sparse:        Option<Vec<u8>>,
 	shallow:       Option<Vec<u8>>,
 	object_dirs:   Vec<PathBuf>,
+	git_crypt:     Option<PathBuf>,
 }
 
 fn snapshot_private_git(original: &GitRepo, source_common: &Path) -> Result<PrivateGitSnapshot> {
@@ -1051,6 +1052,28 @@ fn snapshot_private_git(original: &GitRepo, source_common: &Path) -> Result<Priv
 			}
 		}
 	}
+	// Filter and diff drivers configured only in the repository (git-crypt's
+	// clean/smudge/textconv are the usual case) must follow the admin: without
+	// them every filtered file reads as modified, and its smudged worktree bytes
+	// would be staged and captured as they are.
+	for name in ["filter", "diff"] {
+		for section in config.sections_by_name(name).into_iter().flatten() {
+			if section.meta().source != gix::config::Source::Local {
+				continue;
+			}
+			let Some(driver) = section.header().subsection_name() else {
+				continue;
+			};
+			let driver = driver.to_str_lossy();
+			for key in section.value_names() {
+				let key: &str = key.as_ref();
+				if let Some(value) = section.value(key) {
+					config_values
+						.push((format!("{name}.{driver}.{key}"), value.to_str_lossy().into_owned()));
+				}
+			}
+		}
+	}
 	let shared = copy_named_files(&original.info().git_dir, "sharedindex.")?;
 	let sparse = read_optional_file(&original.info().git_dir.join("info/sparse-checkout"))?;
 	let shallow = read_optional_file(&common.join("shallow"))?;
@@ -1069,7 +1092,24 @@ fn snapshot_private_git(original: &GitRepo, source_common: &Path) -> Result<Priv
 			});
 		}
 	}
-	Ok(PrivateGitSnapshot { head, index, refs, config_values, shared, sparse, shallow, object_dirs })
+	// git-crypt keeps its keys in `<git dir>/git-crypt`; the private admin
+	// reaches the source's by link, so no key material is copied.
+	let git_crypt = [original.info().git_dir.join("git-crypt"), common.join("git-crypt")]
+		.into_iter()
+		.find(|dir| dir.is_dir())
+		.map(fs::canonicalize)
+		.transpose()?;
+	Ok(PrivateGitSnapshot {
+		head,
+		index,
+		refs,
+		config_values,
+		shared,
+		sparse,
+		shallow,
+		object_dirs,
+		git_crypt,
+	})
 }
 
 fn materialize_private_git(worktree_root: &Path, snapshot: PrivateGitSnapshot) -> Result<()> {
@@ -1103,6 +1143,9 @@ fn materialize_private_git(worktree_root: &Path, snapshot: PrivateGitSnapshot) -
 	}
 	for (name, bytes) in snapshot.shared {
 		fs::write(git_entry.join(name), bytes)?;
+	}
+	if let Some(dir) = snapshot.git_crypt {
+		link_dir(&dir, &git_entry.join("git-crypt"))?;
 	}
 	if let Some(bytes) = snapshot.index {
 		fs::write(git_entry.join("index"), bytes)?;
@@ -1846,6 +1889,15 @@ fn path_matches(path: &str, wanted: &str) -> bool {
 		|| path
 			.strip_prefix(wanted)
 			.is_some_and(|r| r.starts_with('/'))
+}
+
+/// Point `link` at the directory `target` without copying its contents.
+fn link_dir(target: &Path, link: &Path) -> Result<()> {
+	#[cfg(unix)]
+	std::os::unix::fs::symlink(target, link)?;
+	#[cfg(windows)]
+	std::os::windows::fs::symlink_dir(target, link)?;
+	Ok(())
 }
 
 fn set_config_file(path: &Path, key: &str, value: &str) -> Result<()> {
@@ -3363,5 +3415,64 @@ mod tests {
 			git(&source_grand, &["rev-parse", "HEAD"]),
 			git(&private_grand, &["rev-parse", "HEAD"])
 		);
+	}
+
+	/// A repo-local clean/smudge driver (git-crypt's shape, here a rot13 `tr`)
+	/// and git-crypt's key dir must follow a detached copy: without them every
+	/// filtered file reads as modified.
+	#[cfg(unix)]
+	#[test]
+	fn detach_git_dir_keeps_repo_local_filter_drivers_and_git_crypt_keys() {
+		let temp = TempDir::new().unwrap();
+		let source = temp.path().join("source");
+		fs::create_dir_all(&source).unwrap();
+		git(&source, &["init", "-q", "-b", "main"]);
+		git(&source, &["config", "user.name", "Proof"]);
+		git(&source, &["config", "user.email", "proof.invalid"]);
+		git(&source, &["config", "core.hooksPath", "/dev/null"]);
+		git(&source, &["config", "filter.rot.clean", "tr a-z n-za-m"]);
+		git(&source, &["config", "filter.rot.smudge", "tr a-z n-za-m"]);
+		git(&source, &["config", "filter.rot.required", "true"]);
+		git(&source, &["config", "diff.rot.textconv", "\"tr\" a-z n-za-m # textconv"]);
+		fs::write(source.join(".gitattributes"), "*.sec filter=rot diff=rot\n").unwrap();
+		fs::write(source.join("plain.sec"), "hello\n").unwrap();
+		git(&source, &["add", ".gitattributes", "plain.sec"]);
+		git(&source, &["commit", "-q", "-m", "filtered"]);
+		let common = fs::canonicalize(source.join(".git")).unwrap();
+		fs::create_dir_all(common.join("git-crypt/keys")).unwrap();
+		fs::write(common.join("git-crypt/keys/default"), "not a real key\n").unwrap();
+		let linked = temp.path().join("linked");
+		git(&source, &["worktree", "add", "-q", "--detach", linked.to_str().unwrap()]);
+		assert_eq!(git(&source, &["cat-file", "-p", "HEAD:plain.sec"]), "uryyb");
+
+		assert_eq!(detach_git_dir(&linked, &common).unwrap(), DetachGitDirResult::Detached);
+
+		for (key, value) in [
+			("filter.rot.clean", "tr a-z n-za-m"),
+			("filter.rot.smudge", "tr a-z n-za-m"),
+			("filter.rot.required", "true"),
+			("diff.rot.textconv", "\"tr\" a-z n-za-m # textconv"),
+		] {
+			assert_eq!(git(&linked, &["config", "--local", key]), value);
+		}
+		let key_link = linked.join(".git/git-crypt");
+		assert!(
+			fs::symlink_metadata(&key_link)
+				.unwrap()
+				.file_type()
+				.is_symlink()
+		);
+		assert_eq!(fs::read_link(&key_link).unwrap(), common.join("git-crypt"));
+		// Force a content comparison: the clean filter must turn the smudged
+		// worktree bytes back into the committed blob.
+		let file = fs::File::options()
+			.write(true)
+			.open(linked.join("plain.sec"))
+			.unwrap();
+		file
+			.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+			.unwrap();
+		assert_eq!(git(&linked, &["status", "--porcelain"]), "");
+		assert_eq!(fs::read_to_string(linked.join("plain.sec")).unwrap(), "hello\n");
 	}
 }

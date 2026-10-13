@@ -1196,6 +1196,65 @@ describe("detachGitDir", () => {
 			}
 		},
 	);
+
+	// git-crypt's shape: a clean/smudge driver configured only in the repo.
+	// The copy's private admin lost it, so every filtered file showed its
+	// smudged (decrypted) bytes as an unstaged change in the baseline.
+	it.skipIf(process.platform !== "darwin")(
+		"keeps repo-local filter drivers so filtered files stay clean in the isolation",
+		async () => {
+			const main = await createGitRepo();
+			for (const [key, value] of [
+				["user.email", "src@example.com"],
+				["user.name", "Source User"],
+				["filter.rot.clean", "tr a-z n-za-m"],
+				["filter.rot.smudge", "tr a-z n-za-m"],
+				["filter.rot.required", "true"],
+			]) {
+				await runGit(main, ["config", key!, value!]);
+			}
+			await fs.writeFile(path.join(main, ".gitattributes"), "*.sec filter=rot\n");
+			await fs.writeFile(path.join(main, "plain.sec"), "hello\n");
+			await runGit(main, ["add", ".gitattributes", "plain.sec"]);
+			await runGit(main, ["commit", "-q", "-m", "filtered"]);
+			expect(await runGit(main, ["cat-file", "-p", "HEAD:plain.sec"])).toBe("uryyb");
+			const wt = `${main}-linked`;
+			tempDirs.push(wt);
+			await runGit(main, ["worktree", "add", "-q", "--detach", wt]);
+
+			vi.spyOn(natives, "isoResolve").mockResolvedValue({
+				kind: natives.IsoBackendKind.Apfs,
+				candidates: [natives.IsoBackendKind.Apfs],
+				fellBack: false,
+				reason: undefined,
+			});
+			const worktreeBase = await fs.mkdtemp(path.join(os.tmpdir(), "omp-detach-wtbase-"));
+			tempDirs.push(worktreeBase);
+			const originalWorktreeDir = process.env.OMP_WORKTREE_DIR;
+			delete process.env.OMP_WORKTREE_DIR;
+			setWorktreesDir(worktreeBase);
+			try {
+				const handle = await ensureIsolation(wt, "filter-driver");
+				try {
+					const baseline = await captureIsolationBaseline(handle.mergedDir, wt);
+					expect(baseline.root.unstaged).toBe("");
+					expect(await runGit(handle.mergedDir, ["status", "--porcelain"])).toBe("");
+					// An edit comes back through the clean filter: the patch carries
+					// the stored (filtered) form, never the smudged worktree bytes.
+					await fs.writeFile(path.join(handle.mergedDir, "plain.sec"), "world\n");
+					const delta = await captureDeltaPatch(handle.mergedDir, baseline);
+					expect(delta.rootPatch).toContain("+jbeyq");
+					expect(delta.rootPatch).not.toContain("world");
+				} finally {
+					await cleanupIsolation(handle);
+				}
+			} finally {
+				setWorktreesDir(undefined);
+				if (originalWorktreeDir === undefined) delete process.env.OMP_WORKTREE_DIR;
+				else process.env.OMP_WORKTREE_DIR = originalWorktreeDir;
+			}
+		},
+	);
 });
 
 describe("captureDeltaPatch with initialized submodules", () => {
