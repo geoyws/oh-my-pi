@@ -236,6 +236,151 @@ describe("settings YAML source preservation", () => {
 		}
 	}
 
+	describe("string transitions", () => {
+		// Each authored form splits into the bytes before the edited value, the value, and the bytes after it.
+		const authored: Record<string, { before: string; value: string; after: string; previous: string | null }> = {
+			plain: { before: "    bankMission: ", value: "old mission", after: " # mission\n", previous: "old mission" },
+			double: {
+				before: "    bankMission: ",
+				value: '"old mission"',
+				after: " # mission\n",
+				previous: "old mission",
+			},
+			single: {
+				before: "    bankMission: ",
+				value: "'old mission'",
+				after: " # mission\n",
+				previous: "old mission",
+			},
+			empty: { before: "    bankMission:", value: "", after: " # mission\n", previous: null },
+			literal: {
+				before: "    bankMission: ",
+				value: "|\n        old\n        mission\n",
+				after: "",
+				previous: "old\nmission\n",
+			},
+			folded: {
+				before: "    bankMission: ",
+				value: ">-\n        old\n        mission\n",
+				after: "",
+				previous: "old mission",
+			},
+		};
+		const head = "# header\nshared: &shared [a, b] # anchor\nhindsight:\n";
+		const tail =
+			"    bankId: bank # neighbour\n    retainMission: |\n        keep\n        me\ntheme:\n    dark: titanium # tail\n";
+		const values = [
+			"first line\nsecond line",
+			"trailing newline\n",
+			"kept trailing\n\n",
+			"  leading indent\nnext",
+			"--- marker\n...",
+			"space before \nbreak",
+			"tab\tand 'quotes\" \\ # hash: colon",
+			"single line",
+		];
+		for (const newline of ["\n", "\r\n"]) {
+			for (const [form, parts] of Object.entries(authored)) {
+				for (const value of values) {
+					it("sets " + form + " " + JSON.stringify(value) + " with " + JSON.stringify(newline), async () => {
+						const crlf = (text: string) => text.replaceAll("\n", newline);
+						const before = crlf(head + parts.before);
+						const after = crlf(parts.after + tail);
+						await Bun.write(config, before + crlf(parts.value) + after);
+						const settings = await Settings.init({ cwd, agentDir });
+						expect(settings.get("hindsight.bankMission") ?? null).toBe(parts.previous);
+						settings.set("hindsight.bankMission", value);
+						await settings.flush();
+						const output = await Bun.file(config).text();
+						expect(output.startsWith(before)).toBe(true);
+						expect(output.endsWith(after)).toBe(true);
+						expect(YAML.parse(output)).toEqual({
+							shared: ["a", "b"],
+							hindsight: { bankMission: value, bankId: "bank", retainMission: "keep\nme\n" },
+							theme: { dark: "titanium" },
+						});
+						expect(fs.readdirSync(agentDir).filter(name => name.startsWith("config.yml.broken-"))).toEqual([]);
+						const reopened = await Settings.loadIsolated({ cwd, agentDir });
+						expect(reopened.get("hindsight.bankMission")).toBe(value);
+						expect(reopened.get("hindsight.bankId")).toBe("bank");
+						expect(reopened.get("theme.dark")).toBe("titanium");
+					});
+				}
+			}
+		}
+
+		// Header comments sit inside the block scalar's range; the values cover block
+		// output, single-line output, and the library's fallback to quoting.
+		for (const newline of ["\n", "\r\n"]) {
+			for (const header of ["| # managed", ">- # managed", "|+2   #managed: keep"]) {
+				for (const value of ["first\nsecond\n", "single", "trailing whitespace\n  ", "bell\u0007\nnext"]) {
+					it(
+						"keeps " +
+							JSON.stringify(header) +
+							" for " +
+							JSON.stringify(value) +
+							" with " +
+							JSON.stringify(newline),
+						async () => {
+							const crlf = (text: string) => text.replaceAll("\n", newline);
+							const comment = header.slice(header.indexOf(" "));
+							const before = crlf(head + "    bankMission: ");
+							const after = crlf(tail);
+							await Bun.write(config, before + crlf(header + "\n        old\n        text\n") + after);
+							const settings = await Settings.init({ cwd, agentDir });
+							settings.set("hindsight.bankMission", value);
+							await settings.flush();
+							const output = await Bun.file(config).text();
+							expect(output.startsWith(before)).toBe(true);
+							expect(output.endsWith(after)).toBe(true);
+							const edited = output.slice(before.length, output.length - after.length);
+							expect(edited.split(newline)[0].endsWith(comment)).toBe(true);
+							expect(edited.split(comment)).toHaveLength(2);
+							expect(YAML.parse(output)).toEqual({
+								shared: ["a", "b"],
+								hindsight: { bankMission: value, bankId: "bank", retainMission: "keep\nme\n" },
+								theme: { dark: "titanium" },
+							});
+							expect(fs.readdirSync(agentDir).filter(name => name.startsWith("config.yml.broken-"))).toEqual([]);
+							const reopened = await Settings.loadIsolated({ cwd, agentDir });
+							expect(reopened.get("hindsight.bankMission")).toBe(value);
+							expect(reopened.get("hindsight.bankId")).toBe("bank");
+						},
+					);
+				}
+			}
+		}
+
+		it("sets a multiline value inside a flow mapping", async () => {
+			const before = "# header\nhindsight: { bankMission: ";
+			const after = ", bankId: bank } # flow\ntheme:\n    dark: titanium # tail\n";
+			await Bun.write(config, before + "old" + after);
+			const settings = await Settings.init({ cwd, agentDir });
+			settings.set("hindsight.bankMission", "first\n  second\n");
+			await settings.flush();
+			const output = await Bun.file(config).text();
+			expect(output.startsWith(before)).toBe(true);
+			expect(output.endsWith(after)).toBe(true);
+			const reopened = await Settings.loadIsolated({ cwd, agentDir });
+			expect(reopened.get("hindsight.bankMission")).toBe("first\n  second\n");
+			expect(reopened.get("hindsight.bankId")).toBe("bank");
+		});
+
+		it("adds a multiline value beside existing keys", async () => {
+			const source = head + tail;
+			await Bun.write(config, source);
+			const settings = await Settings.init({ cwd, agentDir });
+			settings.set("hindsight.bankMission", "--- first\nsecond\n");
+			await settings.flush();
+			const output = await Bun.file(config).text();
+			expect(output.startsWith(head + tail.slice(0, tail.indexOf("theme:")))).toBe(true);
+			expect(output.endsWith("theme:\n    dark: titanium # tail\n")).toBe(true);
+			const reopened = await Settings.loadIsolated({ cwd, agentDir });
+			expect(reopened.get("hindsight.bankMission")).toBe("--- first\nsecond\n");
+			expect(reopened.get("hindsight.retainMission")).toBe("keep\nme\n");
+		});
+	});
+
 	describe("merge keys", () => {
 		const source =
 			"x-common: &common\n    enabled: true\n    contextBefore: 2\ngrep:\n    <<: *common # shared\n    contextAfter: 3\ntheme:\n    dark: titanium\n";

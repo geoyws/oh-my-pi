@@ -1,6 +1,6 @@
 import { YAML } from "bun";
 import type { Node, Pair, YAMLMap } from "yaml";
-import { Document, isAlias, isMap, isNode, isScalar, isSeq, parseDocument } from "yaml";
+import { Document, isAlias, isMap, isNode, isScalar, isSeq, parseDocument, Scalar, visit } from "yaml";
 
 const YAML_MAPPING_HEADER_TRAILING_SPACE = /: +$/gm;
 
@@ -52,6 +52,7 @@ export function reconcileYamlConfig(source: string, value: unknown): string {
 		}
 	};
 	findIndent(document.contents);
+	const stringifyOptions = { indent, lineWidth: 0, doubleQuotedMinMultiLineLength: Number.POSITIVE_INFINITY };
 	const render = (next: unknown, previous?: Node, flow = false): string => {
 		const output = new Document(next);
 		if (
@@ -62,12 +63,55 @@ export function reconcileYamlConfig(source: string, value: unknown): string {
 			output.contents.type = previous.type;
 		}
 		if (flow && (isMap(output.contents) || isSeq(output.contents))) output.contents.flow = true;
-		return output.toString({ indent, lineWidth: 0 }).replace(/\n$/, "").replace(/\n/g, newline);
+		// Spliced text cannot know its parent's indentation, so strings the library
+		// would spread over several lines (newlines, document markers) use the
+		// single-line double-quoted form that new config files already use.
+		visit(output, {
+			Scalar(_, scalar) {
+				if (typeof scalar.value === "string" && /\n|^(?:%|---|\.\.\.)/m.test(scalar.value)) {
+					scalar.type = Scalar.QUOTE_DOUBLE;
+				}
+			},
+		});
+		return output.toString(stringifyOptions).replace(/\n$/, "").replace(/\n/g, newline);
 	};
-	const replace = (node: Node, next: unknown): void => {
+	// An authored block scalar keeps its style. It is rendered as the value of a
+	// column-0 key with a 2-space step: the library always writes indentation
+	// indicators as 2, so only that step keeps them truthful. Content lines then
+	// move to the parent key's column, plus the inferred step when no indicator
+	// pins the content indentation.
+	const renderBlockScalar = (next: unknown, previous: Node, parentColumn: number): string | undefined => {
+		if (typeof next !== "string" || !isScalar(previous)) return undefined;
+		if (previous.type !== Scalar.BLOCK_LITERAL && previous.type !== Scalar.BLOCK_FOLDED) return undefined;
+		const output = new Document({ k: next });
+		const value = isMap(output.contents) ? output.contents.items[0]?.value : undefined;
+		if (!isScalar(value)) return undefined;
+		value.type = previous.type;
+		const [first, ...lines] = output
+			.toString({ ...stringifyOptions, indent: 2 })
+			.replace(/\n$/, "")
+			.split("\n");
+		// The library falls back to quoting when block style cannot represent the value.
+		const header = /^k: ([|>].*)$/.exec(first)?.[1];
+		if (header === undefined) return undefined;
+		const padding = " ".repeat(parentColumn + (/\d/.test(header) ? 2 : indent));
+		return [header, ...lines.map(line => (line === "" ? line : padding + line.slice(2)))].join(newline);
+	};
+	const replace = (node: Node, next: unknown, parentColumn?: number): void => {
 		if (!node.range) throw new Error("YAML node has no source range");
 		// Expand only the edited alias occurrence, never its shared anchor.
-		let text = render(next, node, true);
+		let text =
+			(parentColumn === undefined ? undefined : renderBlockScalar(next, node, parentColumn)) ??
+			render(next, node, true);
+		// A block scalar's header comment lies inside its range; carry its authored
+		// bytes to the end of the replacement's first line, whatever style that is.
+		if (isScalar(node) && (node.type === Scalar.BLOCK_LITERAL || node.type === Scalar.BLOCK_FOLDED)) {
+			const comment = /^[|>][-+0-9]*([ \t]+#[^\r\n]*)/.exec(source.slice(node.range[0]))?.[1];
+			if (comment !== undefined) {
+				const firstLineEnd = text.indexOf(newline);
+				text = firstLineEnd < 0 ? text + comment : text.slice(0, firstLineEnd) + comment + text.slice(firstLineEnd);
+			}
+		}
 		if (node.range[0] === node.range[1] && source[node.range[0] - 1] === ":") text = " " + text;
 		if (source.slice(node.range[0], node.range[1]).endsWith("\n")) text += newline;
 		edits.push({ start: node.range[0], end: node.range[1], text });
@@ -90,10 +134,10 @@ export function reconcileYamlConfig(source: string, value: unknown): string {
 		}
 		return inherited;
 	};
-	const reconcile = (node: Node, next: unknown): void => {
+	const reconcile = (node: Node, next: unknown, parentColumn?: number): void => {
 		if (Bun.deepEquals(node.toJS(document), next)) return;
 		if (!isMap(node) || !isMapping(next)) {
-			replace(node, next);
+			replace(node, next, parentColumn);
 			return;
 		}
 		const keys = new Set<string>();
@@ -117,7 +161,7 @@ export function reconcileYamlConfig(source: string, value: unknown): string {
 				const key = String(pair.key.value);
 				keys.add(key);
 				if (present(key)) {
-					if (child) reconcile(child, next[key]);
+					if (child) reconcile(child, next[key], node.flow ? undefined : column(pair.key.range[0]));
 					else
 						edits.push({
 							start: pair.key.range[1] + 1,
