@@ -5,9 +5,8 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 import { AsyncJobManager } from "../../src/async";
 import { Settings } from "../../src/config/settings";
 import { runEvalAgent, type EvalAgentBridgeOptions, type EvalAgentResult } from "../../src/eval/agent-bridge";
-import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP } from "../../src/eval/bridge-timeout";
+import { EVAL_TIMEOUT_PAUSE_OP } from "../../src/eval/bridge-timeout";
 import { runEvalWait } from "../../src/eval/handle-bridge";
-import { IdleTimeout } from "../../src/eval/idle-timeout";
 import { disposeAllVmContexts } from "../../src/eval/js/context-manager";
 import { executeJs } from "../../src/eval/js/executor";
 import { disposeAllKernelSessions, executePython } from "../../src/eval/py/executor";
@@ -24,6 +23,7 @@ import { AgentOutputManager } from "../../src/task/output-manager";
 import type { AgentDefinition } from "../../src/task/types";
 import type { AgentProgress, SingleResult, StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "../../src/tools";
+import { EvalTool } from "../../src/tools/eval";
 
 const taskAgent = {
 	name: "task",
@@ -571,7 +571,6 @@ describe("agent() through eval runtimes", () => {
 
 	afterEach(() => {
 		vi.restoreAllMocks();
-		vi.useRealTimers();
 	});
 
 	afterAll(async () => {
@@ -827,149 +826,62 @@ describe("agent() through eval runtimes", () => {
 		expect(displayAgentEvents.at(-1)?.event).toEqual(completed);
 	});
 
-	it("pauses the idle watchdog while a quiet agent() runs past the budget", async () => {
-		using tempDir = TempDir.createSync("@omp-eval-agent-timeout-pause-");
-		const { session } = makeEvalSession(
+	it("does not extend compute time for an unwaited agent's progress and keeps its handle usable", async () => {
+		using tempDir = TempDir.createSync("@omp-eval-agent-background-progress-");
+		const { session, sessionId } = makeEvalSession(
 			tempDir,
-			"js-agent-timeout-pause",
-			Settings.isolated({ "task.maxRuntimeMs": 1 }),
+			"agent-background-progress",
+			Settings.isolated({ "task.isolation.enabled": false, "eval.autoBackground.enabled": false }),
 		);
+		session.getEvalSessionId = () => sessionId;
 		mockAgents();
-
-		// runSubprocess runs far past the eval timeout budget and emits NO progress
-		// of its own; the bridge pause must make that delegated time invisible to
-		// the watchdog. Fake timers replace the real wait: the subprocess parks on
-		// `released` so the test can advance the clock past the budget while the
-		// bridge call is provably in flight, then release it deterministically.
-		let release: (() => void) | undefined;
-		const released = new Promise<void>(resolve => {
-			release = resolve;
-		});
-		let markInFlight: (() => void) | undefined;
-		const inFlight = new Promise<void>(resolve => {
-			markInFlight = resolve;
-		});
-		let observedMaxRuntimeMs: number | undefined;
+		const release = Promise.withResolvers<void>();
+		let progressCount = 0;
 		vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => {
-			observedMaxRuntimeMs = options.maxRuntimeMs;
-			markInFlight?.();
-			await released;
-			return singleResult(options, { output: "done" });
-		});
-
-		const ops: string[] = [];
-		vi.useFakeTimers();
-		using idle = new IdleTimeout(20);
-		const resultPromise = runEvalAgentAndWait(
-			{ prompt: "investigate" },
-			{
-				session,
-				signal: idle.signal,
-				emitStatus: event => {
-					ops.push(event.op);
-					if (event.op === EVAL_TIMEOUT_PAUSE_OP) idle.pause();
-					if (event.op === EVAL_TIMEOUT_RESUME_OP) idle.resume();
-				},
-			},
-		);
-
-		// The bridge paused the watchdog; the subprocess is now blocked in flight.
-		await inFlight;
-		// `agent()` must not pin the wall-clock cap: leaving it unset lets the
-		// executor inherit `task.maxRuntimeMs` exactly like the task tool does.
-		expect(observedMaxRuntimeMs).toBeUndefined();
-		// Burn far more than the 20ms budget while paused: the watchdog stays armed-off.
-		vi.advanceTimersByTime(1_000);
-		expect(idle.signal.aborted).toBe(false);
-
-		release?.();
-		const result = await resultPromise;
-
-		expect(result.text).toBe("done");
-		expect(ops).toEqual([EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP]);
-		expect(idle.signal.aborted).toBe(false);
-
-		// RESUME re-armed a fresh window; once the runtime stays idle past it the
-		// watchdog finally fires.
-		vi.advanceTimersByTime(idle.idleMs + 5);
-		expect(idle.signal.aborted).toBe(true);
-	});
-
-	it("keeps timeout paused despite agent() progress snapshots", async () => {
-		using tempDir = TempDir.createSync("@omp-eval-agent-progress-timeout-pause-");
-		const { session } = makeEvalSession(tempDir, "js-agent-progress-timeout-pause");
-		mockAgents();
-
-		// Stream frequent progress snapshots (op:"agent") well past the budget.
-		// They render as status, but timeout accounting is controlled only by the
-		// bridge pause/resume events — so even a flood of snapshots must not re-arm
-		// the watchdog. Fake timers make "past the budget" deterministic: the
-		// subprocess emits its snapshots, parks on `released`, and the test advances
-		// the clock far past the window before releasing it.
-		let release: (() => void) | undefined;
-		const released = new Promise<void>(resolve => {
-			release = resolve;
-		});
-		let markInFlight: (() => void) | undefined;
-		const inFlight = new Promise<void>(resolve => {
-			markInFlight = resolve;
-		});
-		vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => {
-			for (let i = 0; i < 20; i++) {
+			const interval = setInterval(() => {
+				progressCount++;
 				options.onProgress?.({
-					index: options.index,
-					id: options.id,
-					agent: options.agent.name,
-					agentSource: options.agent.source,
+					...singleResult(options),
 					status: "running",
-					task: options.task,
-					assignment: options.assignment,
-					description: options.description,
 					recentTools: [],
 					recentOutput: [],
-					toolCount: i,
-					tokens: 0,
-					requests: 0,
+					toolCount: progressCount,
 					cost: 0,
-					durationMs: i * 10,
 				});
+			}, 50);
+			try {
+				await release.promise;
+				return singleResult(options, { output: "background survived" });
+			} finally {
+				clearInterval(interval);
 			}
-			markInFlight?.();
-			await released;
-			return singleResult(options, { output: "done" });
 		});
-
-		const ops: string[] = [];
-		vi.useFakeTimers();
-		using idle = new IdleTimeout(250);
-		const resultPromise = runEvalAgentAndWait(
-			{ prompt: "investigate" },
-			{
-				session,
-				signal: idle.signal,
-				emitStatus: event => {
-					ops.push(event.op);
-					if (event.op === EVAL_TIMEOUT_PAUSE_OP) idle.pause();
-					if (event.op === EVAL_TIMEOUT_RESUME_OP) idle.resume();
-				},
-			},
-		);
-
-		// All snapshots have streamed and the subprocess is blocked in flight.
-		await inFlight;
-		// Far exceed the 250ms budget while paused: the snapshots already delivered
-		// must not have re-armed the watchdog.
-		vi.advanceTimersByTime(10_000);
-		expect(idle.signal.aborted).toBe(false);
-
-		release?.();
-		const result = await resultPromise;
-
-		expect(result.text).toBe("done");
-		expect(ops[0]).toBe(EVAL_TIMEOUT_PAUSE_OP);
-		expect(ops).toContain("agent");
-		expect(ops.at(-1)).toBe(EVAL_TIMEOUT_RESUME_OP);
-		expect(idle.signal.aborted).toBe(false);
+		const tool = new EvalTool(session);
+		try {
+			await tool.execute("seed", { language: "js", code: "print('ready');" });
+			const result = await tool.execute("unwaited-agent", {
+				language: "js",
+				code: 'const handle = await agent("background"); print(handle.id); while (true) {}',
+				timeout: 1,
+			});
+			const text = result.content
+				.filter(block => block.type === "text")
+				.map(block => block.text)
+				.join("\n");
+			expect(text).toContain("timed out after 1 seconds");
+			expect(progressCount).toBeGreaterThan(1);
+			const jobs = session.asyncJobManager!.getRunningJobs({ ownerId: "Main" });
+			expect(jobs).toHaveLength(1);
+			const job = jobs[0]!;
+			expect(text).toContain(job.id);
+			release.resolve();
+			await job.promise;
+			const recovered = await runEvalWait({ items: [{ kind: "agent", id: job.id }] }, { session });
+			expect(recovered.items[0]?.text).toBe("background survived");
+		} finally {
+			release.resolve();
+			await session.asyncJobManager!.dispose({ timeoutMs: 5000 });
+		}
 	});
 
 	it("interrupting a JavaScript agent() aborts it at once but waits out its critical phase", async () => {
@@ -1157,89 +1069,67 @@ describe("runEvalAgent isolation", () => {
 		expect(result.text).toContain("Applied patches: yes");
 	});
 
-	it("keeps the timeout paused through isolation merge/apply so the cell can't abort mid-cherry-pick", async () => {
+	it("waits through slow isolation baseline capture and patch application", async () => {
+		using tempDir = TempDir.createSync("@omp-eval-isolation-budget-");
+		const { session, sessionId } = makeEvalSession(
+			tempDir,
+			"isolation-budget",
+			Settings.isolated({
+				"task.isolation.enabled": true,
+				"task.isolation.merge": "patch",
+				"eval.autoBackground.enabled": false,
+			}),
+		);
+		session.getEvalSessionId = () => sessionId;
 		mockAgents();
-		mockIsolationContext();
-		const ops: string[] = [];
-		vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockImplementation(async opts => {
-			ops.push("subprocess");
-			return singleResult(opts.baseOptions, { output: "done", patchPath: `/artifacts/${opts.agentId}.patch` });
+		const baseline = {
+			repoRoot: "/repo-root",
+			baseline: {
+				root: {
+					repoRoot: "/repo-root",
+					headCommit: "HEAD",
+					staged: "",
+					unstaged: "",
+					untracked: [],
+					untrackedPatch: "",
+				},
+				nested: [],
+			},
+		};
+		vi.spyOn(isolationRunner, "prepareIsolationContext").mockImplementation(async () => {
+			await Bun.sleep(1250);
+			return baseline;
 		});
+		vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockImplementation(async opts =>
+			singleResult(opts.baseOptions, { output: "isolated result", patchPath: "/artifacts/result.patch" }),
+		);
 		vi.spyOn(isolationRunner, "mergeIsolatedChanges").mockImplementation(async () => {
-			ops.push("merge");
+			await Bun.sleep(1250);
 			return {
-				summary: "\n\nMerged",
+				summary: "\n\nApplied patches: yes",
 				changesApplied: true,
 				hadAnyChanges: true,
 				mergedBranchForNestedPatches: false,
 			};
 		});
-
-		await runEvalAgentAndWait(
-			{ prompt: "migration", isolated: true },
-			{
-				session: isolatedSession(),
-				emitStatus: event => {
-					if (event.op === EVAL_TIMEOUT_PAUSE_OP || event.op === EVAL_TIMEOUT_RESUME_OP) ops.push(event.op);
-				},
-			},
-		);
-
-		const pauseIdx = ops.indexOf(EVAL_TIMEOUT_PAUSE_OP);
-		const resumeIdx = ops.lastIndexOf(EVAL_TIMEOUT_RESUME_OP);
-		const mergeIdx = ops.indexOf("merge");
-		expect(pauseIdx).toBeGreaterThanOrEqual(0);
-		expect(resumeIdx).toBeGreaterThan(pauseIdx);
-		expect(mergeIdx).toBeGreaterThan(pauseIdx);
-		expect(mergeIdx).toBeLessThan(resumeIdx);
-	});
-
-	it("keeps the timeout paused through isolation baseline capture", async () => {
-		mockAgents();
-		const ops: string[] = [];
-		vi.spyOn(isolationRunner, "prepareIsolationContext").mockImplementation(async () => {
-			ops.push("prepare");
-			return {
-				repoRoot: "/repo-root",
-				baseline: {
-					root: {
-						repoRoot: "/repo-root",
-						headCommit: "HEAD",
-						staged: "",
-						unstaged: "",
-						untracked: [],
-						untrackedPatch: "",
-					},
-					nested: [],
-				},
-			};
-		});
-		vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockImplementation(async opts =>
-			singleResult(opts.baseOptions, { output: "done", patchPath: `/artifacts/${opts.agentId}.patch` }),
-		);
-		vi.spyOn(isolationRunner, "mergeIsolatedChanges").mockResolvedValue({
-			summary: "\n\nMerged",
-			changesApplied: true,
-			hadAnyChanges: true,
-			mergedBranchForNestedPatches: false,
-		});
-
-		await runEvalAgentAndWait(
-			{ prompt: "scout", isolated: true },
-			{
-				session: isolatedSession(),
-				emitStatus: event => {
-					if (event.op === EVAL_TIMEOUT_PAUSE_OP || event.op === EVAL_TIMEOUT_RESUME_OP) ops.push(event.op);
-				},
-			},
-		);
-
-		const pauseIdx = ops.indexOf(EVAL_TIMEOUT_PAUSE_OP);
-		const resumeIdx = ops.lastIndexOf(EVAL_TIMEOUT_RESUME_OP);
-		const prepareIdx = ops.indexOf("prepare");
-		expect(pauseIdx).toBeGreaterThanOrEqual(0);
-		expect(prepareIdx).toBeGreaterThan(pauseIdx);
-		expect(prepareIdx).toBeLessThan(resumeIdx);
+		const tool = new EvalTool(session);
+		try {
+			await tool.execute("seed", { language: "js", code: "print('ready');" });
+			const result = await tool.execute("isolated-wait", {
+				language: "js",
+				code: 'print(await agent("migration", { isolated: true }).wait());',
+				timeout: 1,
+			});
+			const text = result.content
+				.filter(block => block.type === "text")
+				.map(block => block.text)
+				.join("\n");
+			expect(text).toContain("isolated result");
+			expect(text).toContain("Applied patches: yes");
+			expect(result.details?.cells?.[0]?.status).toBe("complete");
+		} finally {
+			await session.asyncJobManager!.dispose({ timeoutMs: 5000 });
+		}
 	});
 
 	it("keeps schema-backed isolated output parseable by moving merge text into details", async () => {

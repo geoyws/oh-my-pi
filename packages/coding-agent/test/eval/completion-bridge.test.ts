@@ -7,7 +7,7 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
 import type { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
-import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP } from "../../src/eval/bridge-timeout";
+import { EVAL_TIMEOUT_PAUSE_OP } from "../../src/eval/bridge-timeout";
 import {
 	EVAL_HANDLE_CONCURRENCY,
 	getCompletionHandle,
@@ -17,11 +17,11 @@ import {
 	type EvalCompletionResult,
 } from "../../src/eval/completion-bridge";
 import { runEvalWait } from "../../src/eval/handle-bridge";
-import { IdleTimeout } from "../../src/eval/idle-timeout";
 import { disposeAllVmContexts } from "../../src/eval/js/context-manager";
 import { executeJs } from "../../src/eval/js/executor";
 import { disposeAllKernelSessions, type PythonResult } from "../../src/eval/py/executor";
 import type { ToolSession } from "../../src/tools";
+import { EvalTool } from "../../src/tools/eval";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
 async function runEvalCompletionAndWait(
@@ -628,44 +628,6 @@ describe("runEvalCompletion", () => {
 		expect(waited.items.map(item => item.status)).toEqual(Array(total).fill("completed"));
 		expect(peak).toBe(EVAL_HANDLE_CONCURRENCY);
 	});
-
-	it("pauses the idle watchdog while a slow completion() request is in flight", async () => {
-		vi.useFakeTimers();
-		try {
-			// A oneshot completion emits no status until it returns; delegated model
-			// time must be invisible to the eval timeout budget.
-			const started = Promise.withResolvers<void>();
-			vi.spyOn(ai, "completeSimple").mockImplementation(async () => {
-				started.resolve();
-				await Bun.sleep(200);
-				return assistant({ text: "the answer" });
-			});
-
-			const ops: string[] = [];
-			using idle = new IdleTimeout(60);
-			const pendingResult = runEvalCompletionAndWait(
-				{ prompt: "q", model: "smol" },
-				{
-					session: makeSession(),
-					signal: idle.signal,
-					emitStatus: event => {
-						ops.push(event.op);
-						if (event.op === EVAL_TIMEOUT_PAUSE_OP) idle.pause();
-						if (event.op === EVAL_TIMEOUT_RESUME_OP) idle.resume();
-					},
-				},
-			);
-			await started.promise;
-			vi.advanceTimersByTime(200);
-			const result = await pendingResult;
-
-			expect(result.text).toBe("the answer");
-			expect(ops).toEqual([EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP]);
-			expect(idle.signal.aborted).toBe(false);
-		} finally {
-			vi.useRealTimers();
-		}
-	});
 });
 
 describe("completion() through eval runtimes", () => {
@@ -701,6 +663,68 @@ describe("completion() through eval runtimes", () => {
 			plain: "hello from smol",
 			structured: { ok: true, n: 3 },
 		});
+	});
+
+	it("waits for a slow completion and resumes a fresh compute window in the same cell", async () => {
+		using tempDir = TempDir.createSync("@omp-eval-completion-budget-");
+		const session = {
+			...makeSession(),
+			cwd: tempDir.path(),
+			getSessionId: () => "completion-budget",
+			getSessionFile: () => path.join(tempDir.path(), "session.jsonl"),
+		};
+		const tool = new EvalTool(session);
+		vi.spyOn(ai, "completeSimple").mockImplementation(async () => {
+			await Bun.sleep(2500);
+			return assistant({ text: "slow answer" });
+		});
+		await tool.execute("seed", { language: "js", code: "print('ready');" });
+		const result = await tool.execute("slow-completion", {
+			language: "js",
+			code: `const answer = await completion("q", { model: "smol" }).wait();
+await Bun.sleep(600);
+print(answer);
+while (true) {}`,
+			timeout: 1,
+		});
+		const text = result.content
+			.filter(block => block.type === "text")
+			.map(block => block.text)
+			.join("\n");
+		expect(text).toContain("slow answer");
+		expect(text).toContain("timed out after 1 seconds");
+	});
+
+	it("cancels a completion-only wait without waiting for the provider to settle", async () => {
+		using tempDir = TempDir.createSync("@omp-eval-completion-cancel-");
+		const entered = Promise.withResolvers<void>();
+		const waiting = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const controller = new AbortController();
+		vi.spyOn(ai, "completeSimple").mockImplementation(async () => {
+			entered.resolve();
+			await release.promise;
+			return assistant({ text: "late answer" });
+		});
+		const cell = executeJs('return await completion("q", { model: "smol" }).wait();', {
+			cwd: tempDir.path(),
+			sessionId: "completion-cancel",
+			session: makeSession(),
+			signal: controller.signal,
+			onStatus: event => {
+				if (event.op === EVAL_TIMEOUT_PAUSE_OP) waiting.resolve();
+			},
+		});
+		try {
+			await Promise.all([entered.promise, waiting.promise]);
+			controller.abort(new Error("external interrupt"));
+			const result = await cell;
+			expect(result.cancelled).toBe(true);
+			expect(result.output).not.toContain("late answer");
+		} finally {
+			release.resolve();
+			await cell;
+		}
 	});
 
 	it("exposes plain and structured completion() in the Python runtime", async () => {
