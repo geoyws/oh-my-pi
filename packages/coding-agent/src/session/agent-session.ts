@@ -8102,7 +8102,11 @@ export class AgentSession implements SettingsScope {
 		const ctx = this.#extensionRunner.createCommandContext();
 
 		try {
-			await this.#extensionRunner.runScoped(() => command.handler(args, ctx));
+			// Attribute `pi.exec` children the command starts to this session,
+			// like custom commands and every other extension entry point.
+			await this.#extensionRunner.runScoped(() =>
+				runWithExecOwner(this.sessionManager.getSessionId(), () => command.handler(args, ctx)),
+			);
 			return true;
 		} catch (err) {
 			// Emit error via extension runner

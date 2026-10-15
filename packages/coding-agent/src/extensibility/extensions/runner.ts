@@ -877,7 +877,10 @@ export class ExtensionRunner {
 						const ctx = this.createContext();
 						for (const handler of ext.fileWriteFallbackHandlers) {
 							try {
-								if (await handler(req, ctx)) return true;
+								// Attribute `pi.exec` children the handler starts to
+								// this session: this session's dispose kills them,
+								// other sessions' dispose spares them.
+								if (await runWithExecOwner(this.sessionId, () => handler(req, ctx))) return true;
 							} catch (error) {
 								logger.warn("Extension file write fallback handler threw; trying next handler", {
 									extension: ext.path,
@@ -896,7 +899,8 @@ export class ExtensionRunner {
 						const ctx = this.createContext();
 						for (const handler of ext.fileDeleteFallbackHandlers) {
 							try {
-								if (await handler(req, ctx)) return true;
+								// Owned by this session, like the write path above.
+								if (await runWithExecOwner(this.sessionId, () => handler(req, ctx))) return true;
 							} catch (error) {
 								logger.warn("Extension file delete fallback handler threw; trying next handler", {
 									extension: ext.path,
@@ -1542,12 +1546,12 @@ export class ExtensionRunner {
 								event.type === "tool_call" ? budget : undefined,
 							);
 							result = await this.#toolRegistrationScope.run(registrationScope, () =>
-							// Attribute `pi.exec` children the handler starts to this
-							// session: this session's dispose kills them, other
-							// sessions' dispose spares them. Covers every
-							// emit-dispatched handler, including session_shutdown.
-							runWithExecOwner(this.sessionId, () => handler(event, handlerContext)),
-						);
+								// Attribute `pi.exec` children the handler starts to this
+								// session: this session's dispose kills them, other
+								// sessions' dispose spares them. Covers every
+								// emit-dispatched handler, including session_shutdown.
+								runWithExecOwner(this.sessionId, () => handler(event, handlerContext)),
+							);
 						} catch (error) {
 							handlerFailure = { error };
 						} finally {
