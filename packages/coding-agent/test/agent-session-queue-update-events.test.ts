@@ -203,6 +203,7 @@ describe("AgentSession queue_update events", () => {
 		// pending input and queue listeners must hear that arrival too.
 		const streaming = Promise.withResolvers<void>();
 		const claimed = Promise.withResolvers<void>();
+		const finish = Promise.withResolvers<void>();
 		const followUpStream = createMockModel({ responses: [{ content: ["answered"] }] }).stream;
 		let calls = 0;
 		const target = createSession([{ content: ["answered"] }], "all", async (model, context, options) => {
@@ -212,10 +213,6 @@ describe("AgentSession queue_update events", () => {
 			const signal = options?.signal;
 			if (!live || !signal) throw new Error("live steering was not offered");
 			const stream = new AssistantMessageEventStream();
-			streaming.resolve();
-			await live.wait(signal);
-			if (!(await live.claim(signal))) throw new Error("steer was not claimed");
-			claimed.resolve();
 			const partial = {
 				role: "assistant" as const,
 				content: [{ type: "text" as const, text: "ok" }],
@@ -234,25 +231,49 @@ describe("AgentSession queue_update events", () => {
 				stopReason: "stop" as const,
 			};
 			stream.push({ type: "start", partial });
-			stream.push({ type: "done", reason: "stop", message: partial });
+			stream.push({ type: "text_delta", contentIndex: 0, delta: "ok", partial });
+			void (async () => {
+				await live.wait(signal);
+				const claim = await live.claim(signal);
+				if (!claim) throw new Error("steer was not claimed");
+				claimed.resolve();
+				await finish.promise;
+				// This provider does not integrate the steer into its response.
+				claim.reject();
+				stream.push({ type: "done", reason: "stop", message: partial });
+			})().catch(error => {
+				claimed.reject(error);
+				stream.fail(error);
+			});
 			return stream;
 		});
 		const updates = collectQueueUpdates(target);
+		target.subscribe(event => {
+			// Wait for consumed provider output, not merely stream creation.
+			if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta")
+				streaming.resolve();
+		});
 		const running = target.prompt("start");
 		await streaming.promise;
 		await target.steer("use tabs");
 		await claimed.promise;
 		expect(target.getQueuedMessages()).toEqual({ steering: ["use tabs"], followUp: [], liveSteered: 1 });
+		expect(updates.at(-1)).toEqual({ steering: ["use tabs"], followUp: [], liveSteered: 1 });
+		expect(target.messages).not.toContainEqual(
+			expect.objectContaining({ role: "user", content: [{ type: "text", text: "use tabs" }] }),
+		);
 
+		finish.resolve();
 		await running;
 
-		// The transcript-arrival transition must be announced: the recorded
-		// steer leaves the live-steered set (liveSteered back to 0) while the
-		// visible queue is momentarily empty. This synthetic provider never
-		// integrates the steer into its response, so the agent afterwards
-		// restores it to the steering queue for a later turn — the arrival
-		// notification itself is this test's contract, not that restore.
+		// This provider rejects the live claim instead of integrating it into
+		// its response, so the steer is delivered as ordinary input on the
+		// next turn. Queue listeners must see it disappear from pending input
+		// (liveSteered back to 0), and the transcript must record its arrival.
 		expect(updates).toContainEqual({ steering: [], followUp: [], liveSteered: 0 });
 		expect(target.getQueuedMessages().liveSteered).toBe(0);
+		expect(target.messages).toContainEqual(
+			expect.objectContaining({ role: "user", content: [{ type: "text", text: "use tabs" }] }),
+		);
 	});
 });
