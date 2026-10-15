@@ -740,8 +740,10 @@ impl Process {
 	/// Sends `TERM_SIGNAL` to the optional process group, every live descendant,
 	/// and the root, then optionally waits up to `graceful_ms` for the tree to
 	/// exit before escalating to `KILL_SIGNAL`. Pass `graceful_ms < 0` to skip
-	/// the wait entirely (the polite signal is still emitted). Returns `true`
-	/// when the tree has exited by the end of the hard wave's wait window.
+	/// the wait entirely (the polite signal is still emitted). With `group`, the
+	/// hard wave always runs, since a reparented group member is invisible to
+	/// the descendant walk. Returns `true` when the tree has exited by the end
+	/// of the hard wave's wait window.
 	pub async fn terminate_tree(
 		&self,
 		group: bool,
@@ -848,11 +850,15 @@ impl Process {
 		let process_group = if group { self.group_id() } else { None };
 		let protected = host_protected_pids();
 
+		// Snapshot the tree before any signal: once a TERM-handling leader dies,
+		// its children are reparented away and a later walk can no longer find
+		// them, while a group member that ignores TERM keeps running.
+		let mut descendants = self.signalable_descendants(&protected);
+
 		// Polite wave: SIGTERM the group, every live descendant, then the root.
 		if let Some(pgid) = process_group {
 			let _ = kill_process_group(pgid, TERM_SIGNAL);
 		}
-		let mut descendants = self.signalable_descendants(&protected);
 		for child in &descendants {
 			let _ = child.inner.kill(TERM_SIGNAL);
 		}
@@ -862,7 +868,9 @@ impl Process {
 
 		// Optional grace wait. A negative `graceful_ms` skips the wait entirely
 		// (we still emit the polite signal so cleanup handlers can run before
-		// KILL).
+		// KILL). With a process group, polite exit of the walked tree does not
+		// prove the group is empty — a reparented member that ignores TERM is
+		// invisible to the walk — so the hard group wave always runs.
 		if graceful_ms >= 0 {
 			let exited = wait_for_exit(
 				self,
@@ -871,17 +879,19 @@ impl Process {
 				ct.clone(),
 			)
 			.await?;
-			if exited {
+			if exited && process_group.is_none() {
 				return Ok(true);
 			}
 		}
 
 		// Hard wave. Re-walk the tree so any grandchild spawned during the grace
-		// period — or any process re-parented to the root — is signalled too.
+		// period — or any process re-parented to the root — is signalled too,
+		// and keep the pre-TERM snapshot so descendants reparented away from a
+		// dead root are still killed and awaited.
 		if let Some(pgid) = process_group {
 			let _ = kill_process_group(pgid, KILL_SIGNAL);
 		}
-		descendants = self.signalable_descendants(&protected);
+		descendants.extend(self.signalable_descendants(&protected));
 		for child in &descendants {
 			let _ = child.inner.kill(KILL_SIGNAL);
 		}

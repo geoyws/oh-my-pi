@@ -36,9 +36,12 @@ describe("ptree kill without a usable native process handle", () => {
 	});
 
 	// The detached group's leader dies on SIGTERM while a TERM-ignoring
-	// descendant keeps the inherited stdout/stderr pipes open. The fallback
+	// descendant keeps the inherited stdout/stderr pipes open. Termination
 	// must still escalate to the group after the grace period, or wait() never
-	// sees EOF.
+	// sees EOF. Rows with a `fromPid` replacement exercise the JS fallback; the
+	// unstubbed row drives the real native handle against a live leader whose
+	// holder was adopted outside its tree, so only the native group wave can
+	// reach it.
 	it.skipIf(process.platform === "win32").each([
 		[
 			"the handle lookup throws",
@@ -49,6 +52,7 @@ describe("ptree kill without a usable native process handle", () => {
 		],
 		["the handle lookup finds no process", () => null, false],
 		["the leader has already exited by signal", () => null, true],
+		["the native handle terminates a live leader whose holder left its tree", undefined, false],
 	])("kills a pipe-holding group after its leader dies to SIGTERM when %s", async (_name, fromPid, leaderExited) => {
 		// Real process lifecycle against the platform clock: fake timers cannot
 		// drive child exit or pipe EOF, so the deadlines below only bound failure.
@@ -57,10 +61,15 @@ describe("ptree kill without a usable native process handle", () => {
 		const SETTLE_MS = GRACE_MS + 1_000;
 		const REAP_MS = 500;
 		const marker = `ptree-dead-leader-${process.pid}-${Date.now()}`;
+		const holderReparented = fromPid === undefined;
 		// Inner shell (and its sleeps, which inherit SIG_IGN) ignore TERM; the
 		// outer group leader does not. The readiness line is printed only after
 		// the trap is installed.
-		const script = `sh -c "trap '' TERM; printf '%s %s\\n' ${marker} \\$\\$; while sleep 1; do :; done" & wait`;
+		const holderScript = `sh -c "trap '' TERM; printf '%s %s\\n' ${marker} \\$\\$; while sleep 1; do :; done"`;
+		// Reparented: the subshell exits at once, so the holder is adopted outside
+		// the leader's tree yet stays in its process group holding the pipes; the
+		// leader then waits as a TERM-killable sleep.
+		const script = holderReparented ? `(${holderScript} &); exec sleep 60` : `${holderScript} & wait`;
 		const child = spawn(["/bin/sh", "-c", script], { detached: true });
 		let holder: Process | null = null;
 		let restoreFromPid: (() => void) | undefined;
@@ -86,8 +95,22 @@ describe("ptree kill without a usable native process handle", () => {
 			holder = Process.fromPid(holderPid);
 			if (!holder) throw new Error(`descendant ${holderPid} is not observable`);
 
-			const fromPidSpy = spyOn(Process, "fromPid").mockImplementation(fromPid);
-			restoreFromPid = () => fromPidSpy.mockRestore();
+			if (holderReparented) {
+				// A descendant walk from the live leader must find nothing, so the
+				// holder is reachable only through the leader's process group. No
+				// event reports the subshell's exit, so poll for it within READY_MS.
+				const leader = Process.fromPid(child.pid);
+				if (!leader) throw new Error(`leader ${child.pid} is not observable`);
+				const detachDeadline = Date.now() + READY_MS;
+				while (leader.children().length > 0 && Date.now() < detachDeadline) await Bun.sleep(10);
+				expect(leader.children(), `holder ${holderPid} is still inside the leader's tree`).toEqual([]);
+				expect(leader.status()).toBe(ProcessStatus.Running);
+				expect(holder.groupId()).toBe(child.pid);
+			}
+			if (fromPid) {
+				const fromPidSpy = spyOn(Process, "fromPid").mockImplementation(fromPid);
+				restoreFromPid = () => fromPidSpy.mockRestore();
+			}
 			const waiting = child.wait({ allowAbort: true });
 			waiting.catch(() => {});
 			const reason = new AbortError(new Error("cancelled"), "");
