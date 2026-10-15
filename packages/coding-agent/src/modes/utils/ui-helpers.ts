@@ -69,8 +69,10 @@ import {
 	type SkillPromptDetails,
 } from "../../session/messages";
 import type { SessionContext, StrippedToolCallsMarker } from "../../session/session-context";
+import { UserMessageRefusedError } from "../../session/agent-session";
 import { executeBuiltinSlashCommand, lookupBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
 import { parseSlashCommand } from "../../slash-commands/helpers/parse";
+import { restoreRefusedDraft } from "../../slash-commands/helpers/draft";
 import { buildSkillCommandPrompt, invokeSkillCommandFromText, isKnownSkillCommand } from "../skill-command";
 import {
 	createAssistantMessageComponent,
@@ -1226,6 +1228,32 @@ export class UiHelpers {
 	}
 
 	async #deliverQueuedMessage(message: CompactionQueuedMessage): Promise<void> {
+		try {
+			await this.#dispatchQueuedMessage(message);
+		} catch (error) {
+			if (error instanceof UserMessageRefusedError) {
+				// A refusal is final: never back into the queue (where the drain
+				// would fail it again), but the composer cleared it on /queue, so
+				// the text goes back into the editor.
+				this.#handBackRefused(message, error);
+				return;
+			}
+			throw error;
+		}
+	}
+
+	/**
+	 * Shows the refusal's safe notice and puts the refused queued text back
+	 * into the editor, ahead of anything typed since it was queued. The text
+	 * was never sent or persisted.
+	 */
+	#handBackRefused(message: CompactionQueuedMessage, error: UserMessageRefusedError): void {
+		this.ctx.showError(error.notice);
+		restoreRefusedDraft(this.ctx.editor, message.text, message.images);
+		this.ctx.ui.requestRender();
+	}
+
+	async #dispatchQueuedMessage(message: CompactionQueuedMessage): Promise<void> {
 		const builtin = await executeBuiltinSlashCommand(message.text, {
 			ctx: this.ctx,
 			input: message.images ? { images: message.images } : undefined,
@@ -1238,6 +1266,7 @@ export class UiHelpers {
 			const forwarded = await this.ctx.session.prompt(builtin, {
 				streamingBehavior: message.mode,
 				images: message.images,
+				source: "interactive",
 			});
 			this.#parkLoopOnLocalConsume(message.text, forwarded);
 			return;
@@ -1247,12 +1276,13 @@ export class UiHelpers {
 				propagateErrors: true,
 				queueOnly: true,
 				images: message.images,
+				source: "interactive",
 			})
 		) {
 			return;
 		}
 		if (this.ctx.isKnownSlashCommand(message.text)) {
-			const forwarded = await this.ctx.session.prompt(message.text);
+			const forwarded = await this.ctx.session.prompt(message.text, { source: "interactive" });
 			this.#parkLoopOnLocalConsume(message.text, forwarded);
 			return;
 		}
@@ -1260,8 +1290,8 @@ export class UiHelpers {
 			message.text,
 			() =>
 				message.mode === "followUp"
-					? this.ctx.session.followUp(message.text, message.images)
-					: this.ctx.session.steer(message.text, message.images),
+					? this.ctx.session.followUp(message.text, message.images, { source: "interactive" })
+					: this.ctx.session.steer(message.text, message.images, { source: "interactive" }),
 			{ imageCount: message.images?.length ?? 0 },
 		);
 	}
@@ -1356,7 +1386,12 @@ export class UiHelpers {
 					firstPrompt.images,
 				);
 				promptPromise = built
-					? this.ctx.session.promptCustomMessage(built.message, built.options).catch(restoreQueue)
+					? this.ctx.session
+							.promptCustomMessage(built.message, { ...built.options, source: "interactive" })
+							.catch((error: unknown) => {
+								if (error instanceof UserMessageRefusedError) this.#handBackRefused(firstPrompt, error);
+								else restoreQueue(error);
+							})
 					: Promise.resolve();
 			} else {
 				const disposeFirstPrompt = this.ctx.recordLocalSubmission(
@@ -1367,10 +1402,12 @@ export class UiHelpers {
 					.prompt(firstPrompt.text, {
 						streamingBehavior: firstPrompt.mode === "followUp" ? "followUp" : "steer",
 						images: firstPrompt.images,
+						source: "interactive",
 					})
 					.catch((error: unknown) => {
 						disposeFirstPrompt();
-						restoreQueue(error);
+						if (error instanceof UserMessageRefusedError) this.#handBackRefused(firstPrompt, error);
+						else restoreQueue(error);
 					});
 			}
 

@@ -42,6 +42,7 @@ import type { InteractiveModeContext, SubmittedUserInput } from "../../modes/typ
 import manualContinuePrompt from "../../prompts/system/manual-continue.md" with { type: "text" };
 import { AgentRegistry } from "../../registry/agent-registry";
 import type { RestoredQueuedMessage } from "../../session/agent-session-types";
+import { UserMessageRefusedError } from "../../session/agent-session";
 import { USER_INTERRUPT_LABEL } from "../../session/messages";
 import { PINNED_HUD_TOGGLE_ID } from "@oh-my-pi/pi-tui/prompt/composer";
 import { pickRecentFocusableAgentId } from "./session-focus-controller";
@@ -909,6 +910,42 @@ export class InputController {
 		return compacted.text.trim();
 	}
 
+	/**
+	 * Hand back a refused `!`/`$` line whose images Enter left in the editor.
+	 * While those images are still the live prefix of `pendingImages`, they
+	 * already sit at the indices the refused text's `[Image #N]` markers name,
+	 * and any draft typed since already counts them in its own markers: put the
+	 * refused text back ahead of it and leave the images where they are.
+	 * Returns false when the prefix no longer matches (the caller falls back to
+	 * re-adding the images through {@link restoreDetachedDraft}).
+	 */
+	#restoreRefusedInPlace(text: string, images: ImageContent[] | undefined): boolean {
+		if (!images?.length) return false;
+		const editor = this.ctx.editor;
+		if (!images.every((image, index) => editor.pendingImages[index] === image)) return false;
+		const laterText = editor.getExpandedText();
+		editor.setCollapsedText(laterText.trim() ? `${text}\n\n${laterText}` : text);
+		return true;
+	}
+
+	/** Refusal hand-back for a `!`/`$` line: in place when its images are still the live prefix. */
+	#handBackRefusedCommandLine(
+		error: unknown,
+		text: string,
+		images: ImageContent[] | undefined,
+		imageLinks: (string | undefined)[] | undefined,
+	): boolean {
+		if (!(error instanceof UserMessageRefusedError)) return false;
+		if (this.#restoreRefusedInPlace(text, images)) {
+			this.ctx.showError(error.notice);
+		} else {
+			this.#restoreRefusedSubmission(error, text, images, imageLinks);
+		}
+		this.ctx.updatePendingMessagesDisplay();
+		this.ctx.ui.requestRender();
+		return true;
+	}
+
 	#dropSubmittedPending(images: ImageContent[] | undefined, links: (string | undefined)[] | undefined): void {
 		if (!images?.length) return;
 		const pending = this.ctx.editor.pendingImages;
@@ -936,6 +973,25 @@ export class InputController {
 		}
 		if (!text && !images?.length) return undefined;
 		return { text, images, imageLinks };
+	}
+
+	/**
+	 * Restore a submission refused by a `before_user_message` handler. The
+	 * refused text was never sent or persisted; merge it back alongside any
+	 * newer draft typed while dispatch was pending (never clobber it) and
+	 * show only the handler's safe notice. Returns true when `error` is a
+	 * refusal; other errors fall through to the caller's own handling.
+	 */
+	#restoreRefusedSubmission(
+		error: unknown,
+		text: string,
+		images?: ImageContent[],
+		imageLinks?: (string | undefined)[],
+	): boolean {
+		if (!(error instanceof UserMessageRefusedError)) return false;
+		restoreDetachedDraft(this.ctx.editor, text, images, imageLinks);
+		this.ctx.showError(error.notice);
+		return true;
 	}
 
 	setupEditorSubmitHandler(): void {
@@ -1142,6 +1198,17 @@ export class InputController {
 				const isExcluded = text.startsWith("!!");
 				const command = isExcluded ? text.slice(2).trim() : text.slice(1).trim();
 				if (command) {
+					// User-authored shell text is persisted with the execution and
+					// replayed into later context: gate it before anything runs.
+					// Production Enter already emptied the composer, so a refusal
+					// merges the full original line (with its `!` prefix) back
+					// ahead of any newer draft instead of only reporting.
+					try {
+						await this.ctx.session.gateUserMessage(text, inputImages, "interactive");
+					} catch (error) {
+						if (this.#handBackRefusedCommandLine(error, text, inputImages, inputImageLinks)) return;
+						throw error;
+					}
 					if (this.ctx.session.isBashRunning) {
 						this.ctx.showWarning(
 							`A bash command is already running. Press ${appKey(this.ctx.keybindings, "app.interrupt")} to cancel it first.`,
@@ -1163,6 +1230,16 @@ export class InputController {
 			if (pythonCommand) {
 				const { code, isExcluded } = pythonCommand;
 				if (code) {
+					// Same pre-persistence gate as `!`: user-authored code is
+					// persisted with the execution result. A refusal merges the
+					// full original line (with its `$` prefix) back — the
+					// composer is already empty on production Enter.
+					try {
+						await this.ctx.session.gateUserMessage(text, inputImages, "interactive");
+					} catch (error) {
+						if (this.#handBackRefusedCommandLine(error, text, inputImages, inputImageLinks)) return;
+						throw error;
+					}
 					if (this.ctx.session.isEvalRunning) {
 						this.ctx.showWarning(
 							`A Python execution is already running. Press ${appKey(this.ctx.keybindings, "app.interrupt")} to cancel it first.`,
@@ -1197,8 +1274,9 @@ export class InputController {
 			if (this.#isLocalExtensionCommand(text)) {
 				this.ctx.editor.clearDraft(text);
 				try {
-					await this.ctx.session.prompt(text, { images: inputImages });
+					await this.ctx.session.prompt(text, { images: inputImages, source: "interactive" });
 				} catch (error) {
+					if (this.#restoreRefusedSubmission(error, text, inputImages, inputImageLinks)) return;
 					// Restore the snapshot only when nothing newer was attached
 					// while the command ran; otherwise the newer draft wins.
 					if (inputImages && inputImages.length > 0 && this.ctx.editor.pendingImages.length === 0) {
@@ -1231,7 +1309,7 @@ export class InputController {
 				try {
 					const forwarded = await this.ctx.withLocalSubmission(
 						text,
-						() => this.ctx.session.prompt(text, { streamingBehavior: "steer", images }),
+						() => this.ctx.session.prompt(text, { streamingBehavior: "steer", images, source: "interactive" }),
 						{ imageCount: images?.length ?? 0 },
 					);
 					// An inline `/loop` body arms the loop only after dispatch
@@ -1241,6 +1319,13 @@ export class InputController {
 					// state untouched, so the previous body (if any) survives.
 					if (submittedMode === "loop" && forwarded) this.ctx.setLoopPrompt(text);
 				} catch (error) {
+					// A refusal merges back alongside any newer draft instead of
+					// overwriting it (see #restoreRefusedSubmission).
+					if (this.#restoreRefusedSubmission(error, text, images, inputImageLinks)) {
+						this.ctx.updatePendingMessagesDisplay();
+						this.ctx.ui.requestRender();
+						return;
+					}
 					// Don't lose the queued steer draft: restore images then the collapsed
 					// text so chip tokens (and band cards) survive the retry.
 					if (images && images.length > 0) {
@@ -1308,7 +1393,7 @@ export class InputController {
 				try {
 					const forwarded = await this.ctx.withLocalSubmission(
 						text,
-						() => this.ctx.session.prompt(text, { streamingBehavior: "steer", images }),
+						() => this.ctx.session.prompt(text, { streamingBehavior: "steer", images, source: "interactive" }),
 						{
 							imageCount: images?.length ?? 0,
 						},
@@ -1318,6 +1403,14 @@ export class InputController {
 					// loop instead of resubmitting a local action on next idle.
 					if (!forwarded && this.ctx.loopPrompt === text) this.ctx.pauseLoop();
 				} catch (error) {
+					// A refusal merges back alongside any newer draft instead of
+					// overwriting it (see #restoreRefusedSubmission).
+					if (this.#restoreRefusedSubmission(error, text, images, inputImageLinks)) {
+						if (this.ctx.loopPrompt === text) this.ctx.pauseLoop();
+						this.ctx.updatePendingMessagesDisplay();
+						this.ctx.ui.requestRender();
+						return;
+					}
 					// Don't lose the message: hand images then collapsed text back to the
 					// editor so the user can retry (e.g. prompt dispatch rejecting an
 					// extension command).
@@ -1452,11 +1545,22 @@ export class InputController {
 			if (isContinueShortcut) {
 				await target.prompt(manualContinuePrompt, { synthetic: true, userInitiated: true });
 			} else {
-				await this.ctx.withLocalSubmission(text, () => target.prompt(text, { streamingBehavior, images }), {
-					imageCount: images?.length ?? 0,
-				});
+				await this.ctx.withLocalSubmission(
+					text,
+					() => target.prompt(text, { streamingBehavior, images, source: "interactive" }),
+					{
+						imageCount: images?.length ?? 0,
+					},
+				);
 			}
 		} catch (error) {
+			// A refusal merges back alongside any newer draft instead of
+			// overwriting it (see #restoreRefusedSubmission).
+			if (this.#restoreRefusedSubmission(error, text, images, imageLinks)) {
+				this.ctx.updatePendingMessagesDisplay();
+				this.ctx.ui.requestRender();
+				return;
+			}
 			// Hand the message back, mirroring the main submit error path: restore
 			// pasted images so the user can retry an image-only or text+image draft.
 			if (images && images.length > 0) {
@@ -1675,10 +1779,16 @@ export class InputController {
 				imageLinks: draftImageLinks,
 				optimistic: true,
 				propagateErrors: true,
+				source: "interactive",
 			});
 			if (!dispatched) restoreDraft();
 			return dispatched;
 		} catch (error) {
+			// A refusal merges back alongside any newer draft typed while
+			// dispatch was pending instead of overwriting it (see
+			// #restoreRefusedSubmission); other errors keep the legacy
+			// snapshot restore.
+			if (this.#restoreRefusedSubmission(error, text, draftImages, draftImageLinks)) return true;
 			restoreDraft();
 			this.ctx.showError(error instanceof Error ? error.message : String(error));
 			return true;
@@ -1799,9 +1909,10 @@ export class InputController {
 							await this.ctx.session.prompt(message, {
 								images: queuedImages,
 								streamingBehavior: "followUp",
+								source: "interactive",
 							});
 						} else {
-							await this.ctx.session.followUp(message, queuedImages);
+							await this.ctx.session.followUp(message, queuedImages, { source: "interactive" });
 						}
 					},
 					{ imageCount: queuedImages?.length ?? 0 },
@@ -1809,6 +1920,19 @@ export class InputController {
 				queuedCount++;
 			}
 		} catch (error) {
+			// A refusal merges back alongside any newer draft typed while
+			// dispatch was pending instead of overwriting it (see
+			// #restoreRefusedSubmission). The detached path already merges;
+			// only the live-editor path needs the refusal branch.
+			if (
+				queuedCount === 0 &&
+				options.detachedText === undefined &&
+				this.#restoreRefusedSubmission(error, text, images, imageLinks)
+			) {
+				this.ctx.updatePendingMessagesDisplay();
+				this.ctx.ui.requestRender();
+				return;
+			}
 			if (queuedCount === 0) {
 				if (options.detachedText !== undefined) {
 					restoreDetachedDraft(this.ctx.editor, options.detachedText, images, imageLinks);
@@ -1828,10 +1952,20 @@ export class InputController {
 						: `=>\n${remaining
 								.map((message, index) => `${index + 1}. ${message.replaceAll("\n", "\n   ")}`)
 								.join("\n")}`;
-				if (options.detachedText !== undefined) restoreDetachedDraft(this.ctx.editor, restored);
-				else this.ctx.editor.setText(restored);
+				// A refusal merges the remainder back alongside any newer
+				// draft typed while dispatch was pending instead of
+				// overwriting it; other errors keep the legacy snapshot.
+				if (error instanceof UserMessageRefusedError || options.detachedText !== undefined) {
+					restoreDetachedDraft(this.ctx.editor, restored);
+				} else {
+					this.ctx.editor.setText(restored);
+				}
 			}
-			this.ctx.showError(error instanceof Error ? error.message : String(error));
+			if (error instanceof UserMessageRefusedError) {
+				this.ctx.showError(error.notice);
+			} else {
+				this.ctx.showError(error instanceof Error ? error.message : String(error));
+			}
 		}
 
 		this.ctx.updatePendingMessagesDisplay();
@@ -1931,7 +2065,7 @@ export class InputController {
 			try {
 				await this.ctx.withLocalSubmission(
 					text,
-					() => this.ctx.session.prompt(text, { streamingBehavior: "followUp", images }),
+					() => this.ctx.session.prompt(text, { streamingBehavior: "followUp", images, source: "interactive" }),
 					{ imageCount: images?.length ?? 0 },
 				);
 			} catch (error) {
@@ -1945,9 +2079,13 @@ export class InputController {
 		// Not streaming — just submit normally
 		this.ctx.editor.addToHistory(text);
 		try {
-			await this.ctx.withLocalSubmission(text, () => this.ctx.session.prompt(text, { images }), {
-				imageCount: images?.length ?? 0,
-			});
+			await this.ctx.withLocalSubmission(
+				text,
+				() => this.ctx.session.prompt(text, { images, source: "interactive" }),
+				{
+					imageCount: images?.length ?? 0,
+				},
+			);
 		} catch (error) {
 			restoreOnError(error);
 		}

@@ -477,6 +477,7 @@ Cancelable pre-events:
 
 - `input`
 - `before_agent_start`
+- `before_user_message` — pre-persistence gate for a user message (see “Refusing a user message before it is sent” below)
 - `before_provider_request` — receives `{ payload }`; return the replacement payload itself (not `{ payload }`). Handlers chain. Provider transports must invoke `onPayload`; `devin-agent` does not.
 - `after_provider_response` — notification before response-body consumption: `{ status, headers, requestId?, metadata? }`. Provider request/response handlers receive the model used for that request in `ctx.model`.
 - `context` — receives conversation messages and may return `{ messages }`; replacements chain without rewriting persisted history
@@ -539,6 +540,67 @@ restore its text and attachments alongside any newer draft. This does not make
 the established interactive input-handler chain cancellable by Esc.
 Builtin submission cleanup also preserves the newer draft, including `/clear`
 and `/new`. Commands retain their explicit prefill and session-transition actions.
+
+#### Refusing a user message before it is sent
+
+`before_user_message` gates a user message after command/template expansion but
+before it reaches the provider, the session JSONL, or any queue that later
+persists it. It fires at submission for `prompt`, `steer`, `followUp`,
+`sendUserMessage`, and `promptCustomMessage`, and again at queued/aside
+delivery for messages enqueued before extensions finished registering — so a
+late-registered handler still faces every message. Each message passes the
+handlers once: already-gated messages skip the delivery recheck. Synthetic
+prompts (agent continuations) and agent-attributed or hidden custom messages
+are not user input and skip the gate.
+
+User-invoked `/skill:` expansions are gated too: the handler runs once on the
+raw invocation (the typed draft/args) and once on the rendered skill text
+before either is persisted or sent, on every ingress (interactive Enter,
+RPC, ACP, compaction drain). A skill refusal behaves like any other refusal
+for its ingress — the interactive draft (the raw `/skill:` text) is handed
+back for editing, RPC/ACP fail with only the notice.
+
+Visible user-attributed custom prompts from writable-collab peers are gated
+the same way, so an idle host gates exactly what a streaming host's recheck
+would gate. `/btw` questions, `/goal` and RPC goal objectives, `/tan` work,
+`/omfg` complaints, `/cleanse` requests, `/guided-goal` and `/ratchet` text, summarizer instructions (`/compact`,
+`/handoff`, `/tree`), and local shell (`!`) and Python (`$`) commands are
+gated at their own ingress points before they are persisted or sent. A
+refused queued message takes its hidden companions (attachment paths, image
+descriptions, keyword notices) with it. Programmatic RPC `bash`
+execution is outside the gate: it is an execution API, not a user message.
+
+| Submission | `source` |
+|---|---|
+| Main-session Enter or Ctrl+Enter | `"interactive"` |
+| RPC `prompt`, `steer`, `follow_up` | `"rpc"` |
+| ACP `session/prompt` | `"acp"` |
+| Print/headless initial and follow-up messages | `"print"` |
+| Programmatic `sendUserMessage` without a known ingress | `"unknown"` |
+| Delivery-time recheck of a queued message | `"queued"` |
+| Delivery-time recheck of a stranded aside | `"aside"` |
+
+Return `{ refuse: true, notice }` to drop the message: it is never sent, never
+persisted, never queued, and the UI shows only `notice`. The notice must be
+safe to display verbatim and must never quote the message text; a refusal
+without a notice receives a generic fallback. Any other return (including
+`undefined`) admits the message. A handler that throws or exceeds its timeout
+refuses the message (fail-closed) with the generic fallback notice, and the
+failure still reports through the error channel — a leaked secret is
+irreversible, while a blocked draft is handed back to the editor for editing.
+The first refusal wins; later handlers are skipped. An interactive refusal
+restores the typed draft alongside any newer text typed while dispatch was
+pending. A delivery-time refusal drops the message in place and emits a
+transient `notice` event carrying only the safe notice.
+
+```ts
+pi.on("before_user_message", event => {
+	if (containsSecret(event.text)) {
+		return { refuse: true, notice: "Blocked: this message looks like it contains a secret." };
+	}
+	return undefined;
+});
+```
 
 ### Tool lifecycle
 

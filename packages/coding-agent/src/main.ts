@@ -102,6 +102,7 @@ import {
 	resolvePrewalkTarget,
 } from "./sdk";
 import type { AgentSession } from "./session/agent-session";
+import { UserMessageRefusedError } from "./session/agent-session";
 import { createAuthStorageSettingsSync, describeAuthBrokerStartupError } from "./session/auth-broker-config";
 import type { AuthStorage } from "./session/auth-storage";
 import { describePendingToolCalls } from "./session/exit-diagnostics";
@@ -396,7 +397,7 @@ export async function submitInteractiveInput(
 		| "clearOptimisticSkillMessage"
 		| "optimisticSkillMessagePending"
 	> &
-		Partial<Pick<InteractiveMode, "loopPrompt" | "pauseLoop">>,
+		Partial<Pick<InteractiveMode, "loopPrompt" | "pauseLoop" | "restoreRefusedPrompt">>,
 	session: Pick<AgentSession, "prompt" | "promptCustomMessage" | "isStreaming">,
 	input: SubmittedUserInput,
 ): Promise<void> {
@@ -456,18 +457,37 @@ export async function submitInteractiveInput(
 			});
 		} else if (isKnownSkillCommand(skillHost, input.text)) {
 			// Resubmitted skill text must dispatch through the skill path, or the
-			// model receives a literal `/skill:` token.
-			await invokeSkillCommandFromText(skillHost, input.text, streamingBehavior, {
-				images: input.images,
-				imageLinks: input.imageLinks,
-				optimistic: true,
-				propagateErrors: true,
-			});
+			// model receives a literal `/skill:` token. A refusal hands the raw
+			// invocation back for editing, like a refused plain prompt.
+			try {
+				await invokeSkillCommandFromText(skillHost, input.text, streamingBehavior, {
+					images: input.images,
+					imageLinks: input.imageLinks,
+					optimistic: true,
+					propagateErrors: true,
+					source: "interactive",
+				});
+			} catch (error: unknown) {
+				if (error instanceof UserMessageRefusedError) {
+					mode.restoreRefusedPrompt?.({ text: input.text, images: input.images, imageLinks: input.imageLinks });
+				}
+				mode.showError(error instanceof Error ? error.message : "Unknown error occurred");
+			}
 		} else {
 			let forwarded = false;
 			try {
-				forwarded = await session.prompt(input.text, { images: input.images, streamingBehavior });
+				forwarded = await session.prompt(input.text, {
+					images: input.images,
+					streamingBehavior,
+					source: "interactive",
+				});
 			} catch (error: unknown) {
+				// A refused submission never reached the agent: hand the draft
+				// back (never clobbering a newer draft) and show only the
+				// handler's safe notice.
+				if (error instanceof UserMessageRefusedError) {
+					mode.restoreRefusedPrompt?.({ text: input.text, images: input.images, imageLinks: input.imageLinks });
+				}
 				mode.showError(error instanceof Error ? error.message : "Unknown error occurred");
 			}
 			// Dispatch consumed the body locally (void custom command) or rejected
@@ -776,8 +796,15 @@ async function runInteractiveMode(
 			// before this dispatch runs (the composer accepts input as soon as the
 			// first turn starts): the CLI message queues into that turn instead of
 			// dying with AgentBusyError.
-			await session.prompt(initialMessage, { images: initialImages, streamingBehavior: "steer" });
+			await session.prompt(initialMessage, {
+				images: initialImages,
+				streamingBehavior: "steer",
+				source: "interactive",
+			});
 		} catch (error: unknown) {
+			if (error instanceof UserMessageRefusedError) {
+				mode.restoreRefusedPrompt({ text: initialMessage, images: initialImages });
+			}
 			const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 			mode.showError(errorMessage);
 		}
@@ -786,8 +813,11 @@ async function runInteractiveMode(
 	for (const message of initialMessages) {
 		try {
 			using _keepalive = new EventLoopKeepalive();
-			await session.prompt(message, { streamingBehavior: "steer" });
+			await session.prompt(message, { streamingBehavior: "steer", source: "interactive" });
 		} catch (error: unknown) {
+			if (error instanceof UserMessageRefusedError) {
+				mode.restoreRefusedPrompt({ text: message, images: undefined });
+			}
 			const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 			mode.showError(errorMessage);
 		}

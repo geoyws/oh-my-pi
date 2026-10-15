@@ -127,6 +127,7 @@ import {
 	type DroppedPrompt,
 	type ResolvedRoleModel,
 	SHUTDOWN_CONSOLIDATE_BUDGET_MS,
+	UserMessageRefusedError,
 } from "../session/agent-session";
 import type { CompactMode } from "../session/compact-modes";
 import type { ForeignSessionSource } from "../session/foreign-session-store";
@@ -150,6 +151,7 @@ import {
 import type { ShakeMode } from "../session/shake-types";
 import { BUILTIN_SLASH_COMMAND_RESERVED_NAMES, buildTuiBuiltinSlashCommands } from "../slash-commands/builtin-registry";
 import { buildStaticInlineHint } from "../slash-commands/builtin-completions";
+import { restoreRefusedDraft } from "../slash-commands/helpers/draft";
 import { formatCoarseDuration } from "@oh-my-pi/pi-tui/chrome/format";
 import { type DictationTarget, MicCursor, type SttCallbacks, STTController, type SttState } from "../stt";
 import type { SpaceHoldHandler } from "@oh-my-pi/pi-tui/space-hold";
@@ -3365,6 +3367,24 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	/**
+	 * Hands back a submission refused by a `before_user_message` handler. The
+	 * refused text was never sent or persisted. The refusal arrives
+	 * asynchronously, so merge it ahead of any newer draft typed while
+	 * dispatch was pending (mirrors cancelPendingSubmission) instead of
+	 * dropping it when the editor is no longer empty.
+	 */
+	restoreRefusedPrompt(prompt: DroppedPrompt): void {
+		this.clearOptimisticUserMessage();
+		this.#pendingWorkingMessage = undefined;
+		if (this.loadingAnimation) {
+			this.#stopLoadingAnimation(true);
+		}
+		this.rebuildChatFromMessages();
+		restoreRefusedDraft(this.editor, prompt.text, prompt.images, prompt.imageLinks);
+		this.ui.requestRender();
+	}
+
+	/**
 	 * Hands back a prompt the session dropped before dispatch (an Esc abort or
 	 * usage preflight denial raced turn setup). The message was never persisted,
 	 * so the tree/branch selectors cannot offer it — remove the optimistic
@@ -3378,11 +3398,15 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		this.rebuildChatFromMessages();
 		// The drop arrives asynchronously (after the abort settles); never clobber
-		// a draft the user has already started typing in the meantime.
+		// a draft the user has already started typing in the meantime. Images
+		// likewise only restore onto an empty pending tray, so attachments added
+		// since the submission are kept.
 		if (!this.editor.getText().trim()) {
-			this.editor.pendingImages = prompt.images ? [...prompt.images] : [];
-			this.editor.pendingImageLinks = prompt.images ? prompt.images.map(() => undefined) : [];
-			this.editor.imageLinks = this.editor.pendingImageLinks;
+			if (this.editor.pendingImages.length === 0) {
+				this.editor.pendingImages = prompt.images ? [...prompt.images] : [];
+				this.editor.pendingImageLinks = prompt.images ? prompt.images.map(() => undefined) : [];
+				this.editor.imageLinks = this.editor.pendingImageLinks;
+			}
 			this.editor.setText(prompt.text);
 		}
 		this.ui.requestRender();
@@ -5861,6 +5885,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			await invokeSkillCommandFromText(this, initialPrompt, "steer", {
 				images: input?.images,
 				propagateErrors: true,
+				source: "interactive",
 			});
 			return true;
 		}
@@ -5923,6 +5948,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					await invokeSkillCommandFromText(this, initialPrompt, "steer", {
 						images: input?.images,
 						propagateErrors: true,
+						source: "interactive",
 					});
 				} finally {
 					this.#vibeSkillInFlight--;
@@ -6195,6 +6221,14 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.showWarning("Resume the current goal first, or drop it before setting a new objective.");
 				return false;
 			}
+			// The rough objective (and its images) ride into a synthetic kickoff,
+			// which the prompt gate skips: gate them before the goal tool is
+			// exposed or anything is sent. A refusal propagates so the Enter path
+			// restores the `/guided-goal` line.
+			const initial = rest?.trim() ?? "";
+			if (initial || input?.images?.length) {
+				await this.session.gateUserMessage(initial, input?.images, "interactive");
+			}
 
 			// Expose the goal tool for the interview so the agent can finish by
 			// calling `goal create`. Record the pre-interview toolset first: the
@@ -6227,6 +6261,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			}
 			return true;
 		} catch (error) {
+			if (error instanceof UserMessageRefusedError) throw error;
 			this.#guidedGoalInterviewActive = false;
 			this.showError(error instanceof Error ? error.message : String(error));
 			return false;
@@ -6367,6 +6402,9 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	/** Enter through the same goal activation path as `/goal set`, then start its first turn. */
 	async startGoalAtStartup(objective: string): Promise<void> {
+		// The objective is persisted with the goal record and replayed into
+		// later turns: gate it before the goal is created (see #startGoalFromObjective).
+		await this.session.gateUserMessage(objective, undefined, "interactive");
 		await this.#enterGoalMode({ objective, silent: true });
 		if (!this.goalModeEnabled) return;
 		this.#resetGoalContinuationSuppression();
@@ -6378,6 +6416,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		objective: string,
 		input?: Pick<SubmittedUserInput, "images" | "imageLinks">,
 	): Promise<boolean> {
+		// The objective is user-authored text that createGoal persists to the
+		// session JSONL (and, mid-stream, steers into the provider) before the
+		// prompt below would reach its own gate. A refusal throws here, before
+		// anything is written; the Enter path restores the `/goal` line.
+		await this.session.gateUserMessage(objective, input?.images, "interactive");
 		await this.#enterGoalMode({ objective, silent: true });
 		this.#resetGoalContinuationSuppression();
 		if (this.session.isStreaming) {
@@ -6404,6 +6447,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		objective: string,
 		input?: Pick<SubmittedUserInput, "images" | "imageLinks">,
 	): Promise<boolean> {
+		// Same pre-persistence gate as #startGoalFromObjective: replaceGoal
+		// writes the objective before the prompt's own gate would run.
+		await this.session.gateUserMessage(objective, input?.images, "interactive");
 		const state = await this.session.goalRuntime.replaceGoal({ objective });
 		this.session.setGoalModeState(state);
 		this.goalModeEnabled = true;

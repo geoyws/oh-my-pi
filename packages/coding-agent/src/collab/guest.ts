@@ -34,6 +34,7 @@ import { shouldDisableReasoning, toReasoningEffort } from "@oh-my-pi/pi-tui/thin
 import { emitSubagentFrame } from "../utils/event-bus";
 import { GuestLifecycleEmitter } from "../extensibility/extensions/lifecycle-mirror";
 import { setSessionTerminalTitle } from "../utils/title-generator";
+import { restoreRefusedDraft } from "../slash-commands/helpers/draft";
 import { importRoomKey } from "./crypto";
 import { collabDisplayName } from "./display-name";
 import {
@@ -669,6 +670,15 @@ export class CollabGuestLink {
 				break;
 			}
 			case "error":
+				if (frame.refused) {
+					// Our prompt was refused by the host's before_user_message gate.
+					// Enter already cleared the composer: put the refused text (and
+					// images) back ahead of any newer draft, never clobbering it.
+					restoreRefusedDraft(this.#ctx.editor, frame.refused.text, frame.refused.images);
+					this.#ctx.showError(frame.message);
+					this.#ctx.ui.requestRender();
+					break;
+				}
 				this.#ctx.showError(`Collab host: ${frame.message}`);
 				break;
 			default:

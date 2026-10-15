@@ -52,6 +52,7 @@ function createContext() {
 			prompt,
 			queuedMessageCount: 0,
 			getQueuedMessages: () => ({ steering: [], followUp: [] }),
+			gateUserMessage: vi.fn(async () => {}),
 		} as unknown as InteractiveModeContext["session"],
 		sessionManager: { getSessionName: () => "named-session" } as unknown as InteractiveModeContext["sessionManager"],
 		compactionQueuedMessages: [] as InteractiveModeContext["compactionQueuedMessages"],

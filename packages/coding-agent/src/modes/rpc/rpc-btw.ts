@@ -33,7 +33,7 @@ interface RunningBtw {
 const CANCELLED_WHILE_STARTING = "The /btw question was cancelled before it started";
 
 export class RpcBtwController {
-	readonly #session: Pick<AgentSession, "model" | "runEphemeralTurn" | "sessionManager">;
+	readonly #session: Pick<AgentSession, "model" | "runEphemeralTurn" | "sessionManager" | "gateUserMessage">;
 	readonly #output: (frame: RpcBtwOutputFrame) => void;
 	#store: BtwHistoryStore | undefined;
 	/** `sessionId \0 artifactsDir` the store was opened for. */
@@ -49,7 +49,7 @@ export class RpcBtwController {
 	readonly #unsaved = new Map<string, RunningBtw>();
 
 	constructor(
-		session: Pick<AgentSession, "model" | "runEphemeralTurn" | "sessionManager">,
+		session: Pick<AgentSession, "model" | "runEphemeralTurn" | "sessionManager" | "gateUserMessage">,
 		output: (frame: RpcBtwOutputFrame) => void,
 	) {
 		this.#session = session;
@@ -78,6 +78,10 @@ export class RpcBtwController {
 			const manager = this.#session.sessionManager;
 			await manager.ensureOnDisk();
 			if (epoch !== this.#epoch) throw new Error(CANCELLED_WHILE_STARTING);
+			// The question is persisted via `store.upsert` below and sent to a
+			// provider: gate it first. A refusal throws before anything is
+			// persisted or dispatched, carrying only the handler's notice.
+			await this.#session.gateUserMessage(trimmed, undefined, "rpc");
 			const { record, history, conversationKey } = beginBtwTurn(trimmed, manager.getLeafId(), previous);
 			try {
 				await store.upsert(record);

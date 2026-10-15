@@ -1965,6 +1965,14 @@ export class CommandController {
 				mode,
 			);
 		}
+		// User-authored summarizer focus is sent to the summarizer provider and
+		// persisted with the compaction entry: gate it first. Agent-authored
+		// `internalGuidance` above never faces the gate. A refusal propagates
+		// to the slash builtin, which owns the exact original line and merges
+		// it back into the composer.
+		if (customInstructions?.trim()) {
+			await this.ctx.session.gateUserMessage(customInstructions, undefined, "interactive");
+		}
 		return this.executeCompaction(customInstructions, false, beforeFlush, mode);
 	}
 
@@ -2098,6 +2106,13 @@ export class CommandController {
 			return;
 		}
 
+		// User-authored handoff focus reaches the summarizer provider: gate it
+		// before any UI teardown or history mutation. A refusal propagates to
+		// the slash builtin, which owns the exact original line and merges it
+		// back into the composer.
+		if (customInstructions?.trim()) {
+			await this.ctx.session.gateUserMessage(customInstructions, undefined, "interactive");
+		}
 		if (this.ctx.loadingAnimation) {
 			this.ctx.loadingAnimation.stop();
 			this.ctx.loadingAnimation = undefined;

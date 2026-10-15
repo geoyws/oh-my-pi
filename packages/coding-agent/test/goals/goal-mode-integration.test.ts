@@ -10,7 +10,7 @@ import { GoalTool } from "@oh-my-pi/pi-coding-agent/goals/tools/goal-tool";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { SubmittedUserInput } from "@oh-my-pi/pi-coding-agent/modes/types";
-import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AgentSession, UserMessageRefusedError } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { normalizeCustomMessagePayload } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -363,6 +363,40 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(harness.mode.editor.getText()).toBe(commandText);
 		expect(harness.mode.editor.pendingImages).toEqual(images);
 		expect(harness.mode.editor.pendingImageLinks).toEqual(imageLinks);
+	});
+
+	it("refuses a /goal objective before the goal is created, persisted or prompted", async () => {
+		const secret = "FAKE-SECRET-NOT-REAL";
+		const commandText = `/goal ship with ${secret}`;
+		vi.spyOn(harness.session, "gateUserMessage").mockRejectedValue(new UserMessageRefusedError("Blocked: secret"));
+		const createGoal = vi.spyOn(harness.session.goalRuntime, "createGoal");
+		const prompt = vi.spyOn(harness.session, "prompt").mockResolvedValue(true);
+		const showError = vi.spyOn(harness.mode, "showError");
+		harness.mode.editor.setText(commandText);
+
+		await executeBuiltinSlashCommand(commandText, { ctx: harness.mode });
+
+		expect(showError).toHaveBeenCalledWith("Blocked: secret");
+		expect(harness.mode.editor.getText()).toBe(commandText);
+		expect(createGoal).not.toHaveBeenCalled();
+		expect(prompt).not.toHaveBeenCalled();
+		expect(harness.session.getGoalModeState()).toBeUndefined();
+		expect(JSON.stringify(harness.session.sessionManager.getEntries())).not.toContain(secret);
+	});
+
+	it("refuses a /goal set replacement before the active goal is replaced", async () => {
+		const secret = "FAKE-SECRET-NOT-REAL";
+		await harness.mode.handleGoalModeCommand("Ship the release");
+		vi.spyOn(harness.session, "gateUserMessage").mockRejectedValue(new UserMessageRefusedError("Blocked: secret"));
+		const replaceGoal = vi.spyOn(harness.session.goalRuntime, "replaceGoal");
+
+		await expect(harness.mode.handleGoalModeCommand(`set replace with ${secret}`)).rejects.toBeInstanceOf(
+			UserMessageRefusedError,
+		);
+
+		expect(replaceGoal).not.toHaveBeenCalled();
+		expect(harness.session.getGoalModeState()?.goal.objective).toBe("Ship the release");
+		expect(JSON.stringify(harness.session.sessionManager.getEntries())).not.toContain(secret);
 	});
 
 	it("keeps images pasted while delayed plan setup completes in the later draft", async () => {

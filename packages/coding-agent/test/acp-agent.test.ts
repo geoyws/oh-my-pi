@@ -137,7 +137,9 @@ class FakeAgentSession {
 	}
 	promptCalls: string[] = [];
 	customMessages: Array<{ customType: string; content: string; details?: unknown }> = [];
-	customMessageOptions: Array<{ streamingBehavior?: "steer" | "followUp"; queueChipText?: string } | undefined> = [];
+	customMessageOptions: Array<
+		{ streamingBehavior?: "steer" | "followUp"; queueChipText?: string; source?: string } | undefined
+	> = [];
 	skillsSettings = { enableSkillCommands: true };
 	skills: Array<{ name: string; description: string; filePath: string; baseDir: string; source: string }> = [];
 	async refreshSkillsAndCommands(): Promise<void> {}
@@ -276,7 +278,7 @@ class FakeAgentSession {
 
 	async promptCustomMessage(
 		message: { customType: string; content: string; details?: unknown },
-		options?: { streamingBehavior?: "steer" | "followUp"; queueChipText?: string },
+		options?: { streamingBehavior?: "steer" | "followUp"; queueChipText?: string; source?: string },
 	): Promise<void> {
 		this.customMessages.push(message);
 		this.customMessageOptions.push(options);
@@ -2108,7 +2110,7 @@ describe("ACP agent", () => {
 		expect(customMessage.content).toContain("# Sample\nDo work.");
 		expect(customMessage.content).toContain(`[Skill directory: ${skillDir}]`);
 		expect(customMessage.content).toContain("User: extra context");
-		expect(session.customMessageOptions[0]).toEqual({ streamingBehavior: "steer" });
+		expect(session.customMessageOptions[0]).toEqual({ streamingBehavior: "steer", source: "acp" });
 
 		harness.abortController.abort();
 		await Bun.sleep(0);

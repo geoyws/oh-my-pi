@@ -14,6 +14,9 @@ import * as clipboard from "@oh-my-pi/pi-coding-agent/utils/clipboard";
 import { Container, Input, type KeyId, type TUI } from "@oh-my-pi/pi-tui";
 import type { DictationTarget } from "@oh-my-pi/pi-coding-agent/stt/push-to-talk";
 import { SPACE_HOLD_MECHANICAL_RUN, type SpaceHoldHandler } from "@oh-my-pi/pi-tui/space-hold";
+import { UserMessageRefusedError } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
+import { getEditorTheme } from "@oh-my-pi/pi-tui/theme/tui-adapters";
 
 interface TurnArgs {
 	promptText: string;
@@ -97,8 +100,11 @@ async function harness(spaceHoldKeys: readonly KeyId[] = ["space"]) {
 		model: { provider: "anthropic", id: "claude-sonnet-4-5" },
 		isStreaming: false,
 		runEphemeralTurn,
+		gateUserMessage: vi.fn(async () => {}),
 	} as unknown as InteractiveModeContext["session"];
+	const editor = new CustomEditor(getEditorTheme());
 	const ctx = {
+		editor,
 		ui: {
 			requestRender: vi.fn(),
 			requestComponentRender: vi.fn(),
@@ -155,6 +161,7 @@ async function harness(spaceHoldKeys: readonly KeyId[] = ["space"]) {
 		directory,
 		manager,
 		managers,
+		editor,
 		ctx,
 		controller,
 		requests,
@@ -341,6 +348,21 @@ describe("BTW follow-up lifecycle", () => {
 		panel.handleInput("c");
 		await drain();
 		expect(copy).toHaveBeenCalledWith("Useful original answer");
+	});
+
+	it("a refused history-panel follow-up leaves the main composer untouched", async () => {
+		const h = await harness();
+		const topic = await h.root("Original question", "Original answer");
+		h.editor.setText("unrelated main draft");
+		vi.spyOn(h.ctx.session, "gateUserMessage").mockRejectedValueOnce(new UserMessageRefusedError("Blocked."));
+		const calls = h.runEphemeralTurn.mock.calls.length;
+
+		expect(await h.controller.startFollowUp(topic.id, "follow-up FAKE-SECRET-NOT-REAL")).toBe(false);
+
+		// The panel keeps its own draft; the main composer never held this question.
+		expect(h.editor.getExpandedText()).toBe("unrelated main draft");
+		expect(h.ctx.showError).toHaveBeenCalledWith("Blocked.");
+		expect(h.runEphemeralTurn.mock.calls.length).toBe(calls);
 	});
 
 	it("refuses a busy move without cancellation and clears BTW only after successful relocation", async () => {

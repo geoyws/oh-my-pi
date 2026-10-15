@@ -1,5 +1,6 @@
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { buildSkillPromptMessage, getSkillSlashCommandName, parseSkillInvocation } from "../extensibility/skills";
+import type { UserMessageSource } from "../extensibility/extensions/types";
 import { type CustomMessage, SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "../session/messages";
 import type { InteractiveModeContext } from "./types";
 
@@ -41,6 +42,8 @@ interface InvokeSkillCommandOptions {
 	 * does not leave the submission invisible (issue #8895).
 	 */
 	optimistic?: boolean;
+	/** Where this invocation entered the session (for the `before_user_message` gate). */
+	source?: UserMessageSource;
 }
 
 /** Built custom-message payload and delivery options for a `/skill:` command. */
@@ -103,7 +106,7 @@ export async function invokeSkillCommandFromText(
 				{ imageLinks: options?.imageLinks },
 			);
 		}
-		await ctx.session.promptCustomMessage(built.message, promptOptions);
+		await ctx.session.promptCustomMessage(built.message, { ...promptOptions, source: options?.source });
 		return true;
 	} catch (err) {
 		if (optimistic) ctx.clearOptimisticSkillMessage();

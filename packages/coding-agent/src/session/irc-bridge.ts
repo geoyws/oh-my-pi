@@ -249,9 +249,10 @@ export class IrcBridge {
 		void this.#host.emitSessionEvent({ type: "irc_message", message: record });
 	}
 
-	/** Persists queued IRC records that missed their step-boundary injection. */
-	flushPending(): void {
-		for (const record of this.drainPending()) {
+	/** Persists queued IRC records that missed their step-boundary injection. Callers that
+	 *  must filter them first (the `before_user_message` recheck) drain and pass them in. */
+	flushPending(records: readonly AgentMessage[] = this.drainPending()): void {
+		for (const record of records) {
 			this.#host.agent.emitExternalEvent({ type: "message_start", message: record });
 			this.#host.agent.emitExternalEvent({ type: "message_end", message: record });
 		}

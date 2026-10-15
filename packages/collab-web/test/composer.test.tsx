@@ -3,14 +3,22 @@ import type { KeyboardEvent } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { GuestClient } from "../src/lib/client";
 import type { ComposerProps } from "../src/components/shell/Composer";
-import { Composer, shouldSubmitOnEnter } from "../src/components/shell/Composer";
+import { Composer, shouldSubmitOnEnter, withRefusedDraft } from "../src/components/shell/Composer";
 import { encodeBase64Url } from "../src/lib/link";
 
 const LINK = `roomroomroom1234#${encodeBase64Url(new Uint8Array(32))}`;
 const client = new GuestClient(LINK, "tester");
 
 function props(uiRequest: ComposerProps["uiRequest"]): ComposerProps {
-	return { client, phase: "live", readOnly: false, uiRequest, working: true, queuedMessageCount: 0 };
+	return {
+		client,
+		phase: "live",
+		readOnly: false,
+		uiRequest,
+		working: true,
+		queuedMessageCount: 0,
+		refusedDraft: null,
+	};
 }
 
 describe("Composer host UI requests", () => {
@@ -71,6 +79,16 @@ function keydown(key: string, opts: { shiftKey?: boolean; isComposing?: boolean 
 		nativeEvent: { isComposing: opts.isComposing ?? false },
 	} as KeyEvt;
 }
+
+describe("withRefusedDraft", () => {
+	it("puts a refused prompt back into a cleared composer", () => {
+		expect(withRefusedDraft("key=sk-1", "")).toBe("key=sk-1");
+	});
+
+	it("keeps text typed after the send, below the refused prompt", () => {
+		expect(withRefusedDraft("key=sk-1", "next thought")).toBe("key=sk-1\nnext thought");
+	});
+});
 
 describe("shouldSubmitOnEnter IME guard", () => {
 	it("submits on a plain Enter with no composition", () => {

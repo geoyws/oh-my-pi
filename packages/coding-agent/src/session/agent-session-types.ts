@@ -37,7 +37,7 @@ import type { LoadedCustomCommand } from "../extensibility/custom-commands";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import type { ExtensionRunner, PreparedExtension } from "../extensibility/extensions";
 import type { CacheWarmer } from "./cache-warmer";
-import type { ContextUsage } from "../extensibility/extensions/types";
+import type { ContextUsage, UserMessageSource } from "../extensibility/extensions/types";
 import type { SkillDescriptionCatalog } from "../extensibility/skill-descriptions";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import type { FileSlashCommand } from "../extensibility/slash-commands";
@@ -428,6 +428,8 @@ export interface PromptOptions {
 	userInitiated?: boolean;
 	/** Explicit billing/initiator attribution. */
 	attribution?: MessageAttribution;
+	/** Where this message entered the session (for the `before_user_message` gate). Defaults to `"unknown"`. */
+	source?: UserMessageSource;
 	/** Skip pre-send compaction checks for this prompt. */
 	skipCompactionCheck?: boolean;
 	/** Delegator's open-endedness description (task tool `solutionSpace`); replaces the prompt as `auto` thinking classification input. */
@@ -453,6 +455,8 @@ export interface DroppedPrompt {
 	text: string;
 	/** Image attachments submitted with the prompt. */
 	images?: ImageContent[];
+	/** Display links paired with `images` (chip restoration on hand-back). */
+	imageLinks?: (string | undefined)[];
 }
 
 /** Options for AgentSession.followUp(). */
@@ -463,12 +467,16 @@ export interface FollowUpOptions {
 	expandPromptTemplates?: boolean;
 	/** Explicit billing/initiator attribution. */
 	attribution?: MessageAttribution;
+	/** Where this message entered the session (for the `before_user_message` gate). Defaults to `"unknown"`. */
+	source?: UserMessageSource;
 }
 
 /** Options for AgentSession.steer(). */
 export interface SteerOptions {
 	/** Explicit billing/initiator attribution. */
 	attribution?: MessageAttribution;
+	/** Where this message entered the session (for the `before_user_message` gate). Defaults to `"unknown"`. */
+	source?: UserMessageSource;
 }
 
 /** Options for AgentSession.sendUserMessage(). */
@@ -477,6 +485,8 @@ export interface SendUserMessageOptions {
 	deliverAs?: "steer" | "followUp" | "aside";
 	/** Explicit billing/initiator attribution. */
 	attribution?: MessageAttribution;
+	/** Where this message entered the session (for the `before_user_message` gate). Defaults to `"unknown"`. */
+	source?: UserMessageSource;
 }
 
 /** Result from a handoff operation. */

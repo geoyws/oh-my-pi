@@ -54,6 +54,7 @@ import {
 } from "../../extensibility/plugins/marketplace";
 import { getAvailableThemes, getSymbolTheme, previewTheme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { AgentHubOpenOptions, InteractiveModeContext } from "../../modes/types";
+import { UserMessageRefusedError } from "../../session/agent-session";
 import type { SessionOAuthAccountList } from "../../session/agent-session-types";
 import type { ResetCreditAccountStatus, ResetCreditRedeemOutcome } from "../../session/auth-storage";
 import {
@@ -1528,6 +1529,33 @@ export class SelectorController {
 
 						// User made a complete choice
 						break;
+					}
+					// User-authored summarization focus reaches the summarizer
+					// provider: gate it before navigation mutates anything.
+					// Recovery choice (boring on purpose): a refusal reopens
+					// the same hook editor prefilled with the refused text, so
+					// the operator edits the flagged content out and resubmits
+					// in place instead of retyping it. The modal flow needs no
+					// composer interplay and no extra render juggling; each
+					// refusal still reports only the handler's notice, and
+					// cancelling the editor returns to the tree selector.
+					while (customInstructions?.trim()) {
+						try {
+							await this.ctx.session.gateUserMessage(customInstructions, undefined, "interactive");
+							break;
+						} catch (error) {
+							if (!(error instanceof UserMessageRefusedError)) throw error;
+							this.ctx.showError(error.notice);
+							const retry = await this.ctx.showHookEditor(
+								"Custom summarization instructions",
+								customInstructions,
+							);
+							if (retry === undefined) {
+								this.showTreeSelector();
+								return;
+							}
+							customInstructions = retry;
+						}
 					}
 
 					// Set up escape handler and loader if summarizing
