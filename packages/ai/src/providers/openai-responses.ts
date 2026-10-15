@@ -982,6 +982,11 @@ const streamOpenAIResponsesOnce = (
 							strictRetryAvailable = false;
 							forceDisableStrictTools = true;
 							disableStrictToolsForScope(providerSessionState, strictToolsScope);
+							// A stripped retry proved the history holds blobs foreign
+							// to this credential: the fallback must neither replay
+							// them nor re-chain onto a server-held prefix that may
+							// hold them (decision seq 289).
+							const mustStayStripped = stripForeignEncryptedForSession || strippedForeignEncryptedRetryAttempted;
 							const fallbackBuilt = buildParams(
 								model,
 								context,
@@ -990,12 +995,12 @@ const streamOpenAIResponsesOnce = (
 								strictToolsScope,
 								true,
 								chainState?.canAppend ? chainState.lastParams?.input : undefined,
-								stripForeignEncryptedForSession,
+								mustStayStripped,
 							);
 							const fallbackParams = fallbackBuilt.params;
 							if (chainState && !chainState.disabled) fallbackParams.store = true;
 							let fallbackChained: OpenAIResponsesChainedParams =
-								chainState && !chainState.disabled
+								!mustStayStripped && chainState && !chainState.disabled
 									? buildOpenAIResponsesChainedParams(
 											fallbackParams,
 											fallbackBuilt.trailingScaffoldingItems,

@@ -6,6 +6,7 @@ import {
 import type { Context, FetchImpl, Model, ModelSpec, Tool } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { createOpenAIResponsesHistoryPayload } from "@oh-my-pi/pi-ai/utils";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
 
 const azureModel: Model<"azure-openai-responses"> = buildModel({
 	id: "gpt-5-mini",
@@ -548,5 +549,135 @@ describe("azure openai responses credential binding", () => {
 		const same = await captureAzurePayload(context, azureModel, { credentialId: 11 });
 		expect(hasEncryptedReasoning(same.input)).toBe(true);
 		expect(hasFunctionCall(same.input, "call_azure")).toBe(true);
+	});
+
+	it("retries a foreign-caller 400 once stripped, keeping the effort fallback and onPayload", async () => {
+		const reasoningModel: Model<"azure-openai-responses"> = buildModel({
+			id: "gpt-5-mini",
+			name: "GPT 5.2 Test",
+			api: "azure-openai-responses",
+			provider: "azure",
+			baseUrl: "https://azure.example.test/openai/v1",
+			reasoning: true,
+			compat: { supportsReasoningParams: true, supportsReasoningEffort: true },
+			thinking: { mode: "effort", efforts: [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh] },
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 16_384,
+		} as ModelSpec<"azure-openai-responses">);
+		const context: Context = {
+			messages: [credentialTurn(undefined), { role: "user", content: "continue", timestamp: Date.now() }],
+		};
+		const foreignCallerResponse = () =>
+			new Response(
+				JSON.stringify({
+					error: {
+						message: "reasoning 'encrypted_content' was not issued to this caller",
+						type: "invalid_request_error",
+					},
+				}),
+				{ status: 400, headers: { "content-type": "application/json" } },
+			);
+		const bodies: Record<string, unknown>[] = [];
+		let onPayloadCalls = 0;
+		const fetchMock = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				bodies.push(typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : {});
+				if (bodies.length === 1) {
+					return new Response(
+						JSON.stringify({
+							error: {
+								message: `invalid reasoning value: 'xhigh' (must be "high", "medium", "low", "max", or "none")`,
+								type: "invalid_request_error",
+								param: "reasoning.effort",
+							},
+						}),
+						{ status: 400, headers: { "content-type": "application/json" } },
+					);
+				}
+				if (bodies.length === 2) return foreignCallerResponse();
+				return createSseResponse([
+					{
+						type: "response.completed",
+						response: {
+							status: "completed",
+							usage: {
+								input_tokens: 1,
+								output_tokens: 1,
+								total_tokens: 2,
+								input_tokens_details: { cached_tokens: 0 },
+							},
+						},
+					},
+				]);
+			},
+			{ preconnect: fetch.preconnect },
+		);
+
+		const result = await streamAzureOpenAIResponses(reasoningModel, context, {
+			apiKey: "test-key",
+			fetch: fetchMock as unknown as typeof fetch,
+			azureBaseUrl: "https://azure.example.test/openai/v1",
+			azureApiVersion: "v1",
+			reasoning: "xhigh",
+			onPayload: async payload => {
+				onPayloadCalls += 1;
+				return payload;
+			},
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(bodies).toHaveLength(3);
+		// The effort fallback applies first, then the stripped retry re-applies
+		// it instead of reverting to the rejected effort.
+		expect(bodies.map(body => (body.reasoning as { effort?: string } | undefined)?.effort)).toEqual([
+			"xhigh",
+			"max",
+			"max",
+		]);
+		expect(hasEncryptedReasoning(bodies[0]!.input)).toBe(true);
+		expect(hasEncryptedReasoning(bodies[1]!.input)).toBe(true);
+		expect(hasEncryptedReasoning(bodies[2]!.input)).toBe(false);
+		expect(hasFunctionCall(bodies[2]!.input, "call_azure")).toBe(true);
+		for (const body of bodies) expect(body.previous_response_id).toBeUndefined();
+		// onPayload runs for the initial send and again for the stripped resend.
+		expect(onPayloadCalls).toBe(2);
+	});
+
+	it("surfaces a second foreign-caller 400 instead of looping", async () => {
+		let attempts = 0;
+		const fetchMock = Object.assign(
+			async (): Promise<Response> => {
+				attempts += 1;
+				return new Response(
+					JSON.stringify({
+						error: {
+							message: "reasoning 'encrypted_content' was not issued to this caller",
+							type: "invalid_request_error",
+						},
+					}),
+					{ status: 400, headers: { "content-type": "application/json" } },
+				);
+			},
+			{ preconnect: fetch.preconnect },
+		);
+
+		const result = await streamAzureOpenAIResponses(
+			azureModel,
+			{
+				messages: [credentialTurn(undefined), { role: "user", content: "continue", timestamp: Date.now() }],
+			},
+			{
+				apiKey: "test-key",
+				fetch: fetchMock as unknown as typeof fetch,
+				azureBaseUrl: azureModel.baseUrl,
+				azureApiVersion: "v1",
+			},
+		).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorStatus).toBe(400);
+		expect(attempts).toBe(2);
 	});
 });

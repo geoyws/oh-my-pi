@@ -2514,6 +2514,79 @@ describe("openai-responses stripped retry chaining", () => {
 		expect(bodies).toHaveLength(4);
 		expect(bodies[3]!.previous_response_id).toBe("resp_2");
 	});
+
+	it("keeps the strict-tools fallback stripped and unchained after the stripped retry", async () => {
+		const echoTool: Tool = {
+			name: "echo",
+			description: "Echo input",
+			parameters: {
+				type: "object",
+				properties: { text: { type: "string" } },
+				required: ["text"],
+				additionalProperties: false,
+			},
+		};
+		const bodies: Record<string, unknown>[] = [];
+		const fetchMock: FetchImpl = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				bodies.push(parseJsonBody(init));
+				if (bodies.length === 1) return statefulSse("Answer 1", "resp_1", "enc_11");
+				if (bodies.length === 2) return foreignCallerResponse();
+				if (bodies.length === 3) {
+					return new Response(
+						JSON.stringify({
+							error: { message: "Invalid schema for function 'echo'", type: "invalid_request_error" },
+						}),
+						{ status: 400, headers: { "content-type": "application/json" } },
+					);
+				}
+				return statefulSse("Answer 2", "resp_2");
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const session = {
+			apiKey: "test-key",
+			sessionId: "chain-strip-strict-session",
+			providerSessionState,
+			statefulResponses: true,
+			fetch: fetchMock,
+		};
+
+		const user1 = { role: "user" as const, content: "First question", timestamp: 1000 };
+		const first = await streamOpenAIResponses(
+			credentialModel,
+			{ messages: [user1], tools: [echoTool] },
+			{ ...session, credentialId: 11 },
+		).result();
+		expect(first.stopReason).toBe("stop");
+
+		const second = await streamOpenAIResponses(
+			credentialModel,
+			{
+				messages: [user1, first, { role: "user", content: "Second question", timestamp: 1001 }],
+				tools: [echoTool],
+			},
+			{ ...session, credentialId: 7 },
+		).result();
+		expect(second.stopReason).toBe("stop");
+		expect(bodies).toHaveLength(4);
+		// The chained attempt references the server-held baseline …
+		expect(bodies[1]!.previous_response_id).toBe("resp_1");
+		// … the stripped retry drops it …
+		expect(bodies[2]!.previous_response_id).toBeUndefined();
+		expect(containsEncryptedReasoning(bodies[2]!.input as unknown[])).toBe(false);
+		// … and the strict-tools fallback after the stripped retry must stay
+		// stripped and unchained (decision seq 289): the server-held prefix
+		// may itself hold the foreign blob.
+		expect(bodies[3]!.previous_response_id).toBeUndefined();
+		expect(containsEncryptedReasoning(bodies[3]!.input as unknown[])).toBe(false);
+		expect(JSON.stringify(bodies[3]!.input)).toContain("Second question");
+		const strictFlags = (body: Record<string, unknown>) =>
+			((body.tools as Array<{ strict?: boolean }> | undefined) ?? []).map(tool => tool.strict);
+		expect(strictFlags(bodies[1]!)).toEqual([true]);
+		expect(strictFlags(bodies[3]!)).not.toContain(true);
+	});
 });
 
 describe("openai-responses user history encrypted reasoning strip", () => {

@@ -1787,7 +1787,9 @@ export async function compact(
 		const previousV2CredentialId = previousRemoteCompaction?.credentialId;
 		let servingV2CredentialId: number | undefined;
 		const v2Requests = new Map<number | undefined, CompactionV2Request>();
-		const buildV2RequestForCredential = async (credentialId: number | undefined): Promise<CompactionV2Request> => {
+		const buildV2RequestForCredential = async (
+			credentialId: number | undefined,
+		): Promise<CompactionV2Request | undefined> => {
 			const cached = v2Requests.get(credentialId);
 			if (cached) return cached;
 			// The preserved prefix shares the stored transcript's
@@ -1846,9 +1848,12 @@ export async function compact(
 					prefixCredentialId: previousV2CredentialId,
 				});
 			}
-			if (remoteHistory.length === 0) {
-				throw new Error("OpenAI V2 remote compaction input is empty");
-			}
+			// An empty converted transcript (or a preserved prefix emptied by
+			// the credential strip) carries nothing worth a remote round trip.
+			// Skip V2 silently like the V1 history check below so compaction
+			// falls through to local summarization instead of recording a
+			// native failure for sending nothing.
+			if (remoteHistory.length === 0) return undefined;
 			const instructions = codexBody
 				? typeof codexBody.instructions === "string"
 					? codexBody.instructions
@@ -1908,8 +1913,8 @@ export async function compact(
 		}
 		let builtV2CredentialId = preResolvedV2CredentialId;
 		try {
-			let v2Request = await buildV2RequestForCredential(builtV2CredentialId);
-			if (v2Request.input.length > 0) {
+			const v2Request = await buildV2RequestForCredential(builtV2CredentialId);
+			if (v2Request !== undefined) {
 				const remote = await withAuth(
 					credentialTracker.key,
 					async key => {
@@ -1917,12 +1922,17 @@ export async function compact(
 						// replays the old row's blobs, so rebuild for the row
 						// actually serving this attempt.
 						const attemptCredentialId = credentialTracker.credentialIdOf(key);
+						let requestForAttempt = v2Request;
 						if (attemptCredentialId !== builtV2CredentialId) {
 							builtV2CredentialId = attemptCredentialId;
-							v2Request = await buildV2RequestForCredential(builtV2CredentialId);
+							const rebuilt = await buildV2RequestForCredential(builtV2CredentialId);
+							// The sibling's strip emptied the input: nothing to
+							// send on this row either.
+							if (rebuilt === undefined) return undefined;
+							requestForAttempt = rebuilt;
 						}
 						servingV2CredentialId = attemptCredentialId;
-						return requestCompactionV2Streaming(model, key, v2Request, signal, {
+						return requestCompactionV2Streaming(model, key, requestForAttempt, signal, {
 							fetch: summaryOptions.fetch,
 							providerSessionState: summaryOptions.providerSessionState,
 							preferWebsockets: summaryOptions.preferWebsockets,
@@ -1931,11 +1941,13 @@ export async function compact(
 					},
 					{ signal },
 				);
-				preserveData = {
-					...preserveData,
-					...storeCompactionV2PreserveData(remote, model, servingV2CredentialId),
-				};
-				usedRemoteCompaction = true;
+				if (remote !== undefined) {
+					preserveData = {
+						...preserveData,
+						...storeCompactionV2PreserveData(remote, model, servingV2CredentialId),
+					};
+					usedRemoteCompaction = true;
+				}
 			}
 		} catch (err) {
 			// swallowing it here would downgrade Esc into "fall back to local
