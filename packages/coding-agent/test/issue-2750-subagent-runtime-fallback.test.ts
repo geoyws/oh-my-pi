@@ -304,7 +304,11 @@ describe("subagent runtime model resolution", () => {
 			} as never,
 			enableLsp: false,
 		});
-		expect(persisted).toEqual({ primary: "primary/bad-runtime-model", chain: ["fallback/working-model"] });
+		expect(persisted).toEqual({
+			primary: "primary/bad-runtime-model",
+			chain: ["fallback/working-model"],
+			exhaustive: true,
+		});
 	});
 
 	it("does not attribute the run to a fallback that never served a turn", async () => {

@@ -39,11 +39,16 @@ export interface RetryFallbackModelLookup {
  * Inputs shared by startup (sdk) and runtime (turn-recovery) fallback-chain
  * resolution. `chains` is pre-expanded so callers can apply the default chain
  * to roles beyond the configured model roles (e.g. a subagent fallback role).
+ * `exhaustiveRoles` names installed chains that own their session end to end:
+ * a `subagent:<id>` chain built from an explicit multi-entry override list.
+ * Resolution returns that chain for any of its rungs and recovery walks it
+ * alone, so the walk can never hop into the current model's own chain.
  */
 export interface RetryFallbackResolutionContext {
 	chains: RetryFallbackChains;
 	getModelRole(role: string): string | undefined;
 	modelLookup: RetryFallbackModelLookup;
+	exhaustiveRoles?: ReadonlySet<string>;
 }
 
 /** Active retry fallback state retained until the primary can be restored. */
@@ -175,13 +180,30 @@ export function getRetryFallbackChains(settings: Settings): RetryFallbackChains 
 /**
  * A dynamic role pinned to one model selector with its own fallback chain.
  * Subagents own one under `subagent:<id>`; `session_init` persists it so cold
- * revival restores the same routing the spawn installed.
+ * revival restores the same routing the spawn installed. `exhaustive` marks a
+ * chain built from an explicit multi-entry override list: it owns its session
+ * end to end and the walk must never leave it for a model-keyed chain.
  */
 export interface RetryFallbackRole {
 	/** Selector the role is assigned (the chain's primary). */
 	primary: string;
 	/** Fallback selectors walked after the primary. */
 	chain: string[];
+	/** True when the chain is an explicit multi-entry override list. */
+	exhaustive?: boolean;
+}
+
+/**
+ * Installed exhaustive chains per session settings. The flag travels inside
+ * {@link RetryFallbackRole} (so `session_init` persists it for cold revival),
+ * but the live chains map holds only selectors — this side table is what the
+ * runtime consults. Session-scoped like the overrides themselves.
+ */
+const exhaustiveRetryFallbackRoles = new WeakMap<Settings, Set<string>>();
+
+/** Names of installed exhaustive chains for `settings` (empty when none). */
+export function getExhaustiveRetryFallbackRoles(settings: Settings): ReadonlySet<string> {
+	return exhaustiveRetryFallbackRoles.get(settings) ?? new Set();
 }
 
 /** Reads the primary and non-empty chain installed for `role`, if any. */
@@ -189,7 +211,9 @@ export function getRetryFallbackRole(settings: Settings, role: string): RetryFal
 	const primary = settings.getModelRole(role);
 	const chain = cfgRetryFallbackChains.get(settings)[role];
 	if (!primary || !Array.isArray(chain) || chain.length === 0) return undefined;
-	return { primary, chain };
+	const roleState: RetryFallbackRole = { primary, chain };
+	if (exhaustiveRetryFallbackRoles.get(settings)?.has(role)) roleState.exhaustive = true;
+	return roleState;
 }
 
 /**
@@ -200,8 +224,18 @@ export function getRetryFallbackRole(settings: Settings, role: string): RetryFal
 export function installRetryFallbackRole(
 	settings: Settings,
 	role: string,
-	{ primary, chain }: RetryFallbackRole,
+	{ primary, chain, exhaustive }: RetryFallbackRole,
 ): void {
+	if (exhaustive) {
+		let roles = exhaustiveRetryFallbackRoles.get(settings);
+		if (!roles) {
+			roles = new Set();
+			exhaustiveRetryFallbackRoles.set(settings, roles);
+		}
+		roles.add(role);
+	} else {
+		exhaustiveRetryFallbackRoles.get(settings)?.delete(role);
+	}
 	const modelRoles: Record<string, string> = {};
 	const existingRoles = settings.getModelRoles();
 	for (const key in existingRoles) {
@@ -420,9 +454,43 @@ function selectorMatchKind(
 }
 
 /**
- * Resolve the chain key for a concrete selector by specificity: exact model,
- * longest matching wildcard, hinted role, then matching role keys with
- * `default` preferred over other shared assignments, then default.
+ * Exhaustive installed chain owning the current selector, if any: the hinted
+ * role when it is exhaustive, else the first exhaustive chain whose rungs
+ * (primary or later entries) include the current model. The rung scan covers
+ * mid-walk models whose primary no longer matches, so a hop off the primary
+ * can never escape into that model's own model-keyed chain.
+ */
+function resolveExhaustiveChainKey(
+	context: RetryFallbackResolutionContext,
+	currentSelector: string,
+	parsedCurrent: RetryFallbackSelector,
+	currentPlainSelector: string | undefined,
+	roleHint?: string,
+): string | undefined {
+	const exhaustive = context.exhaustiveRoles;
+	if (!exhaustive || exhaustive.size === 0) return undefined;
+	if (roleHint && exhaustive.has(roleHint) && Array.isArray(context.chains[roleHint])) return roleHint;
+	const currentBase = formatRetryFallbackBaseSelector(parsedCurrent);
+	for (const key in context.chains) {
+		if (!exhaustive.has(key) || !Array.isArray(context.chains[key])) continue;
+		const primary = getRetryFallbackPrimarySelector(context, key);
+		const rungs = primary ? [primary.raw, ...context.chains[key]] : [...context.chains[key]];
+		const owns = rungs.some(rung => {
+			if (rung === currentSelector || rung === currentPlainSelector) return true;
+			const parsed = parseRetryFallbackSelector(rung, context.modelLookup);
+			if (!parsed || formatRetryFallbackBaseSelector(parsed) !== currentBase) return false;
+			return parsed.thinkingLevel === undefined || parsed.thinkingLevel === parsedCurrent.thinkingLevel;
+		});
+		if (owns) return key;
+	}
+	return undefined;
+}
+
+/**
+ * Resolve the chain key for a concrete selector by specificity: an exhaustive
+ * installed chain first, then exact model, longest matching wildcard, hinted
+ * role, then matching role keys with `default` preferred over other shared
+ * assignments, then default.
  */
 export function resolveRetryFallbackChainKey(
 	context: RetryFallbackResolutionContext,
@@ -445,6 +513,18 @@ export function resolveRetryFallbackChainKey(
 		currentPlainSelector && currentPlainSelector !== currentSelector
 			? (parseRetryFallbackSelector(currentPlainSelector, context.modelLookup) ?? parsedCurrent)
 			: undefined;
+
+	// 0. An exhaustive installed chain owns its session end to end: when the
+	//    current model is one of its rungs it wins over every model-keyed chain,
+	//    so an explicit multi-entry override list can never spend other models.
+	const exhaustiveKey = resolveExhaustiveChainKey(
+		context,
+		currentSelector,
+		parsedCurrent,
+		currentPlainSelector,
+		roleHint,
+	);
+	if (exhaustiveKey) return exhaustiveKey;
 
 	// 1. Model-selector keys — most specific. Parsed exact effort beats
 	//    model-normalized effort, which beats a suffixless (any-effort) key,

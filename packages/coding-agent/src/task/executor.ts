@@ -316,6 +316,8 @@ function installSubagentRetryFallbackChain(args: {
 	);
 	if (selectedIndex < 0) return undefined;
 	const fallbackSelectors = candidates.slice(selectedIndex + 1).map(candidate => candidate.selector);
+	// An explicit multi-entry override list is its own complete retry chain: mark
+	// it exhaustive so the runtime never leaves it for a model-keyed chain.
 	// A single configured model may reuse its role's (or the default) configured chain, but never an implicit parent fallback.
 	const fallbackChain = fallbackSelectors.length > 0 ? fallbackSelectors : inheritedFallbackChain;
 	if (
@@ -327,7 +329,11 @@ function installSubagentRetryFallbackChain(args: {
 	}
 
 	const role = subagentRetryFallbackRole(id);
-	installRetryFallbackRole(settings, role, { primary: candidates[selectedIndex].selector, chain: fallbackChain });
+	installRetryFallbackRole(settings, role, {
+		primary: candidates[selectedIndex].selector,
+		chain: fallbackChain,
+		...(fallbackSelectors.length > 0 ? { exhaustive: true as const } : {}),
+	});
 	return role;
 }
 
