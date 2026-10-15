@@ -1674,6 +1674,14 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.retryLoader.stop();
 			this.retryLoader = undefined;
 		}
+		// The detached session's `provider_retry_wait_end` never reaches us, so a
+		// countdown left set would keep `ensureLoadingAnimation` from restoring
+		// "Working…" for the newly attached session. A later wait mounts afresh
+		// (its start sets the wait id with the loader), so nothing else is stale.
+		if (this.providerRetryLoader) {
+			this.providerRetryLoader.stop();
+			this.providerRetryLoader = undefined;
+		}
 		this.statusContainer.disposeChildren();
 		this.pendingMessagesContainer.disposeChildren();
 		this.#clearJudgmentBatchProgress();
