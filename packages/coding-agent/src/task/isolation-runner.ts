@@ -18,6 +18,7 @@
  *
  * Step 1 happens once per top-level call; steps 2 and 3 are per-spawn.
  */
+import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type * as natives from "@oh-my-pi/pi-natives";
@@ -134,16 +135,179 @@ async function rescueTaskBranch(repoRoot: string, branchName: string, baseSha: s
 /** Resolved repo shared by every isolated spawn in a single call. */
 export interface IsolationContext {
 	repoRoot: string;
+	/**
+	 * `repoRoot`-relative start directory for the child (`""` at the root).
+	 * Set when the task named a subdirectory via `cwd`; the child runs in the
+	 * matching subdirectory of the isolation copy.
+	 */
+	workdirOffset?: string;
+	/**
+	 * Canonical child start directory in the parent checkout (realpath of the
+	 * requested `cwd`, or the caller cwd when absent). Merge-back re-resolves
+	 * it and refuses to write anywhere but {@link IsolationContext.repoRoot}.
+	 */
+	childCwd?: string;
+}
+
+/** Canonical child checkout selected by a task `cwd` override. */
+export interface ResolvedTaskCwd {
+	/** Git root the child is isolated from and merged back into. */
+	repoRoot: string;
+	/** Canonical child start directory (realpath of the requested `cwd`, or the caller cwd when absent). */
+	childCwd: string;
+	/** `repoRoot`-relative offset of `childCwd` (`""` at the root). */
+	workdirOffset: string;
+}
+
+function taskCwdError(requested: string, reason: string): Error {
+	return new Error(`Invalid task "cwd" ${JSON.stringify(requested)}: ${reason}.`);
+}
+
+/**
+ * Police symlinks along the requested path: every link at or below the repo
+ * root must resolve inside that root. Ancestors above the root (e.g. macOS
+ * `/tmp` → `/private/tmp`) are the caller's checkout alias and are ignored —
+ * the walk follows them so a link hidden behind such an alias is still
+ * checked against the canonical root.
+ */
+async function assertNoRepoEscape(requested: string, repoRoot: string): Promise<void> {
+	const parts = path.relative(path.parse(requested).root, requested).split(path.sep).filter(Boolean);
+	let resolved = path.parse(requested).root;
+	for (const part of parts) {
+		const prefix = path.join(resolved, part);
+		let stat: Stats;
+		try {
+			stat = await fs.lstat(prefix);
+		} catch {
+			return;
+		}
+		if (stat.isSymbolicLink()) {
+			const target = await fs.readlink(prefix);
+			const absoluteTarget = path.resolve(path.dirname(prefix), target);
+			const prefixInside = prefix === repoRoot || !path.relative(repoRoot, prefix).startsWith("..");
+			if (prefixInside) {
+				let targetReal = absoluteTarget;
+				try {
+					targetReal = await fs.realpath(absoluteTarget);
+				} catch {}
+				if (targetReal !== repoRoot && path.relative(repoRoot, targetReal).startsWith("..")) {
+					throw taskCwdError(
+						requested,
+						`resolves through a symlink (${prefix} -> ${target}) that points outside its git repository ${JSON.stringify(repoRoot)}; pass the canonical path inside the target checkout instead`,
+					);
+				}
+			}
+			resolved = absoluteTarget;
+		} else {
+			resolved = prefix;
+		}
+	}
+}
+/**
+ * Refuse a path whose lexical checkout disagrees with its resolved repo: the
+ * caller named a path inside one checkout but it resolves into another
+ * through a symlink. `getRepoRoot` discovers lexically (a `<link>/.git`
+ * probe follows the link), so a canonical mismatch against the resolved root
+ * exposes the hop. When the requested path itself is a link into the repo,
+ * the tree naming the link must be that same repo.
+ */
+async function assertSameRepoThroughLexicalTree(normalized: string, repoRoot: string): Promise<void> {
+	let lexicalRoot: string;
+	try {
+		lexicalRoot = await getRepoRoot(normalized);
+	} catch {
+		// No checkout names this path lexically; the resolved root governs.
+		return;
+	}
+	const lexicalCanonical = await fs.realpath(lexicalRoot);
+	if (lexicalCanonical !== repoRoot) {
+		throw taskCwdError(
+			normalized,
+			`names ${JSON.stringify(lexicalRoot)} but resolves into a different git repository ${JSON.stringify(repoRoot)} through a symlink that points outside its git repository; pass the canonical path inside the target checkout instead`,
+		);
+	}
+	if ((await fs.lstat(normalized)).isSymbolicLink()) {
+		let parentRoot: string | undefined;
+		try {
+			parentRoot = await getRepoRoot(path.dirname(normalized));
+		} catch {
+			parentRoot = undefined;
+		}
+		if (parentRoot !== undefined) {
+			const parentCanonical = await fs.realpath(parentRoot);
+			if (parentCanonical !== repoRoot) {
+				throw taskCwdError(
+					normalized,
+					`resolves through a symlink into ${JSON.stringify(repoRoot)} from a different checkout ${JSON.stringify(parentCanonical)} that points outside its git repository; pass the canonical path inside the target checkout instead`,
+				);
+			}
+		}
+	}
+}
+
+/**
+ * Resolve the checkout a task `cwd` names. Absent (or empty) keeps the
+ * caller cwd untouched. Present resolves to realpath and must exist, be a
+ * directory, and sit inside a git work tree; a symlink hop that leaves the
+ * named checkout — along the path or where the path itself is the link — is
+ * refused. Fails closed before allocating any isolation or touching either
+ * tree — no fallback to the caller cwd.
+ */
+export async function resolveTaskCwd(callerCwd: string, requestedCwd?: string): Promise<ResolvedTaskCwd> {
+	if (requestedCwd === undefined || requestedCwd === "") {
+		return { repoRoot: await getRepoRoot(callerCwd), childCwd: callerCwd, workdirOffset: "" };
+	}
+	if (typeof requestedCwd !== "string" || !path.isAbsolute(requestedCwd)) {
+		throw taskCwdError(String(requestedCwd), "must be an absolute path");
+	}
+	const normalized = path.normalize(requestedCwd);
+	let stat: Stats;
+	try {
+		stat = await fs.stat(normalized);
+	} catch (error) {
+		throw taskCwdError(
+			requestedCwd,
+			`path does not exist${error instanceof Error && error.message ? ` (${error.message})` : ""}`,
+		);
+	}
+	if (!stat.isDirectory()) {
+		throw taskCwdError(requestedCwd, "path is not a directory");
+	}
+	const real = await fs.realpath(normalized);
+	let repoRoot: string;
+	try {
+		repoRoot = await getRepoRoot(real);
+	} catch (error) {
+		throw taskCwdError(
+			requestedCwd,
+			`not inside a git work tree${error instanceof Error && error.message ? `: ${error.message}` : ""}`,
+		);
+	}
+	const offset = path.relative(repoRoot, real);
+	if (offset === ".." || offset.startsWith(`..${path.sep}`) || path.isAbsolute(offset)) {
+		throw taskCwdError(requestedCwd, `not inside a git work tree (resolved outside ${JSON.stringify(repoRoot)})`);
+	}
+	await assertNoRepoEscape(normalized, repoRoot);
+	await assertSameRepoThroughLexicalTree(normalized, repoRoot);
+	return { repoRoot, childCwd: real, workdirOffset: offset === "" ? "" : offset };
 }
 
 /**
  * Resolve the git repo root isolated spawns are copied from and merged back
- * into. Throws when the cwd is not inside a git repository; callers surface
- * the error as a task-tool failure. Each spawn captures its own baseline from
- * its isolation copy (see {@link captureIsolationBaseline}).
+ * into. Without `requestedCwd` this is the caller cwd's repo (unchanged
+ * behaviour); with it, the git root of that path, with the child starting in
+ * the matching subdirectory of the isolation. Throws before allocating any
+ * isolation when the path is unusable; callers surface the error as a
+ * task-tool failure. Each spawn captures its own baseline from its isolation
+ * copy (see {@link captureIsolationBaseline}).
  */
-export async function prepareIsolationContext(cwd: string): Promise<IsolationContext> {
-	return { repoRoot: await getRepoRoot(cwd) };
+export async function prepareIsolationContext(callerCwd: string, requestedCwd?: string): Promise<IsolationContext> {
+	const resolved = await resolveTaskCwd(callerCwd, requestedCwd);
+	return {
+		repoRoot: resolved.repoRoot,
+		...(resolved.workdirOffset === "" ? {} : { workdirOffset: resolved.workdirOffset }),
+		childCwd: resolved.childCwd,
+	};
 }
 
 /** Fingerprint of a captured delta, used to skip re-committing an unchanged workspace on release. */
@@ -459,9 +623,16 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 		const isolationBackend = handle.backend;
 		const baseline = await captureIsolationBaseline(isolationDir, opts.context.repoRoot);
 		taskBaseline = baseline;
+		// A task `cwd` naming a subdirectory starts the child in the matching
+		// subdirectory of the isolation copy; capture and merge-back still run
+		// at the repo root, so the offset never widens the write boundary.
+		const childWorktree =
+			opts.context.workdirOffset !== undefined && opts.context.workdirOffset !== ""
+				? path.join(isolationDir, opts.context.workdirOffset)
+				: isolationDir;
 		const result = await runSubprocess({
 			...opts.baseOptions,
-			worktree: isolationDir,
+			worktree: childWorktree,
 			preloadedExtensionPaths: undefined,
 			preloadedPreparedExtensions: undefined,
 			preloadedCustomToolPaths: undefined,
@@ -650,6 +821,26 @@ export interface IsolationMergeOptions {
 	result: SingleResult;
 	repoRoot: string;
 	mergeMode: "patch" | "branch";
+	/**
+	 * The isolation repo root this run was captured from. When present the
+	 * merge refuses to write anywhere else, so a task `cwd` naming another
+	 * checkout can never land in the caller tree.
+	 */
+	expectedRepoRoot?: string;
+}
+
+/**
+ * Fail closed when a merge is aimed at any repo but the one the isolation
+ * was captured from. String comparison is exact on purpose: both sides are
+ * canonical roots from {@link resolveTaskCwd}, so any difference means a
+ * wrong-tree apply.
+ */
+function assertMergeTarget(repoRoot: string, expectedRepoRoot: string | undefined): void {
+	if (expectedRepoRoot !== undefined && path.resolve(repoRoot) !== path.resolve(expectedRepoRoot)) {
+		throw new Error(
+			`Refusing to apply isolated changes to ${JSON.stringify(repoRoot)}: the task was isolated from ${JSON.stringify(expectedRepoRoot)}.`,
+		);
+	}
 }
 
 export interface IsolationMergeOutcome {
@@ -677,6 +868,7 @@ export interface IsolationMergeOutcome {
  */
 export async function mergeIsolatedChanges(opts: IsolationMergeOptions): Promise<IsolationMergeOutcome> {
 	const { result, repoRoot, mergeMode } = opts;
+	assertMergeTarget(repoRoot, opts.expectedRepoRoot);
 	const repo = vcs.requireGit(repoRoot);
 	try {
 		if (mergeMode === "branch") {
@@ -823,6 +1015,8 @@ export interface NestedPatchApplyOptions {
 	changesApplied: boolean | null;
 	/** Branch mode gates nested apply on whether the root branch merged. */
 	mergedBranchForNestedPatches: boolean;
+	/** Isolation repo root the run was captured from; refuses to write anywhere else. */
+	expectedRepoRoot?: string;
 	/** Optional AI commit-message callback for nested commits; falls back to a generic message. */
 	commitMessage?: (diff: string) => Promise<string | null>;
 }
@@ -838,6 +1032,7 @@ export interface NestedPatchApplyOptions {
  */
 export async function applyEligibleNestedPatches(opts: NestedPatchApplyOptions): Promise<string> {
 	const { result, repoRoot, mergeMode, changesApplied, mergedBranchForNestedPatches, commitMessage } = opts;
+	assertMergeTarget(repoRoot, opts.expectedRepoRoot);
 	if (mergeMode === "patch" && changesApplied === false) return "";
 	const nestedPatches = result.nestedPatches ?? [];
 	const eligible =

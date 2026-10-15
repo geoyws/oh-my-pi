@@ -17,7 +17,8 @@ Shared edits need one integration owner{{#if ircEnabled}}; siblings coordinate v
 {{/if}}`schemaMode`: default permissive warns after retries; strict fails.
 {{#if isolationEnabled}}{{#if applyIsolatedChanges}}`isolated`: worktree; successful changes apply to parent.
 {{else}}`isolated`: worktree; changes retained, not applied.
-{{/if}}{{/if}}Children start blank;{{#if ircEnabled}} parent IRC steers immediately;{{/if}} large payloads via `local://<path>`, NEVER inline.
+{{/if}}`cwd`: absolute checkout path the child works in — pass it whenever the assignment names an assigned worktree; isolated runs copy and merge back that repo, never the caller checkout.
+{{/if}}Children start blank;{{#if ircEnabled}} parent IRC steers immediately;{{/if}} large payloads via `local://<path>`, NEVER inline.
 
 # Format
 {{#if batchEnabled}}`context`: shared (`# Goal`, `# Contract` interfaces); NEVER repeat per task.

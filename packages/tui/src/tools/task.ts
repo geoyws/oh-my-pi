@@ -2218,6 +2218,12 @@ export interface TaskItem {
 	tools?: string[];
 	/** Run this spawn in an isolated worktree (batch form; flat form carries it top-level). */
 	isolated?: boolean;
+	/**
+	 * Absolute path of the checkout the child works in. Pass it whenever the
+	 * assignment names an assigned worktree: isolated runs copy and merge back
+	 * that repo (never the caller cwd); non-isolated runs start the child there.
+	 */
+	cwd?: string;
 }
 
 /**
@@ -2249,6 +2255,11 @@ export interface TaskParams {
 	context?: string;
 	/** Run in an isolated worktree (flat form; per-item in batch form). */
 	isolated?: boolean;
+	/**
+	 * Absolute checkout path the child works in (flat form; per-item in batch
+	 * form). See {@link TaskItem.cwd}.
+	 */
+	cwd?: string;
 }
 
 /**

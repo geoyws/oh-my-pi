@@ -43,6 +43,7 @@ import {
 	persistNestedPatches,
 	prepareIsolationContext,
 	renderIsolationSummary,
+	resolveTaskCwd,
 	runIsolatedSubprocess,
 } from "./isolation-runner";
 import { generateTaskName } from "./name-generator";
@@ -57,7 +58,7 @@ import type {
 	StructuredSubagentSchemaSource,
 } from "@oh-my-pi/pi-tui/tools/task";
 import type { WorkPoolYieldItem } from "./workpool-yield";
-import { parseIsolationBackend } from "./worktree";
+import { getRepoRoot, parseIsolationBackend } from "./worktree";
 
 import {
 	cfgIsolationBackend,
@@ -124,6 +125,12 @@ export interface StructuredSubagentRequest {
 	invokedAt?: number;
 	acquiredAt?: number;
 	isolation?: StructuredSubagentIsolationControls;
+	/**
+	 * Absolute checkout path the child works in. Isolated runs copy and merge
+	 * back that repo (never the caller cwd); non-isolated runs start there.
+	 * Validated fail-closed before any isolation is allocated.
+	 */
+	cwd?: string;
 	/** The parent agent name forbidden from recursively spawning itself. */
 	blockedAgent?: string;
 	/** Preserve a completed temporary artifacts directory for an agent:// handle. */
@@ -521,6 +528,7 @@ function buildExecutorOptions(
 	policy: EffectiveSubagentPolicy,
 	lease: ArtifactLease,
 	id: string,
+	childCwd?: string,
 ): ExecutorOptions {
 	const { session } = request;
 	const { skills, autoloadSkills } = resolveAutoloadSkills(session, policy.agent);
@@ -528,7 +536,9 @@ function buildExecutorOptions(
 	const restrictToolNames = policy.planMode || session.restrictToolNames === true;
 	const enableMCP = !restrictToolNames && (session.enableMCP ?? true);
 	return {
-		cwd: session.cwd,
+		// A task `cwd` names the child's checkout; isolated runs override this
+		// with their worktree below, non-isolated runs start here directly.
+		cwd: childCwd ?? session.cwd,
 		additionalDirectories: session.additionalDirectories,
 		getApiKey: session.getApiKey,
 		credentialSourceSessionId: session.getCredentialSourceSessionId?.(),
@@ -749,6 +759,26 @@ function describeSalvagedWork(result: SingleResult): string {
  * lease or child dispatch; callers keep responsibility for their result text.
  */
 export async function runStructuredSubagent(request: StructuredSubagentRequest): Promise<StructuredSubagentResult> {
+	// Resolve an explicit `cwd` before leasing artifacts or allocating any
+	// isolation: a bad path fails closed here, touching neither tree. Absent
+	// stays exactly as before — notably, non-isolated runs outside any repo
+	// never need a repo root, so nothing resolves here in that case.
+	let childCwd: string | undefined;
+	if (request.cwd !== undefined && request.cwd !== "") {
+		try {
+			childCwd = (await resolveTaskCwd(request.session.cwd, request.cwd)).childCwd;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			const isolated = request.isolation?.requested === true;
+			throw new StructuredSubagentError(
+				isolated ? "isolation" : "preflight",
+				isolated
+					? `Isolated subagent execution could not be prepared: ${message}`
+					: `Subagent execution could not be prepared: ${message}`,
+				{ cause: error },
+			);
+		}
+	}
 	const policy = await applySpawnHook(request, await resolveEffectiveSubagentPolicy(request));
 	const lease = await leaseArtifacts(request.session, request.invocationKind);
 	let changesApplied: boolean | null = null;
@@ -771,7 +801,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			...request.identity,
 			label: request.identity?.label ?? (request.invocationKind === "eval" ? "EvalAgent" : undefined),
 		});
-		const baseOptions = buildExecutorOptions(request, policy, lease, id);
+		const baseOptions = buildExecutorOptions(request, policy, lease, id, childCwd);
 		baseOptions.onCleanupDeferred = completion => {
 			deferredCleanup = completion;
 		};
@@ -779,7 +809,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 		let isolationContext: IsolationContext | null = null;
 		if (policy.isIsolated) {
 			try {
-				isolationContext = await prepareIsolationContext(request.session.cwd);
+				isolationContext = await prepareIsolationContext(request.session.cwd, request.cwd);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				throw new StructuredSubagentError(
@@ -823,10 +853,22 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			!result.error &&
 			!result.aborted
 		) {
+			// Never merge into the caller tree when `cwd` named another repo:
+			// re-resolve the recorded child checkout and refuse a mismatch.
+			if (isolationContext.childCwd !== undefined) {
+				const freshRoot = await getRepoRoot(isolationContext.childCwd);
+				if (freshRoot !== isolationContext.repoRoot) {
+					throw new StructuredSubagentError(
+						"isolation",
+						`Refusing to apply isolated changes to ${JSON.stringify(isolationContext.repoRoot)}: the child checkout ${JSON.stringify(isolationContext.childCwd)} now resolves to ${JSON.stringify(freshRoot)}.`,
+					);
+				}
+			}
 			const outcome = await mergeIsolatedChanges({
 				result,
 				repoRoot: isolationContext.repoRoot,
 				mergeMode: policy.mergeMode,
+				expectedRepoRoot: isolationContext.repoRoot,
 			});
 			mergeSummary = outcome.summary;
 			changesApplied = outcome.changesApplied;
@@ -837,6 +879,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 					mergeMode: policy.mergeMode,
 					changesApplied: outcome.changesApplied,
 					mergedBranchForNestedPatches: outcome.mergedBranchForNestedPatches,
+					expectedRepoRoot: isolationContext.repoRoot,
 					commitMessage: makeIsolationCommitMessage(request.session)(),
 				});
 				mergeSummary += nestedPatchSummary;

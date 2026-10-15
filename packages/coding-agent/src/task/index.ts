@@ -291,6 +291,7 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
 	if ("tools" in params) item.tools = params.tools;
 	if ("effort" in params) item.effort = params.effort;
 	if ("isolated" in params) item.isolated = params.isolated;
+	if ("cwd" in params) item.cwd = params.cwd;
 	return [item];
 }
 
@@ -317,6 +318,11 @@ function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string
 		spawn.isolated = item.isolated;
 	} else if ("isolated" in params) {
 		spawn.isolated = params.isolated;
+	}
+	if (item.cwd !== undefined) {
+		spawn.cwd = item.cwd;
+	} else if ("cwd" in params) {
+		spawn.cwd = params.cwd;
 	}
 	return spawn;
 }
@@ -1646,6 +1652,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				invokedAt: launchTiming?.invokedAt,
 				acquiredAt: launchTiming?.acquiredAt,
 				...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
+				...("cwd" in params ? { cwd: params.cwd } : {}),
 				blockedAgent: this.#blockedAgent,
 				enableLsp: (this.session.enableLsp ?? true) && cfgTaskEnableLsp.get(this.session.settings),
 				enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
