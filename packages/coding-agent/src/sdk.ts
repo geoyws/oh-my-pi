@@ -222,7 +222,12 @@ import {
 } from "./session/session-tools";
 import { anthropicSlowModeHasNoSiblingHeadroom } from "./session/anthropic-slow-mode";
 import { CacheWarmer } from "./session/cache-warmer";
-import { createSettingsAwareStreamFn, resolveOpenAIWebsocketPreference } from "./session/settings-stream-fn";
+import {
+	createSettingsAwareStreamFn,
+	resolveOpenAIWebsocketPreference,
+	type ProviderRetryWaitObserver,
+	type ProviderRetryWaitStreamRole,
+} from "./session/settings-stream-fn";
 import { SnapcompactInlineTransformer } from "./session/snapcompact-inline";
 import { createSnapcompactSavingsRecorder } from "./session/snapcompact-savings-journal";
 import { createSpeculativeToolExecutionConfig } from "./speculation/host";
@@ -4274,37 +4279,80 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// the session drives. Wrapped in a per-provider concurrency limiter so
 		// each LLM HTTP request — not the whole subagent lifecycle — holds the
 		// slot, preventing the nested-spawn deadlock from issue #3749.
-		const settingsBoundStreamFn = wrapStreamFnWithBlobUrlFallback(
-			wrapStreamFnWithProviderConcurrency(
-				settings,
-				createSettingsAwareStreamFn(settings, undefined, {
-					canAutoAccept: streamModel =>
-						anthropicSlowModeHasNoSiblingHeadroom(modelRegistry.authStorage, streamModel, session?.sessionId),
-					notify: (level, message) => session?.emitNotice(level, message, "anthropic-slow-mode"),
-					onLane: lane => session?.noteAnthropicSlowModeLane(lane),
-				}),
-			),
-			() => blobBroker.current,
-		);
+		// Provider-internal retry backoffs (pi-ai sleeps between its own stream
+		// retries) are otherwise invisible — the UI shows a stalled turn. Each
+		// role chain carries an observer that relays them to the session so the
+		// TUI can show a countdown. `session` is late-bound below, so events
+		// raised before construction are dropped. One shared waitId counter
+		// across every role keeps concurrent waits pairable with their own end.
+		let nextProviderRetryWaitId = 0;
+		const makeProviderRetryWaitObserver = (role: ProviderRetryWaitStreamRole): ProviderRetryWaitObserver => ({
+			onStart: info => {
+				nextProviderRetryWaitId += 1;
+				const waitId = nextProviderRetryWaitId;
+				session?.emitProviderRetryWait({ type: "provider_retry_wait_start", ...info, waitId, role });
+				return waitId;
+			},
+			onEnd: result => {
+				session?.emitProviderRetryWait({
+					type: "provider_retry_wait_end",
+					aborted: result.aborted,
+					waitId: result.waitId,
+				});
+			},
+		});
+		const slowModeStreamContext = {
+			canAutoAccept: (streamModel: Model) =>
+				anthropicSlowModeHasNoSiblingHeadroom(modelRegistry.authStorage, streamModel, session?.sessionId),
+			notify: (level: "info" | "warning" | "error", message: string) =>
+				session?.emitNotice(level, message, "anthropic-slow-mode"),
+			onLane: (lane: string) => session?.noteAnthropicSlowModeLane(lane),
+		};
+		const makeRoleBoundStreamFn = (role: ProviderRetryWaitStreamRole): StreamFn =>
+			wrapStreamFnWithBlobUrlFallback(
+				wrapStreamFnWithProviderConcurrency(
+					settings,
+					createSettingsAwareStreamFn(
+						settings,
+						undefined,
+						slowModeStreamContext,
+						makeProviderRetryWaitObserver(role),
+					),
+				),
+				() => blobBroker.current,
+			);
 		// Outbound credential-pattern redaction follows THIS session's `secrets.enabled` per
 		// request, not the process-wide switch (the newest effect holder's): concurrent ACP/SDK
 		// sessions in one process each keep their own policy.
-		const settingsAwareStreamFn: StreamFn = (streamModel, context, streamOptions) =>
-			withCredentialRedaction(cfgSecretsEnabled.get(settings), () =>
-				settingsBoundStreamFn(streamModel, context, streamOptions),
-			);
-		// Primary-agent (and its auto-learn capture twin) provider options read per
-		// request, so `/settings` changes to budgets, Kimi format, or the Codex
-		// websocket policy reach the next call without a session recreate.
-		const primaryStreamFn: StreamFn = (streamModel, context, streamOptions) => {
-			const kimiApiFormat = cfgProvidersKimiApiFormat.get(settings);
-			return settingsAwareStreamFn(streamModel, context, {
-				...streamOptions,
-				thinkingBudgets: streamOptions?.thinkingBudgets ?? cfgThinkingBudgets.get(settings),
-				kimiApiFormat: streamOptions?.kimiApiFormat ?? (kimiApiFormat === "auto" ? undefined : kimiApiFormat),
-				preferWebsockets: streamOptions?.preferWebsockets ?? resolveOpenAIWebsocketPreference(settings),
-			});
-		};
+		const withSessionCredentialRedaction =
+			(bound: StreamFn): StreamFn =>
+			(streamModel, context, streamOptions) =>
+				withCredentialRedaction(cfgSecretsEnabled.get(settings), () => bound(streamModel, context, streamOptions));
+		const settingsBoundStreamFn = makeRoleBoundStreamFn("main");
+		const settingsAwareStreamFn: StreamFn = withSessionCredentialRedaction(settingsBoundStreamFn);
+		// Primary-agent provider options read per request, so `/settings` changes
+		// to budgets, Kimi format, or the Codex websocket policy reach the next
+		// call without a session recreate.
+		const withPrimaryProviderOptions =
+			(aware: StreamFn): StreamFn =>
+			(streamModel, context, streamOptions) => {
+				const kimiApiFormat = cfgProvidersKimiApiFormat.get(settings);
+				return aware(streamModel, context, {
+					...streamOptions,
+					thinkingBudgets: streamOptions?.thinkingBudgets ?? cfgThinkingBudgets.get(settings),
+					kimiApiFormat: streamOptions?.kimiApiFormat ?? (kimiApiFormat === "auto" ? undefined : kimiApiFormat),
+					preferWebsockets: streamOptions?.preferWebsockets ?? resolveOpenAIWebsocketPreference(settings),
+				});
+			};
+		const primaryStreamFn: StreamFn = withPrimaryProviderOptions(settingsAwareStreamFn);
+		// Side-channel (`/btw`, `/omfg`, IRC auto-replies, handoff) and advisor
+		// chains share the session's waitId counter but report their own role,
+		// so a side backoff never unmounts the main turn's countdown. The
+		// auto-learn capture twin rides the side chain: its retries are side
+		// work even while a main turn is streaming.
+		const sideSettingsAwareStreamFn: StreamFn = withSessionCredentialRedaction(makeRoleBoundStreamFn("side"));
+		const sidePrimaryStreamFn: StreamFn = withPrimaryProviderOptions(sideSettingsAwareStreamFn);
+		const advisorSettingsAwareStreamFn: StreamFn = withSessionCredentialRedaction(makeRoleBoundStreamFn("advisor"));
 		// Prompt-cache warmer for the main agent loop only: replays the last
 		// request through the same primary wrapper just before the entry would
 		// expire, so idle gaps do not force a full-prefix cache re-write.
@@ -4629,8 +4677,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			transformProviderContext,
 			onPayload,
 			onResponse,
-			sideStreamFn: settingsAwareStreamFn,
-			advisorStreamFn: settingsAwareStreamFn,
+			sideStreamFn: sideSettingsAwareStreamFn,
+			advisorStreamFn: advisorSettingsAwareStreamFn,
 			convertToLlm: convertToLlmFinal,
 			rebuildSystemPrompt,
 			getXdevToolEntries: () => (toolSession.xdev ? xdevEntries(toolSession.xdev) : []),
@@ -5205,7 +5253,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					hideThinkingSummary: agent.hideThinkingSummary,
 					maxRetryDelayMs: agent.maxRetryDelayMs,
 					getToolContext: toolCall => toolContextStore.getContext(toolCall),
-					streamFn: primaryStreamFn,
+					streamFn: sidePrimaryStreamFn,
 					transformToolCallArguments,
 					// No fallback resolver. The capture agent advertises only
 					// `learn`/`manage_skill`, both of which stay top-level and never

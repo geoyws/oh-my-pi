@@ -1788,9 +1788,13 @@ async function openInitialCodexEventStream(
 					if (requestSetup.requestSignal.aborted) throw requestSetup.requestSignal.reason;
 					const deadlineError = operationDeadlineExceeded(options, websocketRetryDelayMs);
 					if (deadlineError) throw deadlineError;
-					await scheduler.wait(websocketRetryDelayMs, {
-						signal: requestSetup.requestSignal,
-					});
+					// The hook only observes: same delay, same signal, same abort rejection.
+					if (options?.providerRetryWait)
+						await options.providerRetryWait(websocketRetryDelayMs, requestSetup.requestSignal, {
+							attempt: websocketRetries,
+							maxAttempts: websocketRetryBudget,
+						});
+					else await scheduler.wait(websocketRetryDelayMs, { signal: requestSetup.requestSignal });
 					continue;
 				}
 				break;
@@ -3108,9 +3112,13 @@ class CodexStreamProcessor {
 		const whitespaceRetryDelayMs = CODEX_WHITESPACE_LOOP_RETRY_DELAY_MS * this.runtime.whitespaceLoopRetries;
 		const whitespaceDeadlineError = operationDeadlineExceeded(this.options, whitespaceRetryDelayMs);
 		if (whitespaceDeadlineError) throw whitespaceDeadlineError;
-		await scheduler.wait(whitespaceRetryDelayMs, {
-			signal: this.requestSetup.requestSignal,
-		});
+		// The hook only observes: same delay, same signal, same abort rejection.
+		if (this.options?.providerRetryWait)
+			await this.options.providerRetryWait(whitespaceRetryDelayMs, this.requestSetup.requestSignal, {
+				attempt: this.runtime.whitespaceLoopRetries,
+				maxAttempts: CODEX_WHITESPACE_LOOP_RETRY_LIMIT,
+			});
+		else await scheduler.wait(whitespaceRetryDelayMs, { signal: this.requestSetup.requestSignal });
 
 		if (this.runtime.transport === "websocket" && websocketState) {
 			await this.#reopenWebSocketStream(websocketState);
@@ -3196,9 +3204,13 @@ class CodexStreamProcessor {
 		const reconnectDelayMs = CODEX_WEBSOCKET_RETRY_DELAY_MS * Math.max(1, this.runtime.websocketStreamRetries);
 		const reconnectDeadlineError = operationDeadlineExceeded(this.options, reconnectDelayMs);
 		if (reconnectDeadlineError) throw reconnectDeadlineError;
-		await scheduler.wait(reconnectDelayMs, {
-			signal: this.requestSetup.requestSignal,
-		});
+		// The hook only observes: same delay, same signal, same abort rejection.
+		if (this.options?.providerRetryWait)
+			await this.options.providerRetryWait(reconnectDelayMs, this.requestSetup.requestSignal, {
+				attempt: this.runtime.websocketStreamRetries,
+				maxAttempts: CODEX_WEBSOCKET_RETRY_BUDGET,
+			});
+		else await scheduler.wait(reconnectDelayMs, { signal: this.requestSetup.requestSignal });
 		await this.#reopenWebSocketStream(websocketState);
 		return true;
 	}
@@ -3353,9 +3365,13 @@ class CodexStreamProcessor {
 			const replayDelayMs = CODEX_WEBSOCKET_RETRY_DELAY_MS * Math.max(1, this.runtime.websocketStreamRetries);
 			const replayDeadlineError = operationDeadlineExceeded(this.options, replayDelayMs);
 			if (replayDeadlineError) throw replayDeadlineError;
-			await scheduler.wait(replayDelayMs, {
-				signal: this.requestSetup.requestSignal,
-			});
+			// The hook only observes: same delay, same signal, same abort rejection.
+			if (this.options?.providerRetryWait)
+				await this.options.providerRetryWait(replayDelayMs, this.requestSetup.requestSignal, {
+					attempt: this.runtime.websocketStreamRetries,
+					maxAttempts: CODEX_WEBSOCKET_RETRY_BUDGET,
+				});
+			else await scheduler.wait(replayDelayMs, { signal: this.requestSetup.requestSignal });
 			await this.#reopenWebSocketStream(state);
 			return true;
 		}
@@ -3449,9 +3465,13 @@ class CodexStreamProcessor {
 		const providerRetryDelayMs = CODEX_RETRY_DELAY_MS * this.runtime.providerRetryAttempt;
 		const providerDeadlineError = operationDeadlineExceeded(this.options, providerRetryDelayMs);
 		if (providerDeadlineError) throw providerDeadlineError;
-		await scheduler.wait(providerRetryDelayMs, {
-			signal: this.requestSetup.requestSignal,
-		});
+		// The hook only observes: same delay, same signal, same abort rejection.
+		if (this.options?.providerRetryWait)
+			await this.options.providerRetryWait(providerRetryDelayMs, this.requestSetup.requestSignal, {
+				attempt: this.runtime.providerRetryAttempt,
+				maxAttempts: CODEX_MAX_RETRIES,
+			});
+		else await scheduler.wait(providerRetryDelayMs, { signal: this.requestSetup.requestSignal });
 
 		if (this.runtime.transport === "websocket" && websocketState) {
 			await this.#reopenWebSocketStream(websocketState);

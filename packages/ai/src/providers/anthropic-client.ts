@@ -20,14 +20,14 @@
  *   `retry-after`, otherwise exponential backoff (0.5s * 2^n, capped at 8s,
  *   with up to 25% jitter).
  */
-import { scheduler } from "node:timers/promises";
 import * as AIError from "../error";
 import { AnthropicApiError, AnthropicConnectionError, AnthropicConnectionTimeoutError } from "../error";
 import { type OperationDeadlineOptions, operationDeadlineExceeded } from "../utils/operation-deadline";
+import { waitForRetry } from "../utils/retry-wait";
 
 export { AnthropicApiError, AnthropicConnectionError, AnthropicConnectionTimeoutError };
 
-import type { FetchImpl } from "../types";
+import type { FetchImpl, ProviderRetryWaitFn } from "../types";
 import type { MessageCreateParams } from "./anthropic-wire";
 
 /** Default pre-response timeout, matching the SDK's 10-minute default. */
@@ -101,6 +101,12 @@ export interface AnthropicClientOptions {
 	defaultHeaders?: Record<string, string>;
 	fetch?: FetchImpl;
 	fetchOptions?: AnthropicFetchOptions;
+	/**
+	 * Reports this client's own retry sleeps (429/529/5xx and connection
+	 * errors). Without it the sleeps are invisible above the transport, so a
+	 * multi-second overload backoff reads as a hung request.
+	 */
+	providerRetryWait?: ProviderRetryWaitFn;
 }
 
 function createAbortError(): Error {
@@ -282,7 +288,7 @@ export class AnthropicHttpClient {
 			} catch (error) {
 				if (callerSignal?.aborted) throw createAbortError();
 				if (attempt < maxRetries) {
-					await this.#backoff(attempt, undefined, callerSignal, options);
+					await this.#backoff(attempt, maxRetries, undefined, callerSignal, options);
 					continue;
 				}
 				if (error instanceof AIError.AnthropicConnectionTimeoutError) throw error;
@@ -301,7 +307,7 @@ export class AnthropicHttpClient {
 					throw await AIError.AnthropicApiError.fromResponse(response, callerSignal);
 				}
 				await response.body?.cancel().catch(() => {});
-				await this.#backoff(attempt, response.headers, callerSignal, options);
+				await this.#backoff(attempt, maxRetries, response.headers, callerSignal, options);
 				continue;
 			}
 
@@ -345,6 +351,7 @@ export class AnthropicHttpClient {
 
 	async #backoff(
 		attempt: number,
+		maxRetries: number,
 		responseHeaders: Headers | undefined,
 		signal: AbortSignal | undefined,
 		deadline: OperationDeadlineOptions | undefined,
@@ -359,7 +366,12 @@ export class AnthropicHttpClient {
 		const deadlineError = operationDeadlineExceeded(deadline, delayMs);
 		if (deadlineError) throw deadlineError;
 		try {
-			await scheduler.wait(delayMs, { signal });
+			// The hook only observes the wait: same delay, same signal, and an
+			// abort still surfaces as the canonical abort error below.
+			await waitForRetry(this.#options.providerRetryWait, delayMs, signal, {
+				attempt: attempt + 1,
+				maxAttempts: maxRetries,
+			});
 		} catch {
 			throw createAbortError();
 		}

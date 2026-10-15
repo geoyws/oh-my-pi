@@ -14,7 +14,13 @@
  * classifier and are separately bounded by the caller's policy.
  */
 import * as AIError from "../error";
-import type { AssistantMessage, AssistantMessageEvent, Context } from "../types";
+import type {
+	AssistantMessage,
+	AssistantMessageEvent,
+	Context,
+	ProviderRetryAttemptInfo,
+	ProviderRetryWaitFn,
+} from "../types";
 import { AssistantMessageEventStream } from "./event-stream";
 import { type OperationDeadlineOptions, markOperationProgress, operationDeadlineExceeded } from "./operation-deadline";
 import { waitForRetry } from "./retry-wait";
@@ -60,7 +66,7 @@ function isMeaningfulCompletionEvent(event: AssistantMessageEvent): boolean {
 
 interface StreamRetryOptions extends OperationDeadlineOptions {
 	signal?: AbortSignal;
-	providerRetryWait?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
+	providerRetryWait?: ProviderRetryWaitFn;
 	acceptEmptyResponse?: boolean;
 }
 
@@ -163,12 +169,17 @@ export function withReplaySafeStreamRetry<M, O extends StreamRetryOptions>(
 				);
 
 			let delayMs: number | undefined;
+			// Two independent budgets share one sleep; report whichever one is
+			// spending an attempt so a UI can show the right counter.
+			let retryInfo: ProviderRetryAttemptInfo | undefined;
 			if (retryEmpty) {
 				delayMs = EMPTY_COMPLETION_BASE_DELAY_MS * 2 ** emptyRetries;
 				emptyRetries++;
+				retryInfo = { attempt: emptyRetries, maxAttempts: MAX_EMPTY_COMPLETION_RETRIES };
 			} else if (retryProviderError) {
 				delayMs = EMPTY_COMPLETION_BASE_DELAY_MS * 2 ** providerErrorRetries;
 				providerErrorRetries++;
+				retryInfo = { attempt: providerErrorRetries, maxAttempts: policy.maxProviderErrorRetries ?? 0 };
 			}
 
 			if (delayMs !== undefined && !signal?.aborted) {
@@ -182,7 +193,7 @@ export function withReplaySafeStreamRetry<M, O extends StreamRetryOptions>(
 					return;
 				}
 				try {
-					await waitForRetry(options?.providerRetryWait, delayMs, signal);
+					await waitForRetry(options?.providerRetryWait, delayMs, signal, retryInfo);
 				} catch (waitError) {
 					flush();
 					if (signal?.aborted) {

@@ -244,7 +244,7 @@ describe("provider operation deadline", () => {
 
 		expect(attempt).toBe(2);
 		// The budget must not shorten or skip a retry it can afford.
-		expect(providerRetryWait).toHaveBeenCalledWith(30_000, undefined);
+		expect(providerRetryWait).toHaveBeenCalledWith(30_000, undefined, expect.objectContaining({ attempt: 1 }));
 		expect(result.stopReason).toBe("stop");
 		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "recovered" }]);
 	});

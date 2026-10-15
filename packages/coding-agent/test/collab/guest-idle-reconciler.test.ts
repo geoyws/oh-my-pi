@@ -130,6 +130,24 @@ describe("reconcileGuestIdleHostState", () => {
 		reconcileGuestIdleHostState(ctx, false);
 		expect(loaderStop).toHaveBeenCalledTimes(1);
 	});
+
+	it("stops a replicated provider-retry countdown whose wait_end never arrived", () => {
+		// A reconnect can drop `provider_retry_wait_end`. The next idle state
+		// frame is then the only thing that can retire the countdown; leaving it
+		// pinned would also suppress "Working…" on every later turn, because
+		// `ensureLoadingAnimation` yields to an owned status area.
+		const { ctx, visibleChildren } = makeCtx(false);
+		const countdownStop: Mock<() => void> = mock(() => {});
+		const countdown = { stop: countdownStop };
+		ctx.providerRetryLoader = countdown;
+		visibleChildren.push(countdown);
+
+		reconcileGuestIdleHostState(ctx, false);
+
+		expect(countdownStop).toHaveBeenCalledTimes(1);
+		expect(ctx.providerRetryLoader).toBeUndefined();
+		expect(visibleChildren).toEqual([]);
+	});
 });
 
 describe("reconcileGuestSnapshotHostState", () => {
@@ -149,6 +167,7 @@ describe("reconcileGuestSnapshotHostState", () => {
 			ensureLoadingAnimation,
 			autoCompactionLoader: undefined,
 			retryLoader: undefined,
+			providerRetryLoader: undefined,
 		};
 		reconcileGuestSnapshotHostState(ctx, false);
 		const stoppedAt = statusLine.getActiveMs();
@@ -172,6 +191,7 @@ describe("reconcileGuestSnapshotHostState", () => {
 			ensureLoadingAnimation,
 			autoCompactionLoader: undefined,
 			retryLoader: undefined,
+			providerRetryLoader: undefined,
 		};
 		reconcileGuestSnapshotHostState(ctx, true);
 		expect(markActivityStart).toHaveBeenCalledTimes(1);
@@ -199,6 +219,7 @@ describe("reconcileGuestSnapshotHostState", () => {
 			autoCompactionLoader:
 				staleMaintenanceLoader as unknown as GuestSnapshotActivityReconcilerCtx["autoCompactionLoader"],
 			retryLoader: undefined,
+			providerRetryLoader: undefined,
 		};
 
 		clearGuestTransientStatus(ctx);
@@ -220,6 +241,7 @@ describe("reconcileGuestSnapshotHostState", () => {
 			ensureLoadingAnimation,
 			autoCompactionLoader: undefined,
 			retryLoader: {} as GuestSnapshotActivityReconcilerCtx["retryLoader"],
+			providerRetryLoader: undefined,
 		};
 		reconcileGuestSnapshotHostState(ctx, true);
 		expect(ensureLoadingAnimation).not.toHaveBeenCalled();
@@ -234,6 +256,7 @@ describe("reconcileGuestSnapshotHostState", () => {
 			ensureLoadingAnimation,
 			autoCompactionLoader: {} as GuestSnapshotActivityReconcilerCtx["autoCompactionLoader"],
 			retryLoader: undefined,
+			providerRetryLoader: undefined,
 		};
 		reconcileGuestSnapshotHostState(ctx, true);
 		expect(ensureLoadingAnimation).not.toHaveBeenCalled();

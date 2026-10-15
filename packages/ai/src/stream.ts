@@ -63,6 +63,7 @@ import type {
 	FetchImpl,
 	Model,
 	OptionsForApi,
+	ProviderRetryWaitFn,
 	SimpleStreamOptions,
 	StreamOptions,
 	ThinkingBudgets,
@@ -1095,6 +1096,7 @@ async function resolveWithThinkingLoopRetries(
 	signal: AbortSignal | undefined,
 	dispatch: () => AssistantMessageEventStream,
 	onAttempt?: (message: AssistantMessage) => void,
+	providerRetryWait?: ProviderRetryWaitFn,
 ): Promise<AssistantMessage> {
 	const dispatchAttempt = async (): Promise<AssistantMessage> => {
 		const response = dispatch();
@@ -1116,7 +1118,16 @@ async function resolveWithThinkingLoopRetries(
 		// backoff, so there is no nested-retry product to bound here.
 		signal?.throwIfAborted();
 		const delay = Math.min(THINKING_LOOP_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1), THINKING_LOOP_RETRY_MAX_DELAY_MS);
-		await scheduler.wait(delay, { signal });
+		// Each attempt re-issues the whole request, so from the caller's side of
+		// `complete`/`completeSimple` this sleep is as invisible as a provider's
+		// own retry sleep. The hook only observes: same delay, same signal.
+		if (providerRetryWait)
+			await providerRetryWait(delay, signal, {
+				attempt,
+				// The budget counts dispatches; the retry budget is one fewer.
+				maxAttempts: THINKING_LOOP_MAX_ATTEMPTS - 1,
+			});
+		else await scheduler.wait(delay, { signal });
 		message = await dispatchAttempt();
 		thinkingLoopRetry = isRetryableThinkingLoop(message);
 	}
@@ -1129,7 +1140,12 @@ export async function complete<TApi extends Api>(
 	context: Context,
 	options?: OptionsForApi<TApi>,
 ): Promise<AssistantMessage> {
-	return resolveWithThinkingLoopRetries(options?.signal, () => stream(model, context, options));
+	return resolveWithThinkingLoopRetries(
+		options?.signal,
+		() => stream(model, context, options),
+		undefined,
+		options?.providerRetryWait,
+	);
 }
 
 type AuthRetryFailure = {
@@ -1601,6 +1617,7 @@ export async function completeSimple<TApi extends Api>(
 		options?.signal,
 		() => streamSimple(model, context, sessionOptions),
 		onAttempt,
+		options?.providerRetryWait,
 	);
 }
 
@@ -1856,6 +1873,10 @@ function mapOptionsForApi<TApi extends Api>(
 		maxRetryDelayMs: options?.maxRetryDelayMs,
 		operationTimeoutMs: options?.operationTimeoutMs,
 		operationDeadlineAt: options?.operationDeadlineAt,
+		// Without this the hook is silently dropped here: every provider reads it
+		// off its own `OptionsForApi`, so a caller-supplied retry-wait observer
+		// never reached the retry loops that honour it.
+		providerRetryWait: options?.providerRetryWait,
 		metadata: options?.metadata,
 		taskBudget: options?.taskBudget,
 		sessionId: options?.sessionId,

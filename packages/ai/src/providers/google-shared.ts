@@ -1098,7 +1098,14 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 				const deadlineError = operationDeadlineExceeded(options, emptyRetryDelayMs);
 				if (deadlineError) throw deadlineError;
 				try {
-					await scheduler.wait(emptyRetryDelayMs, { signal: options?.signal });
+					// The hook only observes: same delay, same signal, and the catch
+					// below still converts an abort into the canonical AbortError.
+					if (options?.providerRetryWait)
+						await options.providerRetryWait(emptyRetryDelayMs, options.signal, {
+							attempt: emptyAttempt + 1,
+							maxAttempts: MAX_EMPTY_STREAM_RETRIES,
+						});
+					else await scheduler.wait(emptyRetryDelayMs, { signal: options?.signal });
 				} catch {
 					throw new AIError.AbortError();
 				}

@@ -10,15 +10,17 @@
  * OpenRouter never saw `providers.openrouterVariant`, breaking sticky routing
  * and OpenRouter response-cache hits across advisor calls.
  */
+import { scheduler } from "node:timers/promises";
 import {
 	fitOutputTokensToContextWindow,
 	type StreamFn,
 	Tokenizer,
 	tokenizerEncodingForModel,
 } from "@oh-my-pi/pi-agent-core";
-import { type Model, type SimpleStreamOptions, streamSimple } from "@oh-my-pi/pi-ai";
+import { type Model, type ProviderRetryAttemptInfo, type SimpleStreamOptions, streamSimple } from "@oh-my-pi/pi-ai";
 import { serverSideFallbackModels } from "@oh-my-pi/pi-catalog/compat/server-side-fallback";
 import type { Encoding } from "@oh-my-pi/pi-natives";
+import { logger } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
 import { type AnthropicSlowModeLanes, anthropicSlowModeLanes } from "./anthropic-slow-mode";
 
@@ -67,6 +69,35 @@ export interface SettingsStreamSlowModeContext {
 	onLane?: (lane: string) => void;
 }
 
+/** Describes a provider-internal retry backoff that is about to be slept through. */
+export interface ProviderRetryWaitInfo {
+	delayMs: number;
+	model: string;
+	provider: string;
+	api: string;
+	/** 1-based retry index, when the waiting retry loop tracks one. */
+	attempt?: number;
+	/** Retry budget of that loop, when known. */
+	maxAttempts?: number;
+}
+
+/** Which stream role a provider-internal retry backoff was observed on. */
+export type ProviderRetryWaitStreamRole = "main" | "advisor" | "side";
+
+/**
+ * Observer notified around provider-internal retry backoffs.
+ *
+ * `onStart` allocates the wait's correlation id and returns it; the wrapper
+ * threads it back into `onEnd` so concurrent waits on different streams pair
+ * up even when their sleeps overlap. Ids must be unique across every role
+ * sharing the session — a per-role counter would collide the moment a main
+ * turn and an advisor turn back off together.
+ */
+export interface ProviderRetryWaitObserver {
+	onStart(info: ProviderRetryWaitInfo): number;
+	onEnd(result: { aborted: boolean; waitId: number }): void;
+}
+
 /**
  * Build a {@link StreamFn} that reads provider routing/guard settings from
  * `settings` per call and forwards to `base` (defaults to `streamSimple`).
@@ -76,11 +107,17 @@ export interface SettingsStreamSlowModeContext {
  * would exceed the model's context window (see
  * {@link fitOutputTokensToContextWindow}); every request this session drives,
  * including side turns like `/btw`, goes through here.
+ *
+ * When `retryWaitObserver` is supplied and the caller did not bring its own
+ * `providerRetryWait`, the wrapper installs one that reports the wait and then
+ * performs exactly the sleep pi-ai's default would have performed, so retry
+ * delays, attempt counts, and abort semantics are unchanged.
  */
 export function createSettingsAwareStreamFn(
 	settings: Settings,
 	base: StreamFn = streamSimple,
 	slowModeContext?: SettingsStreamSlowModeContext,
+	retryWaitObserver?: ProviderRetryWaitObserver,
 ): StreamFn {
 	// One tokenizer per encoding, so per-message counts are reused across requests.
 	const tokenizers = new Map<Encoding | null, Tokenizer>();
@@ -125,6 +162,37 @@ export function createSettingsAwareStreamFn(
 		const fallbacks =
 			streamOptions?.fallbacks ??
 			(serverSideFallbackChain.length > 0 ? serverSideFallbackChain.map(id => ({ model: id })) : undefined);
+		// Only fill the hole: a caller that brought its own wait keeps it untouched.
+		const providerRetryWait =
+			streamOptions?.providerRetryWait ??
+			(retryWaitObserver
+				? async (delayMs: number, signal?: AbortSignal, attemptInfo?: ProviderRetryAttemptInfo): Promise<void> => {
+						const info: ProviderRetryWaitInfo = {
+							delayMs,
+							model: model.id,
+							provider: model.provider,
+							api: model.api,
+							// Absent when the waiting loop keeps no counter; the UI then
+							// drops the "(n/m)" instead of inventing one.
+							...(attemptInfo !== undefined
+								? { attempt: attemptInfo.attempt, maxAttempts: attemptInfo.maxAttempts }
+								: {}),
+						};
+						logger.info("Provider retry wait", { ...info });
+						const waitId = retryWaitObserver.onStart(info);
+						try {
+							await scheduler.wait(delayMs, { signal });
+						} catch (error) {
+							// `scheduler.wait` only rejects on abort; treat any rejection as
+							// one so the indicator always clears, and rethrow so pi-ai's
+							// cancellation handling is byte-for-byte what it was before.
+							logger.debug("Provider retry wait aborted", { ...info, waitId });
+							retryWaitObserver.onEnd({ aborted: true, waitId });
+							throw error;
+						}
+						retryWaitObserver.onEnd({ aborted: false, waitId });
+					}
+				: undefined);
 		// Anthropic usage-limit stages: the provider consults these hooks only for
 		// first-party OAuth requests, so attaching them per anthropic call is safe.
 		// Wrap-up tracking runs for everyone; the setting (`/slow`) gates only the
@@ -177,6 +245,7 @@ export function createSettingsAwareStreamFn(
 			...(fallbacks !== undefined ? { fallbacks } : {}),
 			...(storeResponses !== undefined ? { storeResponses } : {}),
 			...(slowModeHooks !== undefined ? { anthropicSlowMode: slowModeHooks } : {}),
+			...(providerRetryWait !== undefined ? { providerRetryWait } : {}),
 		};
 		return base(model, context, merged);
 	};

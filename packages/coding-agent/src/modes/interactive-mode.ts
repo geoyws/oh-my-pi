@@ -1299,6 +1299,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	loadingAnimation: Loader | undefined = undefined;
 	autoCompactionLoader: Loader | undefined = undefined;
 	retryLoader: Loader | undefined = undefined;
+	providerRetryLoader: Loader | undefined = undefined;
 	#pendingWorkingMessage: string | undefined;
 	#retryHintRow: DescribedComponent | undefined;
 	#workingMessageAccentCacheKey?: WorkingMessageAccentCacheKey;
@@ -7446,7 +7447,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	ensureLoadingAnimation(): void {
-		if (this.autoCompactionLoader || this.retryLoader) return;
+		if (this.autoCompactionLoader || this.retryLoader || this.providerRetryLoader) return;
 		if (!this.loadingAnimation) {
 			this.#clearWorkingMessageAccentCache();
 			this.statusContainer.disposeChildren();
