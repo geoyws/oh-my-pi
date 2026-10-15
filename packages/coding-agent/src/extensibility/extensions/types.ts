@@ -1196,8 +1196,10 @@ export interface InputEvent {
  * Unlike `input` (interactive/RPC ingress only, `handled: true` clears the
  * draft), this covers every user-message ingress: typed prompts, queued and
  * aside deliveries, user-invoked skill expansions, writable-collab peer
- * prompts, `/btw` questions, summarizer instructions (`/compact`, `/handoff`,
- * `/tree`), and local shell (`!`) and Python (`$`) commands. A refusal keeps
+ * prompts, `/btw` questions, `/goal` and RPC goal objectives, `/tan` work,
+ * `/omfg` complaints, `/cleanse` requests, summarizer instructions
+ * (`/compact`, `/handoff`, `/tree`), and local shell (`!`) and Python (`$`)
+ * commands. A refusal keeps
  * the interactive editor draft. Return `{ refuse: true, notice }` to drop the
  * message: it is never sent, never persisted, and the UI shows only `notice`.
  * The notice is the extension's responsibility — it must be safe to display

@@ -508,6 +508,7 @@ describe("RpcGoalController continuation gate", () => {
 				}),
 			},
 			promptCustomMessage: (message: { customType: string }) => admit(message.customType),
+			gateUserMessage: async () => {},
 			waitForIdle: () => idle.promise,
 		};
 		let dropped = 0;

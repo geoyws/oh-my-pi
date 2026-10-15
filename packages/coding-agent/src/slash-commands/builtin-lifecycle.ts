@@ -46,6 +46,32 @@ export const shutdownHandlerTui = (
 	return commandConsumed();
 };
 
+/**
+ * Gate user-authored slash text that a command persists or sends to a model
+ * outside `prompt()` (`/tan` work, `/omfg` complaint, `/cleanse` request).
+ * A refusal merges the original slash line back ahead of any newer draft,
+ * shows only the handler's notice, and returns false so nothing starts.
+ */
+async function admitTuiSlashText(
+	command: ParsedSlashCommand,
+	runtime: TuiSlashCommandRuntime,
+	text: string,
+): Promise<boolean> {
+	if (!text) return true;
+	try {
+		await runtime.ctx.session.gateUserMessage(text, undefined, "interactive");
+		return true;
+	} catch (error) {
+		if (error instanceof UserMessageRefusedError) {
+			restoreDetachedDraft(runtime.ctx.editor, command.text);
+			runtime.ctx.showError(error.notice);
+			runtime.ctx.ui.requestRender();
+			return false;
+		}
+		throw error;
+	}
+}
+
 /** Parse the `/shake` subcommand into a {@link ShakeMode}; empty defaults to elide. */
 function parseShakeMode(args: string): ShakeMode | { error: string } {
 	const verb = args.trim().toLowerCase();
@@ -495,6 +521,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		handleTui: async (command, runtime) => {
 			const work = command.text.slice(`/${command.name}`.length).trim();
 			clearSubmittedText(runtime);
+			if (!(await admitTuiSlashText(command, runtime, work))) return;
 			await runtime.ctx.handleTanCommand(work);
 		},
 	},
@@ -507,6 +534,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		handleTui: async (command, runtime) => {
 			const complaint = command.text.slice(`/${command.name}`.length).trim();
 			clearSubmittedText(runtime);
+			if (!(await admitTuiSlashText(command, runtime, complaint))) return;
 			await runtime.ctx.handleOmfgCommand(complaint);
 		},
 	},
@@ -519,6 +547,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		handleTui: async (command, runtime) => {
 			const args = command.text.slice(`/${command.name}`.length).trim();
 			clearSubmittedText(runtime);
+			if (!(await admitTuiSlashText(command, runtime, args))) return;
 			await runtime.ctx.handleCleanseCommand(args);
 		},
 	},

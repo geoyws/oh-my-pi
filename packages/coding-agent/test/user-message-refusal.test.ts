@@ -35,12 +35,16 @@ import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { submitInteractiveInput } from "@oh-my-pi/pi-coding-agent/main";
 import { tryRunRpcSkillCommand } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
+import { RpcGoalController } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-goal";
+import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { executeBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
 import { restoreRefusedDraft } from "@oh-my-pi/pi-coding-agent/slash-commands/helpers/draft";
 import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
 import type { SlashCommandRuntime } from "@oh-my-pi/pi-coding-agent/slash-commands/types";
 import type { DroppedPrompt } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import { getEditorTheme } from "@oh-my-pi/pi-tui/theme/tui-adapters";
+import { tagImageAttachmentSource } from "@oh-my-pi/pi-tui/prompt/image-source";
 
 const SECRET = "token FAKE-SECRET-NOT-REAL-0000";
 const NOTICE = "Blocked: this message looks like it contains a secret. It was not sent or saved.";
@@ -397,6 +401,39 @@ describe("before_user_message refusal", () => {
 		expect(JSON.stringify(harness.contexts).includes("first")).toBe(true);
 	});
 
+	it("a refused queued message drops its hidden companions even when another message survives", async () => {
+		lateApi.current = undefined;
+		harness = await createHarness({
+			factory: pi => {
+				lateApi.current = pi;
+			},
+			withSlowTool: true,
+		});
+		// One batch holding both steers: [A's attachment notice, A, B].
+		harness.session.setSteeringMode("all", false);
+		const run = harness.session.prompt("first");
+		await harness.toolEntered;
+		// The attachment notice names the file path, which carries the secret.
+		const image = tagImageAttachmentSource(
+			{ type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+			"/tmp/FAKE-SECRET-NOT-REAL-shot.png",
+			"image",
+		);
+		await harness.session.steer("refuse-me [Image #1]", [image]);
+		await harness.session.steer("clean survivor");
+		lateApiCurrent()?.on("before_user_message", (event: BeforeUserMessageEvent) => {
+			if (event.text.includes("refuse-me")) return { refuse: true, notice: NOTICE };
+			return undefined;
+		});
+		harness.releaseTool?.();
+		await run;
+		await harness.session.waitForIdle();
+		expect(harness.notices.filter(notice => notice === NOTICE)).toHaveLength(1);
+		expect(JSON.stringify(harness.contexts).includes("clean survivor")).toBe(true);
+		expect(leakedEverywhere(harness, "refuse-me")).toEqual([]);
+		expect(leakedEverywhere(harness, "FAKE-SECRET")).toEqual([]);
+	});
+
 	it("acp source: refused at the session layer, clean sends", async () => {
 		harness = await createHarness();
 		await expect(harness.session.prompt(`acp ${SECRET}`, { source: "acp" })).rejects.toBeInstanceOf(
@@ -588,6 +625,51 @@ describe("before_user_message refusal", () => {
 		expect(harness.seenSources).toEqual(["interactive"]);
 		await harness.session.gateUserMessage("clean side question", undefined, "rpc");
 		expect(harness.seenSources).toEqual(["interactive", "rpc"]);
+		expect(harness.streamCalls).toBe(0);
+		expect(harness.sessionManager.getEntries()).toEqual(entriesBefore);
+		expect(leakedEverywhere(harness, "FAKE-SECRET")).toEqual([]);
+	});
+
+	it("interactive /tan, /omfg and /cleanse: refusal restores the line and starts nothing", async () => {
+		harness = await createHarness();
+		const entriesBefore = structuredClone(harness.sessionManager.getEntries());
+		for (const name of ["tan", "omfg", "cleanse"] as const) {
+			const editor = new CustomEditor(getEditorTheme());
+			const showError = vi.fn();
+			const started = vi.fn(async (_text: string) => {});
+			const ctx = {
+				session: harness.session,
+				editor,
+				showError,
+				ui: { requestRender: () => {} },
+				handleTanCommand: started,
+				handleOmfgCommand: started,
+				handleCleanseCommand: started,
+			} as unknown as InteractiveModeContext;
+			const line = `/${name} deploy with ${SECRET}`;
+			expect(await executeBuiltinSlashCommand(line, { ctx })).toBe(true);
+			expect(started).not.toHaveBeenCalled();
+			expect(editor.getExpandedText()).toBe(line);
+			expect(showError).toHaveBeenCalledWith(NOTICE);
+
+			// Clean text still reaches the command.
+			await executeBuiltinSlashCommand(`/${name} tidy the docs`, { ctx });
+			expect(started).toHaveBeenCalledWith("tidy the docs");
+		}
+		expect(harness.streamCalls).toBe(0);
+		expect(harness.sessionManager.getEntries()).toEqual(entriesBefore);
+		expect(leakedEverywhere(harness, "FAKE-SECRET")).toEqual([]);
+	});
+
+	it("RPC goal create: a refused objective creates no goal and writes nothing", async () => {
+		harness = await createHarness();
+		const entriesBefore = structuredClone(harness.sessionManager.getEntries());
+		const controller = new RpcGoalController(harness.session, () => {});
+		await expect(controller.handle({ op: "create", objective: `ship it with ${SECRET}` })).rejects.toBeInstanceOf(
+			UserMessageRefusedError,
+		);
+		expect(harness.session.getGoalModeState()).toBeUndefined();
+		expect(harness.seenSources).toEqual(["rpc"]);
 		expect(harness.streamCalls).toBe(0);
 		expect(harness.sessionManager.getEntries()).toEqual(entriesBefore);
 		expect(leakedEverywhere(harness, "FAKE-SECRET")).toEqual([]);

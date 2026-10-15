@@ -7933,8 +7933,9 @@ export class AgentSession implements SettingsScope {
 	 * marked by the submission-time gate) faces the check here, at the last
 	 * moment before provider dispatch. Refused messages are removed from the
 	 * dequeued batch in place so the agent loop cannot deliver or persist
-	 * them; when no user-authored message survives, their hidden companions
-	 * go too. Each refusal emits a `notice` event carrying only the handler's
+	 * them, together with the hidden companions grouped before each; when no
+	 * user-authored message survives, any remaining companions go too. Each
+	 * refusal emits a `notice` event carrying only the handler's
 	 * safe notice. Returns the surviving user-authored messages.
 	 */
 	async #dropRefusedDelivery(
@@ -7962,8 +7963,14 @@ export class AgentSession implements SettingsScope {
 				survivors.push(message);
 				continue;
 			}
+			// Its hidden companions (image descriptions, attachment paths,
+			// keyword notices) sit contiguously before it and carry its
+			// content: drop the whole group even when other messages survive.
 			const index = mutable.indexOf(message);
-			if (index >= 0) mutable.splice(index, 1);
+			if (index >= 0) {
+				const start = this.#queuedUserGroupStart(mutable, index);
+				mutable.splice(start, index - start + 1);
+			}
 			this.emitNotice("warning", notice ?? "An extension refused to send this message.", "before_user_message");
 		}
 		if (survivors.length === 0) {

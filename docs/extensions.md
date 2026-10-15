@@ -562,9 +562,12 @@ back for editing, RPC/ACP fail with only the notice.
 
 Visible user-attributed custom prompts from writable-collab peers are gated
 the same way, so an idle host gates exactly what a streaming host's recheck
-would gate. `/btw` questions, summarizer instructions (`/compact`, `/handoff`,
-`/tree`), and local shell (`!`) and Python (`$`) commands are gated at their
-own ingress points before they are persisted or sent. Programmatic RPC `bash`
+would gate. `/btw` questions, `/goal` and RPC goal objectives, `/tan` work,
+`/omfg` complaints, `/cleanse` requests, summarizer instructions (`/compact`,
+`/handoff`, `/tree`), and local shell (`!`) and Python (`$`) commands are
+gated at their own ingress points before they are persisted or sent. A
+refused queued message takes its hidden companions (attachment paths, image
+descriptions, keyword notices) with it. Programmatic RPC `bash`
 execution is outside the gate: it is an execution API, not a user message.
 
 | Submission | `source` |
