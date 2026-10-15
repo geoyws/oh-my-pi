@@ -660,9 +660,9 @@ function spawnInternal<In extends InMask = InMask>(
 	// Bun.spawn resolves the executable against the PATH captured at process
 	// startup when `env` is omitted, so a runtime PATH change (a test fake
 	// prepended to process.env.PATH, direnv, installer shims) would be
-	// invisible to the child. Snapshot the live process.env instead, so spawns
-	// observe the current environment. Callers that pass `env` keep it as-is.
-	const commandEnv = rest.env ?? { ...process.env };
+	// invisible to it. Passing the live env makes spawns observe the current
+	// environment. Callers that pass `env` keep it as-is.
+	const commandEnv = rest.env ?? Bun.env;
 	const child = Bun.spawn(useSubreaper ? [process.execPath, "-e", LINUX_SUBREAPER_SCRIPT] : cmd, {
 		stdin: "ignore",
 		stdout: "pipe",

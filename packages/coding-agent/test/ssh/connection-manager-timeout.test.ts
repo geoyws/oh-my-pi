@@ -33,6 +33,7 @@ beforeAll(async () => {
 	const fake = path.join(binDir, "ssh");
 	await fs.writeFile(fake, `#!/bin/sh\necho "hit $@" >> ${JSON.stringify(sentinel)}\ntrap '' TERM\nsleep 300\n`, {
 		mode: 0o755,
+	});
 	originalPath = process.env.PATH;
 	process.env.PATH = `${binDir}${path.delimiter}${originalPath ?? ""}`;
 	// Warm the fake once: the first exec of a new file can outlast the test

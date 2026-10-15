@@ -51,21 +51,28 @@ interface CachedArchiveReader {
 	ino: bigint;
 	mtimeNs: bigint;
 	// Change time: moves on every write and permission change and cannot be
-	// set back with utimes, unlike mtime. Compared at nanosecond resolution:
-	// millisecond floats collide when two writes land in the same quantum
-	// (e.g. an in-place rewrite with a restored mtime on overlayfs), serving
-	// a stale index. A content hash would also work but costs a full file
-	// read on every paged access, defeating this ranged-read cache.
+	// set back with utimes, unlike mtime.
 	ctimeNs: bigint;
 	size: bigint;
 	entryCount: number;
 }
 
 /**
+ * Filesystems stamp ctime from a coarse clock (a kernel tick on Linux without
+ * multigrain timestamps, up to seconds on network mounts), so two writes in
+ * the same quantum leave identical stat identities. A file changed this close
+ * to when it was indexed is "racily clean" (git's term): its identity cannot
+ * prove that no later same-quantum write happened, so it is reopened instead.
+ * Archives at rest keep the cache; only a just-written one pays a re-index.
+ */
+const RACY_IDENTITY_WINDOW_NS = 2_000_000_000n;
+
+/**
  * Recently opened archives, so paging through members does not re-read and
  * re-index the archive per read. Bounded by count and by total indexed entries;
  * an entry is reused only while the file's identity (inode, size, mtimeNs,
- * ctimeNs) holds, so a rewrite or a permission change reopens the archive.
+ * ctimeNs) holds and was not racily clean when indexed, so a rewrite or a
+ * permission change reopens the archive.
  */
 const archiveReaderCache = new LRUCache<string, CachedArchiveReader>({
 	max: 4,
@@ -75,8 +82,6 @@ const archiveReaderCache = new LRUCache<string, CachedArchiveReader>({
 
 async function openArchiveCached(absolutePath: string): Promise<ArchiveReader> {
 	// A vanished or unreadable archive is reported by the opener, as it always has been.
-	// Nanosecond identity: ctime moves on every write and cannot be restored
-	// with utimes, so an in-place rewrite with a pinned mtime still misses.
 	const stat = await fs.stat(absolutePath, { bigint: true }).catch(() => null);
 	if (!stat) return openArchive(absolutePath);
 	const cached = archiveReaderCache.get(absolutePath);
@@ -89,8 +94,9 @@ async function openArchiveCached(absolutePath: string): Promise<ArchiveReader> {
 	) {
 		return cached.reader;
 	}
+	const indexedAtNs = BigInt(Date.now()) * 1_000_000n;
 	const reader = await openArchive(absolutePath);
-	if (!CACHEABLE_ARCHIVE_FORMATS[reader.format]) {
+	if (!CACHEABLE_ARCHIVE_FORMATS[reader.format] || indexedAtNs - stat.ctimeNs < RACY_IDENTITY_WINDOW_NS) {
 		archiveReaderCache.delete(absolutePath);
 		return reader;
 	}

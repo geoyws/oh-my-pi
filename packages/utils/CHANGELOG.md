@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `ptree.spawn`/`ptree.exec` resolving the command against the `PATH` the process started with, ignoring later `process.env.PATH` changes; commands now resolve against the current environment unless the caller passes its own `env`
+
 ## [18.10.0] - 2026-10-12
 
 ### Added

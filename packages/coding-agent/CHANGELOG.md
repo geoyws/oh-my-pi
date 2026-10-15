@@ -5,6 +5,7 @@
 ### Fixed
 
 - Fixed a subagent whose `task.agentModelOverrides` entry is an explicit multi-entry list (e.g. scout) escaping its list on retry: the installed `subagent:<id>` chain used to lose to the current model's model-keyed chain, spending expensive models on readers. The list is now the session's complete retry chain — recovery walks it alone and stops with the normal exhausted-retry error when it runs out.
+- Fixed `read` on Linux sometimes listing an archive's old members after the archive was rewritten in place within the same timestamp tick (same size, mtime restored); an archive changed in the last two seconds is now re-indexed instead of served from the cache
 
 ## [18.10.1] - 2026-10-12
 
