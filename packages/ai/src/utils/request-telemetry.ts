@@ -179,8 +179,13 @@ export class ProviderRequestTelemetry {
 	/** Close the record from a resolved assistant message. */
 	completed(message: AssistantMessage): void {
 		const errorId = message.stopReason === "error" ? (message.errorId ?? AIError.classifyMessage(message)) : 0;
+		// Zero means an unclassified error, not a successful provider result.
 		const outcome: ProviderRequestOutcome =
-			message.stopReason === "aborted" ? "aborted" : errorId === 0 ? "ok" : outcomeFromFlags(errorId);
+			message.stopReason === "aborted"
+				? "aborted"
+				: message.stopReason === "error"
+					? outcomeFromFlags(errorId)
+					: "ok";
 		const usage = message.usage;
 		this.#end({
 			outcome,
