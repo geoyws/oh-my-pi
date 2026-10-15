@@ -276,10 +276,10 @@ impl Shell {
 	/// already-completed runs before the host drops the session.
 	pub async fn shutdown(&self) {
 		self.abort().await;
-		if let Ok(mut guard) = self.session.try_lock() {
-			if let Some(core) = guard.as_mut() {
-				terminate_background_jobs(&mut core.shell).await;
-			}
+		if let Ok(mut guard) = self.session.try_lock()
+			&& let Some(core) = guard.as_mut()
+		{
+			terminate_background_jobs(&mut core.shell).await;
 		}
 	}
 
