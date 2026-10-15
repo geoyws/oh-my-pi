@@ -49,8 +49,7 @@ interface ParkedHarness {
 	session: AgentSession;
 	sessionManager: SessionManager;
 	mock: MockModel;
-	/** Resolves the moment the first turn's model stream begins (deterministic
-	 *  "now streaming" signal — no wall-clock polling). */
+	/** Resolves when the first turn is parked in a running tool after model output. */
 	streamStarted: Promise<void>;
 }
 
@@ -90,26 +89,42 @@ describe("AgentSession advisor auto-resume suppression", () => {
 	});
 
 	/**
-	 * First turn parks open (a 60s mock delay that abort cancels) so a steer/park
-	 * + interrupt can be sequenced while the agent is genuinely streaming. The
-	 * `streamStarted` promise resolves from the mock handler, before the delay, so
-	 * tests await the real stream-begin signal rather than a timer.
+	 * Park after visible model output, not in a pre-output provider delay: new
+	 * steering deliberately cancels and reissues a silent provider request. A
+	 * running tool keeps these abort/settle tests at their intended queued-input
+	 * boundary without racing that independent provider-wait behavior.
 	 */
 	async function createParkedSession(tailResponses: MockResponse[] = []): Promise<ParkedHarness> {
 		const started = Promise.withResolvers<void>();
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({
 			responses: [
-				() => {
-					started.resolve();
-					return { content: ["working"], delayMs: 60_000 };
-				},
+				{ content: ["working", { type: "toolCall", id: "park", name: "park", arguments: {} }] },
 				...tailResponses,
 			],
 		});
 		const agent = new Agent({
 			getApiKey: () => "test-key",
-			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [
+					{
+						name: "park",
+						label: "Park",
+						description: "Wait for the test interrupt",
+						parameters: type({}),
+						execute: async (_id, _params, signal) => {
+							started.resolve();
+							await new Promise<void>(resolve => {
+								if (signal?.aborted) resolve();
+								else signal?.addEventListener("abort", () => resolve(), { once: true });
+							});
+							return { content: [{ type: "text", text: "Interrupted" }], details: {} };
+						},
+					},
+				],
+			},
 			streamFn: mock.stream,
 		});
 		const sessionManager = SessionManager.inMemory();

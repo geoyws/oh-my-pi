@@ -82,6 +82,7 @@ describe("AgentSession before_agent_start system prompt override", () => {
 			settings: Settings.isolated({ "compaction.enabled": false, "todo.enabled": false }),
 			modelRegistry: { getApiKey: async () => "test-key" } as never,
 			extensionRunner: {
+				hasHandlers: () => false,
 				emitBeforeAgentStart: async () => ({ systemPrompt: [OVERRIDE] }),
 				emit: async () => undefined,
 			} as unknown as ExtensionRunner,
