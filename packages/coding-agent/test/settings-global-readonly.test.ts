@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { YAML } from "bun";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
-import { getProjectAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { getProjectAgentDir, isRecord, TempDir } from "@oh-my-pi/pi-utils";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
 
 let state: SettingsTestState;
@@ -38,6 +38,14 @@ async function load(options: Parameters<typeof Settings.loadIsolated>[0] = {}): 
 	const settings = await Settings.loadIsolated({ cwd, agentDir, ...options });
 	instances.push(settings);
 	return settings;
+}
+
+function readProjectConfig(file: string): { autoResume: unknown; modelRoles: Record<string, unknown> } {
+	const parsed: unknown = YAML.parse(fs.readFileSync(file, "utf8"));
+	if (!isRecord(parsed)) throw new Error(`${file} is not a YAML mapping`);
+	const modelRoles = parsed.modelRoles;
+	if (!isRecord(modelRoles)) throw new Error(`${file} has no modelRoles mapping`);
+	return { autoResume: parsed.autoResume, modelRoles };
 }
 
 for (const switchName of ["config.readOnly", "PI_CONFIG_READONLY"] as const) {
@@ -74,7 +82,7 @@ for (const switchName of ["config.readOnly", "PI_CONFIG_READONLY"] as const) {
 			expect(settings.getModelRoleStorage()).toBe("project");
 			settings.setModelRole("default", "provider/project:high");
 			await settings.flush();
-			const project = YAML.parse(fs.readFileSync(projectConfig, "utf8"));
+			const project = readProjectConfig(projectConfig);
 			expect(project.modelRoles.default).toBe("provider/project:high");
 			expect(project.modelRoles.smol).toBe("provider/keep:low");
 			expect(project.autoResume).toBe(false);
@@ -195,7 +203,7 @@ for (const switchName of ["config.readOnly", "PI_CONFIG_READONLY"] as const) {
 				const settings = await load();
 				settings.setModelRole("smol", "provider/project:high");
 				await settings.flush();
-				expect(YAML.parse(fs.readFileSync(target, "utf8")).modelRoles.smol).toBe("provider/project:high");
+				expect(readProjectConfig(target).modelRoles.smol).toBe("provider/project:high");
 				expect((await load()).getModelRole("smol")).toBe("provider/project:high");
 				expect(fs.readFileSync(config, "utf8")).toBe(bytes);
 				expect(
@@ -248,9 +256,9 @@ it("retains writable project-directory creation", async () => {
 	const settings = await load();
 	settings.setProjectModelRole("default", "provider/project:high");
 	await settings.flush();
-	expect(
-		YAML.parse(fs.readFileSync(path.join(getProjectAgentDir(cwd), "config.yml"), "utf8")).modelRoles.default,
-	).toBe("provider/project:high");
+	expect(readProjectConfig(path.join(getProjectAgentDir(cwd), "config.yml")).modelRoles.default).toBe(
+		"provider/project:high",
+	);
 });
 
 it("keeps programmatic readOnly stronger than the named policy", async () => {
