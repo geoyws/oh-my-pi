@@ -15,6 +15,7 @@ import { appKey, editorKey } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
 import { formatModelRoleAlias, roleCandidatePool } from "../../config/model-roles";
 import { resolveModelRoleValue } from "../../config/model-resolver";
 import { isSettingsInitialized, settings } from "../../config/settings";
+import { runWithExecOwner } from "../../exec/exec";
 import { InternalUrlRouter, resolveLocalRoot } from "../../internal-urls";
 import { AskDialogComponent } from "@oh-my-pi/pi-tui/overlays/ask-dialog";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
@@ -2824,7 +2825,9 @@ export class InputController {
 				if (!runner.isExtensionActive(shortcut.extensionPath)) return;
 				const ctx = runner.createCommandContext();
 				try {
-					runner.runScoped(() => shortcut.handler(ctx));
+					// Attribute `pi.exec` children the shortcut starts to this
+					// session, like every other extension entry point.
+					runner.runScoped(() => runWithExecOwner(runner.sessionId, () => shortcut.handler(ctx)));
 				} catch (err) {
 					runner.emitError({
 						extensionPath: shortcut.extensionPath,
