@@ -115,9 +115,20 @@ export function reconcileYamlConfig(source: string, value: unknown): string {
 				text = firstLineEnd < 0 ? text + comment : text.slice(0, firstLineEnd) + comment + text.slice(firstLineEnd);
 			}
 		}
-		if (node.range[0] === node.range[1] && source[node.range[0] - 1] === ":") text = " " + text;
-		if (source.slice(node.range[0], node.range[1]).endsWith("\n")) text += newline;
-		edits.push({ start: node.range[0], end: node.range[1], text });
+		let start = node.range[0];
+		let end = node.range[1];
+		// An empty value's range follows the blanks after its key's `:`; fill it
+		// right after the indicator so those blanks still separate any comment.
+		if (start === end) {
+			let indicator = start;
+			while (source[indicator - 1] === " " || source[indicator - 1] === "\t") indicator--;
+			if (source[indicator - 1] === ":") {
+				start = end = indicator;
+				text = " " + text;
+			}
+		}
+		if (source.slice(start, end).endsWith("\n")) text += newline;
+		edits.push({ start, end, text });
 	};
 	const isMergePair = (pair: Pair): boolean =>
 		isScalar(pair.key) && typeof pair.key.value === "symbol" && pair.key.value.description === "<<";
