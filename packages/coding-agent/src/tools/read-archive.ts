@@ -1,3 +1,4 @@
+import * as fs from "node:fs/promises";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { TextContent } from "@oh-my-pi/pi-ai";
 import {
@@ -47,19 +48,31 @@ const CACHEABLE_ARCHIVE_FORMATS: Partial<Record<ArchiveFormat, true>> = { zip: t
 
 interface CachedArchiveReader {
 	reader: ArchiveReader;
-	ino: number;
-	mtimeMs: number;
-	/** Change time: moves on every write and permission change and cannot be set back, unlike mtime. */
-	ctimeMs: number;
-	size: number;
+	ino: bigint;
+	mtimeNs: bigint;
+	// Change time: moves on every write and permission change and cannot be
+	// set back with utimes, unlike mtime.
+	ctimeNs: bigint;
+	size: bigint;
 	entryCount: number;
 }
 
 /**
+ * Filesystems stamp ctime from a coarse clock (a kernel tick on Linux without
+ * multigrain timestamps, up to seconds on network mounts), so two writes in
+ * the same quantum leave identical stat identities. A file changed this close
+ * to when it was indexed is "racily clean" (git's term): its identity cannot
+ * prove that no later same-quantum write happened, so it is reopened instead.
+ * Archives at rest keep the cache; only a just-written one pays a re-index.
+ */
+const RACY_IDENTITY_WINDOW_NS = 2_000_000_000n;
+
+/**
  * Recently opened archives, so paging through members does not re-read and
  * re-index the archive per read. Bounded by count and by total indexed entries;
- * an entry is reused only while the file's identity (inode, mtime, ctime, size)
- * holds, so a rewrite or a permission change reopens the archive.
+ * an entry is reused only while the file's identity (inode, size, mtimeNs,
+ * ctimeNs) holds and was not racily clean when indexed, so a rewrite or a
+ * permission change reopens the archive.
  */
 const archiveReaderCache = new LRUCache<string, CachedArchiveReader>({
 	max: 4,
@@ -69,22 +82,21 @@ const archiveReaderCache = new LRUCache<string, CachedArchiveReader>({
 
 async function openArchiveCached(absolutePath: string): Promise<ArchiveReader> {
 	// A vanished or unreadable archive is reported by the opener, as it always has been.
-	const stat = await Bun.file(absolutePath)
-		.stat()
-		.catch(() => null);
+	const stat = await fs.stat(absolutePath, { bigint: true }).catch(() => null);
 	if (!stat) return openArchive(absolutePath);
 	const cached = archiveReaderCache.get(absolutePath);
 	if (
 		cached &&
 		cached.ino === stat.ino &&
-		cached.mtimeMs === stat.mtimeMs &&
-		cached.ctimeMs === stat.ctimeMs &&
+		cached.mtimeNs === stat.mtimeNs &&
+		cached.ctimeNs === stat.ctimeNs &&
 		cached.size === stat.size
 	) {
 		return cached.reader;
 	}
+	const indexedAtNs = BigInt(Date.now()) * 1_000_000n;
 	const reader = await openArchive(absolutePath);
-	if (!CACHEABLE_ARCHIVE_FORMATS[reader.format]) {
+	if (!CACHEABLE_ARCHIVE_FORMATS[reader.format] || indexedAtNs - stat.ctimeNs < RACY_IDENTITY_WINDOW_NS) {
 		archiveReaderCache.delete(absolutePath);
 		return reader;
 	}
@@ -93,8 +105,8 @@ async function openArchiveCached(absolutePath: string): Promise<ArchiveReader> {
 	archiveReaderCache.set(absolutePath, {
 		reader,
 		ino: stat.ino,
-		mtimeMs: stat.mtimeMs,
-		ctimeMs: stat.ctimeMs,
+		mtimeNs: stat.mtimeNs,
+		ctimeNs: stat.ctimeNs,
 		size: stat.size,
 		entryCount,
 	});

@@ -657,6 +657,11 @@ function spawnInternal<In extends InMask = InMask>(
 ): ChildProcess<In> {
 	const { timeout = -1, signal, stderr, detached, subreaper = false, ...rest } = opts ?? {};
 	const useSubreaper = subreaper && process.platform === "linux";
+	// Bun.spawn resolves the executable against the PATH captured at process
+	// startup when `env` is omitted, so a runtime PATH change (a test fake
+	// prepended to process.env.PATH, direnv, installer shims) would be
+	// invisible to it. Passing the live env makes spawns observe the current
+	// environment. Callers that pass `env` keep it as-is.
 	const commandEnv = rest.env ?? Bun.env;
 	const child = Bun.spawn(useSubreaper ? [process.execPath, "-e", LINUX_SUBREAPER_SCRIPT] : cmd, {
 		stdin: "ignore",
@@ -672,7 +677,7 @@ function spawnInternal<In extends InMask = InMask>(
 					[LINUX_SUBREAPER_COMMAND_ENV]: JSON.stringify(cmd),
 					[LINUX_SUBREAPER_BUN_BE_BUN_ENV]: commandEnv.BUN_BE_BUN,
 				}
-			: rest.env,
+			: commandEnv,
 	});
 	const cp = new ChildProcess(child, stderr === "full", retainFullStderr, detached === true, useSubreaper);
 	if (signal) cp.attachSignal(signal);
