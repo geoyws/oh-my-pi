@@ -15,7 +15,14 @@ import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { getWorktreeDir, hashPath, logger } from "@oh-my-pi/pi-utils";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import type { Settings } from "../config/settings";
-import { formatIsolationBackend, parseIsolationBackend } from "../task/worktree";
+import {
+	dirtyWorktreeSubmodules,
+	formatIsolationBackend,
+	initializedWorktreeSubmodules,
+	initWorktreeSubmodules,
+	parseIsolationBackend,
+} from "../task/worktree";
+import type { SubmoduleNotCarried } from "../task/worktree";
 import { resolveAvailableWorktreePath } from "../tools/gh-pr-checkout";
 
 import { cfgIsolationBackend, cfgWorktreeCleanSource, cfgWorktreeClone } from "../task/settings";
@@ -35,6 +42,13 @@ export interface SessionWorktree {
 	baseCommit: string;
 	/** Whether uncommitted source changes were carried into the worktree. */
 	keptChanges: boolean;
+	/**
+	 * Source-initialized submodules whose state a plain checkout plus pin
+	 * initialization could not carry across: the new tree holds them at
+	 * their recorded pins while the source keeps the changes. Empty when
+	 * `keptChanges` is false (nothing was meant to carry).
+	 */
+	submodulesNotCarried: SubmoduleNotCarried[];
 }
 
 /** State of a session-owned worktree at exit. */
@@ -77,24 +91,38 @@ export function defaultSessionWorktreeBranch(now = new Date()): string {
 export function formatSessionWorktreeSummary(worktree: SessionWorktree, sourceCleaned = false): string {
 	const how =
 		worktree.clonedWith === undefined ? "checked out" : `cloned via ${formatIsolationBackend(worktree.clonedWith)}`;
+	const notCarried = worktree.submodulesNotCarried;
 	const changeStatus = !worktree.keptChanges
 		? "started from clean HEAD"
-		: sourceCleaned
-			? "uncommitted changes moved, source checkout cleaned"
-			: "uncommitted changes carried over";
+		: notCarried.length > 0
+			? `uncommitted changes carried over except ${notCarried.map(entry => `${entry.path} (${entry.reason})`).join(", ")}; the source checkout keeps those changes`
+			: sourceCleaned
+				? "uncommitted changes moved, source checkout cleaned"
+				: "uncommitted changes carried over";
 	return `Moved to worktree ${worktree.path} on branch ${worktree.branch} (${how}, ${changeStatus}).`;
 }
 
 /**
  * If `worktree.cleanSource` is enabled, resets and cleans the source checkout.
  * Catches git errors and returns `{ cleaned: true }` on success, or `{ cleaned: false, errorMessage }` on failure.
+ * Pass the worktree's {@link SessionWorktree.submodulesNotCarried} as
+ * `preserveSubmodules`: cleaning would destroy those uncarried changes, so a
+ * non-empty list skips the reset/clean and reports `skipped` instead.
  */
 export async function cleanSourceCheckoutIfConfigured(
 	sourceCwd: string,
 	settings: Settings,
-): Promise<{ cleaned: boolean; errorMessage?: string }> {
+	options: { preserveSubmodules?: string[] } = {},
+): Promise<{ cleaned: boolean; errorMessage?: string; skipped?: string }> {
 	if (!cfgWorktreeCleanSource.get(settings)) {
 		return { cleaned: false };
+	}
+	const preserved = options.preserveSubmodules ?? [];
+	if (preserved.length > 0) {
+		return {
+			cleaned: false,
+			skipped: `submodule changes were not carried over: ${preserved.join(", ")}`,
+		};
 	}
 	try {
 		const repository = vcs.requireGit(sourceCwd);
@@ -147,12 +175,39 @@ export async function createSessionWorktree(
 	await fs.mkdir(path.dirname(worktreePath), { recursive: true });
 
 	await repository.createBranch(branch, baseCommit, false);
+	const cloneSetting = cfgWorktreeClone.get(settings);
+	// A clone copies initialized submodule gitfiles verbatim, which dangle
+	// from a main checkout or point into a linked worktree's source. Start
+	// from a plain checkout and initialize private submodule clones instead.
+	const sourceRoot = repository.info().repoRoot;
+	const submodulePaths = cloneSetting ? await initializedWorktreeSubmodules(sourceRoot) : [];
 	const result = await repository.worktreeAdd(worktreePath, branch, {
 		detach: false,
-		clone: cfgWorktreeClone.get(settings),
+		clone: submodulePaths.length === 0 && cloneSetting,
 		backend: parseIsolationBackend(cfgIsolationBackend.get(settings)),
 		keepChanges,
 	});
+	if (submodulePaths.length > 0) {
+		try {
+			const inited = await initWorktreeSubmodules(worktreePath, submodulePaths);
+			if (inited.skipped.length > 0) {
+				logger.warn("worktree submodules not present at the target commit, left uninitialized", {
+					path: worktreePath,
+					submodules: inited.skipped,
+				});
+			}
+		} catch (error) {
+			logger.warn("worktree submodules were left uninitialized", {
+				path: worktreePath,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+	// Pin initialization cannot carry uncommitted submodule changes across,
+	// so detect them now: the summary names them and the source is never
+	// cleaned while any are outstanding.
+	const submodulesNotCarried =
+		keepChanges && submodulePaths.length > 0 ? await dirtyWorktreeSubmodules(sourceRoot, submodulePaths) : [];
 	return {
 		path: await fs.realpath(worktreePath),
 		branch,
@@ -161,6 +216,7 @@ export async function createSessionWorktree(
 		sourceCwd: cwd,
 		baseCommit,
 		keptChanges: keepChanges,
+		submodulesNotCarried,
 	};
 }
 

@@ -553,6 +553,189 @@ export function formatIsolationBackend(backend: IsoBackendKind): Exclude<Isolati
 	}
 }
 
+/**
+ * Initialized submodules in the source checkout, listed recursively as paths
+ * relative to `sourceRoot` (`[]` when there are none or the lookup fails).
+ *
+ * Clone-first worktree creation copies the source checkout verbatim, including
+ * every initialized submodule's `.git` gitfile. From a main checkout the copy
+ * reads `gitdir: ../.git/modules/<name>`, which dangles because the new
+ * tree's `.git` is a file; from a linked worktree it points into the source
+ * tree's module dir, so the new tree shares submodule state with the source.
+ * When this list is non-empty the caller must pass `clone: false` to
+ * `worktreeAdd` and populate the new tree with {@link initWorktreeSubmodules}
+ * instead.
+ */
+export async function initializedWorktreeSubmodules(sourceRoot: string): Promise<string[]> {
+	try {
+		return await vcs.requireGit(sourceRoot).submodulePaths();
+	} catch {
+		return [];
+	}
+}
+
+/** Outcome of {@link initWorktreeSubmodules}. */
+export interface WorktreeSubmoduleInit {
+	/** Initialized paths, parents before children. */
+	initialized: string[];
+	/**
+	 * Source-initialized paths with no gitlink at the target commit (removed
+	 * or renamed on the checked-out ref, or under such a path); left empty.
+	 */
+	skipped: string[];
+}
+
+/**
+ * Populate the submodules a plain (non-cloned) worktree left empty, giving
+ * each its own module dir under the new tree's admin. Call with the exact
+ * list from {@link initializedWorktreeSubmodules} so only submodules the
+ * source had initialized are fetched.
+ *
+ * Initialization runs level by level, parents before children: `git submodule
+ * update` only accepts paths known to the checkout it runs in, so a nested
+ * path is initialized from inside its freshly initialized parent, never as a
+ * nested pathspec from the root (git aborts the whole command on those).
+ * Paths with no gitlink at the target commit are skipped and reported in
+ * {@link WorktreeSubmoduleInit.skipped} instead of aborting the rest. Genuine
+ * failures throw with git's stderr; callers downgrade to a warning because
+ * the tree itself is a valid plain checkout either way.
+ */
+export async function initWorktreeSubmodules(
+	worktreePath: string,
+	submodules: string[],
+): Promise<WorktreeSubmoduleInit> {
+	const result: WorktreeSubmoduleInit = { initialized: [], skipped: [] };
+	const byDepth = [...submodules].sort((a, b) => a.split("/").length - b.split("/").length);
+	for (const relative of byDepth) {
+		const slash = relative.lastIndexOf("/");
+		const parent = slash < 0 ? "" : relative.slice(0, slash);
+		const base = slash < 0 ? relative : relative.slice(slash + 1);
+		if (parent !== "" && result.skipped.includes(parent)) {
+			result.skipped.push(relative);
+			continue;
+		}
+		const parentAbs = parent === "" ? worktreePath : path.join(worktreePath, parent);
+		if (!(await isSubmoduleGitlink(parentAbs, base))) {
+			result.skipped.push(relative);
+			continue;
+		}
+		await runSubmoduleUpdate(parentAbs, base, relative);
+		result.initialized.push(relative);
+	}
+	return result;
+}
+
+/**
+ * A source submodule whose state a plain checkout plus pin initialization
+ * cannot carry into a new tree.
+ */
+export interface SubmoduleNotCarried {
+	/** Path relative to the source root. */
+	path: string;
+	/** Why it was not carried, e.g. "uncommitted changes" or "local commits not carried". */
+	reason: string;
+}
+
+/**
+ * Source-initialized submodules the new tree cannot reproduce: a plain
+ * checkout followed by pin initialization resets every submodule to its
+ * recorded pin, so a submodule is reported when its worktree, index, or
+ * untracked files are dirty, or when its HEAD differs from the gitlink
+ * recorded in the superproject's index or HEAD (a new local commit, a staged
+ * pin move, or a checkout of another commit) — at any depth. Paths the check
+ * cannot assess are reported too, so callers treat unverifiable state as not
+ * carried rather than cleaning it away.
+ */
+export async function dirtyWorktreeSubmodules(
+	sourceRoot: string,
+	submodules: string[],
+): Promise<SubmoduleNotCarried[]> {
+	const notCarried: SubmoduleNotCarried[] = [];
+	for (const relative of submodules) {
+		const reason = await submoduleCarryBlocker(sourceRoot, relative);
+		if (reason !== undefined) notCarried.push({ path: relative, reason });
+	}
+	return notCarried;
+}
+
+/** Why the source submodule at `relative` cannot be carried, or undefined when it can. */
+async function submoduleCarryBlocker(sourceRoot: string, relative: string): Promise<string | undefined> {
+	const slash = relative.lastIndexOf("/");
+	const parentAbs = slash < 0 ? sourceRoot : path.join(sourceRoot, relative.slice(0, slash));
+	const base = slash < 0 ? relative : relative.slice(slash + 1);
+	const subAbs = path.join(sourceRoot, relative);
+	let dirty: boolean;
+	try {
+		dirty = (await vcs.requireGit(subAbs).statusPorcelain({ untracked: "all" })).trim() !== "";
+	} catch {
+		return "could not assess state";
+	}
+	const subHead = await runGitLine(subAbs, ["rev-parse", "HEAD"]);
+	const indexLine = await runGitLine(parentAbs, ["ls-files", "-s", "--", base]);
+	const headLine = await runGitLine(parentAbs, ["ls-tree", "HEAD", "--", base]);
+	const indexPin = indexLine
+		?.split("\n")
+		.find(line => line.startsWith("160000 "))
+		?.split(/\s+/)[1];
+	const headPin = headLine === undefined ? undefined : /^160000 commit ([0-9a-f]+)\t/.exec(headLine)?.[1];
+	if (subHead === undefined || indexPin === undefined || !/^[0-9a-f]+$/.test(indexPin) || headPin === undefined) {
+		return "could not assess state";
+	}
+	const reasons: string[] = [];
+	if (dirty) reasons.push("uncommitted changes");
+	if (subHead !== indexPin || subHead !== headPin) reasons.push("local commits not carried");
+	return reasons.length > 0 ? reasons.join(" and ") : undefined;
+}
+
+/** First stdout line of a git command in `dir`, or undefined when git fails. */
+async function runGitLine(dir: string, args: string[]): Promise<string | undefined> {
+	const proc = Bun.spawn(["git", ...args], {
+		cwd: dir,
+		stdout: "pipe",
+		stderr: "pipe",
+		windowsHide: true,
+	});
+	const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+	await new Response(proc.stderr).text();
+	if ((exitCode ?? 0) !== 0) return undefined;
+	return stdout.trim();
+}
+
+/** True when the checkout at `dir` registers `base` as a gitlink in its index. */
+async function isSubmoduleGitlink(dir: string, base: string): Promise<boolean> {
+	const proc = Bun.spawn(["git", "ls-files", "-s", "--", base], {
+		cwd: dir,
+		stdout: "pipe",
+		stderr: "pipe",
+		windowsHide: true,
+	});
+	const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+	await new Response(proc.stderr).text();
+	if ((exitCode ?? 0) !== 0) return false;
+	return stdout.split("\n").some(line => line.startsWith("160000 "));
+}
+
+async function runSubmoduleUpdate(dir: string, base: string, relative: string): Promise<void> {
+	// Submodule URLs are often local paths (absolute or `../relative`); git
+	// refuses the `file` transport for submodule clones unless it is
+	// explicitly allowed, and repo config is not honored here, so allow it on
+	// the command line. The user already trusts these URLs: the same pins
+	// are initialized in the source checkout.
+	const proc = Bun.spawn(["git", "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--", base], {
+		cwd: dir,
+		stdout: "pipe",
+		stderr: "pipe",
+		windowsHide: true,
+	});
+	const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+	await new Response(proc.stdout).text();
+	if ((exitCode ?? 0) !== 0) {
+		throw new Error(
+			`git submodule update --init -- ${relative} failed: ${stderr.trim() || `exit code ${exitCode ?? 0}`}`,
+		);
+	}
+}
+
 export interface IsolationHandle {
 	/** Merged view materialised by the backend; pass this to the task. */
 	mergedDir: string;
