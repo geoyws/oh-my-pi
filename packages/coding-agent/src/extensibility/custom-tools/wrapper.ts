@@ -4,6 +4,7 @@
 import type { AgentTool, AgentToolUpdateCallback, ToolLoadMode } from "@oh-my-pi/pi-agent-core";
 import type { Static, TSchema } from "@oh-my-pi/pi-ai";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
+import { runWithExecOwner } from "../../exec/exec";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { applyToolProxy } from "../tool-proxy";
 import type { CustomTool, CustomToolContext } from "./types";
@@ -36,7 +37,19 @@ export class CustomToolAdapter<
 		onUpdate?: AgentToolUpdateCallback<TDetails, TParams>,
 		context?: CustomToolContext,
 	) {
-		return this.tool.execute(toolCallId, params, onUpdate, context ?? this.getContext(), signal);
+		// Attribute `pi.exec` children the tool starts to the calling session
+		// (mirrors the extension wrapper's `withFileMutationSession` scope):
+		// this session's dispose kills them, other sessions' dispose spares
+		// them. A context without a session id degrades to postmortem-only
+		// teardown instead of failing the call.
+		const ctx = context ?? this.getContext();
+		let owner: string | undefined;
+		try {
+			owner = ctx.sessionManager.getSessionId();
+		} catch {
+			owner = undefined;
+		}
+		return runWithExecOwner(owner, () => this.tool.execute(toolCallId, params, onUpdate, ctx, signal));
 	}
 
 	/**

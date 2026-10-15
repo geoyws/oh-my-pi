@@ -1,6 +1,7 @@
 /**
  * Shared command execution utilities for hooks and custom tools.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { postmortem, ptree } from "@oh-my-pi/pi-utils";
 
 /**
@@ -13,6 +14,26 @@ export interface ExecOptions {
 	timeout?: number;
 	/** Working directory */
 	cwd?: string;
+	/**
+	 * Owning session: session dispose kills only entries with a matching
+	 * owner. Defaults to the ambient `runWithExecOwner` scope; without
+	 * either, only the postmortem process-exit teardown kills the child.
+	 */
+	sessionKey?: string;
+}
+
+/**
+ * Ambient owner for `execCommand` children, mirroring `withFileMutationSession`:
+ * entered per hook/tool/command invocation by the runner that owns the
+ * handlers, so no caller has to thread a session id through for attribution
+ * to work. An explicit {@link ExecOptions.sessionKey} wins over the ambient
+ * scope. Work that escapes the invocation's async chain (un-awaited timers)
+ * loses the scope and degrades to postmortem-only teardown.
+ */
+const execOwnerStorage = new AsyncLocalStorage<string>();
+
+export function runWithExecOwner<T>(owner: string | undefined, fn: () => T): T {
+	return owner === undefined ? fn() : execOwnerStorage.run(owner, fn);
 }
 
 /**
@@ -38,10 +59,17 @@ export interface ExecResult {
  * reparented to PID 1 and outlive omp. Each entry resolves when its call
  * settles — which, on abort, is after the whole-group TERM→KILL escalation —
  * so awaiting the entries means the recorded groups are dead.
+ *
+ * `owner` is the session the child runs for (explicit `sessionKey` or the
+ * ambient `runWithExecOwner` scope). Session dispose kills only its own
+ * entries, so a subagent finishing never kills another session's in-flight
+ * hook/tool children; entries without an owner die only in the postmortem
+ * process-exit teardown.
  */
 interface LiveExecCommand {
 	child: ptree.ChildProcess;
 	settled: Promise<void>;
+	owner: string | undefined;
 }
 const liveExecCommands = new Set<LiveExecCommand>();
 
@@ -70,14 +98,17 @@ function execShutdownDeadline(ms: number): Promise<void> {
 }
 
 /**
- * TERM-then-KILL every live `execCommand` group and wait (bounded) for the
- * groups to exit. Runs from the postmortem SIGTERM/SIGHUP/exit teardown and
- * from session dispose, so hook/extension/custom-tool children with no signal
- * of their own still die with the session instead of orphaning to PID 1.
- * Abandoned callers observe the kill as `killed: true`.
+ * TERM-then-KILL live `execCommand` groups and wait (bounded) for them to
+ * exit. With an `owner`, only that session's entries are killed — this is
+ * what session dispose calls, so finishing sessions never kill another
+ * session's in-flight hook/extension/tool children. Without an `owner`
+ * every live entry is killed: the postmortem SIGTERM/SIGHUP/exit teardown,
+ * so signal-less children still die with the process instead of orphaning
+ * to PID 1. Abandoned callers observe the kill as `killed: true`.
  */
-export async function shutdownExecCommands(timeoutMs = EXEC_SHUTDOWN_WAIT_MS): Promise<void> {
-	const live = [...liveExecCommands];
+export async function shutdownExecCommands(owner?: string, timeoutMs = EXEC_SHUTDOWN_WAIT_MS): Promise<void> {
+	const live =
+		owner === undefined ? [...liveExecCommands] : [...liveExecCommands].filter(entry => entry.owner === owner);
 	if (live.length === 0) return;
 	for (const { child } of live) {
 		try {
@@ -115,7 +146,10 @@ export async function execCommand(
 	const settled = new Promise<void>(resolve => {
 		markSettled = resolve;
 	});
-	const entry: LiveExecCommand = { child, settled };
+	// Explicit `sessionKey` wins; otherwise the ambient `runWithExecOwner`
+	// scope names the invoking session. Unowned entries die only in the
+	// postmortem all-kill — never by another session's dispose.
+	const entry: LiveExecCommand = { child, settled, owner: options?.sessionKey ?? execOwnerStorage.getStore() };
 	liveExecCommands.add(entry);
 	// Pre-handle the exit rejection: a kill can settle `#exited` while
 	// `wait()` below is still blocked on pipe EOF (a live grandchild holding

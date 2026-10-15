@@ -138,7 +138,7 @@ import type { PythonResult } from "../eval/py/executor";
 import { formatEvalStateContext } from "../eval/state";
 import { WorkPoolRegistry } from "../task/workpool";
 import { type BashPtyOptions, type BashResult, releaseShellSessions } from "../exec/bash-executor";
-import { shutdownExecCommands } from "../exec/exec";
+import { runWithExecOwner, shutdownExecCommands } from "../exec/exec";
 import type { TtsrManager } from "../export/ttsr";
 import type { LoadedCustomCommand } from "../extensibility/custom-commands";
 import type { CustomTool } from "../extensibility/custom-tools/types";
@@ -5705,10 +5705,16 @@ export class AgentSession implements SettingsScope {
 		const advisorRecorderClosed = this.#advisors.recorderClosed();
 		// Awaited: return means every bash-tool process group owned by this
 		// session is dead — nothing outlives dispose into a PPID-1 orphan.
-		// Live `execCommand` groups (hook/extension/custom-tool children, often
-		// signal-less) are shut down alongside: they run detached, so the
-		// kernel SIGHUP path cannot reap them.
-		await Promise.allSettled([releaseShellSessions(this.sessionManager.getSessionId()), shutdownExecCommands()]);
+		// Live `execCommand` groups owned by this session (hook/extension/
+		// custom-tool children, often signal-less) are shut down alongside:
+		// they run detached, so the kernel SIGHUP path cannot reap them.
+		// Only this session's entries are killed — other sessions' in-flight
+		// children (e.g. the parent's, when a subagent disposes) are spared;
+		// the postmortem teardown kills whatever remains at process exit.
+		await Promise.allSettled([
+			releaseShellSessions(this.sessionManager.getSessionId()),
+			shutdownExecCommands(this.sessionManager.getSessionId()),
+		]);
 		const results = await Promise.allSettled([
 			this.#disposeOwnedAsyncJobs(),
 			this.#eval.disposeKernels(),
@@ -8220,7 +8226,11 @@ export class AgentSession implements SettingsScope {
 
 		try {
 			const args = parseCommandArgs(argsString);
-			const result = await loaded.command.execute(args, ctx, argsString);
+			// Attribute `pi.exec` children the command starts to this session,
+			// like hook and tool invocations above.
+			const result = await runWithExecOwner(this.sessionManager.getSessionId(), () =>
+				loaded.command.execute(args, ctx, argsString),
+			);
 			// If result is a string, it's a prompt to send to LLM
 			// If void/undefined, command handled everything
 			return result ?? "";

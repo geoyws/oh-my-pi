@@ -215,6 +215,17 @@ interface InFlightShellRun {
 const inFlightShellRuns = new Set<InFlightShellRun>();
 
 /**
+ * Test-only override for the post-abort in-flight leak bound below. Lets a
+ * test age a run past the bound in milliseconds instead of waiting out the
+ * ~30s production window. Reset to `undefined` when done.
+ */
+let inFlightLeakBoundForTestMs: number | undefined;
+
+export function setInFlightLeakBoundForTest(ms: number | undefined): void {
+	inFlightLeakBoundForTestMs = ms;
+}
+
+/**
  * Upper bound on how long session dispose waits for an in-flight run's
  * cancellation (TERM→KILL escalation and reap). Native cancellation normally
  * settles in ~2s; an unkillable run must not stall dispose forever.
@@ -310,25 +321,35 @@ function quarantineShellSession(
 }
 
 /**
+ * Whether a shell session key belongs to an agent session: either the plain
+ * `${sid}\\n…` form or an `:async:` job key (`${sid}:async:<jobId>\\n…`). The
+ * latter never matches the plain prefix, but an in-flight async run's shell
+ * and cancellation still belong to the disposing session (mirrors the
+ * `${sid}:` match used for retained shells below).
+ */
+function shellKeyOwnedBySession(key: string, agentSessionKey: string): boolean {
+	return key.startsWith(`${agentSessionKey}\n`) || key.startsWith(`${agentSessionKey}:async:`);
+}
+
+/**
  * Shuts down every Shell owned by an agent session (keys built with
  * `agentSessionKey` as the {@link BashExecutorOptions.sessionKey}), plus that
- * session's retained `:async:` shells. Each shell is aborted (an in-flight run
- * cancels through the native TERM→KILL bridge) and its leftover background
- * jobs are terminated with awaited TERM→KILL escalation, so no bash-tool
- * process group outlives session dispose — and, through the postmortem
- * SIGTERM/SIGHUP teardown, process exit. In-flight runs are additionally
- * awaited (bounded): `shutdown()` alone returns while the native cancel
- * bridge still runs its TERM→KILL waves, so returning then would orphan a
- * TERM-ignoring child. The maps are process-global, so without this each
- * disposed session keeps its native shell (and its background jobs) for the
- * life of the process.
+ * session's retained and in-flight `:async:` shells. Each shell is aborted (an
+ * in-flight run cancels through the native TERM→KILL bridge) and its leftover
+ * background jobs are terminated with awaited TERM→KILL escalation, so no
+ * bash-tool process group outlives session dispose — and, through the
+ * postmortem SIGTERM/SIGHUP teardown, process exit. In-flight runs are
+ * additionally awaited (bounded, however long they have been running):
+ * `shutdown()` alone returns while the native cancel bridge still runs its
+ * TERM→KILL waves, so returning then would orphan a TERM-ignoring child. The
+ * maps are process-global, so without this each disposed session keeps its
+ * native shell (and its background jobs) for the life of the process.
  */
 export async function releaseShellSessions(agentSessionKey: string | undefined): Promise<void> {
 	if (!agentSessionKey) return;
-	const prefix = `${agentSessionKey}\n`;
 	const owned: Shell[] = [];
 	for (const [key, shell] of shellSessions) {
-		if (!key.startsWith(prefix)) continue;
+		if (!shellKeyOwnedBySession(key, agentSessionKey)) continue;
 		shellSessions.delete(key);
 		owned.push(shell);
 	}
@@ -338,11 +359,12 @@ export async function releaseShellSessions(agentSessionKey: string | undefined):
 			owned.push(shell);
 		}
 	}
-	// Runs still executing on this session's keys (persistent or one-shot
-	// fallback shells): abort them and wait for the native cancellation —
-	// TERM→KILL waves and reap — to complete. Bounded so an unkillable run
-	// cannot stall dispose; the shutdown below fires the same abort.
-	const inFlight = [...inFlightShellRuns].filter(run => run.key.startsWith(prefix));
+	// Runs still executing on this session's keys — persistent, one-shot
+	// fallback, and `:async:` job shells alike: abort them and wait for the
+	// native cancellation — TERM→KILL waves and reap — to complete. Bounded
+	// so an unkillable run cannot stall dispose; the shutdown below fires the
+	// same abort.
+	const inFlight = [...inFlightShellRuns].filter(run => shellKeyOwnedBySession(run.key, agentSessionKey));
 	const settleInFlight = async (): Promise<void> => {
 		if (inFlight.length === 0) return;
 		await Promise.allSettled(inFlight.map(run => run.abort()));
@@ -734,7 +756,13 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	const userSignal = options?.signal;
 	const runAbortController = new AbortController();
 	let abortCleanupPromise: Promise<void> | undefined;
+	// Assigned once the in-flight entry below exists. Firing the abort starts
+	// the leak-bound countdown for the entry (a run that never settles after
+	// an abort must not pin the registry forever); a healthy long run that
+	// was never aborted stays tracked so dispose still waits for it.
+	let armInFlightLeakBound: () => void = () => {};
 	const abortShell = (): Promise<void> => {
+		armInFlightLeakBound();
 		abortCleanupPromise ??= executionShell.abort().catch(() => undefined);
 		return abortCleanupPromise;
 	};
@@ -802,12 +830,23 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		});
 		const inFlightRun: InFlightShellRun = { key: sessionKey, abort: abortShell, settled: runSettled };
 		inFlightShellRuns.add(inFlightRun);
-		// Defensive bound matching the quarantine window (#10308): a wedged
-		// native run must not pin this entry for the life of the process.
-		const leakTimer = setTimeout(() => inFlightShellRuns.delete(inFlightRun), QUARANTINE_CLEANUP_TIMEOUT_MS);
-		leakTimer.unref?.();
+		// Leak bound for a wedged run that never settles after an abort
+		// (mirrors the quarantine window, #10308). Armed only by the first
+		// `abortShell()` call — never at run start — so a healthy long run
+		// stays tracked and dispose still waits for its cancellation.
+		let leakTimer: NodeJS.Timeout | undefined;
+		armInFlightLeakBound = () => {
+			leakTimer ??= setTimeout(
+				() => inFlightShellRuns.delete(inFlightRun),
+				inFlightLeakBoundForTestMs ?? QUARANTINE_CLEANUP_TIMEOUT_MS,
+			);
+			leakTimer.unref?.();
+		};
 		const settleRun = (): void => {
-			clearTimeout(leakTimer);
+			if (leakTimer !== undefined) {
+				clearTimeout(leakTimer);
+				leakTimer = undefined;
+			}
 			inFlightShellRuns.delete(inFlightRun);
 			markRunSettled();
 		};

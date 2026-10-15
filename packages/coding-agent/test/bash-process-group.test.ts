@@ -3,7 +3,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { executeBash, releaseShellSessions } from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
+import {
+	executeBash,
+	releaseShellSessions,
+	setInFlightLeakBoundForTest,
+} from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 
 /**
@@ -214,7 +218,60 @@ describe("bash process-group kill", () => {
 		expect(result.cancelled).toBe(true);
 	}, 60_000);
 
- 	it("session dispose kills retained async shells' groups", async () => {
+	it("session dispose waits for a run older than the leak bound", async () => {
+		if (process.platform === "win32") return;
+		const marker = uniqueMarker("OLDRUN");
+		strayMarkers.push(marker);
+		const sessionId = `pgkill-oldrun-${marker}`;
+		// Shrink the post-abort leak bound so the run can age past it in
+		// milliseconds instead of ~30s. The bound must only ever drop an
+		// entry after an abort: this run is never aborted before dispose,
+		// so it must stay tracked no matter how old it gets, and dispose
+		// must still wait for its TERM→KILL escalation. No polling after
+		// dispose returns. (Real-clock sleep: process age has no event
+		// handle and cannot run on fake timers.)
+		setInFlightLeakBoundForTest(100);
+		try {
+			const promise = executeBash(termIgnoringGrandchild(marker), {
+				cwd: tempDir,
+				timeout: 0,
+				sessionKey: sessionId,
+			});
+			expect(await pollUntilLive(marker, 10_000)).not.toEqual([]);
+			await Bun.sleep(500);
+			expect(livePids(marker)).not.toEqual([]);
+			await releaseShellSessions(sessionId);
+			expect(livePids(marker)).toEqual([]);
+			const result = await promise;
+			expect(result.cancelled).toBe(true);
+		} finally {
+			setInFlightLeakBoundForTest(undefined);
+		}
+	}, 60_000);
+
+	it("session dispose waits for an in-flight async run's group to die", async () => {
+		if (process.platform === "win32") return;
+		const marker = uniqueMarker("ASYNCFLIGHT");
+		strayMarkers.push(marker);
+		const sessionId = `pgkill-asyncflight-${marker}`;
+		// An `:async:` job's key (`${sid}:async:<jobId>`) never matched the
+		// plain `${sid}\n` dispose prefix, so an in-flight async run was
+		// neither aborted nor awaited. No user abort here: dispose itself
+		// must cancel it and wait (bounded) for the TERM→KILL escalation.
+		// No polling after dispose returns.
+		const promise = executeBash(termIgnoringGrandchild(marker), {
+			cwd: tempDir,
+			timeout: 0,
+			sessionKey: `${sessionId}:async:job1`,
+		});
+		expect(await pollUntilLive(marker, 10_000)).not.toEqual([]);
+		await releaseShellSessions(sessionId);
+		expect(livePids(marker)).toEqual([]);
+		const result = await promise;
+		expect(result.cancelled).toBe(true);
+	}, 60_000);
+
+	it("session dispose kills retained async shells' groups", async () => {
 		if (process.platform === "win32") return;
 		const marker = uniqueMarker("RETAINED");
 		strayMarkers.push(marker);

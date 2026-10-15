@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "bun:test";
-import { execCommand, shutdownExecCommands } from "../src/exec/exec";
+import { execCommand, runWithExecOwner, shutdownExecCommands } from "../src/exec/exec";
 
 const HANG = ["-e", "setTimeout(() => {}, 30_000)"];
 
@@ -154,6 +154,89 @@ describe("execCommand", () => {
 				} catch {}
 			}
 			await fs.promises.rm(dir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
+	it("session shutdown kills only its own exec children; exit teardown kills the rest", async () => {
+		if (process.platform === "win32") return;
+		// Three signal-less children with different owners: two explicit
+		// `sessionKey`s and one ambient `runWithExecOwner` scope (the path
+		// hook/tool runners use). Disposing session A must not touch B or C;
+		// the owner-less postmortem shutdown kills everything remaining.
+		// Bounded sleeps await kernel liveness via pgrep, which has no event
+		// handle and cannot run on fake timers.
+		const tag = `${process.pid}_${Math.random().toString(36).slice(2, 8)}`;
+		const markerA = `EXECCMD_OWNA_${tag}`;
+		const markerB = `EXECCMD_OWNB_${tag}`;
+		const markerC = `EXECCMD_OWNC_${tag}`;
+		const live = (marker: string): number[] =>
+			Bun.spawnSync(["pgrep", "-f", `[${marker[0]}]${marker.slice(1)}`])
+				.stdout.toString()
+				.trim()
+				.split("\n")
+				.filter(Boolean)
+				.map(Number)
+				.filter(pid => Number.isInteger(pid) && pid > 0);
+		const spawnOwned = (marker: string, sessionKey?: string) =>
+			execCommand(
+				"/bin/sh",
+				["-c", `sh -c 'trap "" TERM; while :; do sleep 0.2; done' ${marker} & wait`],
+				process.cwd(),
+				sessionKey === undefined ? undefined : { sessionKey },
+			);
+		try {
+			const pendingA = spawnOwned(markerA, "owner-a");
+			const pendingB = spawnOwned(markerB, "owner-b");
+			const pendingC = runWithExecOwner("owner-c", () => spawnOwned(markerC));
+			for (const marker of [markerA, markerB, markerC]) {
+				const start = Date.now();
+				while (live(marker).length === 0 && Date.now() - start < 10_000) await Bun.sleep(20);
+				expect(live(marker).length).toBeGreaterThan(0);
+			}
+			await shutdownExecCommands("owner-a");
+			expect((await pendingA).killed).toBe(true);
+			expect(live(markerA)).toEqual([]);
+			// B and C are untouched: still alive and their calls unsettled.
+			// A short settle check (not a leak window): a wrongful kill would
+			// settle them near-instantly, while the loops below would spin
+			// for the full script lifetime without the shutdown.
+			expect(live(markerB).length).toBeGreaterThan(0);
+			expect(live(markerC).length).toBeGreaterThan(0);
+			let settledB = false;
+			let settledC = false;
+			void pendingB.then(
+				() => {
+					settledB = true;
+				},
+				() => {
+					settledB = true;
+				},
+			);
+			void pendingC.then(
+				() => {
+					settledC = true;
+				},
+				() => {
+					settledC = true;
+				},
+			);
+			await Bun.sleep(500);
+			expect(settledB).toBe(false);
+			expect(settledC).toBe(false);
+			// The owner-less (postmortem) shutdown kills everything remaining.
+			await shutdownExecCommands();
+			expect((await pendingB).killed).toBe(true);
+			expect((await pendingC).killed).toBe(true);
+			expect(live(markerB)).toEqual([]);
+			expect(live(markerC)).toEqual([]);
+		} finally {
+			for (const marker of [markerA, markerB, markerC]) {
+				for (const pid of live(marker)) {
+					try {
+						process.kill(pid, "SIGKILL");
+					} catch {}
+				}
+			}
 		}
 	}, 60_000);
 });
