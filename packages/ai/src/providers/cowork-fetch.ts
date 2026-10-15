@@ -303,6 +303,7 @@ async function sendCoworkRequest(
 	// `https.request` would otherwise leave the binding in its temporal dead
 	// zone, and an abort arriving on that path would raise a ReferenceError from
 	// inside the listener instead of cancelling.
+	// oxlint-disable-next-line prefer-const -- `let` is load-bearing: see the TDZ note above.
 	let request: ClientRequest | undefined;
 	const release = (): void => {
 		signal?.removeEventListener("abort", abort);
