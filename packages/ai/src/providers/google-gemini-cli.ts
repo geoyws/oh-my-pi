@@ -15,6 +15,7 @@ import {
 } from "@oh-my-pi/pi-catalog/wire/gemini-headers";
 import { extractHttpStatusFromError, fetchWithRetry, readSseJson } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
+import { ProviderOperationDeadlineError } from "../error/validation";
 import type {
 	Api,
 	AssistantMessage,
@@ -1097,9 +1098,12 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 					break;
 				} catch (error) {
 					const status = extractHttpStatusFromError(error);
+					// A spent operation budget is final: failing over would start a
+					// fresh request with its own unbudgeted retries.
 					if (
 						!isLastEndpoint &&
 						!started &&
+						!(error instanceof ProviderOperationDeadlineError) &&
 						(AIError.isTransientStatus(status) ||
 							(status === undefined &&
 								!(error instanceof AIError.ProviderResponseError && error.kind === "output") &&

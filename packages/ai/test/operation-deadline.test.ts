@@ -9,6 +9,7 @@ import * as AIError from "@oh-my-pi/pi-ai/error";
 import { streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
 import type { AnthropicMessagesClientLike } from "@oh-my-pi/pi-ai/providers/anthropic-client";
 import { streamGoogle } from "@oh-my-pi/pi-ai/providers/google";
+import { streamGoogleGeminiCli } from "@oh-my-pi/pi-ai/providers/google-gemini-cli";
 import { streamOpenAICodexResponses } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { streamSimple } from "@oh-my-pi/pi-ai/stream";
 import type {
@@ -432,6 +433,59 @@ describe("operation deadline across provider families", () => {
 		expect(calls).toBe(1);
 		expect(result.stopReason).toBe("error");
 		expect(AIError.isProviderOperationDeadlineText(result.errorMessage)).toBe(true);
+	});
+
+	it("refuses the Gemini CLI empty-stream retry instead of failing over to the next endpoint", async () => {
+		const daily = "https://daily-cloudcode-pa.googleapis.com";
+		const sandbox = "https://daily-cloudcode-pa.sandbox.googleapis.com";
+		const antigravityModel: Model<"google-gemini-cli"> = buildModel({
+			id: "gemini-3-flash",
+			name: "Gemini 3 Flash (Antigravity)",
+			api: "google-gemini-cli",
+			provider: "google-antigravity",
+			baseUrl: daily,
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 32_000,
+		});
+		const savedVersion = process.env.PI_AI_ANTIGRAVITY_VERSION;
+		// Keeps the client-version manifest lookup off the injected fetch.
+		process.env.PI_AI_ANTIGRAVITY_VERSION = "2.19.1";
+		const requested: string[] = [];
+		const fetchMock: FetchImpl = async input => {
+			const url = input instanceof Request ? input.url : input.toString();
+			const endpoint = url.startsWith(sandbox) ? sandbox : daily;
+			requested.push(endpoint);
+			// An eventless STOP: nothing starts, so only the empty-stream retry
+			// (or, wrongly, endpoint failover) can follow.
+			const response = new Response(
+				`data: ${JSON.stringify({ response: { candidates: [{ content: { parts: [{ text: "" }] }, finishReason: "STOP" }] } })}\n\n`,
+				{ status: 200, headers: { "content-type": "text/event-stream" } },
+			);
+			Object.defineProperty(response, "url", { value: `${endpoint}/v1internal:streamGenerateContent?alt=sse` });
+			return response;
+		};
+
+		try {
+			const result = await streamGoogleGeminiCli(antigravityModel, context, {
+				apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
+				antigravityEndpointMode: "auto",
+				fetch: fetchMock,
+				operationTimeoutMs: 900_000,
+				operationDeadlineAt: Date.now() - 1,
+			}).result();
+
+			// The refused retry is final: a fresh request on the alternate
+			// endpoint would run its own unbudgeted retries.
+			expect(requested).toEqual([daily]);
+			expect(result.stopReason).toBe("error");
+			expect(AIError.isProviderOperationDeadlineText(result.errorMessage)).toBe(true);
+		} finally {
+			if (savedVersion === undefined) delete process.env.PI_AI_ANTIGRAVITY_VERSION;
+			else process.env.PI_AI_ANTIGRAVITY_VERSION = savedVersion;
+		}
 	});
 
 	it("stamps the deadline on a streamSimple branch that never reaches the dispatcher", async () => {
