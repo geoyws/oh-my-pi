@@ -1872,9 +1872,18 @@ export class TurnRecovery {
 	 * (`anthropic/claude-opus-5 -> … -> runinfra/deepseek-v4-pro`, whose own
 	 * `runinfra/deepseek-v4-pro -> openrouter/deepseek/…` chain was unreachable).
 	 *
-	 * Two keys is the whole walk per attempt. Chains that point at each other
-	 * alternate models instead of looping in place, and every hop still spends a
-	 * retry attempt, so the budget terminates either way.
+	 * Chains that point at each other alternate models instead of looping in
+	 * place, and every hop still spends a retry attempt, so the budget
+	 * terminates either way.
+	 *
+	 * The session's owning role chain comes last when a more specific key
+	 * shadows it. A model-selector key outranks every role in
+	 * {@link resolveRetryFallbackChainKey}, so a task subagent pinned to
+	 * `subagent:<id>` on a model with its own model-keyed chain would otherwise
+	 * see only that chain: once its rungs are all unusable (parked on a cooldown
+	 * a sibling's walk recorded, or out of credentials), a quota-exhausted 429
+	 * would end the child while its role chain still has a usable rung. The model
+	 * key keeps precedence; the owning role only appends the rungs it lists.
 	 *
 	 * An exhaustive installed chain (`subagent:<id>` from an explicit
 	 * multi-entry override list) walks alone: when either the pinned or the
@@ -1889,10 +1898,15 @@ export class TurnRecovery {
 		const pinned = options?.pinnedRole ?? this.#activeRetryFallback?.role;
 		const exhaustive = getExhaustiveRetryFallbackRoles(this.#host.settings);
 		if (pinned && exhaustive.has(pinned)) return [pinned];
-		const current = this.resolveRetryFallbackRole(currentSelector, currentModel, options?.roleHint);
-		if (!pinned) return current ? [current] : [];
-		if (current && current !== pinned) return exhaustive.has(current) ? [current] : [pinned, current];
-		return [pinned];
+		const roleHint = options?.roleHint ?? this.#liveRetryRoleHint(currentModel);
+		const current = this.resolveRetryFallbackRole(currentSelector, currentModel, roleHint);
+		if (current && exhaustive.has(current) && current !== pinned) return [current];
+		const keys = pinned ? [pinned] : [];
+		if (current && current !== pinned) keys.push(current);
+		if (roleHint && !keys.includes(roleHint) && Array.isArray(this.#getRetryFallbackChains()[roleHint])) {
+			keys.push(roleHint);
+		}
+		return keys;
 	}
 
 	/** Live session role for chain lookup, provided its assignment still matches the active model. */
