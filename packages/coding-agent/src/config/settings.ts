@@ -521,6 +521,64 @@ function physicalTargetSegments(target: string, pathApi: typeof path = path): st
 	return body.split(separator);
 }
 
+/** Resolve policy identity even when a config (or a symlink referent) is missing. */
+function resolveConfigPolicyTarget(filePath: string): string {
+	const absolute = path.isAbsolute(filePath) ? filePath : path.join(process.cwd(), filePath);
+	let resolved = path.parse(absolute).root;
+	const pending = physicalTargetSegments(absolute);
+	let hops = 0;
+	let missing = false;
+	for (let index = 0; index < pending.length; index++) {
+		const segment = pending[index];
+		if (segment === "" || segment === "." || segment === "..") {
+			// Do not normalize away a required directory traversal in a link target.
+			if (missing) {
+				if (segment === "..")
+					throw Object.assign(new Error(`ENOENT: cannot traverse missing config target: ${filePath}`), {
+						code: "ENOENT",
+					});
+			} else if (!fs.statSync(resolved).isDirectory()) {
+				throw Object.assign(new Error(`ENOTDIR: config target requires a directory: ${resolved}`), {
+					code: "ENOTDIR",
+				});
+			}
+			if (segment === "..") resolved = path.dirname(resolved);
+			continue;
+		}
+		const candidate = path.join(resolved, segment);
+		let stat: fs.Stats | undefined;
+		if (!missing) {
+			try {
+				stat = fs.lstatSync(candidate);
+			} catch (error) {
+				if (!isEnoent(error)) throw error;
+				missing = true;
+			}
+		}
+		if (stat?.isSymbolicLink()) {
+			if (++hops > MAX_SYMLINK_HOPS) {
+				throw Object.assign(
+					new Error(`ELOOP: config target exceeds ${MAX_SYMLINK_HOPS} symlink hops: ${filePath}`),
+					{ code: "ELOOP" },
+				);
+			}
+			const target = fs.readlinkSync(candidate);
+			if (path.isAbsolute(target)) resolved = path.parse(target).root;
+			pending.splice(index, 1, ...physicalTargetSegments(target));
+			index--;
+		} else {
+			// Canonicalize existing prefixes too (for example /var versus /private/var).
+			resolved = stat ? fs.realpathSync(candidate) : candidate;
+			if (stat && index < pending.length - 1 && !stat.isDirectory()) {
+				throw Object.assign(new Error(`ENOTDIR: config target requires a directory: ${resolved}`), {
+					code: "ENOTDIR",
+				});
+			}
+		}
+	}
+	return resolved;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Settings Class
 // ═══════════════════════════════════════════════════════════════════════════
@@ -703,9 +761,10 @@ export class Settings {
 
 	#globalWriteRefusal(setting: string): Error {
 		const logical = path.resolve(this.#configPath ?? path.join(this.#agentDir, MAIN_CONFIG_FILENAMES[0]));
-		let target = logical;
-		try { target = fs.realpathSync(logical); } catch { /* Missing targets retain their absolute path. */ }
-		return new Error(`Cannot persist ${setting}: global config is read-only (${target}). Disable config.readOnly / PI_CONFIG_READONLY or assign roles in an existing ${path.resolve(getProjectAgentDir(this.#cwd))} directory.`);
+		const target = resolveConfigPolicyTarget(logical);
+		return new Error(
+			`Cannot persist ${setting}: global config is read-only (${target}). Disable config.readOnly / PI_CONFIG_READONLY or assign roles in an existing ${path.resolve(getProjectAgentDir(this.#cwd))} directory.`,
+		);
 	}
 
 	#assertGlobalWritable(setting: string): void {
@@ -720,12 +779,10 @@ export class Settings {
 			throw this.#globalWriteRefusal(`modelRoles.${role}`);
 		}
 		const projectPath = path.join(projectDir, "config.yml");
-		if (this.#configPath && fs.existsSync(projectPath) && fs.existsSync(this.#configPath) &&
-			fs.realpathSync(projectPath) === fs.realpathSync(this.#configPath)) {
+		if (this.#configPath && resolveConfigPolicyTarget(projectPath) === resolveConfigPolicyTarget(this.#configPath)) {
 			throw this.#globalWriteRefusal(`modelRoles.${role}`);
 		}
 	}
-
 
 	/**
 	 * Get a setting value (sync).
@@ -1504,7 +1561,8 @@ export class Settings {
 			}
 			this.#configOverlay = (await this.#readConfigOverlays(false)).settings;
 			this.#rebuildMerged();
-			this.#globalReadOnly ||= getByPath(this.#global, ["config", "readOnly"]) === true || this.get("config.readOnly") === true;
+			this.#globalReadOnly ||=
+				getByPath(this.#global, ["config", "readOnly"]) === true || this.get("config.readOnly") === true;
 			if (failedMain && this.isGlobalConfigReadOnly()) {
 				this.#unwrapYamlLoadResult(failedMain.filePath, failedMain.result);
 			}
@@ -1856,12 +1914,26 @@ export class Settings {
 
 	async #withYamlWriteLock<T>(filePath: string, fn: (writePath: string) => Promise<T>): Promise<T> {
 		const writePath = await this.#resolveYamlWritePath(filePath);
-		return await withFileLock(writePath, async () => fn(writePath));
+		return await withFileLock(writePath, async () => {
+			// Recheck after lock acquisition, before quarantine or any write via an alias.
+			if (
+				this.isGlobalConfigReadOnly() &&
+				this.#configPath &&
+				resolveConfigPolicyTarget(writePath) === resolveConfigPolicyTarget(this.#configPath)
+			) {
+				throw this.#globalWriteRefusal("modelRoles");
+			}
+			return fn(writePath);
+		});
 	}
 
 	async #loadYamlIfPresentForStartup(filePath: string): Promise<RawSettings | null> {
 		const result = await this.#loadYamlIfPresent(filePath);
-		if (result.kind !== "invalid" || !this.#persist || (filePath === this.#configPath && this.isGlobalConfigReadOnly())) {
+		if (
+			result.kind !== "invalid" ||
+			!this.#persist ||
+			(filePath === this.#configPath && this.isGlobalConfigReadOnly())
+		) {
 			return this.#unwrapYamlLoadResult(filePath, result);
 		}
 		return await this.#withYamlWriteLock(filePath, async writePath => {

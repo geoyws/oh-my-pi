@@ -91,7 +91,11 @@ for (const switchName of ["config.readOnly", "PI_CONFIG_READONLY"] as const) {
 			fs.symlinkSync(target, config);
 			const settings = await load();
 			let error: unknown;
-			try { settings.setModelRole("smol", "provider/project:low"); } catch (caught) { error = caught; }
+			try {
+				settings.setModelRole("smol", "provider/project:low");
+			} catch (caught) {
+				error = caught;
+			}
 			expect(error).toBeInstanceOf(Error);
 			expect((error as Error).message).toContain("modelRoles.smol");
 			expect((error as Error).message).toContain(fs.realpathSync(target));
@@ -100,6 +104,105 @@ for (const switchName of ["config.readOnly", "PI_CONFIG_READONLY"] as const) {
 			expect(fs.existsSync(getProjectAgentDir(cwd))).toBe(false);
 			expect(fs.readFileSync(target, "utf8")).toBe(bytes);
 		});
+
+		it("refuses an initially missing global config through an existing project-directory alias", async () => {
+			const policy = temp.join("policy.yml");
+			fs.writeFileSync(policy, source());
+			fs.symlinkSync(agentDir, getProjectAgentDir(cwd), "dir");
+			const settings = await load({ configFiles: [policy] });
+			expect(settings.isGlobalConfigReadOnly()).toBe(true);
+			expect(() => settings.setModelRole("smol", "provider/project:high")).toThrow("modelRoles.smol");
+			await settings.flush();
+			expect(fs.existsSync(config)).toBe(false);
+			expect(fs.readdirSync(agentDir)).toEqual([]);
+		});
+
+		for (const alias of [
+			"project directory",
+			"global directory",
+			"file chain",
+			"dangling directory target",
+		] as const) {
+			it(`refuses a missing global target reached through a ${alias} alias`, async () => {
+				const bytes = source();
+				fs.writeFileSync(config, bytes);
+				const settings = await load();
+				fs.unlinkSync(config);
+				const projectDir = getProjectAgentDir(cwd);
+				let protectedTarget = config;
+				if (alias === "project directory") {
+					fs.symlinkSync(agentDir, projectDir, "dir");
+				} else if (alias === "global directory") {
+					fs.mkdirSync(projectDir);
+					fs.rmdirSync(agentDir);
+					fs.symlinkSync(projectDir, agentDir, "dir");
+					protectedTarget = path.join(projectDir, "config.yml");
+				} else {
+					fs.mkdirSync(projectDir);
+					const intermediate = temp.join("intermediate.yml");
+					fs.symlinkSync(intermediate, path.join(projectDir, "config.yml"));
+					if (alias === "file chain") {
+						fs.symlinkSync(config, intermediate);
+					} else {
+						const missingDir = temp.join("not-created");
+						const directoryAlias = temp.join("directory-alias");
+						fs.symlinkSync(missingDir, directoryAlias, "dir");
+						protectedTarget = path.join(missingDir, "managed.yml");
+						fs.symlinkSync(path.join(directoryAlias, "managed.yml"), config);
+						fs.symlinkSync(protectedTarget, intermediate);
+					}
+				}
+				for (const value of ["provider/project:high", undefined]) {
+					let error: unknown;
+					try {
+						settings.setModelRole("smol", value);
+					} catch (caught) {
+						error = caught;
+					}
+					expect(error).toBeInstanceOf(Error);
+					expect((error as Error).message).toContain("modelRoles.smol");
+					expect((error as Error).message).toContain("global config is read-only");
+					expect((error as Error).message).toContain(
+						path.join(fs.realpathSync(temp.join()), path.relative(temp.join(), protectedTarget)),
+					);
+				}
+				await settings.flush();
+				expect(fs.existsSync(protectedTarget)).toBe(false);
+				expect(settings.getProjectModelRole("smol")).toBeUndefined();
+				// Restore the managed source and reopen: refused saves left no project role behind.
+				fs.mkdirSync(path.dirname(protectedTarget), { recursive: true });
+				fs.writeFileSync(protectedTarget, bytes);
+				const reopened = await load();
+				expect(reopened.getProjectModelRole("smol")).toBeUndefined();
+				expect(fs.readFileSync(config, "utf8")).toBe(bytes);
+			});
+		}
+
+		for (const alias of ["directory", "dangling file"] as const) {
+			it(`saves and reopens a safe project ${alias} alias`, async () => {
+				const bytes = source();
+				fs.writeFileSync(config, bytes);
+				const projectDir = getProjectAgentDir(cwd);
+				const safeDir = temp.join("safe-project");
+				fs.mkdirSync(safeDir);
+				const target = path.join(safeDir, "config.yml");
+				if (alias === "directory") {
+					fs.symlinkSync(safeDir, projectDir, "dir");
+				} else {
+					fs.mkdirSync(projectDir);
+					fs.symlinkSync(target, path.join(projectDir, "config.yml"));
+				}
+				const settings = await load();
+				settings.setModelRole("smol", "provider/project:high");
+				await settings.flush();
+				expect(YAML.parse(fs.readFileSync(target, "utf8")).modelRoles.smol).toBe("provider/project:high");
+				expect((await load()).getModelRole("smol")).toBe("provider/project:high");
+				expect(fs.readFileSync(config, "utf8")).toBe(bytes);
+				expect(
+					fs.lstatSync(alias === "directory" ? projectDir : path.join(projectDir, "config.yml")).isSymbolicLink(),
+				).toBe(true);
+			});
+		}
 
 		it("preserves overlay precedence across role writes and cwd clones", async () => {
 			fs.writeFileSync(config, source());
@@ -145,7 +248,9 @@ it("retains writable project-directory creation", async () => {
 	const settings = await load();
 	settings.setProjectModelRole("default", "provider/project:high");
 	await settings.flush();
-	expect(YAML.parse(fs.readFileSync(path.join(getProjectAgentDir(cwd), "config.yml"), "utf8")).modelRoles.default).toBe("provider/project:high");
+	expect(
+		YAML.parse(fs.readFileSync(path.join(getProjectAgentDir(cwd), "config.yml"), "utf8")).modelRoles.default,
+	).toBe("provider/project:high");
 });
 
 it("keeps programmatic readOnly stronger than the named policy", async () => {
