@@ -7784,6 +7784,110 @@ describe("openai-codex recovery attempt gate", () => {
 		}
 	});
 
+	const NESTED_HTTP_FAILURES = [
+		["network failure", undefined],
+		["HTTP 408", 408],
+		["HTTP 429", 429],
+		["HTTP 500", 500],
+		["HTTP 503", 503],
+	] as const;
+
+	for (const [label, status] of NESTED_HTTP_FAILURES) {
+		it.each(["before wait", "during wait", "live budget", "caller abort"] as const)(
+			"gates nested " + label + " retries (%s)",
+			async mode => {
+				const caller = new AbortController();
+				const options = {
+					apiKey: createCodexTestToken(),
+					signal: caller.signal,
+					codexSseMaxAttempts: 2,
+					...createBudget(),
+				};
+				// Advance the live operation deadline deterministically, without
+				// racing watchdog timers or replacing the HTTP retry implementation.
+				vi.spyOn(scheduler, "wait").mockImplementation(async () => {
+					if (mode === "during wait" || mode === "caller abort") spendBudget(options);
+					if (mode === "caller abort") caller.abort();
+				});
+				let requests = 0;
+				const fetchMock: FetchImpl = async () => {
+					requests += 1;
+					if (requests === 1) {
+						if (mode === "before wait") spendBudget(options);
+						if (status === undefined) throw new TypeError("fetch failed");
+						// Explicit zero delay covers the immediate retry path too.
+						return new Response("temporary failure", { status, headers: { "retry-after": "0" } });
+					}
+					return new Response(createCompletedCodexSse("Recovered"), { headers: SSE_HEADERS });
+				};
+				const result = await streamOpenAICodexResponses(
+					{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+					createCodexTestContext(),
+					Object.assign(options, { fetch: fetchMock }),
+				).result();
+
+				expect(requests).toBe(mode === "live budget" ? 2 : 1);
+				if (mode === "live budget") {
+					expect(result.stopReason).toBe("stop");
+					expect(result.content.find(block => block.type === "text")?.text).toBe("Recovered");
+				} else if (mode === "caller abort") {
+					expect(result.stopReason).toBe("aborted");
+					expect(result.errorMessage).toBe("Request was aborted");
+				} else {
+					expect(result.stopReason).toBe("error");
+					expect(result.errorMessage).toContain(BUDGET_EXHAUSTED);
+				}
+			},
+		);
+	}
+
+	for (const status of [400, 415]) {
+		it.each(["spent budget", "caller abort", "live budget"] as const)(
+			"gates the uncompressed replay after HTTP " + status + " (%s)",
+			async mode => {
+				await withEnv({ PI_CODEX_ZSTD: "1" }, async () => {
+					const caller = new AbortController();
+					const options = { apiKey: createCodexTestToken(), signal: caller.signal, ...createBudget() };
+					const encodings: Array<string | null> = [];
+					let cancelled = false;
+					const fetchMock: FetchImpl = async (_input, init) => {
+						encodings.push(new Headers(init?.headers).get("content-encoding"));
+						if (encodings.length === 1) {
+							return new Response(new ReadableStream<Uint8Array>({
+								cancel() {
+									cancelled = true;
+									// Rejection cleanup is awaited before replay; spend the
+									// budget here to exercise that exact transport boundary.
+									if (mode !== "live budget") spendBudget(options);
+									if (mode === "caller abort") caller.abort();
+								},
+							}), { status });
+						}
+						return new Response(createCompletedCodexSse("Uncompressed"), { headers: SSE_HEADERS });
+					};
+					const result = await streamOpenAICodexResponses(
+						{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+						createCodexTestContext(),
+						Object.assign(options, { fetch: fetchMock }),
+					).result();
+
+					expect(cancelled).toBe(true);
+					expect(encodings).toEqual(mode === "live budget" ? ["zstd", null] : ["zstd"]);
+					if (mode === "live budget") {
+						expect(result.stopReason).toBe("stop");
+						expect(result.content.find(block => block.type === "text")?.text).toBe("Uncompressed");
+					} else if (mode === "caller abort") {
+						expect(result.stopReason).toBe("aborted");
+						expect(result.errorMessage).toBe("Request was aborted");
+					} else {
+						expect(result.stopReason).toBe("error");
+						expect(result.errorMessage).toContain(BUDGET_EXHAUSTED);
+					}
+				});
+			},
+		);
+	}
+
 	const IDLE_TIMEOUT = {
 		timeouts: { streamIdleTimeoutMs: 20, streamFirstEventTimeoutMs: 60_000 },
 		events: [{ type: "response.created", response: { id: "resp_idle" } }],
