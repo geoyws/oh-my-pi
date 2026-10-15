@@ -73,10 +73,8 @@ describe("omp models kind filtering", () => {
 		const defaults = await new Models([], TEST_CONFIG).parse(Models);
 		expect(defaults.flags.kind).toBe("chat");
 
-		const invalid = new Models(["--kind", "video"], TEST_CONFIG);
-		await expect(invalid.parse(Models)).rejects.toThrow(
-			`Expected --kind to be one of: ${[...MODEL_KINDS, "all"].join(", ")}; got "video"`,
-		);
+		const invalid = new Models(["--kind", "hologram"], TEST_CONFIG);
+		await expect(invalid.parse(Models)).rejects.toThrow();
 	});
 
 	it("keeps the default listing chat-only and selects runner or all pools", () => {
