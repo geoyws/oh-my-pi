@@ -387,6 +387,42 @@ describe("task cwd submodule caller", () => {
 });
 
 describe("task cwd symlink routing", () => {
+	async function expectCwdRefused(caller: string, requested: string, repos: string[]): Promise<void> {
+		const before: Array<{ repo: string; fingerprint: string }> = [];
+		for (const repo of repos) before.push({ repo, fingerprint: await repoFingerprint(repo) });
+		const wtDir = await tempDir("omp-cwd-refuse-wt-");
+		setWorktreesDir(wtDir);
+		mockRcopy();
+		mockDiscovery();
+		const runSpy = vi.spyOn(executorModule, "runSubprocess");
+
+		const error = await prepareIsolationContext(caller, requested).then(
+			() => null,
+			(err: unknown) => err,
+		);
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain(requested);
+		expect((error as Error).message).toContain("outside its git repository");
+
+		await expect(
+			runStructuredSubagent({
+				session: session(caller),
+				invocationKind: "task",
+				assignment: "Edit the assigned worktree.",
+				solutionSpace: "one fix",
+				agent: "worker",
+				cwd: requested,
+				isolation: { requested: true },
+			} satisfies StructuredSubagentRequest),
+		).rejects.toThrow("outside its git repository");
+		expect(runSpy).not.toHaveBeenCalled();
+		expect(await fs.readdir(wtDir)).toEqual([]);
+		expect(artifactsDirsFromRegistry()).toEqual([]);
+		for (const { repo, fingerprint } of before) {
+			expect(await repoFingerprint(repo)).toBe(fingerprint);
+		}
+	}
+
 	it("refuses target/leak/sub where leak points at the caller repo", async () => {
 		const caller = await makeRepo("omp-cwd-leak-caller-");
 		const target = await makeRepo("omp-cwd-leak-target-");
@@ -482,5 +518,37 @@ describe("task cwd symlink routing", () => {
 			expect(tmpContext.repoRoot).toBe(tmpRepo);
 			expect(tmpContext.workdirOffset).toBe("sub");
 		}
+	});
+
+	it("refuses target/leak/nest where leak points at another repo holding a nested checkout", async () => {
+		const caller = await makeRepo("omp-cwd-nestleak-caller-");
+		const target = await makeRepo("omp-cwd-nestleak-target-");
+		const other = await makeRepo("omp-cwd-nestleak-other-");
+		// The deepest lexical .git sits below the hop, so a single-root check
+		// stops there and never inspects `leak`.
+		const nest = path.join(other, "nest");
+		await fs.mkdir(nest, { recursive: true });
+		await git(nest, "init", "-q", "-b", "main");
+		await git(nest, "config", "user.email", "t@t");
+		await git(nest, "config", "user.name", "t");
+		await git(nest, "config", "commit.gpgsign", "false");
+		await fs.writeFile(path.join(nest, "nest.txt"), "nest base\n");
+		await git(nest, "add", "-A");
+		await git(nest, "commit", "-q", "-m", "nest base");
+		await fs.symlink(other, path.join(target, "leak"));
+		await expectCwdRefused(caller, path.join(target, "leak", "nest"), [caller, target, other]);
+	});
+
+	it("refuses target/leak/mod where leak points at a superproject and mod is its submodule", async () => {
+		const caller = await makeRepo("omp-cwd-submodleak-caller-");
+		const target = await makeRepo("omp-cwd-submodleak-target-");
+		const sub = await makeRepo("omp-cwd-submodleak-sub-");
+		const superRepo = await makeRepo("omp-cwd-submodleak-super-");
+		await git(superRepo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", sub, "mod");
+		await git(superRepo, "commit", "-q", "-m", "pin mod");
+		const modCheckout = path.join(superRepo, "mod");
+		expect((await fs.readFile(path.join(modCheckout, ".git"), "utf8")).trim().startsWith("gitdir:")).toBe(true);
+		await fs.symlink(superRepo, path.join(target, "leak"));
+		await expectCwdRefused(caller, path.join(target, "leak", "mod"), [caller, target, superRepo]);
 	});
 });

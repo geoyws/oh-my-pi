@@ -164,167 +164,67 @@ function taskCwdError(requested: string, reason: string): Error {
 }
 
 /**
- * Police symlinks along the requested path: every link at or below the repo
- * root must resolve inside that root. Ancestors above the root (e.g. macOS
- * `/tmp` → `/private/tmp`) are the caller's checkout alias and are ignored —
- * the walk follows them so a link hidden behind such an alias is still
- * checked against the canonical root.
+ * Judge every symlink in the absolute lexical `cwd`, not a single checkout
+ * root: for each component that is a symlink, find the nearest lexical
+ * ancestor prefix strictly above it that contains a `.git` file or directory;
+ * when one exists, the link's realpath must lie inside that ancestor's
+ * realpath, otherwise the path hops out of the named checkout and is refused
+ * fail-closed. A nested checkout below the hop (e.g. `<target>/leak/<nest>`
+ * with its own `.git`, or a submodule gitfile) cannot hide `leak`: `leak`
+ * itself is judged against `<target>`. Symlinks with no `.git`-bearing
+ * lexical ancestor (macOS `/tmp` → `/private/tmp`, `/var`, aliases above the
+ * checkout) stay allowed, as do links that resolve inside their checkout.
+ * This subsumes the earlier resolved-root and single-lexical-root guards:
+ * every escape must cross such a component, and each is now judged where it
+ * sits — including hops above a nested `.git`, which a deepest-root lookup
+ * never reaches.
  */
-async function assertNoRepoEscape(requested: string, repoRoot: string): Promise<void> {
-	const parts = path.relative(path.parse(requested).root, requested).split(path.sep).filter(Boolean);
-	let resolved = path.parse(requested).root;
+async function assertNoSymlinkEscape(requested: string, normalized: string): Promise<void> {
+	const fsRoot = path.parse(normalized).root;
+	const parts = path.relative(fsRoot, normalized).split(path.sep).filter(Boolean);
+	let prefix = fsRoot;
 	for (const part of parts) {
-		const prefix = path.join(resolved, part);
+		prefix = path.join(prefix, part);
 		let stat: Stats;
 		try {
 			stat = await fs.lstat(prefix);
 		} catch {
 			return;
 		}
-		if (stat.isSymbolicLink()) {
-			const target = await fs.readlink(prefix);
-			const absoluteTarget = path.resolve(path.dirname(prefix), target);
-			const prefixInside = prefix === repoRoot || !path.relative(repoRoot, prefix).startsWith("..");
-			if (prefixInside) {
-				let targetReal = absoluteTarget;
-				try {
-					targetReal = await fs.realpath(absoluteTarget);
-				} catch {}
-				if (targetReal !== repoRoot && path.relative(repoRoot, targetReal).startsWith("..")) {
-					throw taskCwdError(
-						requested,
-						`resolves through a symlink (${prefix} -> ${target}) that points outside its git repository ${JSON.stringify(repoRoot)}; pass the canonical path inside the target checkout instead`,
-					);
-				}
-			}
-			resolved = absoluteTarget;
-		} else {
-			resolved = prefix;
-		}
-	}
-}
-
-/**
- * Find the checkout root the caller lexically named: the deepest ancestor of
- * `normalized` (itself included) that is a real directory containing a `.git`
- * file or directory. Ancestors are probed with `lstat`, so a symlink never
- * counts as a checkout root even though the OS resolves it when probing for
- * `.git` — `<target>/leak`, pointing at another repo, is skipped and the walk
- * climbs to `<target>`. Symlinks strictly above the checkout root (e.g. macOS
- * `/tmp` → `/private/tmp`) survive: they resolve to the real checkout dir,
- * which still carries `.git`. Returns `undefined` when no ancestor qualifies
- * (e.g. the whole checkout is named through a symlinked alias); callers then
- * fall back to the resolved-root checks.
- */
-async function findLexicalCheckoutRoot(normalized: string): Promise<string | undefined> {
-	let dir: string | undefined = normalized;
-	while (dir !== undefined) {
-		let stat: Stats | undefined;
+		if (!stat.isSymbolicLink()) continue;
+		const linkTarget = await fs.readlink(prefix);
+		let linkReal = path.resolve(path.dirname(prefix), linkTarget);
 		try {
-			stat = await fs.lstat(dir);
-		} catch {
-			stat = undefined;
-		}
-		if (stat !== undefined && stat.isDirectory()) {
+			linkReal = await fs.realpath(prefix);
+		} catch {}
+		// Nearest lexical ancestor strictly above the link with a checkout
+		// marker. Ancestors are prefixes of the lexical path, so this probe
+		// never traverses the link under test.
+		let ancestor: string | undefined;
+		let dir = path.dirname(prefix);
+		while (true) {
+			let marker = false;
 			try {
 				await fs.lstat(path.join(dir, ".git"));
-				return dir;
+				marker = true;
 			} catch {
-				// No checkout marker here; keep climbing.
+				marker = false;
 			}
+			if (marker) {
+				ancestor = dir;
+				break;
+			}
+			const parent = path.dirname(dir);
+			if (parent === dir) break;
+			dir = parent;
 		}
-		const parent = path.dirname(dir);
-		dir = parent === dir ? undefined : parent;
-	}
-	return undefined;
-}
-
-/**
- * Refuse a `cwd` that reaches another repo through a symlink at or below the
- * lexically named checkout root. `<target>/leak/sub` with `<target>/leak` →
- * caller resolves into the caller repo, so the resolved-root checks alone
- * accept it and the patch would merge into the caller. The lexical root here
- * is `<target>` (a symlink is never a checkout root), whose realpath
- * disagrees with the git root of the resolved path — and the `leak` component
- * itself resolves outside the named checkout. Either condition refuses the
- * path. Links inside the checkout that stay inside (e.g. `link` → `sub`) and
- * aliases above the root keep working.
- */
-async function assertLexicalCheckoutAgreement(normalized: string, repoRoot: string): Promise<void> {
-	const lexicalRoot = await findLexicalCheckoutRoot(normalized);
-	if (lexicalRoot === undefined) return;
-	const lexicalReal = await fs.realpath(lexicalRoot);
-	if (lexicalReal !== repoRoot) {
-		throw taskCwdError(
-			normalized,
-			`names checkout ${JSON.stringify(lexicalRoot)} but resolves into a different git repository ${JSON.stringify(repoRoot)} through a symlink that points outside its git repository; pass the canonical path inside the target checkout instead`,
-		);
-	}
-	const rel = path.relative(lexicalRoot, normalized);
-	if (rel === "") return;
-	let cursor = lexicalRoot;
-	for (const part of rel.split(path.sep).filter(Boolean)) {
-		cursor = path.join(cursor, part);
-		let stat: Stats;
-		try {
-			stat = await fs.lstat(cursor);
-		} catch {
-			return;
-		}
-		if (!stat.isSymbolicLink()) continue;
-		const target = await fs.readlink(cursor);
-		const absoluteTarget = path.resolve(path.dirname(cursor), target);
-		let targetReal = absoluteTarget;
-		try {
-			targetReal = await fs.realpath(absoluteTarget);
-		} catch {}
-		if (targetReal !== lexicalReal && path.relative(lexicalReal, targetReal).startsWith("..")) {
+		if (ancestor === undefined) continue;
+		const ancestorReal = await fs.realpath(ancestor);
+		if (linkReal !== ancestorReal && path.relative(ancestorReal, linkReal).startsWith("..")) {
 			throw taskCwdError(
-				normalized,
-				`resolves through a symlink (${cursor} -> ${target}) that points outside its git repository ${JSON.stringify(lexicalReal)}; pass the canonical path inside the target checkout instead`,
+				requested,
+				`resolves through a symlink (${prefix} -> ${linkTarget}) that points outside its git repository ${JSON.stringify(ancestorReal)}; pass the canonical path inside the target checkout instead`,
 			);
-		}
-	}
-}
-
-/**
- * Refuse a path whose lexical checkout disagrees with its resolved repo: the
- * caller named a path inside one checkout but it resolves into another
- * through a symlink. `getRepoRoot` discovers lexically (a `<link>/.git`
- * probe follows the link), so a canonical mismatch against the resolved root
- * exposes the hop. When the requested path itself is a link into the repo,
- * the tree naming the link must be that same repo.
- */
-async function assertSameRepoThroughLexicalTree(normalized: string, repoRoot: string): Promise<void> {
-	let lexicalRoot: string;
-	try {
-		lexicalRoot = await getRepoRoot(normalized);
-	} catch {
-		// No checkout names this path lexically; the resolved root governs.
-		return;
-	}
-	const lexicalCanonical = await fs.realpath(lexicalRoot);
-	if (lexicalCanonical !== repoRoot) {
-		throw taskCwdError(
-			normalized,
-			`names ${JSON.stringify(lexicalRoot)} but resolves into a different git repository ${JSON.stringify(repoRoot)} through a symlink that points outside its git repository; pass the canonical path inside the target checkout instead`,
-		);
-	}
-	if ((await fs.lstat(normalized)).isSymbolicLink()) {
-		let parentRoot: string | undefined;
-		try {
-			parentRoot = await getRepoRoot(path.dirname(normalized));
-		} catch {
-			parentRoot = undefined;
-		}
-		if (parentRoot !== undefined) {
-			const parentCanonical = await fs.realpath(parentRoot);
-			if (parentCanonical !== repoRoot) {
-				throw taskCwdError(
-					normalized,
-					`resolves through a symlink into ${JSON.stringify(repoRoot)} from a different checkout ${JSON.stringify(parentCanonical)} that points outside its git repository; pass the canonical path inside the target checkout instead`,
-				);
-			}
 		}
 	}
 }
@@ -371,9 +271,7 @@ export async function resolveTaskCwd(callerCwd: string, requestedCwd?: string): 
 	if (offset === ".." || offset.startsWith(`..${path.sep}`) || path.isAbsolute(offset)) {
 		throw taskCwdError(requestedCwd, `not inside a git work tree (resolved outside ${JSON.stringify(repoRoot)})`);
 	}
-	await assertNoRepoEscape(normalized, repoRoot);
-	await assertSameRepoThroughLexicalTree(normalized, repoRoot);
-	await assertLexicalCheckoutAgreement(normalized, repoRoot);
+	await assertNoSymlinkEscape(requestedCwd, normalized);
 	return { repoRoot, childCwd: real, workdirOffset: offset === "" ? "" : offset };
 }
 
