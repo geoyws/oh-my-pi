@@ -96,7 +96,8 @@ export function createSetupHost(ctx: InteractiveModeContext): SetupHost {
 		}),
 		refreshModels: () => ctx.session.modelRegistry.refresh("online-if-uncached"),
 		selectModel: async (model, selector) => {
-			const projectScope = ctx.settings.get("modelRoleStorage") === "project";
+			ctx.settings.assertModelRoleWritable("default");
+			const projectScope = ctx.settings.getModelRoleStorage() === "project";
 			await ctx.session.setModel(model, "default", { selector, persist: !projectScope });
 			if (projectScope) ctx.settings.setProjectModelRole("default", selector);
 			await ctx.settings.flush();

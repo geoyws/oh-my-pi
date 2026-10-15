@@ -28,7 +28,7 @@ export function createModelBrowserSource(settings: Settings): ModelHubSource {
 			return settings.get("retry.fallbackChains");
 		},
 		get modelRoleStorage() {
-			return settings.get("modelRoleStorage");
+			return settings.getModelRoleStorage();
 		},
 		get cycleOrder() {
 			return settings.get("cycleOrder");

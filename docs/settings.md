@@ -33,6 +33,27 @@ The canonical global file is YAML at `config.yml`; `config.yaml` is accepted as 
 - `.json` and `.jsonc` configs are read as-is, with no migration.
 - A settings YAML file whose top level is not a mapping is invalid. On writable startup, `omp` moves an invalid persistent settings file to a uniquely named `.broken-*` backup and exits with the original error and backup path. A `--config` overlay with a bare array/scalar is also a hard error, but is not moved.
 
+### Global read-only policy
+
+Set `config: { readOnly: true }` in the global YAML, or launch with
+`PI_CONFIG_READONLY=1`, to opt out of global configuration persistence.
+The policy is captured at startup; setting it in writable mode takes effect on
+the next launch and runtime overrides cannot turn an active policy off.
+Startup does not migrate legacy settings, quarantine invalid global YAML, or
+seed migration marker files under this policy. Existing global bytes stay unchanged.
+Invalid YAML still reports an error; repair it manually rather than relying on quarantine.
+
+Role assignments route to `<cwd>/.omp/config.yml`, even when
+`modelRoleStorage` is global. The `.omp` directory must already exist;
+otherwise assignment is refused with the setting name and resolved global target.
+Writable mode continues to create project configuration directories normally.
+Other persistent settings writes are refused, including `omp config set` and
+`reset`, which exit nonzero instead of reporting success. Edit the managed file
+manually to disable the policy. Runtime overrides and `PI_CONFIG_FILES` retain
+their normal precedence and are never written back. The programmatic
+`SettingsOptions.readOnly` / `Settings.loadReadOnly` API remains stronger:
+it disables persistence for every layer, including project roles.
+
 ## Reading and writing settings
 
 Use the interactive `/settings` panel inside a session, or the `omp config` command from a shell. Both read merged effective settings. Ordinary persistent writes land in the **global** file; model-selector role changes are the exception when `modelRoleStorage: project` (see [Where writes go](#where-writes-go)).
