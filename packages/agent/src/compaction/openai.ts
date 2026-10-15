@@ -24,6 +24,7 @@ import { applySessionHeader } from "@oh-my-pi/pi-ai/providers/inference-headers"
 import {
 	encodeResponsesToolResultOutput,
 	hoistInterleavedResponsesToolBatchMessages,
+	isForeignEncryptedReasoningError,
 	parseAzureDeploymentNameMap,
 	parseTextSignature,
 } from "@oh-my-pi/pi-ai/providers/openai-shared";
@@ -58,7 +59,11 @@ import { dataUrlImageSize, estimateImageTokens } from "../image-tokens";
 import { Tokenizer } from "../tokenizer";
 import { appendAzureApiVersion, resolveAzureOpenAiBaseUrl } from "./azure-openai-endpoint";
 import { prepareBedrockCompactionRequest } from "./bedrock";
-import { isOpenAiRemoteCompactionApi } from "./compaction-v2-streaming";
+import {
+	isOpenAiRemoteCompactionApi,
+	shouldStripCompactionPrefixItems,
+	stripEncryptedReasoningResponseItems,
+} from "./compaction-v2-streaming";
 import contextWindowTruncatedOutputPrompt from "./prompts/context-window-truncated-output.md" with { type: "text" };
 
 export * from "./compaction-v2-streaming";
@@ -310,6 +315,8 @@ export interface OpenAiRemoteCompactionPreserveData {
 	provider?: string;
 	replacementHistory: Array<Record<string, unknown>>;
 	compactionItem: OpenAiRemoteCompactionItem;
+	/** Credential row that served the compaction which stored this history, when recorded. */
+	credentialId?: number;
 }
 
 export interface OpenAiRemoteCompactionRequest {
@@ -426,6 +433,9 @@ export function getPreservedOpenAiRemoteCompactionData(
 		provider: typeof maybeData.provider === "string" ? maybeData.provider : undefined,
 		replacementHistory: maybeData.replacementHistory as Array<Record<string, unknown>>,
 		compactionItem: compactionItem as unknown as OpenAiRemoteCompactionItem,
+		...(typeof (candidate as { credentialId?: unknown }).credentialId === "number"
+			? { credentialId: (candidate as { credentialId: number }).credentialId }
+			: {}),
 	};
 }
 
@@ -550,9 +560,15 @@ export function buildOpenAiNativeHistory(
 	model: Model,
 	previousReplacementHistory?: Array<Record<string, unknown>>,
 	supportsImageDetailOriginal = false,
+	credential?: { currentCredentialId?: number; prefixCredentialId?: number },
 ): Array<Record<string, unknown>> {
-	const input: Array<Record<string, unknown>> = previousReplacementHistory
-		? adaptComputerHistoryForCompaction([...previousReplacementHistory], model.supportsComputerUse === true)
+	const filteredPrefix =
+		previousReplacementHistory &&
+		shouldStripCompactionPrefixItems(credential?.currentCredentialId, credential?.prefixCredentialId)
+			? stripEncryptedReasoningResponseItems(previousReplacementHistory)
+			: previousReplacementHistory;
+	const input: Array<Record<string, unknown>> = filteredPrefix
+		? adaptComputerHistoryForCompaction([...filteredPrefix], model.supportsComputerUse === true)
 		: [];
 	const transformedMessages = transformMessages(messages, model, id => normalizeOpenAiCompactionToolCallId(id));
 
@@ -632,11 +648,22 @@ export function buildOpenAiNativeHistory(
 					dropMalformedOpenAIResponsesToolCalls(providerPayload.items),
 					model.supportsComputerUse === true,
 				);
+				// Encrypted reasoning is caller-bound: when both the stored
+				// turn and the serving request name a credential row and they
+				// differ, drop only those reasoning items; every other native
+				// item still replays. Either side unknown keeps existing
+				// behavior (the send retry strips on a foreign-caller 400).
+				const replayItems =
+					credential?.currentCredentialId !== undefined &&
+					assistant.credentialId !== undefined &&
+					assistant.credentialId !== credential.currentCredentialId
+						? stripEncryptedReasoningResponseItems(historyItems)
+						: historyItems;
 				if (providerPayload.dt) {
-					input.push(...historyItems);
-					addOpenAiCallIds(historyItems, knownCallIds, customCallIds, computerCallIds);
+					input.push(...replayItems);
+					addOpenAiCallIds(replayItems, knownCallIds, customCallIds, computerCallIds);
 				} else {
-					input.splice(0, input.length, ...historyItems);
+					input.splice(0, input.length, ...replayItems);
 					knownCallIds.clear();
 					customCallIds.clear();
 					computerCallIds.clear();
@@ -648,18 +675,26 @@ export function buildOpenAiNativeHistory(
 			const isDifferentModel =
 				assistant.model !== model.id && assistant.provider === model.provider && assistant.api === model.api;
 
+			// A credential switch also retires the thinking-signature fallback:
+			// its embedded `encrypted_content` was issued to the old caller too.
+			const foreignThinkingSignature =
+				credential?.currentCredentialId !== undefined &&
+				assistant.credentialId !== undefined &&
+				assistant.credentialId !== credential.currentCredentialId;
 			for (const block of assistant.content) {
 				if (block.type === "thinking" && assistant.stopReason !== "error" && block.thinkingSignature) {
-					try {
-						const reasoningItem = JSON.parse(block.thinkingSignature) as Record<string, unknown>;
-						if (reasoningItem && typeof reasoningItem === "object") {
-							input.push(reasoningItem);
+					if (!foreignThinkingSignature) {
+						try {
+							const reasoningItem = JSON.parse(block.thinkingSignature) as Record<string, unknown>;
+							if (reasoningItem && typeof reasoningItem === "object") {
+								input.push(reasoningItem);
+							}
+						} catch {
+							logger.warn("Failed to parse assistant reasoning for remote compaction", {
+								model: assistant.model,
+								provider: assistant.provider,
+							});
 						}
-					} catch {
-						logger.warn("Failed to parse assistant reasoning for remote compaction", {
-							model: assistant.model,
-							provider: assistant.provider,
-						});
 					}
 					continue;
 				}
@@ -907,14 +942,14 @@ export async function requestOpenAiRemoteCompaction(
 		}
 	}
 
-	const response = await fetchImpl(endpoint, {
-		method: "POST",
-		headers,
-		body: stringifyJson(request),
-		signal: ptree.combineSignals(signal, opts?.timeoutMs ?? REMOTE_COMPACTION_TIMEOUT_MS),
-	});
-
-	if (!response.ok) {
+	const sendV1Compaction = (input: Array<Record<string, unknown>>): Promise<Response> =>
+		fetchImpl(endpoint, {
+			method: "POST",
+			headers,
+			body: stringifyJson({ ...request, input }),
+			signal: ptree.combineSignals(signal, opts?.timeoutMs ?? REMOTE_COMPACTION_TIMEOUT_MS),
+		});
+	const failV1Compaction = async (response: Response): Promise<never> => {
 		const cause = await captureOpenAIHttpError(response);
 		logger.warn("OpenAI remote compaction failed", {
 			endpoint,
@@ -930,6 +965,42 @@ export async function requestOpenAiRemoteCompaction(
 				cause,
 			},
 		);
+	};
+	let response = await sendV1Compaction(request.input);
+	// Turns stored before their credential was recorded still replay
+	// caller-bound `encrypted_content` no build-time comparison can drop.
+	// On the server's foreign-caller 400, resend once with every encrypted
+	// reasoning blob stripped; a second failure (or any other error, or a
+	// request with nothing to strip) surfaces normally — no loop.
+	if (!response.ok) {
+		const cause = await captureOpenAIHttpError(response);
+		const failure = new ProviderHttpError(
+			`Remote compaction failed (${response.status} ${response.statusText})`,
+			response.status,
+			{
+				headers: response.headers,
+				cause,
+			},
+		);
+		const stripped = stripEncryptedReasoningResponseItems(request.input);
+		// Match the unwrapped capture: it carries the status, the decoded
+		// body, and the server's wording; the wrapper above has none of those.
+		if (!isForeignEncryptedReasoningError(cause) || stripped.length === request.input.length) {
+			logger.warn("OpenAI remote compaction failed", {
+				endpoint,
+				status: response.status,
+				statusText: response.statusText,
+				errorText: cause.captured.bodyText ?? "",
+			});
+			throw failure;
+		}
+		logger.debug("OpenAI remote compaction foreign encrypted reasoning rejected; retrying stripped", {
+			endpoint,
+			model: model.id,
+			provider: model.provider,
+		});
+		response = await sendV1Compaction(stripped);
+		if (!response.ok) await failV1Compaction(response);
 	}
 
 	const data = (await response.json()) as { output?: unknown[] } | undefined;

@@ -9,16 +9,21 @@ import {
 	type AnthropicCompactionFiles,
 	type Api,
 	type ApiKey,
+	type ApiKeyResolution,
+	type ApiKeyResolver,
 	type AssistantMessage,
 	type CodexCompactionContext,
 	type Context,
 	Effort,
 	type FetchImpl,
+	isApiKeyResolver,
 	type Message,
 	type MessageAttribution,
 	type Model,
 	type OneshotRetryOptions,
 	type ProviderSessionState,
+	resolvedApiKeyBearer,
+	resolveApiKeyOnce,
 	type SimpleStreamOptions,
 	type Tool,
 	type Usage,
@@ -54,6 +59,7 @@ import {
 import {
 	buildCompactionV2Request,
 	buildCompactionV2RequestFromBody,
+	type CompactionV2Request,
 	getCompactionV2PreserveData,
 	requestCompactionV2Streaming,
 	shouldUseCompactionV2Streaming,
@@ -75,7 +81,9 @@ import {
 	isOpenAiRemoteCompactionApi,
 	requestOpenAiRemoteCompaction,
 	requestRemoteCompaction,
+	shouldStripCompactionPrefixItems,
 	shouldUseOpenAiRemoteCompaction,
+	stripEncryptedReasoningResponseItems,
 	trimRemoteCompactionInputToContextWindow,
 	withOpenAiRemoteCompactionPreserveData,
 } from "./openai";
@@ -1513,16 +1521,60 @@ function openAiCompatSupportsImageDetailOriginal(model: Model): boolean {
 	return !!compat && "supportsImageDetailOriginal" in compat && compat.supportsImageDetailOriginal === true;
 }
 
+/**
+ * Filter a preserved compaction prefix for replay under `servingCredentialId`
+ * (shared provenance rule in `./openai`).
+ */
+function filterCompactionPrefixItems(
+	items: Array<Record<string, unknown>> | undefined,
+	servingCredentialId: number | undefined,
+	recordedCredentialId: number | undefined,
+): Array<Record<string, unknown>> | undefined {
+	if (!items) return undefined;
+	return shouldStripCompactionPrefixItems(servingCredentialId, recordedCredentialId)
+		? stripEncryptedReasoningResponseItems(items)
+		: items;
+}
+
+/**
+ * Record every bearer a credential resolver mints so a compaction attempt
+ * can learn the credential row actually serving it. Static keys carry no
+ * row and always resolve to `undefined` (strip-all, like an unknown row).
+ */
+function trackCompactionCredentialResolutions(apiKey: ApiKey): {
+	key: ApiKey;
+	credentialIdOf: (bearer: string) => number | undefined;
+} {
+	if (!isApiKeyResolver(apiKey)) return { key: apiKey, credentialIdOf: () => undefined };
+	const seen = new Map<string, number | undefined>();
+	const record = (resolved: ApiKeyResolution): ApiKeyResolution => {
+		const bearer = resolvedApiKeyBearer(resolved);
+		if (bearer !== undefined) {
+			seen.set(bearer, typeof resolved === "string" ? undefined : resolved?.credentialId);
+		}
+		return resolved;
+	};
+	const tracked: ApiKeyResolver = ctx => {
+		const resolution = apiKey(ctx);
+		return resolution instanceof Promise ? resolution.then(record) : record(resolution);
+	};
+	return { key: tracked, credentialIdOf: bearer => seen.get(bearer) };
+}
+
 function buildOpenAiResponsesCompactionInput(
 	messages: Message[],
 	model: Model<"openai-responses" | "azure-openai-responses" | "openai-codex-responses">,
 	previousReplacementHistory: Array<Record<string, unknown>> | undefined,
+	credential?: { currentCredentialId?: number; prefixCredentialId?: number },
 ): Array<Record<string, unknown>> {
 	const input = buildResponsesInput({
 		model,
 		context: { messages },
 		strictResponsesPairing: model.compat.strictResponsesPairing,
 		supportsImageDetailOriginal: openAiCompatSupportsImageDetailOriginal(model),
+		// Like a normal turn under this credential: caller-bound encrypted
+		// reasoning from another row is dropped, everything else replays.
+		currentCredentialId: credential?.currentCredentialId,
 		nativeHistory: { replay: true, filterReasoning: false },
 		includeThinkingSignatures: true,
 		repairOrphanOutputs: true,
@@ -1534,9 +1586,12 @@ function buildOpenAiResponsesCompactionInput(
 		}
 		nativeInput.push(item);
 	}
-	return stripOpenAIResponsesOutputOnlyStatusesForReplay(
-		previousReplacementHistory ? [...previousReplacementHistory, ...nativeInput] : nativeInput,
+	const prefix = filterCompactionPrefixItems(
+		previousReplacementHistory,
+		credential?.currentCredentialId,
+		credential?.prefixCredentialId,
 	);
+	return stripOpenAIResponsesOutputOnlyStatusesForReplay(prefix ? [...prefix, ...nativeInput] : nativeInput);
 }
 
 /**
@@ -1700,175 +1755,287 @@ export async function compact(
 		const userMessages = convertToLlm(
 			[...messagesToSummarize, ...turnPrefixMessages, ...recentMessages].filter(isUserAuthored),
 		);
-		const retainedUserItems: unknown[] = [...(previousReplacementHistory ?? [])];
 		const remoteSystemPrompt = summaryOptions.remoteSystemPrompt ?? [SUMMARIZATION_SYSTEM_PROMPT];
-		let codexBody: OpenAICodexCompactionBody | undefined;
-		let remoteHistory: Array<Record<string, unknown>>;
-		if (isCodexResponsesModel(model)) {
-			const previousCodexInput: CodexInputItem[] = [];
-			for (const item of previousReplacementHistory ?? []) {
-				if (!isCodexInputItem(item)) {
-					throw new Error("Stored Codex V2 compaction history contains an invalid input item");
-				}
-				previousCodexInput.push(item);
-			}
-			codexBody = await buildTransformedCodexRequestBody(
-				model,
-				{ systemPrompt: remoteSystemPrompt, messages, tools: summaryOptions.tools },
-				{
-					reasoning: resolveCompactionEffort(model, summaryOptions.thinkingLevel),
-					forceReasoningOff: summaryOptions.thinkingLevel === ThinkingLevel.Off,
-					responsesLite: model.useResponsesLite,
-					sessionId: summaryOptions.sessionId,
-					promptCacheKey: summaryOptions.promptCacheKey,
-					providerSessionState: summaryOptions.providerSessionState,
-					codexCompaction: createOpenAICodexCompactionRequestContext({
-						context: summaryOptions.codexCompaction,
-						implementation: "responses_compaction_v2",
-					}),
-				},
-				undefined,
-				previousCodexInput,
-			);
-			const input = Array.isArray(codexBody.input) ? codexBody.input : [];
-			const nativeInput: Array<Record<string, unknown>> = [];
-			for (const item of input) {
-				if (!isRecord(item)) {
-					throw new Error("Codex V2 compaction input contains a non-object item");
-				}
-				nativeInput.push(item);
-			}
-			remoteHistory = stripOpenAIResponsesOutputOnlyStatusesForReplay(nativeInput);
-			codexBody.input = remoteHistory;
+		const isCodexCompaction = isCodexResponsesModel(model);
+		// Retained user items carry no credential-bound blobs, so they are
+		// serialized once; the preserved prefix (filtered per attempt below)
+		// joins them when the request is built.
+		const retainedUserItemsBase: unknown[] = [];
+		if (isCodexCompaction) {
 			for (const message of userMessages) {
 				const userBody = await buildTransformedCodexRequestBody(
 					model,
 					{ messages: [message] },
 					{ responsesLite: model.useResponsesLite },
 				);
-				retainedUserItems.push(...(userBody.input ?? []));
+				retainedUserItemsBase.push(...(userBody.input ?? []));
 			}
 		} else {
-			remoteHistory = buildOpenAiResponsesCompactionInput(messages, model, previousReplacementHistory);
 			for (const message of userMessages) {
-				retainedUserItems.push(...buildOpenAiResponsesCompactionInput([message], model, undefined));
+				retainedUserItemsBase.push(...buildOpenAiResponsesCompactionInput([message], model, undefined));
 			}
 		}
-		if (remoteHistory.length > 0) {
-			try {
-				const instructions = codexBody
-					? typeof codexBody.instructions === "string"
-						? codexBody.instructions
-						: ""
-					: remoteSystemPrompt.join("\n\n");
-				const tools = codexBody
-					? Array.isArray(codexBody.tools)
-						? codexBody.tools
-						: undefined
-					: summaryOptions.tools
-						? convertTools(summaryOptions.tools, model.compat.supportsStrictMode, model)
-						: undefined;
-				const trimmed = trimRemoteCompactionInputToContextWindow(
-					remoteHistory,
-					new Tokenizer(model),
-					model.contextWindow,
-					instructions,
-					tools,
-				);
-				if (trimmed.rewrittenOutputs > 0) {
-					logger.info("Rewrote trailing tool outputs before OpenAI V2 remote compaction", {
-						model: model.id,
-						provider: model.provider,
-						rewrittenOutputs: trimmed.rewrittenOutputs,
-						estimatedTokensBefore: trimmed.estimatedTokensBefore,
-						estimatedTokensAfter: trimmed.estimatedTokensAfter,
-						contextWindow: model.contextWindow,
-					});
+		// The compaction request replays transcript history (and the
+		// preserved prefix) under one credential: build it from the row
+		// actually serving the attempt, so caller-bound encrypted_content
+		// from a previous credential is dropped instead of 400ing.
+		// withAuth may rotate to a sibling after a 401, so the build lives
+		// inside the attempt and is memoized per row. Static keys resolve
+		// to no row: a summary never needs another caller's blobs, so
+		// unknown-at-build-time strips everything.
+		const credentialTracker = trackCompactionCredentialResolutions(apiKey);
+		const previousV2CredentialId = previousRemoteCompaction?.credentialId;
+		let servingV2CredentialId: number | undefined;
+		const v2Requests = new Map<number | undefined, CompactionV2Request>();
+		const buildV2RequestForCredential = async (
+			credentialId: number | undefined,
+		): Promise<CompactionV2Request | undefined> => {
+			const cached = v2Requests.get(credentialId);
+			if (cached) return cached;
+			// The preserved prefix shares the stored transcript's
+			// provenance: strip its encrypted reasoning when the serving
+			// credential is unknown, or when the compaction that stored it
+			// names a different row. Same-row prefixes replay untouched.
+			const filteredPrefix = filterCompactionPrefixItems(
+				previousReplacementHistory,
+				credentialId,
+				previousV2CredentialId,
+			);
+			const retainedUserItems: unknown[] = [...(filteredPrefix ?? []), ...retainedUserItemsBase];
+			let codexBody: OpenAICodexCompactionBody | undefined;
+			let remoteHistory: Array<Record<string, unknown>>;
+			if (isCodexCompaction) {
+				const previousCodexInput: CodexInputItem[] = [];
+				for (const item of filteredPrefix ?? []) {
+					if (!isCodexInputItem(item)) {
+						throw new Error("Stored Codex V2 compaction history contains an invalid input item");
+					}
+					previousCodexInput.push(item);
 				}
-				assertRemoteCompactionInputFits(trimmed, model);
-				const requestOptions = {
-					sessionId: summaryOptions.sessionId,
-					promptCacheKey: summaryOptions.promptCacheKey,
-					retainedMessageBudget: settings.v2RetainedMessageBudget,
-					retainedUserItems,
-				};
-				const request = codexBody
-					? buildCompactionV2RequestFromBody(model, { ...codexBody, input: trimmed.input }, requestOptions)
-					: buildCompactionV2Request(model, trimmed.input, instructions, {
-							...requestOptions,
-							tools,
-							reasoning: buildCompactionV2Reasoning(model, summaryOptions.thinkingLevel),
-						});
+				codexBody = await buildTransformedCodexRequestBody(
+					model,
+					{ systemPrompt: remoteSystemPrompt, messages, tools: summaryOptions.tools },
+					{
+						reasoning: resolveCompactionEffort(model, summaryOptions.thinkingLevel),
+						forceReasoningOff: summaryOptions.thinkingLevel === ThinkingLevel.Off,
+						responsesLite: model.useResponsesLite,
+						sessionId: summaryOptions.sessionId,
+						promptCacheKey: summaryOptions.promptCacheKey,
+						providerSessionState: summaryOptions.providerSessionState,
+						credentialId,
+						codexCompaction: createOpenAICodexCompactionRequestContext({
+							context: summaryOptions.codexCompaction,
+							implementation: "responses_compaction_v2",
+						}),
+					},
+					undefined,
+					previousCodexInput,
+					credentialId === undefined,
+				);
+				const input = Array.isArray(codexBody.input) ? codexBody.input : [];
+				const nativeInput: Array<Record<string, unknown>> = [];
+				for (const item of input) {
+					if (!isRecord(item)) {
+						throw new Error("Codex V2 compaction input contains a non-object item");
+					}
+					nativeInput.push(item);
+				}
+				remoteHistory = stripOpenAIResponsesOutputOnlyStatusesForReplay(nativeInput);
+				codexBody.input = remoteHistory;
+			} else {
+				remoteHistory = buildOpenAiResponsesCompactionInput(messages, model, previousReplacementHistory, {
+					currentCredentialId: credentialId,
+					prefixCredentialId: previousV2CredentialId,
+				});
+			}
+			// An empty converted transcript (or a preserved prefix emptied by
+			// the credential strip) carries nothing worth a remote round trip.
+			// Skip V2 silently like the V1 history check below so compaction
+			// falls through to local summarization instead of recording a
+			// native failure for sending nothing.
+			if (remoteHistory.length === 0) return undefined;
+			const instructions = codexBody
+				? typeof codexBody.instructions === "string"
+					? codexBody.instructions
+					: ""
+				: remoteSystemPrompt.join("\n\n");
+			const tools = codexBody
+				? Array.isArray(codexBody.tools)
+					? codexBody.tools
+					: undefined
+				: summaryOptions.tools
+					? convertTools(summaryOptions.tools, model.compat.supportsStrictMode, model)
+					: undefined;
+			const trimmed = trimRemoteCompactionInputToContextWindow(
+				remoteHistory,
+				new Tokenizer(model),
+				model.contextWindow,
+				instructions,
+				tools,
+			);
+			if (trimmed.rewrittenOutputs > 0) {
+				logger.info("Rewrote trailing tool outputs before OpenAI V2 remote compaction", {
+					model: model.id,
+					provider: model.provider,
+					rewrittenOutputs: trimmed.rewrittenOutputs,
+					estimatedTokensBefore: trimmed.estimatedTokensBefore,
+					estimatedTokensAfter: trimmed.estimatedTokensAfter,
+					contextWindow: model.contextWindow,
+				});
+			}
+			assertRemoteCompactionInputFits(trimmed, model);
+			const requestOptions = {
+				sessionId: summaryOptions.sessionId,
+				promptCacheKey: summaryOptions.promptCacheKey,
+				retainedMessageBudget: settings.v2RetainedMessageBudget,
+				retainedUserItems,
+			};
+			const request = codexBody
+				? buildCompactionV2RequestFromBody(model, { ...codexBody, input: trimmed.input }, requestOptions)
+				: buildCompactionV2Request(model, trimmed.input, instructions, {
+						...requestOptions,
+						tools,
+						reasoning: buildCompactionV2Reasoning(model, summaryOptions.thinkingLevel),
+					});
+			v2Requests.set(credentialId, request);
+			return request;
+		};
+		// Pre-resolve the likely serving row so the common single-attempt
+		// case builds once; a rotated sibling rebuilds inside the attempt.
+		let preResolvedV2CredentialId: number | undefined;
+		try {
+			await resolveApiKeyOnce(credentialTracker.key, signal, resolved => {
+				if (typeof resolved !== "string") preResolvedV2CredentialId = resolved?.credentialId;
+			});
+		} catch {
+			// Resolver failures surface properly at send time inside
+			// withAuth; build credential-blind (strip-all) instead.
+		}
+		let builtV2CredentialId = preResolvedV2CredentialId;
+		try {
+			const v2Request = await buildV2RequestForCredential(builtV2CredentialId);
+			if (v2Request !== undefined) {
 				const remote = await withAuth(
-					apiKey,
-					key =>
-						requestCompactionV2Streaming(model, key, request, signal, {
+					credentialTracker.key,
+					async key => {
+						// withAuth rotated to a sibling: the pre-built request
+						// replays the old row's blobs, so rebuild for the row
+						// actually serving this attempt.
+						const attemptCredentialId = credentialTracker.credentialIdOf(key);
+						let requestForAttempt = v2Request;
+						if (attemptCredentialId !== builtV2CredentialId) {
+							builtV2CredentialId = attemptCredentialId;
+							const rebuilt = await buildV2RequestForCredential(builtV2CredentialId);
+							// The sibling's strip emptied the input: nothing to
+							// send on this row either.
+							if (rebuilt === undefined) return undefined;
+							requestForAttempt = rebuilt;
+						}
+						servingV2CredentialId = attemptCredentialId;
+						return requestCompactionV2Streaming(model, key, requestForAttempt, signal, {
 							fetch: summaryOptions.fetch,
 							providerSessionState: summaryOptions.providerSessionState,
 							preferWebsockets: summaryOptions.preferWebsockets,
 							codexCompaction: summaryOptions.codexCompaction,
-						}),
+						});
+					},
 					{ signal },
 				);
-				preserveData = { ...preserveData, ...storeCompactionV2PreserveData(remote, model) };
-				usedRemoteCompaction = true;
-			} catch (err) {
-				// A user/session abort is a cancellation, not a remote failure —
-				// swallowing it here would downgrade Esc into "fall back to local
-				// summarization" and keep compaction running on an aborted signal.
-				if (signal?.aborted) throw err;
-				nativeCompactionError = selectNativeCompactionError(nativeCompactionError, err);
-				// Claim the V1 fallback only when the V1 block below will run.
-				logger.warn(
-					shouldUseOpenAiRemoteCompaction(model)
-						? "OpenAI V2 remote compaction failed, falling back to V1 remote compaction"
-						: "OpenAI V2 remote compaction failed",
-					{
-						error: err instanceof Error ? err.message : String(err),
-						model: model.id,
-						provider: model.provider,
-					},
-				);
+				if (remote !== undefined) {
+					preserveData = {
+						...preserveData,
+						...storeCompactionV2PreserveData(remote, model, servingV2CredentialId),
+					};
+					usedRemoteCompaction = true;
+				}
 			}
+		} catch (err) {
+			// swallowing it here would downgrade Esc into "fall back to local
+			// summarization" and keep compaction running on an aborted signal.
+			if (signal?.aborted) throw err;
+			nativeCompactionError = selectNativeCompactionError(nativeCompactionError, err);
+			// Claim the V1 fallback only when the V1 block below will run.
+			logger.warn(
+				shouldUseOpenAiRemoteCompaction(model)
+					? "OpenAI V2 remote compaction failed, falling back to V1 remote compaction"
+					: "OpenAI V2 remote compaction failed",
+				{
+					error: err instanceof Error ? err.message : String(err),
+					model: model.id,
+					provider: model.provider,
+				},
+			);
 		}
 	}
 
 	if (!usedRemoteCompaction && settings.remoteEnabled !== false && shouldUseOpenAiRemoteCompaction(model)) {
-		const previousRemoteCompaction = getPreservedOpenAiRemoteCompactionData(previousPreserveData);
-		const previousV2Compaction = getCompactionV2PreserveData(previousPreserveData);
-		const previousReplacementHistory =
-			previousRemoteCompaction?.provider === model.provider
-				? previousRemoteCompaction.replacementHistory
-				: previousV2Compaction?.provider === model.provider
-					? previousV2Compaction.replacementHistory
+		const previousV1Remote = getPreservedOpenAiRemoteCompactionData(previousPreserveData);
+		const previousV1V2 = getCompactionV2PreserveData(previousPreserveData);
+		const previousV1Source =
+			previousV1Remote?.provider === model.provider
+				? previousV1Remote
+				: previousV1V2?.provider === model.provider
+					? previousV1V2
 					: undefined;
-		const remoteHistory = buildOpenAiNativeHistory(
-			(summaryOptions.convertToLlm ?? defaultConvertToLlm)(remoteMessages),
-			model,
-			previousReplacementHistory,
-			openAiCompatSupportsImageDetailOriginal(model),
-		);
-		if (remoteHistory.length > 0) {
+		const previousV1History = previousV1Source?.replacementHistory;
+		const previousV1CredentialId = previousV1Source?.credentialId;
+		const convertedV1Messages = (summaryOptions.convertToLlm ?? defaultConvertToLlm)(remoteMessages);
+		const v1Instructions = summaryOptions.remoteSystemPrompt?.join("\n\n") ?? SUMMARIZATION_SYSTEM_PROMPT;
+		const v1ImageDetail = openAiCompatSupportsImageDetailOriginal(model);
+		// Same credential binding as V2: the native history replays under
+		// the row actually serving the attempt, and the stored prefix is
+		// filtered by the row that wrote it.
+		const v1CredentialTracker = trackCompactionCredentialResolutions(apiKey);
+		let servingV1CredentialId: number | undefined;
+		const v1Histories = new Map<number | undefined, Array<Record<string, unknown>>>();
+		const buildV1HistoryForCredential = (credentialId: number | undefined): Array<Record<string, unknown>> => {
+			const cached = v1Histories.get(credentialId);
+			if (cached) return cached;
+			const history = buildOpenAiNativeHistory(convertedV1Messages, model, previousV1History, v1ImageDetail, {
+				currentCredentialId: credentialId,
+				prefixCredentialId: previousV1CredentialId,
+			});
+			v1Histories.set(credentialId, history);
+			return history;
+		};
+		let preResolvedV1CredentialId: number | undefined;
+		try {
+			await resolveApiKeyOnce(v1CredentialTracker.key, signal, resolved => {
+				if (typeof resolved !== "string") preResolvedV1CredentialId = resolved?.credentialId;
+			});
+		} catch {
+			// Resolver failures surface properly at send time inside
+			// withAuth; build credential-blind (strip-all) instead.
+		}
+		let builtV1CredentialId = preResolvedV1CredentialId;
+		let v1History = buildV1HistoryForCredential(builtV1CredentialId);
+		if (v1History.length > 0) {
 			try {
 				const remote = await withAuth(
-					apiKey,
-					key =>
-						requestOpenAiRemoteCompaction(
-							model,
-							key,
-							remoteHistory,
-							summaryOptions.remoteSystemPrompt?.join("\n\n") ?? SUMMARIZATION_SYSTEM_PROMPT,
-							signal,
-							{
-								fetch: summaryOptions.fetch,
-								sessionId: summaryOptions.sessionId,
-								providerSessionState: summaryOptions.providerSessionState,
-								codexCompaction: summaryOptions.codexCompaction,
-							},
-						),
+					v1CredentialTracker.key,
+					key => {
+						// withAuth rotated to a sibling: rebuild for the row
+						// actually serving this attempt instead of resending
+						// the old row's blobs.
+						const attemptCredentialId = v1CredentialTracker.credentialIdOf(key);
+						if (attemptCredentialId !== builtV1CredentialId) {
+							builtV1CredentialId = attemptCredentialId;
+							v1History = buildV1HistoryForCredential(builtV1CredentialId);
+						}
+						servingV1CredentialId = attemptCredentialId;
+						return requestOpenAiRemoteCompaction(model, key, v1History, v1Instructions, signal, {
+							fetch: summaryOptions.fetch,
+							sessionId: summaryOptions.sessionId,
+							providerSessionState: summaryOptions.providerSessionState,
+							codexCompaction: summaryOptions.codexCompaction,
+						});
+					},
 					{ signal },
 				);
-				preserveData = withOpenAiRemoteCompactionPreserveData(preserveData, remote);
+				preserveData = withOpenAiRemoteCompactionPreserveData(
+					preserveData,
+					servingV1CredentialId === undefined ? remote : { ...remote, credentialId: servingV1CredentialId },
+				);
 				usedRemoteCompaction = true;
 			} catch (err) {
 				// A user/session abort is a cancellation, not a remote failure —

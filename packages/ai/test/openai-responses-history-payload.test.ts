@@ -6,7 +6,15 @@ import {
 	streamOpenAIResponses,
 } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import { buildResponsesInput } from "@oh-my-pi/pi-ai/providers/openai-shared";
-import type { AssistantMessage, Context, Model, ModelSpec, ProviderSessionState, Tool } from "@oh-my-pi/pi-ai/types";
+import type {
+	AssistantMessage,
+	Context,
+	FetchImpl,
+	Model,
+	ModelSpec,
+	ProviderSessionState,
+	Tool,
+} from "@oh-my-pi/pi-ai/types";
 import {
 	createOpenAIResponsesHistoryPayload,
 	sanitizeOpenAIResponsesHistoryItemsForReplay,
@@ -2183,5 +2191,463 @@ describe("openai-responses encrypted reasoning credential binding", () => {
 
 		const same = buildParams(credentialModel, credentialContext(11), { credentialId: 11 }, undefined);
 		expect(containsEncryptedReasoning(same.params.input as unknown[])).toBe(true);
+	});
+});
+
+describe("openai-responses legacy foreign encrypted reasoning retry", () => {
+	const credentialModel = getOpenAIReasoningModel("openai", "gpt-5-mini");
+
+	function legacyTurn(): AssistantMessage {
+		return {
+			role: "assistant",
+			content: [{ type: "text", text: "working on it" }],
+			api: credentialModel.api,
+			provider: credentialModel.provider,
+			model: credentialModel.id,
+			usage: issue5002ZeroUsage,
+			stopReason: "stop",
+			providerPayload: createOpenAIResponsesHistoryPayload(credentialModel.provider, [
+				{
+					type: "message",
+					role: "assistant",
+					content: [{ type: "output_text", text: "working on it" }],
+				},
+				{ type: "reasoning", id: "rs_legacy", summary: [], encrypted_content: "enc_legacy" },
+				{ type: "function_call", call_id: "call_legacy", name: "read", arguments: "{}" },
+			]),
+			timestamp: Date.now(),
+		};
+	}
+
+	function legacyContext(): Context {
+		return {
+			messages: [legacyTurn(), { role: "user", content: "continue", timestamp: Date.now() }],
+		};
+	}
+
+	function foreignCallerResponse(): Response {
+		return new Response(
+			JSON.stringify({
+				error: {
+					message: "reasoning 'encrypted_content' was not issued to this caller",
+					type: "invalid_request_error",
+				},
+			}),
+			{ status: 400, headers: { "content-type": "application/json" } },
+		);
+	}
+
+	function unrelatedBadRequestResponse(): Response {
+		return new Response(
+			JSON.stringify({
+				error: { message: "Input 'input[3].content' is invalid", type: "invalid_request_error" },
+			}),
+			{ status: 400, headers: { "content-type": "application/json" } },
+		);
+	}
+
+	function completedResponse(): Response {
+		const events = [
+			{
+				type: "response.output_item.done",
+				output_index: 0,
+				item: {
+					type: "message",
+					id: "msg_legacy_retry",
+					role: "assistant",
+					content: [{ type: "output_text", text: "recovered" }],
+				},
+			},
+			{
+				type: "response.completed",
+				response: {
+					id: "resp_legacy_retry",
+					status: "completed",
+					usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+				},
+			},
+		];
+		return new Response(`${events.map(event => `data: ${JSON.stringify(event)}`).join("\n\n")}\n\n`, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+	}
+
+	function parseJsonBody(init: RequestInit | undefined): Record<string, unknown> {
+		return JSON.parse(typeof init?.body === "string" ? init.body : "{}") as Record<string, unknown>;
+	}
+
+	it("drops encrypted reasoning on a model change with the same credential", () => {
+		// The 0c76431d rule gates native replay on api+model identity: a
+		// same-credential turn produced under another model id falls back to
+		// a content rebuild, which carries no encrypted blob.
+		const input = buildResponsesInput({
+			model: credentialModel,
+			context: {
+				messages: [
+					{ ...legacyTurn(), credentialId: 11, model: "other-model" },
+					{ role: "user", content: "continue", timestamp: Date.now() },
+				],
+			},
+			strictResponsesPairing: false,
+			supportsImageDetailOriginal: credentialModel.compat.supportsImageDetailOriginal,
+			nativeHistory: { replay: true, filterReasoning: credentialModel.compat.filterReasoningHistory },
+			currentCredentialId: 11,
+		});
+		expect(containsEncryptedReasoning(input)).toBe(false);
+		expect(containsAssistantOutputText(input, "working on it")).toBe(true);
+	});
+
+	it("strips every encrypted blob when asked, keeping other replayed items", () => {
+		const input = buildResponsesInput({
+			model: credentialModel,
+			context: legacyContext(),
+			strictResponsesPairing: false,
+			supportsImageDetailOriginal: credentialModel.compat.supportsImageDetailOriginal,
+			nativeHistory: { replay: true, filterReasoning: credentialModel.compat.filterReasoningHistory },
+			stripEncryptedReasoning: true,
+		});
+		expect(containsEncryptedReasoning(input)).toBe(false);
+		expect(findResponsesInputItem(input, "reasoning")).toBeUndefined();
+		expect(findResponsesInputItemByCallId(input, "function_call", "call_legacy")).toBeDefined();
+		expect(containsAssistantOutputText(input, "working on it")).toBe(true);
+	});
+
+	it("retries a foreign-caller 400 once with encrypted reasoning stripped", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		let attempts = 0;
+		const fetchMock: FetchImpl = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				bodies.push(parseJsonBody(init));
+				attempts += 1;
+				return attempts === 1 ? foreignCallerResponse() : completedResponse();
+			},
+			{ preconnect: fetch.preconnect },
+		);
+
+		const result = await streamOpenAIResponses(credentialModel, legacyContext(), {
+			apiKey: "test-key",
+			fetch: fetchMock,
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(attempts).toBe(2);
+		expect(containsEncryptedReasoning(bodies[0]!.input as unknown[])).toBe(true);
+		const retryInput = bodies[1]!.input as unknown[];
+		expect(containsEncryptedReasoning(retryInput)).toBe(false);
+		expect(findResponsesInputItemByCallId(retryInput, "function_call", "call_legacy")).toBeDefined();
+		expect(containsAssistantOutputText(retryInput, "working on it")).toBe(true);
+	});
+
+	it("surfaces a second foreign-caller 400 instead of looping", async () => {
+		let attempts = 0;
+		const fetchMock: FetchImpl = Object.assign(
+			async (): Promise<Response> => {
+				attempts += 1;
+				return foreignCallerResponse();
+			},
+			{ preconnect: fetch.preconnect },
+		);
+
+		const result = await streamOpenAIResponses(credentialModel, legacyContext(), {
+			apiKey: "test-key",
+			fetch: fetchMock,
+		}).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorStatus).toBe(400);
+		expect(attempts).toBe(2);
+	});
+
+	it("does not retry other 400s", async () => {
+		let attempts = 0;
+		const fetchMock: FetchImpl = Object.assign(
+			async (): Promise<Response> => {
+				attempts += 1;
+				return unrelatedBadRequestResponse();
+			},
+			{ preconnect: fetch.preconnect },
+		);
+
+		const result = await streamOpenAIResponses(credentialModel, legacyContext(), {
+			apiKey: "test-key",
+			fetch: fetchMock,
+		}).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorStatus).toBe(400);
+		expect(attempts).toBe(1);
+	});
+});
+
+describe("openai-responses stripped retry chaining", () => {
+	const credentialModel = getOpenAIReasoningModel("openai", "gpt-5-mini");
+
+	function statefulSse(text: string, responseId: string, encryptedContent?: string): Response {
+		const events = [
+			{ type: "response.created", response: { id: responseId } },
+			...(encryptedContent !== undefined
+				? [
+						{
+							type: "response.output_item.done",
+							output_index: 0,
+							item: {
+								type: "reasoning",
+								id: `rs_${responseId}`,
+								summary: [],
+								encrypted_content: encryptedContent,
+							},
+						},
+					]
+				: []),
+			{
+				type: "response.output_item.done",
+				output_index: 0,
+				item: {
+					type: "message",
+					id: `msg_${responseId}`,
+					role: "assistant",
+					status: "completed",
+					content: [{ type: "output_text", text }],
+				},
+			},
+			{
+				type: "response.completed",
+				response: {
+					id: responseId,
+					status: "completed",
+					usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8 },
+				},
+			},
+		];
+		return new Response(`${events.map(event => `data: ${JSON.stringify(event)}`).join("\n\n")}\n\n`, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+	}
+
+	function foreignCallerResponse(): Response {
+		return new Response(
+			JSON.stringify({
+				error: {
+					message: "reasoning encrypted_content was not issued to this caller",
+					type: "invalid_request_error",
+				},
+			}),
+			{ status: 400, headers: { "content-type": "application/json" } },
+		);
+	}
+
+	function parseJsonBody(init: RequestInit | undefined): Record<string, unknown> {
+		return JSON.parse(typeof init?.body === "string" ? init.body : "{}") as Record<string, unknown>;
+	}
+
+	it("drops previous_response_id on the stripped retry and chains the next turn", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		const fetchMock: FetchImpl = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				bodies.push(parseJsonBody(init));
+				if (bodies.length === 1) return statefulSse("Answer 1", "resp_1", "enc_11");
+				if (bodies.length === 2) return foreignCallerResponse();
+				if (bodies.length === 3) return statefulSse("Answer 2", "resp_2");
+				return statefulSse("Answer 3", "resp_3");
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const session = {
+			apiKey: "test-key",
+			sessionId: "chain-strip-session",
+			providerSessionState,
+			statefulResponses: true,
+			fetch: fetchMock,
+		};
+
+		const user1 = { role: "user" as const, content: "First question", timestamp: 1000 };
+		const first = await streamOpenAIResponses(
+			credentialModel,
+			{ messages: [user1] },
+			{
+				...session,
+				credentialId: 11,
+			},
+		).result();
+		expect(first.stopReason).toBe("stop");
+		// The recorded turn stays legacy: no credentialId, so its encrypted
+		// reasoning replays verbatim under the next credential and the turn
+		// stays chainable until the server rejects the foreign baseline.
+		expect(first.credentialId).toBeUndefined();
+		expect(bodies).toHaveLength(1);
+		const second = await streamOpenAIResponses(
+			credentialModel,
+			{ messages: [user1, first, { role: "user", content: "Second question", timestamp: 1001 }] },
+			{ ...session, credentialId: 7 },
+		).result();
+		expect(second.stopReason).toBe("stop");
+		expect(bodies).toHaveLength(3);
+		// The chained attempt references the server-held baseline …
+		expect(bodies[1]!.previous_response_id).toBe("resp_1");
+		// … but the stripped retry is a full transcript: the server-held
+		// prefix may itself hold the foreign blob.
+		expect(bodies[2]!.previous_response_id).toBeUndefined();
+		expect(containsEncryptedReasoning(bodies[2]!.input as unknown[])).toBe(false);
+		expect(JSON.stringify(bodies[2]!.input)).toContain("Second question");
+
+		const third = await streamOpenAIResponses(
+			credentialModel,
+			{
+				messages: [
+					user1,
+					first,
+					{ role: "user", content: "Second question", timestamp: 1001 },
+					second,
+					{
+						role: "user",
+						content: "Third question",
+						timestamp: 1002,
+					},
+				],
+			},
+			{ ...session, credentialId: 7 },
+		).result();
+		expect(third.stopReason).toBe("stop");
+		expect(bodies).toHaveLength(4);
+		expect(bodies[3]!.previous_response_id).toBe("resp_2");
+	});
+
+	it("keeps the strict-tools fallback stripped and unchained after the stripped retry", async () => {
+		const echoTool: Tool = {
+			name: "echo",
+			description: "Echo input",
+			parameters: {
+				type: "object",
+				properties: { text: { type: "string" } },
+				required: ["text"],
+				additionalProperties: false,
+			},
+		};
+		const bodies: Record<string, unknown>[] = [];
+		const fetchMock: FetchImpl = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				bodies.push(parseJsonBody(init));
+				if (bodies.length === 1) return statefulSse("Answer 1", "resp_1", "enc_11");
+				if (bodies.length === 2) return foreignCallerResponse();
+				if (bodies.length === 3) {
+					return new Response(
+						JSON.stringify({
+							error: { message: "Invalid schema for function 'echo'", type: "invalid_request_error" },
+						}),
+						{ status: 400, headers: { "content-type": "application/json" } },
+					);
+				}
+				return statefulSse("Answer 2", "resp_2");
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const session = {
+			apiKey: "test-key",
+			sessionId: "chain-strip-strict-session",
+			providerSessionState,
+			statefulResponses: true,
+			fetch: fetchMock,
+		};
+
+		const user1 = { role: "user" as const, content: "First question", timestamp: 1000 };
+		const first = await streamOpenAIResponses(
+			credentialModel,
+			{ messages: [user1], tools: [echoTool] },
+			{ ...session, credentialId: 11 },
+		).result();
+		expect(first.stopReason).toBe("stop");
+
+		const second = await streamOpenAIResponses(
+			credentialModel,
+			{
+				messages: [user1, first, { role: "user", content: "Second question", timestamp: 1001 }],
+				tools: [echoTool],
+			},
+			{ ...session, credentialId: 7 },
+		).result();
+		expect(second.stopReason).toBe("stop");
+		expect(bodies).toHaveLength(4);
+		// The chained attempt references the server-held baseline …
+		expect(bodies[1]!.previous_response_id).toBe("resp_1");
+		// … the stripped retry drops it …
+		expect(bodies[2]!.previous_response_id).toBeUndefined();
+		expect(containsEncryptedReasoning(bodies[2]!.input as unknown[])).toBe(false);
+		// … and the strict-tools fallback after the stripped retry must stay
+		// stripped and unchained (decision seq 289): the server-held prefix
+		// may itself hold the foreign blob.
+		expect(bodies[3]!.previous_response_id).toBeUndefined();
+		expect(containsEncryptedReasoning(bodies[3]!.input as unknown[])).toBe(false);
+		expect(JSON.stringify(bodies[3]!.input)).toContain("Second question");
+		const strictFlags = (body: Record<string, unknown>) =>
+			((body.tools as Array<{ strict?: boolean }> | undefined) ?? []).map(tool => tool.strict);
+		expect(strictFlags(bodies[1]!)).toEqual([true]);
+		expect(strictFlags(bodies[3]!)).not.toContain(true);
+	});
+});
+
+describe("openai-responses user history encrypted reasoning strip", () => {
+	const credentialModel = getOpenAIReasoningModel("openai", "gpt-5-mini");
+
+	function userHistoryContext(): Context {
+		return {
+			messages: [
+				{
+					role: "user",
+					content: "summarize this",
+					providerPayload: createOpenAIResponsesHistoryPayload(credentialModel.provider, [
+						{ type: "message", role: "user", content: [{ type: "input_text", text: "summarize this" }] },
+						{ type: "reasoning", id: "rs_user", summary: [], encrypted_content: "enc_user" },
+						{ type: "compaction", encrypted_content: "enc_compaction" },
+					]),
+					timestamp: Date.now(),
+				},
+			],
+		};
+	}
+
+	function replayInput(stripEncryptedReasoning: boolean): unknown[] {
+		return buildResponsesInput({
+			model: credentialModel,
+			context: userHistoryContext(),
+			strictResponsesPairing: false,
+			supportsImageDetailOriginal: credentialModel.compat.supportsImageDetailOriginal,
+			nativeHistory: { replay: true, filterReasoning: false },
+			...(stripEncryptedReasoning ? { stripEncryptedReasoning: true } : {}),
+		});
+	}
+
+	it("keeps user reasoning blobs without the strip flag", () => {
+		expect(containsEncryptedReasoning(replayInput(false))).toBe(true);
+	});
+
+	it("drops only reasoning blobs from user history, keeping other items", () => {
+		const input = replayInput(true);
+		expect(
+			input.filter(
+				item =>
+					typeof item === "object" &&
+					item !== null &&
+					"type" in item &&
+					item.type === "reasoning" &&
+					"encrypted_content" in item &&
+					typeof item.encrypted_content === "string",
+			),
+		).toHaveLength(0);
+		expect(
+			input.some(
+				item =>
+					typeof item === "object" &&
+					item !== null &&
+					"type" in item &&
+					item.type === "compaction" &&
+					"encrypted_content" in item &&
+					item.encrypted_content === "enc_compaction",
+			),
+		).toBe(true);
+		expect(JSON.stringify(input)).toContain("summarize this");
 	});
 });

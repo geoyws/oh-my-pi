@@ -2505,6 +2505,30 @@ describe("compact() remote compaction failure handling", () => {
 		expect(completeSpy).not.toHaveBeenCalled();
 	});
 
+	test("skips V2 on empty remote history and falls back to local summarization", async () => {
+		const completeSpy = vi.spyOn(ai, "completeSimple").mockResolvedValue(localSummaryMessage("local summary"));
+		const preparation = makePreparation();
+		preparation.settings = { ...preparation.settings, remoteStreamingV2Enabled: true };
+		// Azure without an explicit V1 opt-in exposes V2 but no V1 endpoint:
+		// an empty V2 input must skip remote compaction instead of throwing
+		// NativeCompactionError.
+		const model = makeAzureModel({ remoteCompaction: { v2StreamingEnabled: true } });
+		const fetchMock = vi.fn<FetchImpl>(async () => {
+			throw new Error("V2 must not reach the network on empty input");
+		});
+
+		// An empty converted transcript (nothing survives conversion) leaves
+		// V2 with no input while the raw transcript still needs summarizing.
+		const result = await compact(preparation, model, "test-key", undefined, undefined, {
+			fetch: fetchMock,
+			convertToLlm: () => [],
+		});
+
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(completeSpy).toHaveBeenCalled();
+		expect(result.summary).toContain("local summary");
+	});
+
 	test.each(["v2", "codex-v2"])(
 		"retains only user-written turns, as serialized, in V2 replacement history (%s)",
 		async protocol => {
