@@ -97,6 +97,7 @@ async function harness(spaceHoldKeys: readonly KeyId[] = ["space"]) {
 		model: { provider: "anthropic", id: "claude-sonnet-4-5" },
 		isStreaming: false,
 		runEphemeralTurn,
+		gateUserMessage: vi.fn(async () => {}),
 	} as unknown as InteractiveModeContext["session"];
 	const ctx = {
 		ui: {

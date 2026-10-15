@@ -59,6 +59,7 @@ describe("/handoff command", () => {
 					}
 				}),
 				abortHandoff,
+				gateUserMessage: vi.fn(async () => {}),
 			},
 			loadingAnimation: undefined,
 			statusContainer,

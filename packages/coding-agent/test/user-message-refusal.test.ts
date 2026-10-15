@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage, Context } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Context, ImageContent } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -28,6 +28,8 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm, SKILL_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { COLLAB_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/collab/protocol";
+import { SessionProviderBoundary } from "@oh-my-pi/pi-coding-agent/session/session-provider-boundary";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
@@ -68,6 +70,7 @@ interface RefusalHarness {
 	contexts: Context[];
 	toolEntered: Promise<void> | undefined;
 	releaseTool: (() => void) | undefined;
+	streamStarted: Promise<void> | undefined;
 	skillDir: string | undefined;
 	dispose: () => Promise<void>;
 }
@@ -76,6 +79,8 @@ async function createHarness(options?: {
 	factory?: ExtensionFactory;
 	withSlowTool?: boolean;
 	withSkill?: boolean;
+	/** First provider call hangs (abortable 60 s delay) instead of answering. */
+	withHangingStream?: boolean;
 }): Promise<RefusalHarness> {
 	const authStorage = await AuthStorage.create(":memory:");
 	authStorage.keys.setRuntime("openai", "openai-test-key");
@@ -99,6 +104,21 @@ async function createHarness(options?: {
 	);
 	const extensionRunner = new ExtensionRunner([extension], runtime, process.cwd(), sessionManager, modelRegistry);
 	const model = createMockModel({ provider: "openai", id: "gpt-test" }).model;
+	const streamStarted = Promise.withResolvers<void>();
+	const hanging =
+		options?.withHangingStream === true
+			? createMockModel({
+					provider: "openai",
+					id: "gpt-hanging",
+					responses: [
+						() => {
+							streamStarted.resolve();
+							return { content: ["working"], delayMs: 60_000 };
+						},
+					],
+				})
+			: undefined;
+	const activeModel = hanging?.model ?? model;
 
 	let streamCalls = 0;
 	const contexts: Context[] = [];
@@ -118,43 +138,50 @@ async function createHarness(options?: {
 	const tools = options?.withSlowTool === true ? [slowTool] : [];
 	const agent = new Agent({
 		getApiKey: () => "test-key",
-		initialState: { model, systemPrompt: ["Test"], tools, messages: [] },
+		initialState: { model: activeModel, systemPrompt: ["Test"], tools, messages: [] },
 		convertToLlm,
-		streamFn: (_model, context) => {
-			contexts.push(context);
-			const call = streamCalls++;
-			const isToolCall = options?.withSlowTool === true && call === 0;
-			const message: AssistantMessage = isToolCall
-				? {
-						role: "assistant",
-						content: [{ type: "toolCall", id: "tc-0", name: "slow", arguments: {} }],
-						api: model.api,
-						provider: model.provider,
-						model: model.id,
-						usage: zeroUsage,
-						stopReason: "toolUse",
-						timestamp: Date.now(),
+		streamFn:
+			hanging !== undefined
+				? (streamModel, context) => {
+						contexts.push(context);
+						streamCalls++;
+						return hanging.stream(streamModel, context);
 					}
-				: {
-						role: "assistant",
-						content: [{ type: "text", text: "Done." }],
-						api: model.api,
-						provider: model.provider,
-						model: model.id,
-						usage: zeroUsage,
-						stopReason: "stop",
-						timestamp: Date.now(),
-					};
-			const stream = new AssistantMessageEventStream();
-			queueMicrotask(() => {
-				stream.push({ type: "start", partial: message });
-				stream.push({ type: "done", reason: isToolCall ? "toolUse" : "stop", message });
-			});
-			return stream;
-		},
+				: (_model, context) => {
+						contexts.push(context);
+						const call = streamCalls++;
+						const isToolCall = options?.withSlowTool === true && call === 0;
+						const message: AssistantMessage = isToolCall
+							? {
+									role: "assistant",
+									content: [{ type: "toolCall", id: "tc-0", name: "slow", arguments: {} }],
+									api: model.api,
+									provider: model.provider,
+									model: model.id,
+									usage: zeroUsage,
+									stopReason: "toolUse",
+									timestamp: Date.now(),
+								}
+							: {
+									role: "assistant",
+									content: [{ type: "text", text: "Done." }],
+									api: model.api,
+									provider: model.provider,
+									model: model.id,
+									usage: zeroUsage,
+									stopReason: "stop",
+									timestamp: Date.now(),
+								};
+						const stream = new AssistantMessageEventStream();
+						queueMicrotask(() => {
+							stream.push({ type: "start", partial: message });
+							stream.push({ type: "done", reason: isToolCall ? "toolUse" : "stop", message });
+						});
+						return stream;
+					},
 	});
 	const settings = Settings.isolated({ "compaction.enabled": false, "todo.enabled": false });
-	settings.setModelRole("default", `${model.provider}/${model.id}`);
+	settings.setModelRole("default", `${activeModel.provider}/${activeModel.id}`);
 	const skillDir =
 		options?.withSkill === true ? await fs.mkdtemp(path.join(os.tmpdir(), "omp-refusal-skill-")) : undefined;
 	if (skillDir) {
@@ -201,6 +228,7 @@ async function createHarness(options?: {
 		contexts,
 		toolEntered: options?.withSlowTool === true ? toolGate.promise : undefined,
 		releaseTool: options?.withSlowTool === true ? () => toolRelease.resolve() : undefined,
+		streamStarted: options?.withHangingStream === true ? streamStarted.promise : undefined,
 		skillDir,
 		dispose: async () => {
 			unsubscribe();
@@ -501,6 +529,111 @@ describe("before_user_message refusal", () => {
 		expect(harness.streamCalls).toBe(0);
 		expect(harness.sessionManager.getEntries()).toEqual(entriesBefore);
 		expect(leakedEverywhere(harness, "FAKE-SECRET")).toEqual([]);
+	});
+
+	it("idle collab guest prompt is gated like a queued one", async () => {
+		harness = await createHarness();
+		const entriesBefore = structuredClone(harness.sessionManager.getEntries());
+		const error = await harness.session
+			.promptCustomMessage(
+				{
+					customType: COLLAB_PROMPT_MESSAGE_TYPE,
+					content: `peer says ${SECRET}`,
+					display: true,
+					details: { from: "guest" },
+					attribution: "user",
+				},
+				{ streamingBehavior: "steer", source: "unknown" },
+			)
+			.then(
+				() => null,
+				(error: unknown) => error,
+			);
+		expect(error).toBeInstanceOf(UserMessageRefusedError);
+		expect((error as UserMessageRefusedError).message).toBe(NOTICE);
+		expect(harness.streamCalls).toBe(0);
+		expect(harness.sessionManager.getEntries()).toEqual(entriesBefore);
+		expect(leakedEverywhere(harness, "FAKE-SECRET")).toEqual([]);
+	});
+
+	it("refused image prompt never reaches the vision boundary", async () => {
+		harness = await createHarness();
+		const vision = vi.spyOn(SessionProviderBoundary.prototype, "buildImageDescriptionNotice");
+		try {
+			const image: ImageContent = { type: "image", data: "aGVsbG8=", mimeType: "image/png" };
+			const entriesBefore = structuredClone(harness.sessionManager.getEntries());
+			await expect(
+				harness.session.prompt(`look at this ${SECRET}`, { images: [image], source: "interactive" }),
+			).rejects.toBeInstanceOf(UserMessageRefusedError);
+			expect(vision).not.toHaveBeenCalled();
+			expect(harness.streamCalls).toBe(0);
+			expect(harness.sessionManager.getEntries()).toEqual(entriesBefore);
+			expect(leakedEverywhere(harness, "FAKE-SECRET")).toEqual([]);
+		} finally {
+			vision.mockRestore();
+		}
+	});
+
+	it("gateUserMessage refuses side text with only the notice and admits clean text", async () => {
+		harness = await createHarness();
+		const entriesBefore = structuredClone(harness.sessionManager.getEntries());
+		const error = await harness.session.gateUserMessage(`side ${SECRET}`, undefined, "interactive").then(
+			() => null,
+			(error: unknown) => error,
+		);
+		expect(error).toBeInstanceOf(UserMessageRefusedError);
+		expect((error as UserMessageRefusedError).message).toBe(NOTICE);
+		expect(harness.seenSources).toEqual(["interactive"]);
+		await harness.session.gateUserMessage("clean side question", undefined, "rpc");
+		expect(harness.seenSources).toEqual(["interactive", "rpc"]);
+		expect(harness.streamCalls).toBe(0);
+		expect(harness.sessionManager.getEntries()).toEqual(entriesBefore);
+		expect(leakedEverywhere(harness, "FAKE-SECRET")).toEqual([]);
+	});
+
+	it("stranded aside admitted after a session switch never reaches the new session", async () => {
+		lateApi.current = undefined;
+		const entered = Promise.withResolvers<void>();
+		const admit = Promise.withResolvers<void>();
+		harness = await createHarness({
+			factory: pi => {
+				lateApi.current = pi;
+			},
+			withHangingStream: true,
+		});
+		const run = harness.session.prompt("first");
+		await harness.streamStarted;
+		// No handlers yet: the aside strands unchecked behind the running turn
+		// (the idle-only stranded resume leaves it pending while streaming).
+		await harness.session.sendUserMessage(`old aside ${SECRET}`, { deliverAs: "aside" });
+		// Late handler blocks the secret aside's admission. Aborting the hung
+		// stream settles the turn without any provider-leg poll holding it,
+		// so the abort-settle drain starts the (fire-and-forget) recheck while
+		// nothing depends on the pending admission.
+		lateApiCurrent()?.on("before_user_message", (event: BeforeUserMessageEvent) => {
+			if (!event.text.includes("FAKE-SECRET")) return undefined;
+			entered.resolve();
+			return admit.promise.then(() => undefined);
+		});
+		await harness.session.abort();
+		await run.then(
+			() => undefined,
+			() => undefined,
+		);
+		await entered.promise;
+		// Switch while admission is still pending: the drained records belong
+		// to the old session and must never reach the new one.
+		await harness.session.newSession();
+		admit.resolve();
+		await harness.session.waitForIdle();
+		// Integration exception to the no-real-timers rule: the forbidden
+		// old-session delivery (when the guard is missing) travels through
+		// fire-and-forget wake chains with no exposed completion signal, so a
+		// bounded drain lets it manifest for the fail-before direction. On
+		// fixed code nothing is pending and the assertions below are exact.
+		await new Promise(resolve => setTimeout(resolve, 2000));
+		expect(leakedEverywhere(harness, "FAKE-SECRET")).toEqual([]);
+		expect(harness.streamCalls).toBe(1);
 	});
 
 	it("RPC /skill: refusal rejects with only the notice", async () => {

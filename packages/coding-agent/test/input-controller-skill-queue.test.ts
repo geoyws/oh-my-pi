@@ -511,6 +511,8 @@ describe("compaction skill re-invocation", () => {
 		expect(renderedText.text).toContain("Do the thing.");
 		expect(renderedText.text).toContain(`[Skill directory: ${tempDir.path()}]`);
 		expect(renderedText.text).toContain("arg1 arg2");
+		expect(message.content[1]).toEqual(image);
+		expect(message.details).toMatchObject({ name: "test-skill", args: "arg1 arg2", lineCount: 1 });
 		expect(options).toEqual({
 			streamingBehavior: "followUp",
 			queueChipText: "/skill:test-skill arg1 arg2",

@@ -1319,12 +1319,26 @@ export class AgentSession implements SettingsScope {
 
 	/** Async leg of the aside delivery recheck: drop refused user records, then deliver the rest. */
 	async #deliverStrandedAsidesAfterRefusalCheck(records: AgentMessage[]): Promise<void> {
+		// Captured before the handler await so a session switch (or dispose)
+		// completing in flight can be told apart from a settled transition.
+		const sessionGeneration = this.#sessionGeneration;
 		const userMessages = records.filter(isUserAuthoredQueuedMessage);
 		// Refused entries are removed from `records` in place (with their
 		// hidden companions when nothing user-authored survives); whatever
 		// remains is deliverable. A refusal is final and must never be restored.
 		await this.#dropRefusedDelivery(records, userMessages, "aside");
 		if (records.length === 0) return;
+		// The drained records belong to the session that queued them. A
+		// switchSession()/new-session transition (or dispose) that landed
+		// while handlers were pending must not wake them — or fold them —
+		// into the new session's provider or JSONL. Drop them instead, like
+		// the other post-await aside paths.
+		if ((await this.#sessionGenerationChanged(sessionGeneration)) || this.#isDisposed) {
+			logger.warn("Dropping stranded asides after a session change during the refusal check", {
+				sessionId: this.sessionId,
+			});
+			return;
+		}
 		this.#deliverStrandedAsides(records);
 	}
 
@@ -2112,12 +2126,22 @@ export class AgentSession implements SettingsScope {
 				this.#extensionRunner?.hasHandlers("before_user_message") &&
 				drained.some(record => isUserAuthoredQueuedMessage(record) && !this.#userMessageRefusalChecked.has(record))
 			) {
+				// Captured before the handler await: a session switch (or
+				// dispose) completing in flight must not inject the drained
+				// old-session records into the new session's step boundary.
+				const sessionGeneration = this.#sessionGeneration;
 				return (async () => {
 					try {
 						await this.#dropRefusedDelivery(drained, drained.filter(isUserAuthoredQueuedMessage), "aside");
 					} catch (error) {
 						logger.warn("Aside refusal check failed; dropping drained asides", {
 							error: error instanceof Error ? error.message : String(error),
+						});
+						drained.length = 0;
+					}
+					if ((await this.#sessionGenerationChanged(sessionGeneration)) || this.#isDisposed) {
+						logger.warn("Dropping asides after a session change during the refusal check", {
+							sessionId: this.sessionId,
 						});
 						drained.length = 0;
 					}
@@ -7482,6 +7506,16 @@ export class AgentSession implements SettingsScope {
 			!options?.synthetic && !hasPendingUserDirective ? this.#todo.createEagerTodoPrelude(expandedText) : undefined;
 		const eagerTaskPrelude =
 			!options?.synthetic && !hasPendingUserDirective ? this.#todo.createEagerTaskPrelude(expandedText) : undefined;
+		// Pre-persistence `before_user_message` gate BEFORE image normalization
+		// and the vision-description provider call: a refused message must
+		// never send its images to any provider. Runs on the raw submission;
+		// the admitted message is marked so #promptWithMessage skips its own
+		// gate instead of running the handlers a second time. After the
+		// preflight-generation capture above so an abort landing during the
+		// handler await still drops the prompt at the check below.
+		const idleRefusalChecked =
+			!options?.synthetic &&
+			(await this.#checkUserMessageRefusal(expandedText, options?.images, options?.source ?? "unknown"));
 		const attachmentSourceNotices = this.#createAttachmentSourceNotices(options?.images, submittedAt);
 		const normalizedImages = await this.#normalizeImagesForModel(options?.images);
 
@@ -7584,6 +7618,7 @@ export class AgentSession implements SettingsScope {
 			dispatched = await this.#promptWithMessage(message, expandedText, {
 				...options,
 				images: normalizedImages,
+				refusalChecked: idleRefusalChecked || undefined,
 				prependMessages:
 					preludeMessages.length > 0 ||
 					keywordNotices.length > 0 ||
@@ -7642,6 +7677,20 @@ export class AgentSession implements SettingsScope {
 		return this.#admitSubmission(() => this.#promptCustomMessage(message, options));
 	}
 
+	/**
+	 * Pre-persistence `before_user_message` gate for user-authored text that
+	 * enters outside prompt()/steer()/followUp()/promptCustomMessage() — side
+	 * (`/btw`) questions, summarizer instructions (`/compact`, `/handoff`,
+	 * `/tree`), and local shell (`!`/`$`) commands. Runs the handlers in
+	 * order and throws {@link UserMessageRefusedError} on the first refusal
+	 * (fail-closed on handler throw/timeout); the caller must then send and
+	 * persist nothing and surface only the error's notice. No-op when no
+	 * extension handles the event.
+	 */
+	async gateUserMessage(text: string, images?: ImageContent[], source: UserMessageSource = "unknown"): Promise<void> {
+		await this.#checkUserMessageRefusal(text, images, source);
+	}
+
 	async #promptCustomMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
 		options?: Pick<PromptOptions, "streamingBehavior" | "toolChoice" | "onPromptAdmitted"> & {
@@ -7683,6 +7732,14 @@ export class AgentSession implements SettingsScope {
 						.join("");
 
 		let keywordNotices: CustomMessage[] = [];
+		// Pre-persistence `before_user_message` gate for every visible
+		// user-attributed custom prompt: user-invoked skill expansions AND
+		// writable-collab peer prompts both carry user-authored text to the
+		// provider and the session JSONL. Runs before anything is persisted,
+		// queued, or dispatched, matching the queued-delivery recheck's
+		// `isUserAuthoredQueuedMessage` coverage so an idle host gates exactly
+		// what a streaming host's recheck would gate.
+		let refusalChecked = false;
 		if (message.customType === SKILL_PROMPT_MESSAGE_TYPE && message.attribution === "user") {
 			const details = message.details;
 			let skillArgs = "";
@@ -7696,10 +7753,21 @@ export class AgentSession implements SettingsScope {
 			const skillImages = Array.isArray(message.content)
 				? message.content.filter((part): part is ImageContent => part.type === "image")
 				: undefined;
-			await this.#checkSkillPromptRefusal(
+			refusalChecked = await this.#checkSkillPromptRefusal(
 				message,
 				textContent,
 				skillImages && skillImages.length > 0 ? skillImages : undefined,
+				options?.source ?? "unknown",
+			);
+		} else if (message.attribution === "user" && message.display !== false) {
+			// Writable-collab peer prompt (or any future visible
+			// user-attributed custom): single gate on the submitted text.
+			const customImages = Array.isArray(message.content)
+				? message.content.filter((part): part is ImageContent => part.type === "image")
+				: undefined;
+			refusalChecked = await this.#checkUserMessageRefusal(
+				textContent,
+				customImages && customImages.length > 0 ? customImages : undefined,
 				options?.source ?? "unknown",
 			);
 		}
@@ -7718,6 +7786,7 @@ export class AgentSession implements SettingsScope {
 				queueChipText: options?.queueChipText,
 				prependMessages: keywordNotices,
 				onPromptAdmitted: options?.onPromptAdmitted,
+				refusalChecked: refusalChecked || undefined,
 			});
 			outcome.sessionClaimed = true;
 			return true;
@@ -7764,6 +7833,7 @@ export class AgentSession implements SettingsScope {
 				preprocessed: { content: preparedMessage.content, descriptionNotice },
 				prependMessages: keywordNotices,
 				onPromptAdmitted: options?.onPromptAdmitted,
+				refusalChecked: refusalChecked || undefined,
 			});
 			outcome.sessionClaimed = true;
 			return true;
@@ -7814,13 +7884,15 @@ export class AgentSession implements SettingsScope {
 	 * rendering could trim) and once on the rendered text (which merges the
 	 * args into the skill template). Either refusal throws
 	 * {@link UserMessageRefusedError} before anything is persisted or queued.
+	 * Returns true when the gate ran, so the queued record can skip the
+	 * delivery-time recheck's second handler pass.
 	 */
 	async #checkSkillPromptRefusal(
 		message: Pick<CustomMessage<unknown>, "content" | "details">,
 		renderedText: string,
 		images: ImageContent[] | undefined,
 		source: UserMessageSource,
-	): Promise<void> {
+	): Promise<boolean> {
 		const details = message.details;
 		const raw =
 			details && typeof details === "object" && "prompt" in details && typeof details.prompt === "string"
@@ -7828,12 +7900,14 @@ export class AgentSession implements SettingsScope {
 				: details && typeof details === "object" && "args" in details && typeof details.args === "string"
 					? details.args
 					: "";
+		let checked = false;
 		if (raw.trim() && raw !== renderedText) {
-			await this.#checkUserMessageRefusal(raw, images, source);
+			checked = (await this.#checkUserMessageRefusal(raw, images, source)) || checked;
 		}
 		if (renderedText.trim()) {
-			await this.#checkUserMessageRefusal(renderedText, images, source);
+			checked = (await this.#checkUserMessageRefusal(renderedText, images, source)) || checked;
 		}
+		return checked;
 	}
 
 	/** Split a queued user message into gate input (text plus image parts). */
@@ -8065,14 +8139,20 @@ export class AgentSession implements SettingsScope {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
 			acceptTerminalEmptyStop?: boolean;
+			/** #dispatchPrompt already admitted this message pre-normalization: mark it instead of re-running handlers. */
+			refusalChecked?: boolean;
 		},
 	): Promise<boolean> {
 		// Pre-persistence `before_user_message` gate for direct turns: runs
 		// before any provider dispatch, persistence, or queue insertion, so a
 		// refusal throws before the message exists anywhere but the caller.
 		// Custom/agent messages (skills, continuations) are not user input.
+		// (The idle prompt path gates earlier — before image normalization and
+		// the vision-description call — and arrives pre-checked.)
 		if (message.role === "user") {
-			if (await this.#checkUserMessageRefusal(expandedText, options?.images, options?.source ?? "unknown")) {
+			if (options?.refusalChecked) {
+				this.#userMessageRefusalChecked.add(message);
+			} else if (await this.#checkUserMessageRefusal(expandedText, options?.images, options?.source ?? "unknown")) {
 				this.#userMessageRefusalChecked.add(message);
 			}
 		}
@@ -8898,6 +8978,8 @@ export class AgentSession implements SettingsScope {
 			prependMessages?: readonly CustomMessage[];
 			/** Called synchronously once the message is pushed onto its queue. See {@link PromptOptions.onPromptAdmitted}. */
 			onPromptAdmitted?: () => void;
+			/** The submission-time `before_user_message` gate already admitted this message: skip the delivery recheck's second pass. */
+			refusalChecked?: boolean;
 		},
 	): Promise<void> {
 		// Captured before the normalization await below — see #sessionGeneration's doc comment.
@@ -8927,6 +9009,7 @@ export class AgentSession implements SettingsScope {
 		const normalizedAppMessage = preprocessed
 			? { ...appMessage, content: preprocessed.content }
 			: await this.#normalizeAgentMessageImages(appMessage);
+		if (options?.refusalChecked) this.#userMessageRefusalChecked.add(normalizedAppMessage);
 		const descriptionNotice = preprocessed
 			? preprocessed.descriptionNotice
 			: await this.#buildSkillImageDescriptionNotice(normalizedAppMessage);

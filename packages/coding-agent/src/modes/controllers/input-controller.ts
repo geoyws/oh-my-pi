@@ -1161,6 +1161,19 @@ export class InputController {
 				const isExcluded = text.startsWith("!!");
 				const command = isExcluded ? text.slice(2).trim() : text.slice(1).trim();
 				if (command) {
+					// User-authored shell text is persisted with the execution and
+					// replayed into later context: gate it before anything runs.
+					// The draft never left the editor, so a refusal only reports
+					// the handler's notice and keeps the typed text in place.
+					try {
+						await this.ctx.session.gateUserMessage(text, inputImages, "interactive");
+					} catch (error) {
+						if (error instanceof UserMessageRefusedError) {
+							this.ctx.showError(error.notice);
+							return;
+						}
+						throw error;
+					}
 					if (this.ctx.session.isBashRunning) {
 						this.ctx.showWarning(
 							`A bash command is already running. Press ${appKey(this.ctx.keybindings, "app.interrupt")} to cancel it first.`,
@@ -1182,6 +1195,18 @@ export class InputController {
 			if (pythonCommand) {
 				const { code, isExcluded } = pythonCommand;
 				if (code) {
+					// Same pre-persistence gate as `!`: user-authored code is
+					// persisted with the execution result. The draft stays put on
+					// refusal.
+					try {
+						await this.ctx.session.gateUserMessage(text, inputImages, "interactive");
+					} catch (error) {
+						if (error instanceof UserMessageRefusedError) {
+							this.ctx.showError(error.notice);
+							return;
+						}
+						throw error;
+					}
 					if (this.ctx.session.isEvalRunning) {
 						this.ctx.showWarning(
 							`A Python execution is already running. Press ${appKey(this.ctx.keybindings, "app.interrupt")} to cancel it first.`,
@@ -1726,6 +1751,11 @@ export class InputController {
 			if (!dispatched) restoreDraft();
 			return dispatched;
 		} catch (error) {
+			// A refusal merges back alongside any newer draft typed while
+			// dispatch was pending instead of overwriting it (see
+			// #restoreRefusedSubmission); other errors keep the legacy
+			// snapshot restore.
+			if (this.#restoreRefusedSubmission(error, text, draftImages, draftImageLinks)) return true;
 			restoreDraft();
 			this.ctx.showError(error instanceof Error ? error.message : String(error));
 			return true;
@@ -1857,6 +1887,19 @@ export class InputController {
 				queuedCount++;
 			}
 		} catch (error) {
+			// A refusal merges back alongside any newer draft typed while
+			// dispatch was pending instead of overwriting it (see
+			// #restoreRefusedSubmission). The detached path already merges;
+			// only the live-editor path needs the refusal branch.
+			if (
+				queuedCount === 0 &&
+				options.detachedText === undefined &&
+				this.#restoreRefusedSubmission(error, text, images, imageLinks)
+			) {
+				this.ctx.updatePendingMessagesDisplay();
+				this.ctx.ui.requestRender();
+				return;
+			}
 			if (queuedCount === 0) {
 				if (options.detachedText !== undefined) {
 					restoreDetachedDraft(this.ctx.editor, options.detachedText, images, imageLinks);

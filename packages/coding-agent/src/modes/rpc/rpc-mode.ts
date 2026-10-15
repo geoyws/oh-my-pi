@@ -2338,6 +2338,12 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			// =================================================================
 
 			case "compact": {
+				// User-authored summarizer focus reaches the summarizer
+				// provider: gate it first. A refusal rejects with only the
+				// handler's notice and compacts nothing.
+				if (command.customInstructions?.trim()) {
+					await session.gateUserMessage(command.customInstructions, undefined, "rpc");
+				}
 				const result = await session.compact(command.customInstructions);
 				return success(id, "compact", result);
 			}
@@ -2429,6 +2435,11 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				// flight (mirrors the TUI /handoff guard).
 				if (session.isStreaming) {
 					return error(id, "handoff", "Cannot hand off while a response is in progress");
+				}
+				// Same pre-persistence gate as `compact`: user-authored focus
+				// reaches the summarizer provider.
+				if (command.customInstructions?.trim()) {
+					await session.gateUserMessage(command.customInstructions, undefined, "rpc");
 				}
 				const result = await session.handoff(command.customInstructions);
 				return success(id, "handoff", result ? { savedPath: result.savedPath } : null);

@@ -476,6 +476,7 @@ Cancelable pre-events:
 ### Prompt and turn lifecycle
 
 - `input`
+- `before_agent_start`
 - `before_user_message` — pre-persistence gate for a user message (see “Refusing a user message before it is sent” below)
 - `before_provider_request` — receives `{ payload }`; return the replacement payload itself (not `{ payload }`). Handlers chain. Provider transports must invoke `onPayload`; `devin-agent` does not.
 - `after_provider_response` — notification before response-body consumption: `{ status, headers, requestId?, metadata? }`. Provider request/response handlers receive the model used for that request in `ctx.model`.
@@ -544,12 +545,13 @@ and `/new`. Commands retain their explicit prefill and session-transition action
 
 `before_user_message` gates a user message after command/template expansion but
 before it reaches the provider, the session JSONL, or any queue that later
-persists it. It fires at submission for `prompt`, `steer`, `followUp`, and
-`sendUserMessage`, and again at queued/aside delivery for messages enqueued
-before extensions finished registering — so a late-registered handler still
-faces every message. Each message passes the handlers once: already-gated
-messages skip the delivery recheck. Synthetic prompts (agent continuations)
-and non-skill custom messages are not user input and skip the gate.
+persists it. It fires at submission for `prompt`, `steer`, `followUp`,
+`sendUserMessage`, and `promptCustomMessage`, and again at queued/aside
+delivery for messages enqueued before extensions finished registering — so a
+late-registered handler still faces every message. Each message passes the
+handlers once: already-gated messages skip the delivery recheck. Synthetic
+prompts (agent continuations) and agent-attributed or hidden custom messages
+are not user input and skip the gate.
 
 User-invoked `/skill:` expansions are gated too: the handler runs once on the
 raw invocation (the typed draft/args) and once on the rendered skill text
@@ -557,6 +559,13 @@ before either is persisted or sent, on every ingress (interactive Enter,
 RPC, ACP, compaction drain). A skill refusal behaves like any other refusal
 for its ingress — the interactive draft (the raw `/skill:` text) is handed
 back for editing, RPC/ACP fail with only the notice.
+
+Visible user-attributed custom prompts from writable-collab peers are gated
+the same way, so an idle host gates exactly what a streaming host's recheck
+would gate. `/btw` questions, summarizer instructions (`/compact`, `/handoff`,
+`/tree`), and local shell (`!`) and Python (`$`) commands are gated at their
+own ingress points before they are persisted or sent. Programmatic RPC `bash`
+execution is outside the gate: it is an execution API, not a user message.
 
 | Submission | `source` |
 |---|---|

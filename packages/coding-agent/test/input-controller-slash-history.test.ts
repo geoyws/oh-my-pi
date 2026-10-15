@@ -161,7 +161,7 @@ describe("input controller — slash command history (#3148)", () => {
 
 		await editor.onSubmit?.("/id [Image #1]");
 
-		expect(prompt).toHaveBeenCalledWith("/id [Image #1]", { images: [image] });
+		expect(prompt).toHaveBeenCalledWith("/id [Image #1]", { images: [image], source: "interactive" });
 		expect(addToHistory).toHaveBeenCalledWith("/id [Image #1]");
 		expect(onInputCallback).not.toHaveBeenCalled();
 		expect(editor.pendingImages).toEqual([]);
@@ -201,7 +201,7 @@ describe("input controller — slash command history (#3148)", () => {
 
 		await editor.onSubmit?.("/queue inspect the final result");
 
-		expect(followUp).toHaveBeenCalledWith("inspect the final result", undefined);
+		expect(followUp).toHaveBeenCalledWith("inspect the final result", undefined, { source: "interactive" });
 		expect(addToHistory).toHaveBeenCalledWith("/queue inspect the final result");
 		expect(showStatus).toHaveBeenCalledWith("Queued message for when the agent yields");
 	});
@@ -365,7 +365,7 @@ describe("input controller — bare slash commands opt-in", () => {
 
 		await editor.onSubmit?.("id");
 
-		expect(prompt).toHaveBeenCalledWith("/id", { images: undefined });
+		expect(prompt).toHaveBeenCalledWith("/id", { images: undefined, source: "interactive" });
 		expect(onInputCallback).not.toHaveBeenCalled();
 	});
 

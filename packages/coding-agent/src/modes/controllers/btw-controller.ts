@@ -8,6 +8,7 @@ import {
 	getBtwCopyText,
 	getBtwLatestTurn,
 } from "../../session/btw-history";
+import { UserMessageRefusedError } from "../../session/agent-session";
 import { beginBtwTurn, patchLatestBtwTurn, runBtwTurn } from "../../session/btw-turn";
 import { TRUNCATE_LENGTHS } from "@oh-my-pi/pi-tui/render/render-utils";
 import { copyToClipboard } from "../../utils/clipboard";
@@ -398,6 +399,18 @@ export class BtwController {
 					panel.showRecord(active.record.id);
 				}
 				return true;
+			}
+			// The question is persisted to the BTW history sidecar and sent
+			// to a provider: gate it before any checkpoint or dispatch. A
+			// refusal reports only the handler's notice and opens nothing.
+			try {
+				await viewSession.gateUserMessage(trimmedQuestion, undefined, "interactive");
+			} catch (error) {
+				if (error instanceof UserMessageRefusedError) {
+					this.ctx.showError(error.notice);
+					return false;
+				}
+				throw error;
 			}
 			// A just-cancelled/completed turn may still be publishing its checkpoint.
 			await this.flush();

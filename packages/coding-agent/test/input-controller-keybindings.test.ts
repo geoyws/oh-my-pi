@@ -646,6 +646,8 @@ describe("InputController keybinding setup", () => {
 		expect(ctx.locallySubmittedUserSignatures.has("follow up after current response\u00000")).toBe(true);
 		expect(spies.prompt).toHaveBeenCalledWith("follow up after current response", {
 			streamingBehavior: "followUp",
+			images: undefined,
+			source: "interactive",
 		});
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 	});
@@ -660,7 +662,7 @@ describe("InputController keybinding setup", () => {
 
 		expect(ctx.locallySubmittedUserSignatures.has("plain idle submit\u00000")).toBe(true);
 		// Idle submit calls prompt() with no streamingBehavior (images forwarded, undefined here).
-		expect(spies.prompt).toHaveBeenCalledWith("plain idle submit", { images: undefined });
+		expect(spies.prompt).toHaveBeenCalledWith("plain idle submit", { images: undefined, source: "interactive" });
 	});
 
 	it("surfaces and recovers from an idle follow-up dispatch failure", async () => {
@@ -736,7 +738,11 @@ describe("InputController keybinding setup", () => {
 		await editor.onSubmit?.("c");
 
 		expect(onInput).not.toHaveBeenCalled();
-		expect(spies.prompt).toHaveBeenCalledWith("c", { streamingBehavior: "steer", images: undefined });
+		expect(spies.prompt).toHaveBeenCalledWith("c", {
+			streamingBehavior: "steer",
+			images: undefined,
+			source: "interactive",
+		});
 	});
 });
 

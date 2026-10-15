@@ -54,6 +54,7 @@ import {
 } from "../../extensibility/plugins/marketplace";
 import { getAvailableThemes, getSymbolTheme, previewTheme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { AgentHubOpenOptions, InteractiveModeContext } from "../../modes/types";
+import { UserMessageRefusedError } from "../../session/agent-session";
 import type { SessionOAuthAccountList } from "../../session/agent-session-types";
 import type { ResetCreditAccountStatus, ResetCreditRedeemOutcome } from "../../session/auth-storage";
 import {
@@ -1528,6 +1529,22 @@ export class SelectorController {
 
 						// User made a complete choice
 						break;
+					}
+					// User-authored summarization focus reaches the summarizer
+					// provider: gate it before navigation mutates anything. A
+					// refusal reports only the handler's notice and re-shows the
+					// tree selector, like a cancelled summarization.
+					if (customInstructions?.trim()) {
+						try {
+							await this.ctx.session.gateUserMessage(customInstructions, undefined, "interactive");
+						} catch (error) {
+							if (error instanceof UserMessageRefusedError) {
+								this.ctx.showError(error.notice);
+								this.showTreeSelector();
+								return;
+							}
+							throw error;
+						}
 					}
 
 					// Set up escape handler and loader if summarizing
