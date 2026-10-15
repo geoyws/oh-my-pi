@@ -7741,6 +7741,67 @@ describe("openai-codex recovery attempt gate", () => {
 		},
 	);
 
+	it("refuses the websocket access-program replay when its payload preparation spends the budget", async () => {
+		const accountId = "acct-gate-ws-replay-payload";
+		const fetchMock = vi.fn<FetchImpl>(
+			async () => new Response(createCompletedCodexSse("late"), { headers: SSE_HEADERS }),
+		);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		let payloads = 0;
+		const options = {
+			fetch: fetchMock,
+			apiKey: createCodexTestToken(accountId),
+			sessionId: "gate-ws-replay-payload",
+			providerSessionState,
+			...createBudget(),
+			onPayload: async () => {
+				payloads += 1;
+				// The replay's outer gate already passed against a live budget;
+				// spend it while the replay prepares its frame, before any send.
+				if (payloads === 2) spendBudget(options);
+				return undefined;
+			},
+		};
+		let responseCreates = 0;
+		class RejectThenCompleteWebSocket extends MockWebSocket {
+			constructor(url: string, wsOptions?: WsOptions) {
+				super(url, wsOptions);
+				this.scheduleOpen();
+			}
+
+			override send(data: string): void {
+				const frame: unknown = JSON.parse(data);
+				if (!frame || typeof frame !== "object" || !("type" in frame) || frame.type !== "response.create") return;
+				responseCreates += 1;
+				if (responseCreates === 1) {
+					this.sendJson({ type: "response.failed", response: { error: ACCESS_PROGRAM_REJECTION } });
+					return;
+				}
+				this.emitCodexResponse({
+					messageId: "msg_ws_replay_payload",
+					responseId: "resp_ws_replay_payload",
+					text: "late",
+				});
+			}
+		}
+		global.WebSocket = RejectThenCompleteWebSocket as unknown as typeof WebSocket;
+		try {
+			const result = await streamOpenAICodexResponses(
+				accessProgramModel(accountId, true),
+				createCodexTestContext(),
+				options,
+			).result();
+
+			expect(payloads).toBe(2);
+			expect(responseCreates).toBe(1);
+			expect(fetchMock).not.toHaveBeenCalled();
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain(BUDGET_EXHAUSTED);
+		} finally {
+			for (const state of providerSessionState.values()) state.close();
+		}
+	});
+
 	it("refuses the SSE replay of a websocket failure with buffered output once the budget is spent", async () => {
 		const fetchMock = vi.fn<FetchImpl>(
 			async () => new Response(createCompletedCodexSse("late"), { headers: SSE_HEADERS }),
