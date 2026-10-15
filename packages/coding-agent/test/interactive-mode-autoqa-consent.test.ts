@@ -21,10 +21,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { HistoryStorage } from "@oh-my-pi/pi-coding-agent/session/history-storage";
 import { resetSessionIndexForTests } from "@oh-my-pi/pi-coding-agent/session/session-index";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import {
-	__resetAutoQaConsentForTests,
-	resolveAutoQaConsent,
-} from "@oh-my-pi/pi-coding-agent/tools/report-tool-issue";
+import { __resetAutoQaConsentForTests, resolveAutoQaConsent } from "@oh-my-pi/pi-coding-agent/tools/report-tool-issue";
 import { cfgDevAutoqa, cfgDevAutoqaConsent, cfgTodoRemindersMax } from "@oh-my-pi/pi-coding-agent/tools/settings";
 import { getKeybindings, type KeybindingsManager, setKeybindings } from "@oh-my-pi/pi-tui/keybindings";
 import { Composer } from "@oh-my-pi/pi-tui/prompt/composer";
