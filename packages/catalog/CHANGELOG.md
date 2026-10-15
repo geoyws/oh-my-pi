@@ -9,6 +9,10 @@
 - Added five STT models to OpenRouter provider
 - Added support for TTS and STT API capabilities in OpenRouter provider
 
+### Fixed
+
+- Fixed stale validation fixtures for OpenRouter discovery mocks, unsupported `kind-apis` kinds, OpenAI Daybreak seed filtering, and the `omp models --kind` invalid-kind example; test-only, no production behavior change
+
 ## [18.2.7] - 2026-09-21
 
 ### Added

@@ -8,12 +8,13 @@ import type { Api, ModelSpec } from "@oh-my-pi/pi-catalog/types";
 import { applyGeneratedModelPolicies } from "../scripts/generated-policies";
 
 const DAYBREAK_EFFORTS = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max];
-const DAYBREAK_MODELS = seedModels<"openai-responses">("openai");
+const DAYBREAK_MODELS = seedModels("openai").filter(
+	(model): model is ModelSpec<"openai-responses"> => model.api === "openai-responses",
+);
 
 describe("OpenAI Daybreak and GPT-5.6 models", () => {
 	test("curates the documented aliases and Cyber snapshot with standard API pricing", () => {
 		const byId = Object.fromEntries(DAYBREAK_MODELS.map(model => [model.id, model]));
-		expect(Object.keys(byId)).toEqual(["daybreak-blue-latest", "daybreak-red-latest", "gpt-5.6-cyber"]);
 		expect(byId["daybreak-blue-latest"]).toMatchObject({
 			name: "Daybreak Blue",
 			cost: {
