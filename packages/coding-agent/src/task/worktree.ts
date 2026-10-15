@@ -630,7 +630,139 @@ async function detachCopiedRepo(sourceRoot: string, copyRoot: string, sourceComm
 	// Every initialized child needs private metadata before the native baseline
 	// walks gitlinks or an agent runs. An "independent" copy already carries
 	// its own `.git/modules`, which its gitfiles reach.
-	if (detached === "detached") await vcs.rebindCopiedSubmodules(sourceRoot, copyRoot);
+	if (detached !== "detached") return;
+	try {
+		await vcs.rebindCopiedSubmodules(sourceRoot, copyRoot);
+	} catch (error) {
+		// An off-pin source submodule (e.g. after a nested merge-back commit)
+		// refuses the batch rebind but still mirrors the source faithfully,
+		// so each copied submodule gets private metadata individually. Any
+		// other rebind failure (unmerged gitlink, symlinked path, corrupt
+		// admin) stays loud.
+		const offPin =
+			vcs.isVcsError(error) &&
+			(error.message.includes("off-pin submodule") ||
+				(error.stderr ? error.stderr.includes("off-pin submodule") : false));
+		if (!offPin) throw error;
+		await detachOffPinSubmodules(sourceRoot, copyRoot);
+	}
+}
+
+/**
+ * Give every initialized submodule in a copied isolation private metadata one
+ * at a time, after the batch rebind refused an off-pin layout.
+ *
+ * The batch rebind snapshots the source admins and refuses to proceed when
+ * any source submodule HEAD differs from its recorded pin. The verbatim copy
+ * is still a faithful mirror of the source, so each copied submodule is
+ * repaired individually instead: its stale gitfile (which points into the
+ * source checkout's module dir) is re-pointed at the source submodule's own
+ * admin — read, never written — and {@link vcs.detachGitDir} snapshots that
+ * live state (HEAD, index, refs) into a private admin that borrows the source
+ * objects through alternates. A failing submodule is skipped so one exotic
+ * shape never blocks the rest; the verification below reports anything still
+ * shared.
+ */
+async function detachOffPinSubmodules(sourceRoot: string, copyRoot: string): Promise<void> {
+	const [realSourceRoot, realCopyRoot] = await Promise.all([fs.realpath(sourceRoot), fs.realpath(copyRoot)]);
+	const relativePaths = await vcs.requireGit(sourceRoot).submodulePaths();
+	// Deepest first, mirroring the native rebind order.
+	relativePaths.sort((a, b) => b.split("/").length - a.split("/").length || (a < b ? -1 : a > b ? 1 : 0));
+	for (const relativePath of relativePaths) {
+		const sourceSub = path.join(realSourceRoot, relativePath);
+		const copySub = path.join(realCopyRoot, relativePath);
+		const copyGitStat = await fs.lstat(path.join(copySub, ".git")).catch((err: NodeJS.ErrnoException) => {
+			if (err.code === "ENOENT") return null;
+			throw err;
+		});
+		// Uninitialized in the copy (no admin), already a private admin dir,
+		// or a link: nothing stale to repair. A gitfile is already private
+		// only when it opens as this exact directory with an admin that lives
+		// under the copy (compared by realpath: lexical prefixes lie across
+		// symlinked parents). Discovery walks upward, so a dangling gitfile
+		// would otherwise fall through to the parent repo and look private
+		// while every git command inside the submodule fails.
+		if (!copyGitStat?.isFile()) continue;
+		let copyPrivate = false;
+		try {
+			const info = vcs.requireGit(copySub).info();
+			const commonDir = await fs.realpath(info.commonDir);
+			copyPrivate =
+				(await fs.realpath(info.repoRoot)) === (await fs.realpath(copySub)) &&
+				(commonDir === realCopyRoot || commonDir.startsWith(`${realCopyRoot}${path.sep}`));
+		} catch {
+			// A dangling pointer needs repair.
+		}
+		if (copyPrivate) continue;
+		// Never follow the copy's stale pointer: open the source submodule
+		// directly (read-only) for its admin dirs. A source entry that is not
+		// itself a repository (e.g. a linked worktree nested inside the
+		// checkout) is left for the nested-repo pass.
+		let sourceAdmin: { gitDir: string; commonDir: string } | null = null;
+		try {
+			const info = vcs.requireGit(sourceSub).info();
+			if ((await fs.realpath(info.repoRoot)) === (await fs.realpath(sourceSub))) {
+				// Git joins a relative `gitdir:` to the gitfile's own
+				// directory; mirror that so the re-pointed pointer below is
+				// always absolute.
+				sourceAdmin = {
+					gitDir: path.isAbsolute(info.gitDir) ? info.gitDir : path.join(sourceSub, info.gitDir),
+					commonDir: path.isAbsolute(info.commonDir) ? info.commonDir : path.join(sourceSub, info.commonDir),
+				};
+			}
+		} catch {
+			// Not itself a repository: left for the nested-repo pass.
+		}
+		if (sourceAdmin === null) continue;
+		// Re-point the copy's gitfile at the source submodule admin, then
+		// detach: the snapshot reads the live state while the materialized
+		// admin (HEAD, index, refs, alternates) belongs to the copy. The
+		// back-pointer guard inside detachGitDir sees a foreign worktree
+		// entry, so no source admin directory is ever removed.
+		await fs.writeFile(path.join(copySub, ".git"), `gitdir: ${sourceAdmin.gitDir}\n`);
+		await vcs.detachGitDir(copySub, sourceAdmin.commonDir);
+	}
+	await verifyCopiedSubmodulesDetached(sourceRoot, realCopyRoot, relativePaths);
+}
+
+/**
+ * Fail closed when any copied submodule still shares the source checkout's
+ * git metadata: handing out that copy would let task git operations mutate
+ * the source. Writes through a detached admin's alternates only read source
+ * objects, so private admins pass.
+ */
+async function verifyCopiedSubmodulesDetached(
+	sourceRoot: string,
+	realCopyRoot: string,
+	relativePaths: readonly string[],
+): Promise<void> {
+	for (const relativePath of relativePaths) {
+		const copySub = path.join(realCopyRoot, relativePath);
+		const copyGitStat = await fs.lstat(path.join(copySub, ".git")).catch((err: NodeJS.ErrnoException) => {
+			if (err.code === "ENOENT") return null;
+			throw err;
+		});
+		if (!copyGitStat?.isFile()) continue;
+		// Same upward-discovery trap as the repair loop above: only this
+		// exact directory with an admin under the copy counts as private.
+		let copyPrivate = false;
+		try {
+			const info = vcs.requireGit(copySub).info();
+			const commonDir = await fs.realpath(info.commonDir);
+			copyPrivate =
+				(await fs.realpath(info.repoRoot)) === (await fs.realpath(copySub)) &&
+				(commonDir === realCopyRoot || commonDir.startsWith(`${realCopyRoot}${path.sep}`));
+		} catch {
+			// A dangling pointer is still shared (with nothing).
+		}
+		if (copyPrivate) continue;
+		const target = await fs.readFile(path.join(copySub, ".git"), "utf8").catch(() => "<unreadable>");
+		throw new Error(
+			`Isolated copy of submodule "${relativePath}" still shares git metadata with ` +
+				`${sourceRoot} (${target.trim()}); refusing to hand out a checkout whose git ` +
+				`operations could mutate the source.`,
+		);
+	}
 }
 
 /**
