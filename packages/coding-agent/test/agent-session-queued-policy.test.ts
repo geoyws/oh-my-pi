@@ -1096,8 +1096,9 @@ describe("queued user delivery policy", () => {
 			const reached = Promise.withResolvers<void>();
 			const release = Promise.withResolvers<void>();
 			let calls = 0;
-			// The first model call queues the input; the run dequeues it once that call ends and
-			// holds the next call here, before the transcript records it.
+			// The first model call's gate queues the input. A steer cancels that call and the run
+			// drains it for the replacement; a follow-up waits for the first call to end. Either way the
+			// run dequeues it and holds the next call here, before the transcript records it.
 			const removeGate = agent.addBeforeModelCallHook(async () => {
 				if (calls++ === 0) {
 					if (queue === "steering") await session.steer("dequeued input", [image]);

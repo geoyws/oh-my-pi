@@ -250,8 +250,7 @@ describe("AgentSession queue_update events", () => {
 		const updates = collectQueueUpdates(target);
 		target.subscribe(event => {
 			// Wait for consumed provider output, not merely stream creation.
-			if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta")
-				streaming.resolve();
+			if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") streaming.resolve();
 		});
 		const running = target.prompt("start");
 		await streaming.promise;

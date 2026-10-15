@@ -7471,8 +7471,9 @@ describe("openai-codex recovery attempt gate", () => {
 	});
 
 	it("still sends the initial HTTP request when payload preparation spends the operation budget", async () => {
-		const fetchMock = vi.fn<FetchImpl>(async () =>
-			new Response(createStatefulCodexSse("Initial response", "resp_initial_budget"), { headers: SSE_HEADERS }),
+		const fetchMock = vi.fn<FetchImpl>(
+			async () =>
+				new Response(createStatefulCodexSse("Initial response", "resp_initial_budget"), { headers: SSE_HEADERS }),
 		);
 		const options = {
 			apiKey: createCodexTestToken(),
@@ -7977,15 +7978,18 @@ describe("openai-codex recovery attempt gate", () => {
 					const fetchMock: FetchImpl = async (_input, init) => {
 						encodings.push(new Headers(init?.headers).get("content-encoding"));
 						if (encodings.length === 1) {
-							return new Response(new ReadableStream<Uint8Array>({
-								cancel() {
-									cancelled = true;
-									// Rejection cleanup is awaited before replay; spend the
-									// budget here to exercise that exact transport boundary.
-									if (mode !== "live budget") spendBudget(options);
-									if (mode === "caller abort") caller.abort();
-								},
-							}), { status });
+							return new Response(
+								new ReadableStream<Uint8Array>({
+									cancel() {
+										cancelled = true;
+										// Rejection cleanup is awaited before replay; spend the
+										// budget here to exercise that exact transport boundary.
+										if (mode !== "live budget") spendBudget(options);
+										if (mode === "caller abort") caller.abort();
+									},
+								}),
+								{ status },
+							);
 						}
 						return new Response(createStatefulCodexSse("Uncompressed", "resp_encoding_replay"), {
 							headers: SSE_HEADERS,

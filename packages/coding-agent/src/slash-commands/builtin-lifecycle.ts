@@ -286,12 +286,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				// line back ahead of any newer draft, keeping each `[Image #N]`
 				// marker on its own image.
 				if (error instanceof UserMessageRefusedError) {
-					restoreRefusedLine(
-						runtime.ctx.editor,
-						command.text,
-						runtime.input?.images,
-						runtime.input?.imageLinks,
-					);
+					restoreRefusedLine(runtime.ctx.editor, command.text, runtime.input?.images, runtime.input?.imageLinks);
 					runtime.ctx.showError(error.notice);
 					runtime.ctx.ui.requestRender();
 					return;
@@ -404,12 +399,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				// Same refusal-restore contract as /compact above: hand the exact
 				// original slash line back with its image markers aligned.
 				if (error instanceof UserMessageRefusedError) {
-					restoreRefusedLine(
-						runtime.ctx.editor,
-						command.text,
-						runtime.input?.images,
-						runtime.input?.imageLinks,
-					);
+					restoreRefusedLine(runtime.ctx.editor, command.text, runtime.input?.images, runtime.input?.imageLinks);
 					runtime.ctx.showError(error.notice);
 					runtime.ctx.ui.requestRender();
 					return;
