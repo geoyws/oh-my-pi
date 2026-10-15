@@ -820,12 +820,23 @@ function approxTokenCount(text: string): number {
 // Preserve Data
 // ============================================================================
 
-/** Store V2 replacement history in the OpenAI remote-compaction preserve slot. */
-export function storeCompactionV2PreserveData(response: CompactionV2Response, model: Model): Record<string, unknown> {
+/**
+ * Store V2 replacement history in the OpenAI remote-compaction preserve slot.
+ * `credentialId` records the credential row that served the compaction, so a
+ * later compaction under a different credential can drop caller-bound
+ * `encrypted_content` carried in the preserved prefix instead of replaying it
+ * to a caller it was not issued to.
+ */
+export function storeCompactionV2PreserveData(
+	response: CompactionV2Response,
+	model: Model,
+	credentialId?: number,
+): Record<string, unknown> {
 	return {
 		[OPENAI_REMOTE_COMPACTION_PRESERVE_KEY]: {
 			version: "v2",
 			provider: model.provider,
+			...(credentialId !== undefined ? { credentialId } : {}),
 			replacementHistory: response.replacementHistory,
 			usedTokens: response.usedTokens,
 			usage: response.usage,
@@ -835,19 +846,27 @@ export function storeCompactionV2PreserveData(response: CompactionV2Response, mo
 }
 
 /** Retrieve preserved OpenAI replacement history that V2 can extend. */
-export function getCompactionV2PreserveData(
-	preserveData: Record<string, unknown> | undefined,
-): { provider: string; replacementHistory: Array<Record<string, unknown>>; usedTokens: number } | undefined {
+export function getCompactionV2PreserveData(preserveData: Record<string, unknown> | undefined):
+	| {
+			provider: string;
+			replacementHistory: Array<Record<string, unknown>>;
+			usedTokens: number;
+			/** Credential row that served the compaction which stored this history, when recorded. */
+			credentialId?: number;
+	  }
+	| undefined {
 	const candidate = preserveData?.[OPENAI_REMOTE_COMPACTION_PRESERVE_KEY];
 	if (!isRecord(candidate)) return undefined;
 	const provider = stringField(candidate, "provider");
 	if (!provider) return undefined;
 	if (!Array.isArray(candidate.replacementHistory)) return undefined;
+	const credentialId = numberField(candidate, "credentialId");
 
 	return {
 		provider,
 		replacementHistory: candidate.replacementHistory as Array<Record<string, unknown>>,
 		usedTokens: numberField(candidate, "usedTokens") ?? 0,
+		...(credentialId !== undefined ? { credentialId } : {}),
 	};
 }
 

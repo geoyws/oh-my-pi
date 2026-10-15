@@ -19,6 +19,7 @@ import {
 	type Model,
 	type OneshotRetryOptions,
 	type ProviderSessionState,
+	resolveApiKeyOnce,
 	type SimpleStreamOptions,
 	type Tool,
 	type Usage,
@@ -1704,11 +1705,42 @@ export async function compact(
 		const remoteSystemPrompt = summaryOptions.remoteSystemPrompt ?? [SUMMARIZATION_SYSTEM_PROMPT];
 		let codexBody: OpenAICodexCompactionBody | undefined;
 		let remoteHistory: Array<Record<string, unknown>>;
+		let compactionCredentialId: number | undefined;
 		if (isCodexResponsesModel(model)) {
+			// The compaction request replays transcript history (and the
+			// preserved prefix) under one credential: resolve which row
+			// serves it BEFORE building, so caller-bound encrypted_content
+			// from a previous credential is dropped instead of 400ing.
+			// Static keys resolve to no row: a summary never needs another
+			// caller's blobs, so unknown-at-build-time strips everything.
+			try {
+				await resolveApiKeyOnce(apiKey, signal, resolved => {
+					if (typeof resolved !== "string") compactionCredentialId = resolved?.credentialId;
+				});
+			} catch {
+				// Resolver failures surface properly at send time inside
+				// withAuth; build credential-blind (strip-all) instead.
+			}
+			const previousCredentialId = previousRemoteCompaction?.credentialId;
+			// The preserved prefix shares the stored transcript's provenance:
+			// strip its encrypted reasoning when the serving credential is
+			// unknown, or when the compaction that stored it names a
+			// different row. Same-row prefixes replay untouched.
+			const stripCompactionPrefix =
+				compactionCredentialId === undefined ||
+				(previousCredentialId !== undefined && previousCredentialId !== compactionCredentialId);
 			const previousCodexInput: CodexInputItem[] = [];
 			for (const item of previousReplacementHistory ?? []) {
 				if (!isCodexInputItem(item)) {
 					throw new Error("Stored Codex V2 compaction history contains an invalid input item");
+				}
+				if (
+					stripCompactionPrefix &&
+					item.type === "reasoning" &&
+					"encrypted_content" in item &&
+					typeof item.encrypted_content === "string"
+				) {
+					continue;
 				}
 				previousCodexInput.push(item);
 			}
@@ -1722,6 +1754,7 @@ export async function compact(
 					sessionId: summaryOptions.sessionId,
 					promptCacheKey: summaryOptions.promptCacheKey,
 					providerSessionState: summaryOptions.providerSessionState,
+					credentialId: compactionCredentialId,
 					codexCompaction: createOpenAICodexCompactionRequestContext({
 						context: summaryOptions.codexCompaction,
 						implementation: "responses_compaction_v2",
@@ -1729,6 +1762,7 @@ export async function compact(
 				},
 				undefined,
 				previousCodexInput,
+				compactionCredentialId === undefined,
 			);
 			const input = Array.isArray(codexBody.input) ? codexBody.input : [];
 			const nativeInput: Array<Record<string, unknown>> = [];
@@ -1810,7 +1844,10 @@ export async function compact(
 						}),
 					{ signal },
 				);
-				preserveData = { ...preserveData, ...storeCompactionV2PreserveData(remote, model) };
+				preserveData = {
+					...preserveData,
+					...storeCompactionV2PreserveData(remote, model, codexBody ? compactionCredentialId : undefined),
+				};
 				usedRemoteCompaction = true;
 			} catch (err) {
 				// A user/session abort is a cancellation, not a remote failure —
