@@ -376,6 +376,7 @@ function buildParams(
 		strictResponsesPairing: true,
 		supportsImageDetailOriginal: model.compat.supportsImageDetailOriginal,
 		systemRole,
+		currentCredentialId: options?.credentialId,
 		nativeHistory: { replay: true, filterReasoning: false },
 		includeThinkingSignatures: true,
 		developerStringContent: true,

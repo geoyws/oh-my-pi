@@ -1591,6 +1591,9 @@ export function buildParams(
 		context,
 		strictResponsesPairing,
 		supportsImageDetailOriginal: model.compat.supportsImageDetailOriginal,
+		// Per-attempt credential: stream.ts rebuilds the input for every auth
+		// retry, so a mid-session failover drops caller-bound reasoning.
+		currentCredentialId: options?.credentialId,
 		nativeHistory: {
 			replay: shouldReplayNativeHistory,
 			filterReasoning: policy.reasoning.filterReasoningHistory,

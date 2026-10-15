@@ -1948,6 +1948,15 @@ export interface BuildResponsesInputOptions<TApi extends Api> {
 		replay: boolean;
 		filterReasoning: boolean;
 	};
+	/**
+	 * Stored credential row serving the current request, when known. A stored
+	 * assistant turn whose `credentialId` names a different row had its
+	 * `encrypted_content` reasoning issued to another caller; replaying it
+	 * under this credential is rejected (`reasoning 'encrypted_content' was
+	 * not issued to this caller`), so those reasoning items are dropped while
+	 * message/function_call/output items still replay.
+	 */
+	currentCredentialId?: number;
 	includeThinkingSignatures?: boolean;
 	developerStringContent?: boolean;
 	repairOrphanOutputs?: boolean;
@@ -2210,7 +2219,22 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 						)
 					: undefined;
 			const nativeReplayEnabled = options.nativeHistory?.replay === true;
-			const historyItems = providerPayload?.items;
+			// Encrypted reasoning is caller-bound: Meta rejects `encrypted_content`
+			// issued under one credential when replayed under another. When both
+			// the stored turn and the current request name a credential row and
+			// they differ, drop only those reasoning items; every other native
+			// item still replays. Either side unknown keeps existing behavior
+			// (provider/model mismatch already falls back to a content rebuild).
+			const credentialMismatch =
+				options.currentCredentialId !== undefined &&
+				assistantMsg.credentialId !== undefined &&
+				assistantMsg.credentialId !== options.currentCredentialId;
+			const historyItems =
+				credentialMismatch && providerPayload?.items
+					? providerPayload.items.filter(
+							item => item?.type !== "reasoning" || typeof item?.encrypted_content !== "string",
+						)
+					: providerPayload?.items;
 			let suppressHiddenEmptyFallback = false;
 			if (historyItems) {
 				const rawSanitizedHistoryItems = sanitizeOpenAIResponsesAssistantHistoryItemsForReplay(
@@ -2262,12 +2286,14 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 				if (!sanitizedHistoryItems) suppressHiddenEmptyFallback = true;
 			}
 
+			// A credential switch also retires the thinking-signature fallback:
+			// its embedded `encrypted_content` was issued to the old caller too.
 			const convertedOutputItems = convertResponsesAssistantMessage(
 				assistantMsg,
 				options.model,
 				msgIndex,
 				knownCallIds,
-				suppressHiddenEmptyFallback ? false : includeThinkingSignatures,
+				suppressHiddenEmptyFallback || credentialMismatch ? false : includeThinkingSignatures,
 				customCallIds,
 				options.preserveAssistantMessageIds,
 				supportsCustomToolCalls,

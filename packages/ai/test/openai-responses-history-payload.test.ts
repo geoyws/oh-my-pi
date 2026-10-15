@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
-import { type OpenAIResponsesOptions, streamOpenAIResponses } from "@oh-my-pi/pi-ai/providers/openai-responses";
+import {
+	type OpenAIResponsesOptions,
+	buildParams,
+	streamOpenAIResponses,
+} from "@oh-my-pi/pi-ai/providers/openai-responses";
 import { buildResponsesInput } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import type { AssistantMessage, Context, Model, ModelSpec, ProviderSessionState, Tool } from "@oh-my-pi/pi-ai/types";
 import {
@@ -2089,5 +2093,95 @@ describe("OpenAI responses history payload", () => {
 
 		expect(orphanNote(strictOverridePayload.input)?.content).toContain("[Orphan read result;");
 		expect(orphanNote(nonStrictOverridePayload.input)?.content).toContain("[Orphan tool result;");
+	});
+});
+
+describe("openai-responses encrypted reasoning credential binding", () => {
+	const credentialModel = getOpenAIReasoningModel("openai", "gpt-5-mini");
+
+	function credentialTurn(credentialId: number | undefined, modelId = credentialModel.id): AssistantMessage {
+		return {
+			role: "assistant",
+			content: [{ type: "text", text: "working on it" }],
+			api: credentialModel.api,
+			provider: credentialModel.provider,
+			model: modelId,
+			usage: issue5002ZeroUsage,
+			stopReason: "stop",
+			...(credentialId !== undefined ? { credentialId } : {}),
+			providerPayload: createOpenAIResponsesHistoryPayload(credentialModel.provider, [
+				{
+					type: "message",
+					role: "assistant",
+					content: [{ type: "output_text", text: "working on it" }],
+				},
+				{ type: "reasoning", id: "rs_cred", summary: [], encrypted_content: "enc_cred_11" },
+				{ type: "function_call", call_id: "call_cred", name: "read", arguments: "{}" },
+			]),
+			timestamp: Date.now(),
+		};
+	}
+
+	function credentialContext(credentialId: number | undefined, modelId = credentialModel.id): Context {
+		return {
+			messages: [
+				credentialTurn(credentialId, modelId),
+				{ role: "user", content: "continue", timestamp: Date.now() },
+			],
+		};
+	}
+
+	function replayInput(currentCredentialId: number | undefined, storedCredentialId: number | undefined): unknown[] {
+		return buildResponsesInput({
+			model: credentialModel,
+			context: credentialContext(storedCredentialId),
+			strictResponsesPairing: false,
+			supportsImageDetailOriginal: credentialModel.compat.supportsImageDetailOriginal,
+			nativeHistory: { replay: true, filterReasoning: credentialModel.compat.filterReasoningHistory },
+			...(currentCredentialId !== undefined ? { currentCredentialId } : {}),
+		});
+	}
+
+	it("keeps encrypted reasoning byte-identical for the issuing credential", () => {
+		const input = replayInput(11, 11);
+		expect(containsEncryptedReasoning(input)).toBe(true);
+		expect(findResponsesInputItem(input, "reasoning")).toMatchObject({ encrypted_content: "enc_cred_11" });
+		expect(findResponsesInputItemByCallId(input, "function_call", "call_cred")).toBeDefined();
+	});
+
+	it("drops encrypted reasoning issued under another credential but keeps other items", () => {
+		const input = replayInput(7, 11);
+		expect(containsEncryptedReasoning(input)).toBe(false);
+		expect(findResponsesInputItem(input, "reasoning")).toBeUndefined();
+		expect(findResponsesInputItemByCallId(input, "function_call", "call_cred")).toBeDefined();
+		expect(containsAssistantOutputText(input, "working on it")).toBe(true);
+	});
+
+	it("preserves legacy replay when either credential is unknown", () => {
+		expect(containsEncryptedReasoning(replayInput(undefined, 11))).toBe(true);
+		expect(containsEncryptedReasoning(replayInput(7, undefined))).toBe(true);
+	});
+
+	it("drops encrypted reasoning on a model mismatch", () => {
+		const input = buildResponsesInput({
+			model: credentialModel,
+			context: credentialContext(11, "other-model"),
+			strictResponsesPairing: false,
+			supportsImageDetailOriginal: credentialModel.compat.supportsImageDetailOriginal,
+			nativeHistory: { replay: true, filterReasoning: credentialModel.compat.filterReasoningHistory },
+			currentCredentialId: 7,
+		});
+		expect(containsEncryptedReasoning(input)).toBe(false);
+	});
+
+	it("plumbs the request credentialId through buildParams", () => {
+		const switched = buildParams(credentialModel, credentialContext(11), { credentialId: 7 }, undefined);
+		expect(containsEncryptedReasoning(switched.params.input as unknown[])).toBe(false);
+		expect(
+			findResponsesInputItemByCallId(switched.params.input as unknown[], "function_call", "call_cred"),
+		).toBeDefined();
+
+		const same = buildParams(credentialModel, credentialContext(11), { credentialId: 11 }, undefined);
+		expect(containsEncryptedReasoning(same.params.input as unknown[])).toBe(true);
 	});
 });
