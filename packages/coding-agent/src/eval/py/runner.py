@@ -1308,8 +1308,9 @@ def _request_pip_pause(pid: int) -> None:
     """Ask the host to pause the eval watchdog while pip child `pid` runs.
 
     Blocks until the host sees the process exit. The host verifies the pid in
-    the OS process table (live child of this kernel, `<python> -m pip`), so
-    the pause cannot be minted by cell code; see eval/py/pip-wait.ts. Any
+    the OS process table (live child of this kernel, `<python> -m pip`), so a
+    bare status event or a non-pip process cannot pause the deadline; a real
+    pip process can, for as long as it runs. See eval/py/pip-wait.ts. Any
     failure leaves the install counted against the cell timeout.
     """
     base = os.environ.get("PI_TOOL_BRIDGE_URL")

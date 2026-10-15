@@ -8,7 +8,11 @@
  * watchdog only after it has verified, from the OS process table, that the pid
  * is a live direct child of this execution's kernel, runs the kernel's own
  * executable, and was started as `<python> -m pip`. The pause then lasts
- * exactly as long as that process does, so it is bounded by real pip work.
+ * exactly as long as that process does. This binds the pause to a real pip
+ * process, not to the `%pip` magic: cell code that starts its own
+ * `<python> -m pip` child and posts this request also pauses the deadline
+ * for that process's lifetime, the same exposure as a `%pip` install that
+ * hangs.
  *
  * Fails closed: without a kernel pid, a `ps` binary (Windows), or a matching
  * process, nothing is paused and the install counts against the cell timeout.
