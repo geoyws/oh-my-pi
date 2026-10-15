@@ -154,16 +154,30 @@ export function selectSetupScenes(
 	ctx?: InteractiveModeContext,
 	options: SetupSceneSelectionOptions = {},
 ): Promise<SetupScene[]> {
+	// Onboarding saves its preferences and completion in global config. A
+	// read-only global config can never record completion, so automatic
+	// onboarding would reopen on every launch; only an explicit request
+	// proceeds, and runSetupWizard refuses it with the policy reason.
+	if (!options.force && ctx?.settings.isGlobalConfigReadOnly()) return Promise.resolve([]);
 	return selectScenes(storedVersion, scenes, ctx ? createSetupHost(ctx) : undefined, options);
 }
 
 /** Run setup with application-owned persistence and provider effects. */
-export function runSetupWizard(
+export async function runSetupWizard(
 	ctx: InteractiveModeContext,
 	scenes: readonly SetupScene[] = ALL_SCENES,
 	options: RunSetupWizardOptions = {},
 ): Promise<void> {
-	return runWizard(createSetupHost(ctx), scenes, options);
+	// Refuse before the overlay opens: every onboarding scene and the
+	// completion marker write global config, so nothing could be saved.
+	const readOnlyReason = ctx.settings.getGlobalConfigReadOnlyReason();
+	if (readOnlyReason !== undefined) {
+		ctx.showError(
+			`Setup is unavailable. ${readOnlyReason} Provider sign-in stays available through /setup providers.`,
+		);
+		return;
+	}
+	await runWizard(createSetupHost(ctx), scenes, options);
 }
 
 /** Open provider setup without advancing onboarding or replaying the welcome intro. */

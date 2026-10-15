@@ -1232,7 +1232,13 @@ export class SelectorController {
 									});
 									if (!switched) return;
 									if (effectiveIsAuto) {
-										this.ctx.session.setThinkingLevel(AUTO_THINKING, true);
+										// Same contract as onAssign: auto applies live, but the global
+										// default is persisted only while global config is writable —
+										// the role was already cleared and the model already switched.
+										this.ctx.session.setThinkingLevel(
+											AUTO_THINKING,
+											!this.ctx.settings.isGlobalConfigReadOnly(),
+										);
 									} else if (concreteThinking && concreteThinking !== ThinkingLevel.Inherit) {
 										this.ctx.session.setThinkingLevel(concreteThinking);
 									}

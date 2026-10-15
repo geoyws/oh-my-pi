@@ -56,6 +56,17 @@ their normal precedence and are never written back. The programmatic
 `SettingsOptions.readOnly` / `Settings.loadReadOnly` API remains stronger:
 it disables persistence for every layer, including project roles.
 
+Interactive surfaces refuse before changing anything. `/settings` keeps
+every row visible but dimmed and unchangeable; the focused or hovered row
+shows the policy reason in place of its description. Keyboard display
+toggles (tool activity, thinking blocks) report the reason and leave the
+view unchanged. Automatic onboarding does not open, `omp setup` reports the
+reason instead of opening the wizard, and `/setup providers` keeps provider
+sign-in available while a refused web-search choice shows its error inline.
+Clearing a default role in `/model` still switches the live session to the
+exposed fallback, including `auto` thinking, without persisting
+`defaultThinkingLevel` globally.
+
 ## Reading and writing settings
 
 Use the interactive `/settings` panel inside a session, or the `omp config` command from a shell. Both read merged effective settings. Ordinary persistent writes land in the **global** file; model-selector role changes are the exception when `modelRoleStorage: project` (see [Where writes go](#where-writes-go)).

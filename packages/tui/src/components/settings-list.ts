@@ -38,6 +38,20 @@ export interface SettingItem {
 	changed?: boolean;
 	/** Render as a non-interactive section heading. Skipped by navigation and search. */
 	heading?: boolean;
+	/**
+	 * Keep the row visible and focusable but refuse activation. The row renders
+	 * dimmed, and its reason leads the description area whenever the row has
+	 * keyboard focus or the pointer hovers it.
+	 */
+	disabled?: SettingDisabled;
+}
+
+/** Why a visible setting row refuses changes. */
+export interface SettingDisabled {
+	/** Stable machine-readable key for tests and debug state (e.g. `"read-only"`); never rendered. */
+	reason: string;
+	/** The single user-facing reason: what blocks the change and how to unblock it. */
+	message: string;
 }
 
 export interface SettingsListTheme {
@@ -158,19 +172,33 @@ export class SettingsList implements Component {
 		this.#options = options;
 		this.#lastNotifiedSelectionId = this.getSelectedItem()?.id;
 	}
-	/** Return item, selection, filter, and submenu state for debug inspection. */
+	/** Return item, selection, filter, submenu, and disabled-reason state for debug inspection. */
 	debugState(): Record<string, unknown> {
 		const selected = this.getSelectedItem();
+		const described = this.#describedItem();
 		return {
 			itemCount: this.#items.length,
 			filteredItemCount: this.#filteredItems.length,
 			selectedIndex: this.#filteredItems.length > 0 ? this.#selectedIndex : -1,
 			selectedItemId: selected?.id ?? null,
 			selectedItemLabel: selected?.label ?? null,
+			selectedItemDisabledReason: selected?.disabled?.reason ?? null,
+			hoveredItemId: this.#hoveredItemId,
+			describedItemId: described?.id ?? null,
+			describedItemDisabledReason: described?.disabled?.reason ?? null,
 			filterText: this.#filterQuery,
 			sectionFocused: this.#sectionFocus,
 			submenuOpen: this.#submenuComponent !== null,
 		};
+	}
+
+	/** Row explained by the description area: a hovered disabled row, otherwise the keyboard selection. */
+	#describedItem(): SettingItem | undefined {
+		if (this.#hoveredItemId !== null) {
+			const hovered = this.#filteredItems.find(item => !item.heading && item.id === this.#hoveredItemId);
+			if (hovered?.disabled) return hovered;
+		}
+		return this.getSelectedItem();
 	}
 
 	/** Expose the active submenu to the debug tree walker. */
@@ -482,9 +510,9 @@ export class SettingsList implements Component {
 		return this.#padLines(this.#renderMainList(width));
 	}
 
-	/** Warning glyph suffix for a row that carries a risk note, or "" when none applies. */
+	/** Warning glyph suffix for a row that carries a risk note, or "" when none applies (disabled rows show their reason instead). */
 	#warningMark(item: SettingItem): string {
-		return item.warning && this.#theme.warningMark ? ` ${this.#theme.warningMark}` : "";
+		return item.warning && !item.disabled && this.#theme.warningMark ? ` ${this.#theme.warningMark}` : "";
 	}
 
 	#renderItemRow(
@@ -512,6 +540,15 @@ export class SettingsList implements Component {
 		const valueMaxWidth = rowWidth - prefixWidth - maxLabelWidth - visibleWidth(separator) - 2;
 		const valuePlain = truncateToWidth(String(item.currentValue ?? ""), valueMaxWidth, Ellipsis.Omit);
 		const hovered = !isSelected && this.#theme.hovered !== undefined && item.id === this.#hoveredItemId;
+		// Disabled rows stay in place and keep the focus cursor (focus reveals
+		// their reason), with label and value under one dim wash.
+		if (item.disabled) {
+			const text = truncateToWidth(
+				prefix + this.#theme.hint(`${labelPlain}${labelPad}${separator}${valuePlain}`),
+				Math.max(0, rowWidth),
+			);
+			return hovered && this.#theme.hovered ? this.#theme.hovered(text) : text;
+		}
 		// De-emphasized rows (outside the active section) render as plain text
 		// under one dim wash so inner label/value colors don't fight it.
 		if (dimmed && !isSelected) {
@@ -605,13 +642,18 @@ export class SettingsList implements Component {
 
 		// Description area: 1 blank + exactly 3 rows, clamped with an ellipsis,
 		// so moving between items with/without descriptions never shifts rows.
-		// The risk note leads so it survives the clamp when both are present.
+		// A disabled row's reason (or else the risk note) leads so it survives
+		// the clamp; hovering a disabled row explains that row.
 		lines.push("");
-		const selectedItem = this.#filteredItems[this.#selectedIndex];
+		const selectedItem = this.#describedItem();
 		const descLines: string[] = [];
-		if (selectedItem && !selectedItem.heading) {
-			if (selectedItem.warning) {
-				const warningStyle = this.#theme.warning ?? this.#theme.description;
+		if (selectedItem) {
+			const warningStyle = this.#theme.warning ?? this.#theme.description;
+			if (selectedItem.disabled) {
+				for (const line of wrapTextWithAnsi(selectedItem.disabled.message, width - 4)) {
+					descLines.push(warningStyle(`  ${line}`));
+				}
+			} else if (selectedItem.warning) {
 				const mark = this.#theme.warningMark ? `${this.#theme.warningMark} ` : "";
 				for (const line of wrapTextWithAnsi(`${mark}${selectedItem.warning}`, width - 4)) {
 					descLines.push(warningStyle(`  ${line}`));
@@ -780,7 +822,9 @@ export class SettingsList implements Component {
 
 	#activateItem(): void {
 		const item = this.#filteredItems[this.#selectedIndex];
-		if (!item || item.heading) return;
+		// Disabled rows never cycle, open a submenu, or reach onChange; their
+		// reason is already in the description area.
+		if (!item || item.heading || item.disabled) return;
 
 		if (item.submenu) {
 			// Open submenu, passing current value so it can pre-select correctly

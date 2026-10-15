@@ -105,6 +105,7 @@ export function createSettingsHost(): SettingsHost {
 		entries,
 		get: path => settings.get(path as SettingPath),
 		set: (path, value) => settings.set(path as SettingPath, value as never),
+		readOnlyReason: () => settings.getGlobalConfigReadOnlyReason(),
 		normalizeProviderLimits: normalizeProviderMaxInFlightRequests,
 		validateProviderLimits: validateProviderMaxInFlightRequests,
 	};

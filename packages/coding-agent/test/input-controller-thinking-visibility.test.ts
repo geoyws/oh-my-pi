@@ -53,7 +53,7 @@ describe("InputController thinking visibility", () => {
 			hideThinkingBlock: false,
 			effectiveHideThinkingBlock: false,
 			hasDisplayableThinkingContent: true,
-			settings: { set },
+			settings: { set, getGlobalConfigReadOnlyReason: () => undefined },
 			session: { agent: { hideThinkingSummary: false }, thinkingLevel: "off" },
 			chatContainer: {
 				children: [assistant],

@@ -141,7 +141,15 @@ export class WebSearchTab implements SetupTab {
 		if (!option) return;
 		// The wizard picks one favorite; persist it as the head of the priority
 		// list with the remaining providers in their built-in order (auto = reset).
-		this.#host.ctx.saveSearchProvider(option.value);
+		// A refused save (e.g. read-only global config without a project
+		// directory) stays on this tab with its reason, like the model scene.
+		try {
+			this.#host.ctx.saveSearchProvider(option.value);
+		} catch (error) {
+			this.#status = [theme.fg("error", error instanceof Error ? error.message : String(error))];
+			this.#host.requestRender();
+			return;
+		}
 		const label = WEB_SEARCH_ITEMS.find(item => item.value === value)?.label ?? value;
 		this.#status = [theme.fg("success", `${theme.status.success} Web search set to ${label}`)];
 		if (value !== "auto" && this.#availability.get(value as SearchProviderId) === false) {

@@ -130,6 +130,11 @@ export interface SettingsHost {
 	entries: readonly SettingsDisplayEntry[];
 	get(path: string): unknown;
 	set(path: string, value: unknown): void;
+	/**
+	 * User-facing reason every {@link set} is refused right now, or `undefined`
+	 * while settings are writable. Rows stay visible but disabled with this text.
+	 */
+	readOnlyReason(): string | undefined;
 	normalizeProviderLimits(value: unknown): Record<string, number>;
 	validateProviderLimits(value: unknown): Record<string, number>;
 }
