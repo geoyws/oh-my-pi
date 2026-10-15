@@ -144,7 +144,7 @@ describe("InteractiveMode Auto-QA consent production adapter", () => {
 		expect(cfgDevAutoqaConsent.get(local)).toBe(consent);
 		expect(cfgDevAutoqaConsent.get(Settings.instance)).toBe(consent);
 		await Settings.instance.flush();
-		const disk = YAML.parse(await fs.readFile(configPath, "utf8"));
+		const disk = YAML.parse(await fs.readFile(configPath, "utf8")) as Record<string, unknown>;
 		if (consent === "unset") {
 			expect(disk.dev).not.toHaveProperty("autoqaConsent");
 			expect(disk.dev).toEqual(preferences.dev);
