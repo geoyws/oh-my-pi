@@ -445,6 +445,13 @@ describe("AgentSession queued steer delivery", () => {
 				{ content: ["remaining steer answer"] },
 			]);
 			const image = { type: "image" as const, mimeType: "image/png", data: PATH_PASTED_IMAGE.data };
+			// Session normalization always runs; images.autoResize only controls file loading.
+			// Independently repeat this solid pixel with nearest-neighbor, not the
+			// production normalizer or its resize/encoder-selection policy.
+			const expectedPng = await new Bun.Image(Buffer.from(image.data, "base64"))
+				.resize(200, 200, { filter: "nearest" })
+				.png()
+				.bytes();
 			const editor = new CustomEditor(getEditorTheme());
 			const showError = vi.fn();
 			const ctx = {
@@ -486,15 +493,30 @@ describe("AgentSession queued steer delivery", () => {
 			expect(showError).not.toHaveBeenCalled();
 			expect(session.agent.hasQueuedMessages()).toBe(false);
 			const delivered = mock.calls.at(-1)!.context.messages.filter(message => message.role === "user");
-			expect(delivered.flatMap(message => message.content).filter(part => part.type === "image")).toEqual([image]);
+			const deliveredImages = delivered
+				.flatMap(message => (Array.isArray(message.content) ? message.content : []))
+				.filter(part => part.type === "image");
+			expect(deliveredImages).toHaveLength(1);
+			const deliveredImage = deliveredImages[0]!;
+			const decoded = new Bun.Image(Buffer.from(deliveredImage.data, "base64"));
+			const metadata = await decoded.metadata();
+			expect(metadata.width).toBe(200);
+			expect(metadata.height).toBe(200);
+			expect(deliveredImage.mimeType).toBe(`image/${metadata.format}`);
+			expect(await decoded.png().bytes()).toEqual(expectedPng);
 			const retainedImages = session.messages
 				.filter(message => message.role === "user")
 				.flatMap(message => (Array.isArray(message.content) ? message.content : []))
 				.filter(part => part.type === "image");
-			expect(retainedImages).toEqual([image]);
+			// Retain exactly the payload seen by the external provider, once.
+			expect(retainedImages).toEqual(deliveredImages);
 			if (alreadyQueued) {
 				const earlierSteers = delivered
-					.flatMap(message => message.content)
+					.flatMap(message =>
+						typeof message.content === "string"
+							? [{ type: "text" as const, text: message.content }]
+							: message.content,
+					)
 					.filter(part => part.type === "text" && part.text === "earlier steer");
 				expect(earlierSteers).toHaveLength(1);
 			}
