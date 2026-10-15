@@ -168,7 +168,10 @@ export function createSettingsAwareStreamFn(
 			(retryWaitObserver
 				? async (delayMs: number, signal?: AbortSignal, attemptInfo?: ProviderRetryAttemptInfo): Promise<void> => {
 						const info: ProviderRetryWaitInfo = {
-							delayMs,
+							// Whole milliseconds: the RPC wire declares `delayMs` an integer,
+							// and jittered backoffs (Anthropic) are fractional. Rounding up never
+							// shows less wait than remains; the sleep below keeps the exact value.
+							delayMs: Math.ceil(delayMs),
 							model: model.id,
 							provider: model.provider,
 							api: model.api,
