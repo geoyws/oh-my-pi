@@ -745,7 +745,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 			const failure = await relocateHeadlessSession(runtime, worktree.path);
 			if (failure) return failure;
 			const cleanup = await cleanSourceCheckoutIfConfigured(sourceCwd, runtime.settings, {
-				preserveSubmodules: worktree.submodulesNotCarried,
+				preserveSubmodules: worktree.submodulesNotCarried.map(entry => entry.path),
 			});
 			if (cleanup.errorMessage !== undefined) {
 				await runtime.output(

@@ -626,22 +626,79 @@ export async function initWorktreeSubmodules(
 }
 
 /**
- * Source-initialized submodules holding uncommitted changes (staged, unstaged,
- * or untracked): a plain checkout followed by pin initialization cannot carry
- * these across. Paths the check cannot assess are reported too, so callers
- * treat unverifiable state as not carried rather than cleaning it away.
+ * A source submodule whose state a plain checkout plus pin initialization
+ * cannot carry into a new tree.
  */
-export async function dirtyWorktreeSubmodules(sourceRoot: string, submodules: string[]): Promise<string[]> {
-	const dirty: string[] = [];
+export interface SubmoduleNotCarried {
+	/** Path relative to the source root. */
+	path: string;
+	/** Why it was not carried, e.g. "uncommitted changes" or "local commits not carried". */
+	reason: string;
+}
+
+/**
+ * Source-initialized submodules the new tree cannot reproduce: a plain
+ * checkout followed by pin initialization resets every submodule to its
+ * recorded pin, so a submodule is reported when its worktree, index, or
+ * untracked files are dirty, or when its HEAD differs from the gitlink
+ * recorded in the superproject's index or HEAD (a new local commit, a staged
+ * pin move, or a checkout of another commit) — at any depth. Paths the check
+ * cannot assess are reported too, so callers treat unverifiable state as not
+ * carried rather than cleaning it away.
+ */
+export async function dirtyWorktreeSubmodules(
+	sourceRoot: string,
+	submodules: string[],
+): Promise<SubmoduleNotCarried[]> {
+	const notCarried: SubmoduleNotCarried[] = [];
 	for (const relative of submodules) {
-		try {
-			const status = await vcs.requireGit(path.join(sourceRoot, relative)).statusPorcelain({ untracked: "all" });
-			if (status.trim() !== "") dirty.push(relative);
-		} catch {
-			dirty.push(relative);
-		}
+		const reason = await submoduleCarryBlocker(sourceRoot, relative);
+		if (reason !== undefined) notCarried.push({ path: relative, reason });
 	}
-	return dirty;
+	return notCarried;
+}
+
+/** Why the source submodule at `relative` cannot be carried, or undefined when it can. */
+async function submoduleCarryBlocker(sourceRoot: string, relative: string): Promise<string | undefined> {
+	const slash = relative.lastIndexOf("/");
+	const parentAbs = slash < 0 ? sourceRoot : path.join(sourceRoot, relative.slice(0, slash));
+	const base = slash < 0 ? relative : relative.slice(slash + 1);
+	const subAbs = path.join(sourceRoot, relative);
+	let dirty: boolean;
+	try {
+		dirty = (await vcs.requireGit(subAbs).statusPorcelain({ untracked: "all" })).trim() !== "";
+	} catch {
+		return "could not assess state";
+	}
+	const subHead = await runGitLine(subAbs, ["rev-parse", "HEAD"]);
+	const indexLine = await runGitLine(parentAbs, ["ls-files", "-s", "--", base]);
+	const headLine = await runGitLine(parentAbs, ["ls-tree", "HEAD", "--", base]);
+	const indexPin = indexLine
+		?.split("\n")
+		.find(line => line.startsWith("160000 "))
+		?.split(/\s+/)[1];
+	const headPin = headLine === undefined ? undefined : /^160000 commit ([0-9a-f]+)\t/.exec(headLine)?.[1];
+	if (subHead === undefined || indexPin === undefined || !/^[0-9a-f]+$/.test(indexPin) || headPin === undefined) {
+		return "could not assess state";
+	}
+	const reasons: string[] = [];
+	if (dirty) reasons.push("uncommitted changes");
+	if (subHead !== indexPin || subHead !== headPin) reasons.push("local commits not carried");
+	return reasons.length > 0 ? reasons.join(" and ") : undefined;
+}
+
+/** First stdout line of a git command in `dir`, or undefined when git fails. */
+async function runGitLine(dir: string, args: string[]): Promise<string | undefined> {
+	const proc = Bun.spawn(["git", ...args], {
+		cwd: dir,
+		stdout: "pipe",
+		stderr: "pipe",
+		windowsHide: true,
+	});
+	const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+	await new Response(proc.stderr).text();
+	if ((exitCode ?? 0) !== 0) return undefined;
+	return stdout.trim();
 }
 
 /** True when the checkout at `dir` registers `base` as a gitlink in its index. */

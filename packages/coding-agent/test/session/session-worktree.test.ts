@@ -360,18 +360,100 @@ describe("session worktree helpers (real git)", () => {
 		expect(before).not.toBe("");
 
 		const wt = await createSessionWorktree(dirtyParent, Settings.isolated(), "wt/dirty-sub", { keepChanges: true });
-		expect(wt.submodulesNotCarried).toEqual(["sub"]);
+		expect(wt.submodulesNotCarried).toEqual([{ path: "sub", reason: "uncommitted changes" }]);
 		expect(git(path.join(wt.path, "sub"), "rev-parse", "HEAD")).toBe(pin);
-		expect(formatSessionWorktreeSummary(wt, false)).toContain("sub");
+		expect(formatSessionWorktreeSummary(wt, false)).toContain("sub (uncommitted changes)");
 
 		const cleaning = Settings.isolated({ "worktree.cleanSource": true });
 		const cleanup = await cleanSourceCheckoutIfConfigured(dirtyParent, cleaning, {
-			preserveSubmodules: wt.submodulesNotCarried,
+			preserveSubmodules: wt.submodulesNotCarried.map(entry => entry.path),
 		});
 		expect(cleanup.cleaned).toBe(false);
 		expect(cleanup.skipped ?? "").toContain("sub");
 		expect(await Bun.file(path.join(dirtyParent, "sub", "lib.txt")).text()).toBe("x\ndirty edit\n");
 		expect(await exists(path.join(dirtyParent, "sub", "scratch-new.txt"))).toBe(true);
 		expect(git(path.join(dirtyParent, "sub"), "status", "--porcelain")).toBe(before);
+	});
+
+	it("lists a submodule with a new local commit as not carried and never cleans the source", async () => {
+		const subSrc = path.join(root, "committed-sub-src");
+		await fs.mkdir(subSrc);
+		git(subSrc, "init", "-q", "-b", "main");
+		await commitFile(subSrc, "lib.txt");
+		const committedParent = path.join(root, "committed-parent");
+		await fs.mkdir(committedParent);
+		git(committedParent, "init", "-q", "-b", "main");
+		git(committedParent, "config", "core.autocrlf", "false");
+		await commitFile(committedParent, "main.txt");
+		git(committedParent, "-c", "protocol.file.allow=always", "submodule", "add", "-q", subSrc, "sub");
+		git(committedParent, "commit", "-q", "-m", "add sub");
+		git(committedParent, "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init");
+		const pin = git(path.join(committedParent, "sub"), "rev-parse", "HEAD");
+		// A new local commit with a clean submodule worktree: nothing
+		// uncommitted, but the new tree's pin lacks it.
+		await Bun.write(path.join(committedParent, "sub", "lib.txt"), "x\nlocal commit\n");
+		git(path.join(committedParent, "sub"), "add", "lib.txt");
+		git(path.join(committedParent, "sub"), "commit", "-q", "-m", "local sub commit");
+		expect(git(path.join(committedParent, "sub"), "status", "--porcelain")).toBe("");
+		const localHead = git(path.join(committedParent, "sub"), "rev-parse", "HEAD");
+		expect(localHead).not.toBe(pin);
+
+		const wt = await createSessionWorktree(committedParent, Settings.isolated(), "wt/local-sub-commit", {
+			keepChanges: true,
+		});
+		expect(wt.submodulesNotCarried).toEqual([{ path: "sub", reason: "local commits not carried" }]);
+		expect(git(path.join(wt.path, "sub"), "rev-parse", "HEAD")).toBe(pin);
+		expect(formatSessionWorktreeSummary(wt, false)).toContain("sub (local commits not carried)");
+
+		const cleaning = Settings.isolated({ "worktree.cleanSource": true });
+		const cleanup = await cleanSourceCheckoutIfConfigured(committedParent, cleaning, {
+			preserveSubmodules: wt.submodulesNotCarried.map(entry => entry.path),
+		});
+		expect(cleanup.cleaned).toBe(false);
+		expect(cleanup.skipped ?? "").toContain("sub");
+		expect(git(path.join(committedParent, "sub"), "rev-parse", "HEAD")).toBe(localHead);
+		expect(git(committedParent, "status", "--porcelain")).toContain("sub");
+	});
+
+	it("lists a nested submodule with a new local commit without implicating clean levels", async () => {
+		const leafSrc = path.join(root, "commit-leaf-src");
+		await fs.mkdir(leafSrc);
+		git(leafSrc, "init", "-q", "-b", "main");
+		await commitFile(leafSrc, "leaf.txt");
+		const midSrc = path.join(root, "commit-mid-src");
+		await fs.mkdir(midSrc);
+		git(midSrc, "init", "-q", "-b", "main");
+		await commitFile(midSrc, "mid.txt");
+		git(midSrc, "-c", "protocol.file.allow=always", "submodule", "add", "-q", leafSrc, "leaf");
+		git(midSrc, "commit", "-q", "-m", "add leaf");
+		const commitNested = path.join(root, "commit-nested");
+		await fs.mkdir(commitNested);
+		git(commitNested, "init", "-q", "-b", "main");
+		git(commitNested, "config", "core.autocrlf", "false");
+		await commitFile(commitNested, "main.txt");
+		git(commitNested, "-c", "protocol.file.allow=always", "submodule", "add", "-q", midSrc, "mid");
+		git(commitNested, "commit", "-q", "-m", "add mid");
+		git(commitNested, "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init", "--recursive");
+		const leafPin = git(path.join(commitNested, "mid", "leaf"), "rev-parse", "HEAD");
+		await Bun.write(path.join(commitNested, "mid", "leaf", "leaf.txt"), "x\nlocal leaf commit\n");
+		git(path.join(commitNested, "mid", "leaf"), "add", "leaf.txt");
+		git(path.join(commitNested, "mid", "leaf"), "commit", "-q", "-m", "local leaf commit");
+		const leafHead = git(path.join(commitNested, "mid", "leaf"), "rev-parse", "HEAD");
+		expect(leafHead).not.toBe(leafPin);
+
+		const wt = await createSessionWorktree(commitNested, Settings.isolated(), "wt/nested-leaf-commit", {
+			keepChanges: true,
+		});
+		expect(wt.submodulesNotCarried.map(entry => entry.path)).toContain("mid/leaf");
+		expect(wt.submodulesNotCarried).toContainEqual({ path: "mid/leaf", reason: "local commits not carried" });
+		expect(git(path.join(wt.path, "mid", "leaf"), "rev-parse", "HEAD")).toBe(leafPin);
+		expect(formatSessionWorktreeSummary(wt, false)).toContain("mid/leaf");
+
+		const cleaning = Settings.isolated({ "worktree.cleanSource": true });
+		const cleanup = await cleanSourceCheckoutIfConfigured(commitNested, cleaning, {
+			preserveSubmodules: wt.submodulesNotCarried.map(entry => entry.path),
+		});
+		expect(cleanup.cleaned).toBe(false);
+		expect(git(path.join(commitNested, "mid", "leaf"), "rev-parse", "HEAD")).toBe(leafHead);
 	});
 });

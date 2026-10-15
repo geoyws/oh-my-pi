@@ -22,6 +22,7 @@ import {
 	initWorktreeSubmodules,
 	parseIsolationBackend,
 } from "../task/worktree";
+import type { SubmoduleNotCarried } from "../task/worktree";
 import { resolveAvailableWorktreePath } from "../tools/gh-pr-checkout";
 
 import { cfgIsolationBackend, cfgWorktreeCleanSource, cfgWorktreeClone } from "../task/settings";
@@ -42,12 +43,12 @@ export interface SessionWorktree {
 	/** Whether uncommitted source changes were carried into the worktree. */
 	keptChanges: boolean;
 	/**
-	 * Source-initialized submodules with uncommitted changes that a plain
-	 * checkout plus pin initialization could not carry across: the new tree
-	 * holds them at their recorded pins while the source keeps the changes.
-	 * Empty when `keptChanges` is false (nothing was meant to carry).
+	 * Source-initialized submodules whose state a plain checkout plus pin
+	 * initialization could not carry across: the new tree holds them at
+	 * their recorded pins while the source keeps the changes. Empty when
+	 * `keptChanges` is false (nothing was meant to carry).
 	 */
-	submodulesNotCarried: string[];
+	submodulesNotCarried: SubmoduleNotCarried[];
 }
 
 /** State of a session-owned worktree at exit. */
@@ -94,7 +95,7 @@ export function formatSessionWorktreeSummary(worktree: SessionWorktree, sourceCl
 	const changeStatus = !worktree.keptChanges
 		? "started from clean HEAD"
 		: notCarried.length > 0
-			? `uncommitted changes carried over except submodules ${notCarried.join(", ")} (left at their recorded pins; the source checkout keeps those changes)`
+			? `uncommitted changes carried over except ${notCarried.map(entry => `${entry.path} (${entry.reason})`).join(", ")}; the source checkout keeps those changes`
 			: sourceCleaned
 				? "uncommitted changes moved, source checkout cleaned"
 				: "uncommitted changes carried over";

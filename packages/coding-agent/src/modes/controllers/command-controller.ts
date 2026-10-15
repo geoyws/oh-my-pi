@@ -1702,7 +1702,7 @@ export class CommandController {
 			created = worktree;
 			const cleanup: { cleaned: boolean; errorMessage?: string; skipped?: string } = worktree.keptChanges
 				? await cleanSourceCheckoutIfConfigured(cwd, this.ctx.settings, {
-						preserveSubmodules: worktree.submodulesNotCarried,
+						preserveSubmodules: worktree.submodulesNotCarried.map(entry => entry.path),
 					})
 				: { cleaned: false, errorMessage: undefined };
 			if (cleanup.errorMessage !== undefined) {
