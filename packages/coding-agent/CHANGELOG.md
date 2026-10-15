@@ -4,6 +4,8 @@
 
 ### Added
 
+- Added global configuration persistence opt-outs via `config.readOnly` and `PI_CONFIG_READONLY=1`, project role routing with explicit missing-project refusal, and nonzero CLI refusal for protected writes.
+
 - Added comprehensive browser tools for accessibility audits, React internals inspection, console/network monitoring, and performance tracing
 - Introduced tab management, disk-backed screen recording with cursor overlays, and WebMCP protocol support for cross-frame tool discovery
 - Implemented advanced browser control options including custom init scripts, download management, and persistent storage state persistence

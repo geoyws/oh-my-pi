@@ -594,6 +594,8 @@ export class Settings {
 
 	/** Whether to persist changes */
 	#persist: boolean;
+	/** Named policy protects global configuration, not project role storage. */
+	#globalReadOnly = process.env.PI_CONFIG_READONLY === "1";
 
 	private constructor(options: SettingsOptions = {}) {
 		this.#cwd = path.normalize(options.cwd ?? getProjectDir());
@@ -690,6 +692,40 @@ export class Settings {
 	// ─────────────────────────────────────────────────────────────────────────
 	// Core API
 	// ─────────────────────────────────────────────────────────────────────────
+	/** Named policy is global-only; whole-instance readOnly remains independent. */
+	isGlobalConfigReadOnly(): boolean {
+		return this.#persist && this.#globalReadOnly;
+	}
+
+	getModelRoleStorage(): "global" | "project" {
+		return this.isGlobalConfigReadOnly() ? "project" : this.get("modelRoleStorage");
+	}
+
+	#globalWriteRefusal(setting: string): Error {
+		const logical = path.resolve(this.#configPath ?? path.join(this.#agentDir, MAIN_CONFIG_FILENAMES[0]));
+		let target = logical;
+		try { target = fs.realpathSync(logical); } catch { /* Missing targets retain their absolute path. */ }
+		return new Error(`Cannot persist ${setting}: global config is read-only (${target}). Disable config.readOnly / PI_CONFIG_READONLY or assign roles in an existing ${path.resolve(getProjectAgentDir(this.#cwd))} directory.`);
+	}
+
+	#assertGlobalWritable(setting: string): void {
+		if (this.isGlobalConfigReadOnly()) throw this.#globalWriteRefusal(setting);
+	}
+
+	/** Preflight role assignment before changing the live model. */
+	assertModelRoleWritable(role: ModelRole | string): void {
+		if (!this.isGlobalConfigReadOnly()) return;
+		const projectDir = getProjectAgentDir(this.#cwd);
+		if (!fs.existsSync(projectDir) || !fs.statSync(projectDir).isDirectory()) {
+			throw this.#globalWriteRefusal(`modelRoles.${role}`);
+		}
+		const projectPath = path.join(projectDir, "config.yml");
+		if (this.#configPath && fs.existsSync(projectPath) && fs.existsSync(this.#configPath) &&
+			fs.realpathSync(projectPath) === fs.realpathSync(this.#configPath)) {
+			throw this.#globalWriteRefusal(`modelRoles.${role}`);
+		}
+	}
+
 
 	/**
 	 * Get a setting value (sync).
@@ -722,6 +758,7 @@ export class Settings {
 	 */
 	set<P extends SettingPath>(path: P, value: SettingValue<P>): void {
 		assertKnownStatusLineSegments(path, value);
+		this.#assertGlobalWritable(path);
 		const prev = this.get(path);
 		const segments = path.split(".");
 		this.#captureGlobalMutation(path, this.#modifiedPathMutations, getByPath(this.#global, segments));
@@ -869,6 +906,7 @@ export class Settings {
 		});
 		cloned.#storage = this.#storage;
 		cloned.#configPath = this.#configPath;
+		cloned.#globalReadOnly = this.#globalReadOnly;
 		cloned.#global = structuredClone(this.#global);
 		cloned.#project = this.#persist ? await cloned.#loadProjectSettings() : structuredClone(this.#project);
 		if (!this.#persist) cloned.#projectShellPathSource = this.#projectShellPathSource;
@@ -1254,6 +1292,7 @@ export class Settings {
 	}
 
 	#setProjectModelRoleValue(role: ModelRole | string, modelId: string | null): void {
+		this.assertModelRoleWritable(role);
 		const prev = this.get("modelRoles");
 		const projectRoles = getByPath(this.#project, ["modelRoles"]);
 		const current: Record<string, unknown> = isRecord(projectRoles) ? { ...projectRoles } : {};
@@ -1281,6 +1320,11 @@ export class Settings {
 	 * stale skip in place.
 	 */
 	setModelRole(role: ModelRole | string, modelId: string | undefined): void {
+		if (this.isGlobalConfigReadOnly()) {
+			if (modelId === undefined) this.clearProjectModelRole(role);
+			else this.setProjectModelRole(role, modelId);
+			return;
+		}
 		const prev = this.get("modelRoles");
 		const current = this.#modelRolesFromLayer(this.#global);
 		this.#captureGlobalMutation(role, this.#modifiedGlobalModelRoleMutations, current[role]);
@@ -1314,7 +1358,7 @@ export class Settings {
 	 * surviving capture implies no external supersession occurred.
 	 */
 	isProjectModelRoleRuntimeOverrideActive(role: ModelRole | string): boolean {
-		if (this.get("modelRoleStorage") !== "project") return false;
+		if (this.getModelRoleStorage() !== "project") return false;
 		if (!this.#savedRuntimeModelRoleOverrides.has(role)) return false;
 		return !!this.getProjectModelRole(role);
 	}
@@ -1445,12 +1489,32 @@ export class Settings {
 	// ─────────────────────────────────────────────────────────────────────────
 
 	async #load(): Promise<Settings> {
+		if (!this.#persist && this.#configPath) return this.#loadReadOnly();
+		if (this.#persist) {
+			// Read the policy before quarantine, migration, or opening storage.
+			let failedMain: { filePath: string; result: YamlLoadResult } | undefined;
+			for (const filename of MAIN_CONFIG_FILENAMES) {
+				const filePath = path.join(this.#agentDir, filename);
+				const result = await this.#loadYamlIfPresent(filePath, false);
+				if (result.kind === "missing") continue;
+				this.#configPath = filePath;
+				if (result.kind === "loaded") this.#global = result.settings;
+				else failedMain = { filePath, result };
+				break;
+			}
+			this.#configOverlay = (await this.#readConfigOverlays(false)).settings;
+			this.#rebuildMerged();
+			this.#globalReadOnly ||= getByPath(this.#global, ["config", "readOnly"]) === true || this.get("config.readOnly") === true;
+			if (failedMain && this.isGlobalConfigReadOnly()) {
+				this.#unwrapYamlLoadResult(failedMain.filePath, failedMain.result);
+			}
+		}
 		// Project settings discovery is independent of the persist chain, while
 		// the persist steps themselves remain sequential. Wait for both branches
 		// to settle so simultaneous failures produce one catchable error without
 		// abandoning the other rejection.
 		const [globalResult, projectResult] = await Promise.allSettled([
-			this.#persist ? this.#loadGlobalSettings() : Promise.resolve(),
+			this.#persist && !this.isGlobalConfigReadOnly() ? this.#loadGlobalSettings() : Promise.resolve(),
 			this.#loadProjectSettings(),
 		]);
 		if (globalResult.status === "rejected") throw globalResult.reason;
@@ -1797,7 +1861,7 @@ export class Settings {
 
 	async #loadYamlIfPresentForStartup(filePath: string): Promise<RawSettings | null> {
 		const result = await this.#loadYamlIfPresent(filePath);
-		if (result.kind !== "invalid" || !this.#persist) {
+		if (result.kind !== "invalid" || !this.#persist || (filePath === this.#configPath && this.isGlobalConfigReadOnly())) {
 			return this.#unwrapYamlLoadResult(filePath, result);
 		}
 		return await this.#withYamlWriteLock(filePath, async writePath => {
@@ -2000,7 +2064,7 @@ export class Settings {
 	}
 
 	async #migrateFromLegacy(): Promise<void> {
-		if (!this.#configPath) return;
+		if (!this.#configPath || this.isGlobalConfigReadOnly()) return;
 
 		let settings: RawSettings = {};
 		let migrated = false;
@@ -3015,7 +3079,7 @@ export class Settings {
 	}
 
 	#queueSave(): void {
-		if (!this.#persist || !this.#configPath) return;
+		if (!this.#persist || !this.#configPath || this.isGlobalConfigReadOnly()) return;
 
 		// Debounce: wait 100ms for more changes
 		clearTimeout(this.#saveTimer);
@@ -3037,7 +3101,7 @@ export class Settings {
 	}
 
 	async #saveNow(): Promise<void> {
-		if (this.#savesCancelled || !this.#persist || !this.#configPath) return;
+		if (this.#savesCancelled || !this.#persist || !this.#configPath || this.isGlobalConfigReadOnly()) return;
 		if (this.#modified.size === 0 && this.#modifiedGlobalModelRoles.size === 0) return;
 
 		const configPath = this.#configPath;
@@ -3244,6 +3308,7 @@ export class Settings {
 
 	async #saveProjectNow(): Promise<void> {
 		if (this.#savesCancelled || !this.#persist || this.#modifiedProjectModelRoles.size === 0) return;
+		for (const role of this.#modifiedProjectModelRoles) this.assertModelRoleWritable(role);
 
 		const projectConfigPath = path.join(getProjectAgentDir(this.#cwd), "config.yml");
 		const modifiedModelRoles = [...this.#modifiedProjectModelRoles];

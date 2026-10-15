@@ -487,6 +487,7 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	disabledExtensions: { type: "array", default: EMPTY_STRING_ARRAY },
+	"config.readOnly": { type: "boolean", default: false },
 
 	modelRoleStorage: {
 		type: "enum",
