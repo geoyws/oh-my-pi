@@ -378,8 +378,12 @@ describe("/model default role clear under the global read-only policy", () => {
 		expect(fs.readFileSync(config, "utf8")).toBe(bytes);
 		const project: unknown = YAML.parse(fs.readFileSync(projectConfig, "utf8"));
 		if (!isRecord(project) || !isRecord(project.modelRoles)) throw new Error("Expected project modelRoles mapping");
-		expect(project.modelRoles.default).toBeUndefined();
-		expect(project.modelRoles.smol).toBe("provider/keep:low");
+		const reopened = await Settings.loadIsolated({ cwd, agentDir, configFiles: [] });
+		expect({
+			projectDefault: reopened.getProjectModelRole("default"),
+			effectiveDefault: reopened.getModelRole("default"),
+			smol: reopened.getProjectModelRole("smol"),
+		}).toEqual({ projectDefault: undefined, effectiveDefault: globalSelector, smol: "provider/keep:low" });
 		expect(project.autoResume).toBe(false);
 	});
 });
