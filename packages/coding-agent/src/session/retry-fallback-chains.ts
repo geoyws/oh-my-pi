@@ -204,10 +204,17 @@ export interface RetryFallbackRole {
  * so a rebuilt Settings keeps it: `session_init` persists it for cold revival
  * and overlay capture/restore carries it for warm revival. Session-scoped like
  * the overrides themselves.
+ *
+ * The mark can only come from {@link installRetryFallbackRole} at runtime:
+ * readers honor the runtime-override layer alone, so the same id in user
+ * config (global/project files, `--config`, `omp config set`) never takes
+ * effect. Arrays replace wholesale across layers, so a runtime-provenanced
+ * read is exactly the installed value.
  */
 
 /** Names of installed exhaustive chains for `settings` (empty when none). */
 export function getExhaustiveRetryFallbackRoles(settings: Settings): ReadonlySet<string> {
+	if (settings.getProvenance(cfgExhaustiveRetryFallbackRoles) !== "runtime") return new Set();
 	return new Set(cfgExhaustiveRetryFallbackRoles.get(settings) ?? []);
 }
 
@@ -217,7 +224,7 @@ export function getRetryFallbackRole(settings: Settings, role: string): RetryFal
 	const chain = cfgRetryFallbackChains.get(settings)[role];
 	if (!primary || !Array.isArray(chain) || chain.length === 0) return undefined;
 	const roleState: RetryFallbackRole = { primary, chain };
-	if (cfgExhaustiveRetryFallbackRoles.get(settings)?.includes(role)) roleState.exhaustive = true;
+	if (getExhaustiveRetryFallbackRoles(settings).has(role)) roleState.exhaustive = true;
 	return roleState;
 }
 
@@ -231,7 +238,13 @@ export function installRetryFallbackRole(
 	role: string,
 	{ primary, chain, exhaustive }: RetryFallbackRole,
 ): void {
-	const current = cfgExhaustiveRetryFallbackRoles.get(settings) ?? [];
+	// Read-modify-write the runtime layer alone: starting from the merged view
+	// would promote user-configured entries into the runtime layer, where they
+	// would take effect.
+	const current =
+		settings.getProvenance(cfgExhaustiveRetryFallbackRoles) === "runtime"
+			? (cfgExhaustiveRetryFallbackRoles.get(settings) ?? [])
+			: [];
 	cfgExhaustiveRetryFallbackRoles.override(
 		settings,
 		exhaustive ? (current.includes(role) ? current : [...current, role]) : current.filter(entry => entry !== role),

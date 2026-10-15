@@ -3,6 +3,7 @@ import type { Api, Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
+import { cfgExhaustiveRetryFallbackRoles } from "@oh-my-pi/pi-coding-agent/session/settings";
 import {
 	findRetryFallbackCandidates,
 	getExhaustiveRetryFallbackRoles,
@@ -335,5 +336,24 @@ describe("exhaustive subagent fallback chains", () => {
 		expect(fallbackRole).toBe("subagent:deferred-exhaustive");
 		expect(fallbackDefaultChain).toBeUndefined();
 		expect(fallbackExhaustive).toBe(true);
+	});
+
+	it("ignores exhaustive roles supplied through user config", () => {
+		const settings = scoutSettings();
+		// `omp config set` / config file: global layer, never the runtime override.
+		// No subagent install ever runs on a main session, so nothing shadows it.
+		cfgExhaustiveRetryFallbackRoles.set(settings, [SCOUT_ROLE]);
+		expect(getExhaustiveRetryFallbackRoles(settings).size).toBe(0);
+		// A user flag alone installs no chain.
+		expect(getRetryFallbackRole(settings, SCOUT_ROLE)).toBeUndefined();
+		const models = [model("scout-a", "first"), model("scout-b", "second"), model("scout-c", "third")];
+		const context = contextFor(settings, models, [...getExhaustiveRetryFallbackRoles(settings)]);
+		// A main-session lookup still follows the model-keyed chain, never the named role alone.
+		expect(resolveRetryFallbackChainKey(context, FIRST)).toBe("scout-a/first");
+		const recovery = recoveryFor(settings, models);
+		expect(recovery.retryFallbackChainKeys(FIRST, undefined)).toEqual(["scout-a/first"]);
+		expect(
+			recovery.findRetryFallbackCandidates("scout-a/first", FIRST, undefined).map(candidate => candidate.raw),
+		).toEqual([OUTSIDE]);
 	});
 });

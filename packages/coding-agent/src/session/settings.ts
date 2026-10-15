@@ -849,7 +849,9 @@ export const cfgRetryFallbackChains = register({
  * state, never user configuration: written only through
  * `installRetryFallbackRole`, so it rides the same overlay layers as the
  * installed chains and survives settings rebuilds (warm-revival overlay
- * restore). Deliberately has no `ui`: it must never be user-configured.
+ * restore). Readers honor the runtime-override layer alone — the same id in
+ * user config (global/project files, `--config`, `omp config set`) never
+ * takes effect. Deliberately has no `ui`: it must never be user-configured.
  */
 export const cfgExhaustiveRetryFallbackRoles = register({
 	id: "retry.exhaustiveFallbackRoles",
