@@ -13,6 +13,18 @@ const cliEntry = path.join(import.meta.dir, "..", "src", "cli.ts");
 const HOUR_MS = 3_600_000;
 const REPLY = "hello from the unum account";
 const ACCESS = { gmail: "sk-ant-oat01-e2e-gmail", unum: "sk-ant-oat01-e2e-unum" } as const;
+/**
+ * A session id whose first-choice credential is the first stored one (gmail):
+ * the pool starts each session at `xxHash32(sessionId) % accounts`
+ * (packages/ai/src/auth/select.ts). The test asserts the first request really
+ * went to gmail, so a change in that mapping fails loudly instead of skipping.
+ */
+const GMAIL_FIRST_SESSION_ID = (() => {
+	for (let i = 0; ; i += 1) {
+		const candidate = `anthropic-sibling-e2e-${i}`;
+		if (Bun.hash.xxHash32(candidate) % 2 === 0) return candidate;
+	}
+})();
 
 function sse(events: Array<Record<string, unknown>>): string {
 	return events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
@@ -103,7 +115,17 @@ async function runOnce(): Promise<RunOutcome> {
 		storage.close();
 
 		const child = Bun.spawn(
-			[process.execPath, cliEntry, "-p", "--model", "anthropic/claude-sonnet-4-5", "--no-session", "Say hi."],
+			[
+				process.execPath,
+				cliEntry,
+				"-p",
+				"--model",
+				"anthropic/claude-sonnet-4-5",
+				"--no-session",
+				"--provider-session-id",
+				GMAIL_FIRST_SESSION_ID,
+				"Say hi.",
+			],
 			{
 				cwd: agentDir.path(),
 				env: {
@@ -129,21 +151,14 @@ async function runOnce(): Promise<RunOutcome> {
 }
 
 test("a print run that starts on the rate-limited account finishes on its sibling", async () => {
-	// The first account a fresh session picks is ranked per session id; retry
-	// with fresh agent dirs until a run starts on gmail (p(miss 8x) = 2^-8).
-	let outcome: RunOutcome | undefined;
-	for (let attempt = 0; attempt < 8; attempt += 1) {
-		const run = await runOnce();
-		expect(run.exitCode, `${run.stdout}\n${run.stderr}`).toBe(0);
-		expect(run.stdout).toContain(REPLY);
-		if (run.messages[0] === "gmail") {
-			outcome = run;
-			break;
-		}
-	}
-	if (!outcome) throw new Error("no run started on the rate-limited account in 8 attempts");
-	expect(outcome.messages.filter(account => account === "unknown")).toEqual([]);
-	// One rate-limited attempt, then the sibling; never back to the blocked account.
-	expect(outcome.messages.indexOf("unum")).toBeGreaterThan(0);
-	expect(outcome.messages.slice(outcome.messages.indexOf("unum"))).not.toContain("gmail");
-}, 900_000);
+	const run = await runOnce();
+	expect(run.exitCode, `${run.stdout}\n${run.stderr}`).toBe(0);
+	expect(run.stdout).toContain(REPLY);
+	expect(run.messages.filter(account => account === "unknown")).toEqual([]);
+	// Starts on the rate-limited account (the session id pins that), takes one
+	// 429, then the sibling; never back to the blocked account.
+	expect(run.messages[0]).toBe("gmail");
+	const switchedAt = run.messages.indexOf("unum");
+	expect(switchedAt).toBeGreaterThan(0);
+	expect(run.messages.slice(switchedAt)).not.toContain("gmail");
+}, 120_000);

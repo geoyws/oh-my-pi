@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import type { OAuthCredential, UsageProvider } from "@oh-my-pi/pi-ai";
 import * as oauth from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/types";
+import { claudeUsageProvider } from "@oh-my-pi/pi-ai/usage/claude";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 
 // kb omp t-bb73c67f: with two Claude OAuth accounts, OMP kept routing to the
@@ -91,5 +92,57 @@ describe("Anthropic sibling account routing", () => {
 		expect(await authStorage.keys.get("anthropic", sessionId)).toBe("access-unum");
 		// And the move sticks: the session does not drift back while gmail is blocked.
 		expect(await authStorage.keys.get("anthropic", sessionId)).toBe("access-unum");
+	});
+});
+
+// The same ranking through the real Claude usage parser and request path, so
+// a usage report is attributed to an account only by the bearer that fetched
+// it (the stored-usage-identity hypothesis), not by a test-built account id.
+describe("Anthropic ranking from real Claude usage responses", () => {
+	test("the account whose /api/oauth/usage says 100% is never a new session's first pick", async () => {
+		const usageCalls: string[] = [];
+		const usageFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+			const request = input instanceof Request ? input : new Request(input.toString(), init);
+			const bearer = request.headers.get("authorization") ?? "";
+			if (!new URL(request.url).pathname.endsWith("/api/oauth/usage")) return new Response("{}", { status: 404 });
+			usageCalls.push(bearer.includes("access-gmail") ? "gmail" : bearer.includes("access-unum") ? "unum" : "?");
+			const fiveHour = bearer.includes("access-gmail") ? 100 : 5;
+			return Response.json({
+				five_hour: { utilization: fiveHour, resets_at: new Date(Date.now() + 2 * HOUR_MS).toISOString() },
+				seven_day: { utilization: 20, resets_at: new Date(Date.now() + 72 * HOUR_MS).toISOString() },
+			});
+		}) as typeof fetch;
+		const storage = await AuthStorage.create(":memory:", {
+			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsageProvider : undefined),
+			usageFetch,
+		});
+		try {
+			vi.spyOn(oauth, "refreshOAuthToken").mockImplementation(async (_provider, credential) => credential);
+			vi.spyOn(oauth, "getOAuthApiKey").mockImplementation(async (_provider, credentials) => {
+				const credential = credentials.anthropic as OAuthCredentials | undefined;
+				return credential ? { apiKey: credential.access, newCredentials: credential } : null;
+			});
+			// Identities as stored by real logins: distinct accounts and orgs.
+			await storage.credentials.set(
+				"anthropic",
+				(["gmail", "unum"] as const).map(id => ({
+					type: "oauth" as const,
+					access: `access-${id}`,
+					refresh: `refresh-${id}`,
+					expires: Date.now() + HOUR_MS,
+					accountId: `account-${id}`,
+					email: `${id}@example.com`,
+					orgId: `org-${id}`,
+				})),
+			);
+			for (let i = 0; i < 24; i += 1) {
+				expect(await storage.keys.get("anthropic", `real-usage-session-${i}`)).toBe("access-unum");
+			}
+			// Both accounts were measured through their own bearer.
+			expect(new Set(usageCalls)).toEqual(new Set(["gmail", "unum"]));
+		} finally {
+			vi.restoreAllMocks();
+			storage.close();
+		}
 	});
 });
