@@ -832,6 +832,119 @@ async function detachCopiedRepo(sourceRoot: string, copyRoot: string, sourceComm
 }
 
 /**
+ * Final-target resolution of `linkPath` (a symlink inside the isolated copy
+ * rooted at `realCopyRoot`, itself already realpath'd). A resolvable chain
+ * is judged by its realpath; a dangling chain is judged lexically hop by
+ * hop, because creating through a dangling link materialises the target — a
+ * dangling `out -> /elsewhere/missing` still writes outside the copy.
+ * Anything unresolvable, cyclic, or deeper than the hop budget escapes
+ * (fail closed). `abs` is the clean absolute final target for re-anchoring
+ * decisions, or null when no single path can be named (loops, over-deep
+ * chains); `display` is the human-readable pointer for refusal messages.
+ */
+async function resolveCopySymlink(
+	realCopyRoot: string,
+	linkPath: string,
+): Promise<{ abs: string | null; inCopy: boolean; display: string }> {
+	const underCopy = (realPath: string): boolean =>
+		realPath === realCopyRoot || realPath.startsWith(`${realCopyRoot}${path.sep}`);
+	const real = await fs.realpath(linkPath).catch(() => null);
+	if (real !== null) return { abs: real, inCopy: underCopy(real), display: real };
+	// Dangling (or looping) chain: resolve hop by hop without requiring the
+	// final target to exist.
+	let current = linkPath;
+	const seen: Record<string, true> = {};
+	for (let depth = 0; depth < 16; depth++) {
+		if (seen[current]) return { abs: null, inCopy: false, display: `${current} (symlink loop)` };
+		seen[current] = true;
+		const raw = await fs.readlink(current).catch(() => null);
+		if (raw === null) {
+			const norm = path.normalize(current);
+			return { abs: norm, inCopy: underCopy(norm), display: norm };
+		}
+		const abs = path.isAbsolute(raw) ? path.normalize(raw) : path.normalize(path.join(path.dirname(current), raw));
+		const stat = await fs.lstat(abs).catch(() => null);
+		if (stat === null) return { abs, inCopy: underCopy(abs), display: `${raw} (dangling)` };
+		if (!stat.isSymbolicLink()) {
+			const realTarget = await fs.realpath(abs).catch(() => null);
+			const judged = realTarget ?? abs;
+			return { abs: judged, inCopy: underCopy(judged), display: judged };
+		}
+		current = abs;
+	}
+	return { abs: null, inCopy: false, display: `${current} (symlink chain too deep)` };
+}
+
+/**
+ * Whether `linkPath` (a symlink inside the isolated copy rooted at
+ * `realCopyRoot`, itself already realpath'd) can let writes escape the copy.
+ */
+async function symlinkTargetEscapes(
+	realCopyRoot: string,
+	linkPath: string,
+): Promise<{ escapes: boolean; target: string }> {
+	const resolved = await resolveCopySymlink(realCopyRoot, linkPath);
+	return { escapes: !resolved.inCopy, target: resolved.display };
+}
+
+/**
+ * Contain one worktree (never git-metadata) symlink in the copy: links that
+ * already resolve inside stay untouched, links whose final target lies under
+ * the source checkout are re-anchored to the matching path under the copy —
+ * a verbatim absolute `link -> <source>/sub` would otherwise keep pointing
+ * at the source checkout — and anything resolving anywhere else refuses.
+ * Re-anchoring preserves the link's intra-checkout meaning (the child sees
+ * the same tree shape, scoped to its own copy) and stays invisible to the
+ * merge-back diff, whose baseline is captured from the copy after setup.
+ * Git entries and admin interiors never reach this repair: metadata pointers
+ * are judged strictly and refuse.
+ */
+async function containWorktreeSymlink(
+	realSourceRoot: string,
+	realCopyRoot: string,
+	linkPath: string,
+): Promise<{ contained: boolean; target: string }> {
+	const resolved = await resolveCopySymlink(realCopyRoot, linkPath);
+	if (resolved.inCopy) return { contained: true, target: resolved.display };
+	if (
+		resolved.abs !== null &&
+		(resolved.abs === realSourceRoot || resolved.abs.startsWith(`${realSourceRoot}${path.sep}`))
+	) {
+		const dest = path.join(realCopyRoot, path.relative(realSourceRoot, resolved.abs));
+		// Remove the link itself (never its target) and recreate it at the
+		// copy-relative destination, preserving the absolute style.
+		await fs.unlink(linkPath);
+		await fs.symlink(dest, linkPath);
+		return { contained: true, target: dest };
+	}
+	return { contained: false, target: resolved.display };
+}
+
+/**
+ * Whether writable storage inside the admin directory `gitDir` (already
+ * judged contained under `realCopyRoot`) reaches outside the copy through a
+ * hand-planted symlink. Git writes HEAD, the index, `refs/`, and `objects/`
+ * file by file, so a symlinked entry — or a `commondir` pointer that is
+ * itself a symlink — redirects that write at the source checkout even when
+ * the admin directory and its `commondir` target both sit inside the copy.
+ * `objects/info/alternates` is deliberately NOT judged here: a detached
+ * private admin borrows source objects through alternates read-only, and
+ * that borrowing must keep passing. Deeper plants (e.g. under `refs/heads/`
+ * or `logs/`) are caught by the copy-wide containment walk, which judges
+ * every symlink including admin interiors.
+ */
+async function adminStorageEscapes(realCopyRoot: string, gitDir: string): Promise<boolean> {
+	for (const name of ["commondir", "HEAD", "index", "refs", "objects"]) {
+		const entryPath = path.join(gitDir, name);
+		const stat = await fs.lstat(entryPath).catch(() => null);
+		if (stat?.isSymbolicLink()) {
+			if ((await symlinkTargetEscapes(realCopyRoot, entryPath)).escapes) return true;
+		}
+	}
+	return false;
+}
+
+/**
  * Whether the git admin reached through `dotGitPath` (a `.git` entry inside
  * the isolated copy rooted at `copyRoot`) can let git writes escape the
  * copy. Every entry kind resolves to one effective admin directory:
@@ -842,24 +955,27 @@ async function detachCopiedRepo(sourceRoot: string, copyRoot: string, sourceComm
  *   absolute target stands alone, a relative one joins the gitfile's own
  *   directory), following one chained file pointer when the target is
  *   itself a file.
- * The admin escapes when its realpath lies outside the copy, or when its
+ * The admin escapes when its realpath lies outside the copy, when its
  * `commondir` file (resolved relative to the admin when relative, as git
- * writes it) realpaths outside the copy: a directory admin with such a
- * pointer shares HEAD/refs with the source, so `git checkout -b` in the
- * copy writes the source. A missing `commondir` means the admin is its own
- * common dir and is private when contained. Anything unresolvable,
- * unparseable, or of an unrecognized kind escapes (fail closed).
+ * writes it) realpaths outside the copy, or when writable storage inside
+ * the admin (`commondir`/`HEAD`/`index`/`refs`/`objects` as a symlink)
+ * resolves outside the copy: a directory admin with such a pointer shares
+ * HEAD/refs with the source, so `git checkout -b` in the copy writes the
+ * source, and symlinked `refs/`/`objects/` redirect ref and object writes
+ * even when the admin directory and its `commondir` target both sit inside
+ * the copy. A missing `commondir` means the admin is its own common dir and
+ * is private when contained. Anything unresolvable, unparseable, or of an
+ * unrecognized kind escapes (fail closed).
  * `objects/info/alternates` is deliberately NOT judged here: a detached
  * private admin borrows source objects through alternates read-only, and
  * that borrowing must keep passing.
  *
  * Scope: this guards the layouts git itself creates for submodules (gitfiles,
  * absorbed module dirs, linked worktrees, legacy in-tree `.git` dirs) plus
- * `commondir` pointers. It is not a sandbox against git metadata planted by
- * hand to reach outside the checkout, such as symlinked `refs/` or `objects/`
- * inside an admin, or admins outside submodule paths or under node_modules;
- * that hardening belongs with committed out-of-tree symlinks in the
- * isolation copy as a whole.
+ * `commondir` pointers and symlinked admin storage. Admins outside
+ * submodule paths or under node_modules are judged by the same predicate by
+ * the copy-wide containment walk in {@link ensureIsolation}, which visits
+ * every `.git` entry at any depth.
  */
 export async function gitAdminEscapes(copyRoot: string, dotGitPath: string): Promise<boolean> {
 	let realCopyRoot: string;
@@ -912,6 +1028,7 @@ export async function gitAdminEscapes(copyRoot: string, dotGitPath: string): Pro
 		return true;
 	}
 	if (gitDir === null || !underCopy(gitDir)) return true;
+	if (await adminStorageEscapes(realCopyRoot, gitDir)) return true;
 	const commonRaw = await fs.readFile(path.join(gitDir, "commondir"), "utf8").catch(() => null);
 	if (commonRaw === null) return false;
 	const trimmed = commonRaw.trim();
@@ -1010,6 +1127,136 @@ async function detachOffPinSubmodules(sourceRoot: string, copyRoot: string): Pro
 	}
 }
 
+/** Human-readable pointer for a hand-out refusal; the verdict itself comes from the shared predicate. */
+async function describeGitAdminEntry(dotGitPath: string): Promise<string> {
+	const stat = await fs.lstat(dotGitPath).catch(() => null);
+	if (stat?.isSymbolicLink()) return fs.readlink(dotGitPath).catch(() => "<unreadable>");
+	if (stat?.isDirectory()) {
+		const real = await fs.realpath(dotGitPath).catch(() => null);
+		const common = real === null ? null : await fs.readFile(path.join(real, "commondir"), "utf8").catch(() => null);
+		return common === null ? "<unreadable>" : `commondir: ${common.trim()}`;
+	}
+	if (stat?.isFile()) return fs.readFile(dotGitPath, "utf8").catch(() => "<unreadable>");
+	return "unrecognized .git entry kind";
+}
+
+/**
+ * Fail closed when any symlink or git admin pointer in the final isolation
+ * copy resolves outside the copy: handing it out would let live task writes
+ * (as opposed to the already-confined merge path) reach the caller checkout
+ * or the source admin. This is the one copy-wide hand-out gate, on the
+ * final copy after every repair and detach pass, and it runs on every
+ * backend path — including the on-pin rebind, which otherwise performs no
+ * pointer walk at all. A single walk visits every entry at any depth,
+ * including admins outside submodule prefixes, everything under
+ * `node_modules`, and admin-directory interiors (so a plant deeper than the
+ * direct `refs`/`objects` shapes {@link gitAdminEscapes} judges is still
+ * refused by the symlink rule).
+ *
+ * Refuse vs re-anchor per shape. A symlink whose final target lies nowhere
+ * under the source checkout refuses: deleting or dangling it instead would
+ * hand the child a tree that differs from the source and fabricate a
+ * deletion in the merge-back diff, so refusing names the offending entry
+ * and its target for the source checkout to fix. A symlink whose target
+ * lies under the source checkout — typically an absolute intra-checkout
+ * link a verbatim copy left pointing at the source — is re-anchored to the
+ * matching path under the copy, preserving its meaning scoped to the
+ * child's own tree. Git entries and admin interiors are never re-anchored:
+ * silently rewriting a planted admin would bless tampered metadata, so
+ * they refuse. In-copy links — relative links, absolute links that stay
+ * inside, chains that resolve inside, and dangling links whose lexical
+ * target stays inside — keep working untouched, as do detached private
+ * admins (their `objects/info/alternates` borrowing is a file, not a
+ * link, and stays allowed).
+ */
+async function verifyIsolationCopyContained(sourceRoot: string, realCopyRoot: string): Promise<void> {
+	// An unresolvable source root fails the isolation rather than judging
+	// re-anchor targets against nothing.
+	const realSourceRoot = await fs.realpath(sourceRoot);
+	// One lockstep failure shape per verdict; `throw` sites narrow
+	// afterwards, which a `never`-returning closure does not reliably provide.
+	const symlinkFailure = (relativePath: string, target: string): Error =>
+		new Error(
+			`Isolated copy symlink "${relativePath}" points outside the copy (target: ${target.trim()}); ` +
+				`refusing to hand out a checkout the task could write through into ${sourceRoot} or elsewhere. ` +
+				`Remove or re-point the symlink in the source checkout and retry.`,
+		);
+	const gitFailure = (relativePath: string, detail: string): Error =>
+		new Error(
+			`Isolated copy "${relativePath}" still shares git metadata with ` +
+				`${sourceRoot} (${detail.trim()}); refusing to hand out a checkout whose git ` +
+				`operations could mutate the source.`,
+		);
+	const stack: Array<{ dir: string; inAdmin: boolean }> = [{ dir: realCopyRoot, inAdmin: false }];
+	while (stack.length > 0) {
+		const { dir, inAdmin } = stack.pop()!;
+		let entries;
+		try {
+			entries = await fs.readdir(dir, { withFileTypes: true });
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+			throw err;
+		}
+		for (const entry of entries) {
+			const full = path.join(dir, entry.name);
+			const relativePath = path.relative(realCopyRoot, full);
+			const isGitEntry = entry.name === ".git";
+			if (entry.isSymbolicLink()) {
+				// Never descend through a link, so the walk cannot be
+				// steered outside the copy. Git entries and admin
+				// interiors are judged strictly and never rewritten;
+				// worktree links at most re-anchor inside.
+				if (isGitEntry || inAdmin) {
+					let escapes = true;
+					let target = "<unreadable>";
+					try {
+						const verdict = await symlinkTargetEscapes(realCopyRoot, full);
+						escapes = verdict.escapes;
+						target = verdict.target;
+					} catch {
+						escapes = true;
+					}
+					if (escapes) throw symlinkFailure(relativePath, target);
+				} else {
+					let contained = false;
+					let target = "<unreadable>";
+					try {
+						const verdict = await containWorktreeSymlink(realSourceRoot, realCopyRoot, full);
+						contained = verdict.contained;
+						target = verdict.target;
+					} catch {
+						contained = false;
+					}
+					if (!contained) throw symlinkFailure(relativePath, target);
+				}
+				if (isGitEntry) {
+					let adminEscapes = true;
+					try {
+						adminEscapes = await gitAdminEscapes(realCopyRoot, full);
+					} catch {
+						adminEscapes = true;
+					}
+					if (adminEscapes) throw gitFailure(relativePath, await describeGitAdminEntry(full));
+				}
+				continue;
+			}
+			if (isGitEntry) {
+				let escapes = true;
+				try {
+					escapes = await gitAdminEscapes(realCopyRoot, full);
+				} catch {
+					escapes = true;
+				}
+				if (escapes) throw gitFailure(relativePath, await describeGitAdminEntry(full));
+				// Fall through and descend into a directory admin: the admin
+				// verdict above covers the direct storage shapes, while the
+				// symlink rule judges anything planted deeper.
+			}
+			if (entry.isDirectory()) stack.push({ dir: full, inAdmin: inAdmin || isGitEntry });
+		}
+	}
+}
+
 /**
  * Fail closed when any copied submodule still shares the source checkout's
  * git metadata: handing out that copy would let task git operations mutate
@@ -1042,18 +1289,7 @@ async function verifyCopiedSubmodulesDetached(
 		);
 	// Human-readable pointer for the failure message; the verdict itself
 	// comes from the shared predicate above.
-	const describeEntry = async (dotGitPath: string): Promise<string> => {
-		const stat = await fs.lstat(dotGitPath).catch(() => null);
-		if (stat?.isSymbolicLink()) return fs.readlink(dotGitPath).catch(() => "<unreadable>");
-		if (stat?.isDirectory()) {
-			const real = await fs.realpath(dotGitPath).catch(() => null);
-			const common =
-				real === null ? null : await fs.readFile(path.join(real, "commondir"), "utf8").catch(() => null);
-			return common === null ? "<unreadable>" : `commondir: ${common.trim()}`;
-		}
-		if (stat?.isFile()) return fs.readFile(dotGitPath, "utf8").catch(() => "<unreadable>");
-		return "unrecognized .git entry kind";
-	};
+	const describeEntry = describeGitAdminEntry;
 	for (const relativePath of relativePaths) {
 		const copySub = path.join(realCopyRoot, relativePath);
 		// Walk the copy below the submodule root for every `.git` entry,
@@ -1134,17 +1370,18 @@ export async function ensureIsolation(
 			await natives.isoStart(candidate, repoRoot, mergedDir);
 			await detachCopiedRepo(repoRoot, mergedDir, sourceCommonDir);
 			await detachNestedGitfileRepos(repoRoot, mergedDir);
-			// The one fail-closed hand-out gate, on the final copy: the
-			// nested-repo pass above privatizes linked worktrees living
-			// inside submodules, so judging only now never trips on a
-			// pointer a later pass would still have detached. An
-			// unresolvable copy root throws here and fails the isolation
-			// rather than verifying vacuously.
-			await verifyCopiedSubmodulesDetached(
-				repoRoot,
-				await fs.realpath(mergedDir),
-				await vcs.requireGit(repoRoot).submodulePaths(),
-			);
+			// The fail-closed hand-out gates, on the final copy: the nested-repo
+			// pass above privatizes linked worktrees living inside submodules,
+			// so judging only now never trips on a pointer a later pass would
+			// still have detached. The copy-wide containment walk runs on every
+			// backend path — including the on-pin rebind, which otherwise
+			// performs no pointer walk — judging every symlink and every `.git`
+			// entry at any depth in a single walk. An unresolvable copy root
+			// throws here and fails the isolation rather than verifying
+			// vacuously.
+			const realMergedDir = await fs.realpath(mergedDir);
+			await verifyCopiedSubmodulesDetached(repoRoot, realMergedDir, await vcs.requireGit(repoRoot).submodulePaths());
+			await verifyIsolationCopyContained(repoRoot, realMergedDir);
 			return {
 				mergedDir,
 				backend: candidate,
