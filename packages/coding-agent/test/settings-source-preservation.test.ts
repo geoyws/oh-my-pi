@@ -499,6 +499,130 @@ describe("settings YAML source preservation", () => {
 		expect(await Bun.file(config).text()).toBe(source);
 	});
 
+	describe("duplicate keys", () => {
+		for (const project of [false, true]) {
+			const scope = project ? "project" : "global";
+			const setRole = (settings: Settings, modelId: string | undefined) => {
+				if (!project) settings.setModelRole("default", modelId);
+				else if (modelId === undefined) settings.clearProjectModelRole("default");
+				else settings.setProjectModelRole("default", modelId);
+			};
+
+			it(`edits and clears the winning top-level duplicate in ${scope} YAML`, async () => {
+				const source =
+					"# head\nmodelRoles:\n    default: old/first # shadowed\nmodelRoles:\n    default: old/second\n    smol: keep/smol\n\ntheme:\n    dark: titanium\n";
+				const target = project ? projectConfig : config;
+				await Bun.write(target, source);
+				const settings = await Settings.init({ cwd, agentDir });
+				expect(settings.getModelRole("default")).toBe("old/second");
+				setRole(settings, "new/model");
+				await settings.flush();
+				const edited = await Bun.file(target).text();
+				expect(edited).toBe(source.replace("old/second", "new/model"));
+				expect(YAML.parse(edited)).toEqual({
+					modelRoles: { default: "new/model", smol: "keep/smol" },
+					theme: { dark: "titanium" },
+				});
+				const reopened = await Settings.loadIsolated({ cwd, agentDir });
+				expect(reopened.getModelRole("default")).toBe("new/model");
+				expect(reopened.getModelRole("smol")).toBe("keep/smol");
+
+				setRole(settings, undefined);
+				await settings.flush();
+				const cleared = await Bun.file(target).text();
+				// The shadowed first entry stays authored and stays shadowed.
+				expect(cleared.startsWith("# head\nmodelRoles:\n    default: old/first # shadowed\nmodelRoles:\n")).toBe(
+					true,
+				);
+				expect(cleared).toContain("    smol: keep/smol\n\ntheme:\n    dark: titanium\n");
+				expect(cleared).not.toContain("new/model");
+				const reread = await Settings.loadIsolated({ cwd, agentDir });
+				expect(reread.getModelRole("default")).toBeUndefined();
+				expect(reread.getModelRole("smol")).toBe("keep/smol");
+			});
+
+			it(`edits and clears every nested duplicate in ${scope} YAML`, async () => {
+				const source =
+					"modelRoles:\n    default: old/first # shadowed\n    smol: keep/smol\n    default: old/second # winner\n# tail\n";
+				const target = project ? projectConfig : config;
+				await Bun.write(target, source);
+				const settings = await Settings.init({ cwd, agentDir });
+				expect(settings.getModelRole("default")).toBe("old/second");
+				setRole(settings, "new/model");
+				await settings.flush();
+				const edited = await Bun.file(target).text();
+				expect(edited).toBe(source.replace("old/second", "new/model"));
+				expect((await Settings.loadIsolated({ cwd, agentDir })).getModelRole("default")).toBe("new/model");
+
+				setRole(settings, undefined);
+				await settings.flush();
+				const cleared = await Bun.file(target).text();
+				expect(cleared).not.toContain("old/second");
+				expect(cleared).toContain("    smol: keep/smol\n");
+				expect(cleared.endsWith("# tail\n")).toBe(true);
+				const reopened = await Settings.loadIsolated({ cwd, agentDir });
+				expect(reopened.getModelRole("default")).toBeUndefined();
+				expect(reopened.getModelRole("smol")).toBe("keep/smol");
+			});
+		}
+
+		it("edits the winning nested setting duplicate without touching the shadowed one", async () => {
+			const source = "theme:\n    dark: shadowed # first\n    dark: titanium\n";
+			await Bun.write(config, source);
+			const settings = await Settings.init({ cwd, agentDir });
+			expect(settings.get("theme.dark")).toBe("titanium");
+			settings.set("theme.dark", "midnight");
+			await settings.flush();
+			const output = await Bun.file(config).text();
+			expect(output).toBe(source.replace("titanium", "midnight"));
+			expect(YAML.parse(output)).toEqual({ theme: { dark: "midnight" } });
+			expect((await Settings.loadIsolated({ cwd, agentDir })).get("theme.dark")).toBe("midnight");
+		});
+	});
+
+	it("adds a root key after a byte order mark at the authored root indentation", async () => {
+		const source = "\uFEFFtheme:\n    dark: titanium # keep\n\ngrep:\n    contextAfter: 3\n";
+		fs.writeFileSync(config, source, "utf8");
+		const settings = await Settings.init({ cwd, agentDir });
+		settings.setModelRole("default", "new/model");
+		await settings.flush();
+		const output = fs.readFileSync(config, "utf8");
+		expect(output.startsWith("\uFEFFtheme:\n    dark: titanium # keep\n\ngrep:\n    contextAfter: 3\n")).toBe(true);
+		expect(output.slice(source.length).split("\n")[0]).toBe("modelRoles:");
+		expect(YAML.parse(output)).toEqual({
+			theme: { dark: "titanium" },
+			grep: { contextAfter: 3 },
+			modelRoles: { default: "new/model" },
+		});
+		const reopened = await Settings.loadIsolated({ cwd, agentDir });
+		expect(reopened.getModelRole("default")).toBe("new/model");
+		expect(reopened.get("theme.dark")).toBe("titanium");
+		expect(reopened.get("grep.contextAfter")).toBe(3);
+	});
+
+	it("adds root keys and removes entries spelled with explicit key indicators", async () => {
+		const source =
+			"? theme\n: { dark: titanium }\nmodelRoles:\n    ? default\n    : old/model\n    smol: keep/smol\n";
+		await Bun.write(config, source);
+		const settings = await Settings.init({ cwd, agentDir });
+		settings.setModelRole("default", undefined);
+		settings.set("grep.contextAfter", 4);
+		await settings.flush();
+		const output = await Bun.file(config).text();
+		expect(output.startsWith("? theme\n: { dark: titanium }\nmodelRoles:\n    smol: keep/smol\n")).toBe(true);
+		expect(output.slice(source.length - "    ? default\n    : old/model\n".length).split("\n")[0]).toBe("grep:");
+		expect(YAML.parse(output)).toEqual({
+			theme: { dark: "titanium" },
+			modelRoles: { smol: "keep/smol" },
+			grep: { contextAfter: 4 },
+		});
+		const reopened = await Settings.loadIsolated({ cwd, agentDir });
+		expect(reopened.getModelRole("default")).toBeUndefined();
+		expect(reopened.getModelRole("smol")).toBe("keep/smol");
+		expect(reopened.get("grep.contextAfter")).toBe(4);
+		expect(reopened.get("theme.dark")).toBe("titanium");
+	});
+
 	it("preserves an existing config.yaml filename and its source", async () => {
 		const target = path.join(agentDir, "config.yaml");
 		const source = "# alternate filename\ntheme: { dark: \"titanium\", light: 'paper' }\n";

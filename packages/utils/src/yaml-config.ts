@@ -21,29 +21,32 @@ function isMapping(value: unknown): value is Record<string, unknown> {
 
 /** Reconcile the locked source by node ranges, retaining untouched source bytes. */
 export function reconcileYamlConfig(source: string, value: unknown): string {
-	// Match Bun.YAML.parse, which expands `<<` merge keys into the desired value.
-	const document = parseDocument(source, { keepSourceTokens: true, merge: true });
+	// Match Bun.YAML.parse, which expands `<<` merge keys into the desired value
+	// and accepts duplicate keys, the last occurrence winning.
+	const document = parseDocument(source, { keepSourceTokens: true, merge: true, uniqueKeys: false });
 	if (document.errors.length > 0) throw document.errors[0];
 	const edits: SourceEdit[] = [];
 	const newline = source.includes("\r\n") ? "\r\n" : "\n";
 	const lineStart = (offset: number) => source.lastIndexOf("\n", offset - 1) + 1;
-	const column = (offset: number) => offset - lineStart(offset);
+	// The parser's block mapping indent counts neither a byte order mark nor a
+	// `?` explicit key indicator, both of which shift the first key's column.
+	const blockIndent = (node: YAMLMap): number => {
+		if (node.srcToken?.type !== "block-map") throw new Error("YAML block mapping has no source token");
+		return node.srcToken.indent;
+	};
 	const commaBetween = (start: number, end: number): number => {
 		const tail = source.slice(start, end).replace(/#[^\r\n]*/g, comment => " ".repeat(comment.length));
 		const comma = tail.indexOf(",");
 		return comma < 0 ? -1 : start + comma;
 	};
-	// Infer indentation from collection keys, not multiline scalar content.
+	// Infer indentation from collection nesting, not multiline scalar content.
 	let indent = 2;
 	const findIndent = (node: Node | null): void => {
 		if (isMap(node) && !node.flow) {
 			for (const pair of node.items) {
-				if (isNode(pair.key) && pair.key.range && isMap(pair.value) && !pair.value.flow) {
-					const first = pair.value.items[0]?.key;
-					if (isNode(first) && first.range) {
-						const delta = column(first.range[0]) - column(pair.key.range[0]);
-						if (delta > 0) indent = delta;
-					}
+				if (isMap(pair.value) && !pair.value.flow) {
+					const delta = blockIndent(pair.value) - blockIndent(node);
+					if (delta > 0) indent = delta;
 				}
 				if (isNode(pair.value)) findIndent(pair.value);
 			}
@@ -151,6 +154,10 @@ export function reconcileYamlConfig(source: string, value: unknown): string {
 		const materialize = [...inherited.keys()].some(key => !present(key));
 		const kept = (pair: Pair): boolean =>
 			isMergePair(pair) ? !materialize : isScalar(pair.key) && present(String(pair.key.value));
+		// Only the last occurrence of a duplicated key is effective; earlier ones stay
+		// untouched while the key is kept and all are removed with it.
+		const winner = new Map<string, Pair>();
+		for (const pair of node.items) if (isScalar(pair.key)) winner.set(String(pair.key.value), pair);
 		for (let index = 0; index < node.items.length; index++) {
 			const pair: Pair = node.items[index];
 			if (!isScalar(pair.key) || !pair.key.range) throw new Error("Settings YAML keys must be scalars");
@@ -161,7 +168,8 @@ export function reconcileYamlConfig(source: string, value: unknown): string {
 				const key = String(pair.key.value);
 				keys.add(key);
 				if (present(key)) {
-					if (child) reconcile(child, next[key], node.flow ? undefined : column(pair.key.range[0]));
+					if (winner.get(key) !== pair) continue;
+					if (child) reconcile(child, next[key], node.flow ? undefined : blockIndent(node));
 					else
 						edits.push({
 							start: pair.key.range[1] + 1,
@@ -188,6 +196,9 @@ export function reconcileYamlConfig(source: string, value: unknown): string {
 					if (comma >= 0) finish = comma + 1;
 				}
 			} else {
+				// An explicit `?` key indicator belongs to the removed entry.
+				const indicator = pair.srcToken?.start.find(token => token.type === "explicit-key-ind");
+				if (indicator) start = indicator.offset;
 				const beginning = lineStart(start);
 				if (/^ *$/.test(source.slice(beginning, start))) start = beginning;
 			}
@@ -222,8 +233,7 @@ export function reconcileYamlConfig(source: string, value: unknown): string {
 			const last = node.items.at(-1);
 			const lastNode = isNode(last?.value) ? last.value : isNode(last?.key) ? last.key : null;
 			const offset = lastNode?.range?.[2] ?? node.range[1];
-			const first = node.items[0]?.key;
-			const padding = " ".repeat(isNode(first) && first.range ? column(first.range[0]) : 0);
+			const padding = " ".repeat(blockIndent(node));
 			const text = added
 				.map(([key, item]) =>
 					render({ [key]: item })
