@@ -119,6 +119,7 @@ describe("AgentSession.getAllToolInfos", () => {
 			builtInToolNames: [],
 			rebuildSystemPrompt: async toolNames => ({ systemPrompt: [toolNames.join(",")] }),
 			extensionRunner: {
+				hasHandlers: () => false,
 				getRegisteredTool: (name: string) =>
 					name === "git"
 						? {
