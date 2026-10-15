@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { YAML } from "bun";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
-import { getProjectAgentDir, isRecord, TempDir } from "@oh-my-pi/pi-utils";
+import { getAgentDbPath, getLastChangelogVersionPath, getProjectAgentDir, isRecord, TempDir } from "@oh-my-pi/pi-utils";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
 
 let state: SettingsTestState;
@@ -48,6 +49,14 @@ function readProjectConfig(file: string): { autoResume: unknown; modelRoles: Rec
 	return { autoResume: parsed.autoResume, modelRoles };
 }
 
+/** Agent-dir entries other than runtime storage (agent.db and its WAL/SHM sidecars). */
+function configEntries(): string[] {
+	return fs
+		.readdirSync(agentDir)
+		.filter(entry => !/^agent\.db(-wal|-shm)?$/.test(entry))
+		.sort();
+}
+
 for (const switchName of ["config.readOnly", "PI_CONFIG_READONLY"] as const) {
 	describe(switchName, () => {
 		function source(): string {
@@ -69,7 +78,47 @@ for (const switchName of ["config.readOnly", "PI_CONFIG_READONLY"] as const) {
 			await settings.flush();
 			expect(fs.readFileSync(config, "utf8")).toBe(bytes);
 			expect(fs.readFileSync(legacy, "utf8")).toBe('{"queueMode":"one-at-a-time"}\n');
-			expect(fs.readdirSync(agentDir).sort()).toEqual(["config.yml", "settings.json"]);
+			expect(configEntries()).toEqual(["config.yml", "settings.json"]);
+		});
+
+		it("keeps runtime storage recording and reopening without touching global config, legacy rows, or markers", async () => {
+			const bytes = source();
+			fs.writeFileSync(config, bytes);
+			const legacy = path.join(agentDir, "settings.json");
+			const legacyBytes = '{"queueMode":"one-at-a-time"}\n';
+			fs.writeFileSync(legacy, legacyBytes);
+			// Seed a legacy agent.db settings row; writable startup would migrate and clear it.
+			const dbPath = getAgentDbPath(agentDir);
+			await AgentStorage.open(dbPath);
+			AgentStorage.close();
+			const db = new Database(dbPath);
+			db.run("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, 0)", ["autoResume", "false"]);
+			db.close();
+
+			const settings = await load();
+			expect(settings.isGlobalConfigReadOnly()).toBe(true);
+			const storage = settings.getStorage();
+			if (!storage) throw new Error("runtime storage unavailable under the global read-only policy");
+			storage.recordModelUsage("provider/mru");
+			expect(storage.getModelUsageOrder()).toEqual(["provider/mru"]);
+			storage.recordCommandUsage("model");
+			storage.recordCommandUsage("model");
+			expect(storage.listCommandUsage()).toEqual({ model: 2 });
+			settings.cancelPendingSaves();
+			AgentStorage.close();
+
+			const reopened = await load();
+			const reopenedStorage = reopened.getStorage();
+			if (!reopenedStorage) throw new Error("runtime storage unavailable after reopen");
+			expect(reopenedStorage.getModelUsageOrder()).toEqual(["provider/mru"]);
+			expect(reopenedStorage.listCommandUsage()).toEqual({ model: 2 });
+			expect(reopenedStorage.getSettings()).toEqual({ autoResume: false });
+			await reopened.flush();
+
+			expect(fs.readFileSync(config, "utf8")).toBe(bytes);
+			expect(fs.readFileSync(legacy, "utf8")).toBe(legacyBytes);
+			expect(fs.existsSync(getLastChangelogVersionPath(agentDir))).toBe(false);
+			expect(configEntries()).toEqual(["config.yml", "settings.json"]);
 		});
 
 		it("routes role assignment and clearing to an existing project without losing thinking suffixes", async () => {
@@ -122,7 +171,7 @@ for (const switchName of ["config.readOnly", "PI_CONFIG_READONLY"] as const) {
 			expect(() => settings.setModelRole("smol", "provider/project:high")).toThrow("modelRoles.smol");
 			await settings.flush();
 			expect(fs.existsSync(config)).toBe(false);
-			expect(fs.readdirSync(agentDir)).toEqual([]);
+			expect(configEntries()).toEqual([]);
 		});
 
 		for (const alias of [
@@ -248,7 +297,8 @@ it("does not migrate or archive a legacy-only global source", async () => {
 	fs.writeFileSync(legacy, bytes);
 	await load();
 	expect(fs.readFileSync(legacy, "utf8")).toBe(bytes);
-	expect(fs.readdirSync(agentDir)).toEqual(["settings.json"]);
+	expect(configEntries()).toEqual(["settings.json"]);
+	expect(fs.existsSync(getLastChangelogVersionPath(agentDir))).toBe(false);
 });
 
 it("retains writable project-directory creation", async () => {
