@@ -7470,6 +7470,31 @@ describe("openai-codex recovery attempt gate", () => {
 		setAgentDir(TempDir.createSync("@pi-codex-attempt-gate-").path());
 	});
 
+	it("still sends the initial HTTP request when payload preparation spends the operation budget", async () => {
+		const fetchMock = vi.fn<FetchImpl>(async () =>
+			new Response(createStatefulCodexSse("Initial response", "resp_initial_budget"), { headers: SSE_HEADERS }),
+		);
+		const options = {
+			apiKey: createCodexTestToken(),
+			fetch: fetchMock,
+			...createBudget(),
+			onPayload: async () => {
+				spendBudget(options);
+				return undefined;
+			},
+		};
+
+		await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			options,
+		).result();
+
+		// The operation budget gates retries/recovery, not the first send.
+		// Its eventual result may still be bounded by the existing watchdog.
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+	});
+
 	it("refuses the SSE fallback of a failed initial websocket open once the budget is spent", async () => {
 		const fetchMock = vi.fn<FetchImpl>(
 			async () => new Response(createCompletedCodexSse("late"), { headers: SSE_HEADERS }),
