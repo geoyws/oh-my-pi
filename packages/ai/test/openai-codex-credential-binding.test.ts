@@ -137,7 +137,9 @@ describe("openai-codex foreign encrypted reasoning transport retry", () => {
 		setAgentDir(originalAgentDir);
 	});
 
-	const FOREIGN_CALLER_MESSAGE = "reasoning 'encrypted_content' was not issued to this caller";
+	// Real t-af8e8aa4 incident text (unquoted): Meta returns 400 `reasoning
+	// encrypted_content was not issued to this caller (invalid_request_error)`.
+	const FOREIGN_CALLER_MESSAGE = "reasoning encrypted_content was not issued to this caller";
 
 	function sseModel(): Model<"openai-codex-responses"> {
 		// Unofficial base URL: the official endpoint zstd-compresses SSE
@@ -312,11 +314,13 @@ describe("openai-codex foreign encrypted reasoning transport retry", () => {
 		send(data: string): void {
 			ForeignReasoningWebSocket.sends.push(data);
 			if (ForeignReasoningWebSocket.sends.length === 1) {
+				// Real frame shape (openai-codex-stream.test.ts ~3726):
+				// response.failed carries response.error {code, message} and
+				// no numeric status (response.status would be "failed").
 				this.sendJson({
 					type: "response.failed",
 					response: {
-						status: "400",
-						error: { message: FOREIGN_CALLER_MESSAGE, code: "invalid_request_error" },
+						error: { code: "invalid_request_error", message: FOREIGN_CALLER_MESSAGE },
 					},
 				});
 				return;
@@ -421,8 +425,7 @@ describe("openai-codex foreign encrypted reasoning transport retry", () => {
 				this.sendJson({
 					type: "response.failed",
 					response: {
-						status: "400",
-						error: { message: FOREIGN_CALLER_MESSAGE, code: "invalid_request_error" },
+						error: { code: "invalid_request_error", message: FOREIGN_CALLER_MESSAGE },
 					},
 				});
 			}
@@ -453,8 +456,7 @@ describe("openai-codex foreign encrypted reasoning transport retry", () => {
 				this.sendJson({
 					type: "response.failed",
 					response: {
-						status: "400",
-						error: { message: "Input 'input[0]' is invalid", code: "invalid_request_error" },
+						error: { code: "invalid_request_error", message: "Input 'input[0]' is invalid" },
 					},
 				});
 			}
@@ -502,5 +504,87 @@ describe("openai-codex foreign encrypted reasoning transport retry", () => {
 		expect(containsEncryptedReasoning(bodies[0]!.input as unknown[])).toBe(true);
 		expect(containsEncryptedReasoning(bodies[1]!.input as unknown[])).toBe(false);
 		expect(events.some(event => (event as { type?: unknown }).type === "response.completed")).toBe(true);
+	});
+
+	it("retries a mid-stream SSE foreign-caller failure once with encrypted reasoning stripped", async () => {
+		useTempAgentDir();
+		const seenInputs: unknown[][] = [];
+		let attempts = 0;
+		const failedSse = `${[`data: ${JSON.stringify({ type: "response.failed", response: { error: { code: "invalid_request_error", message: FOREIGN_CALLER_MESSAGE } } })}`].join("\n\n")}\n\n`;
+		const fetchMock: FetchImpl = Object.assign(
+			async (): Promise<Response> => {
+				attempts += 1;
+				return attempts === 1
+					? new Response(failedSse, { status: 200, headers: { "content-type": "text/event-stream" } })
+					: completedSseResponse("Recovered");
+			},
+			{ preconnect: fetch.preconnect },
+		);
+
+		const result = await streamOpenAICodexResponses(sseModel(), legacyContext(), {
+			apiKey: createCodexTestToken(),
+			fetch: fetchMock,
+			onPayload: payload => {
+				seenInputs.push([...(((payload as { input?: unknown[] }).input ?? []) as unknown[])]);
+				return undefined;
+			},
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(attempts).toBe(2);
+		expect(seenInputs).toHaveLength(2);
+		expect(containsEncryptedReasoning(seenInputs[0])).toBe(true);
+		expect(containsEncryptedReasoning(seenInputs[1])).toBe(false);
+		expect(containsFunctionCall(seenInputs[1], "call_codex")).toBe(true);
+	});
+
+	it("retries a websocket compaction failure once over SSE without yielding the failure", async () => {
+		useTempAgentDir();
+		const sends: string[] = [];
+		class CompactionFailureWebSocket extends ForeignReasoningWebSocket {
+			constructor(url: string, options?: { headers?: Record<string, string> }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+
+			override send(data: string): void {
+				sends.push(data);
+				this.sendJson({
+					type: "response.failed",
+					response: {
+						error: { code: "invalid_request_error", message: FOREIGN_CALLER_MESSAGE },
+					},
+				});
+			}
+		}
+		global.WebSocket = CompactionFailureWebSocket as unknown as typeof WebSocket;
+		let fetches = 0;
+		const fetchMock: FetchImpl = Object.assign(
+			async (): Promise<Response> => {
+				fetches += 1;
+				return completedSseResponse("Compacted");
+			},
+			{ preconnect: fetch.preconnect },
+		);
+
+		const body = await buildTransformedCodexRequestBody(createCodexModel("gpt-5.5"), legacyContext(), undefined);
+		const events: Array<Record<string, unknown>> = [];
+		for await (const event of await openCodexCompactionEventStream(
+			{ ...createCodexModel("gpt-5.5"), baseUrl: "https://chatgpt.com/backend-api", preferWebsockets: true },
+			{ model: "gpt-5.5", input: body.input },
+			{
+				apiKey: createCodexTestToken(),
+				fetch: fetchMock,
+				sessionId: "ws-compaction-retry-session",
+				providerSessionState: new Map<string, ProviderSessionState>(),
+			},
+		)) {
+			events.push(event as Record<string, unknown>);
+		}
+
+		expect(sends).toHaveLength(1);
+		expect(fetches).toBe(1);
+		expect(events.some(event => event.type === "response.failed" || event.type === "error")).toBe(false);
+		expect(events.some(event => event.type === "response.completed")).toBe(true);
 	});
 });

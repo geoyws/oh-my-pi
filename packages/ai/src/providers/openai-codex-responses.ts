@@ -145,7 +145,8 @@ import {
 	finalizeToolCallArgumentsDone,
 	getOpenAIPromptCacheKey,
 	hasExecutableIncompleteResponsesToolCalls,
-	isForeignEncryptedReasoningError,
+	isForeignEncryptedReasoningFailureEvent,
+	isForeignEncryptedReasoningStreamFailure,
 	isOpenAIResponsesProgressEvent,
 	mapOpenAIResponsesStopReason,
 	normalizeOpenAIPromptCacheKey,
@@ -1834,7 +1835,7 @@ export async function openCodexCompactionEventStream(
 			if (
 				options?.signal?.aborted ||
 				requestSetup.requestSignal.aborted ||
-				!isForeignEncryptedReasoningError(error) ||
+				!isForeignEncryptedReasoningStreamFailure(error) ||
 				!stripEncryptedReasoningFromCodexBody(requestContext.transformedBody)
 			) {
 				throw error;
@@ -1895,6 +1896,28 @@ async function* streamCodexCompactionEvents(
 				completed = true;
 				return;
 			}
+			// A WebSocket rejection arrives as a buffered failure event, not a
+			// throw. Intercept a foreign-`encrypted_content` rejection before
+			// any of it is yielded: strip the staged body once and replay
+			// over SSE. A second failure is yielded to the caller untouched.
+			const foreignFailure = bufferedEvents.findLast(isForeignEncryptedReasoningFailureEvent);
+			const chainedCompactionBaseline =
+				websocketState?.canAppend === true && websocketState.lastResponseId !== undefined;
+			if (
+				foreignFailure !== undefined &&
+				(stripEncryptedReasoningFromCodexBody(requestContext.transformedBody) || chainedCompactionBaseline)
+			) {
+				logger.debug(
+					"[codex] codex compaction foreign encrypted reasoning rejected; retrying with encrypted reasoning stripped",
+					{ provider: model.provider, model: model.id, transport: "websocket" },
+				);
+				if (websocketState) resetCodexWebSocketAppendState(websocketState);
+				const replay = await openCodexSseTransport(model, requestContext, requestSetup, options, websocketState);
+				if (websocketState) websocketState.lastTransport = replay.transport;
+				yield* drainCodexCompactionEvents(replay.eventStream, requestContext);
+				completed = true;
+				return;
+			}
 			const failure = bufferedEvents.findLast(event => event.type === "error" || event.type === "response.failed");
 			if (
 				failure !== undefined &&
@@ -1918,7 +1941,47 @@ async function* streamCodexCompactionEvents(
 				yield event;
 			}
 		} else {
-			yield* drainCodexCompactionEvents(initial.eventStream, requestContext);
+			// An SSE rejection arrives as a failure event mid-stream, not a
+			// throw. Intercept a foreign-`encrypted_content` rejection before
+			// it is yielded, strip the staged body once, and drain the
+			// reopened stream instead. A second failure (or a body with
+			// nothing to strip and no chain baseline) is yielded untouched.
+			let events = initial.eventStream;
+			let strippedRetryAvailable = true;
+			while (true) {
+				let switched = false;
+				for await (const event of events) {
+					const chainedBaseline =
+						websocketState?.canAppend === true && websocketState.lastResponseId !== undefined;
+					if (
+						strippedRetryAvailable &&
+						isForeignEncryptedReasoningFailureEvent(event) &&
+						(stripEncryptedReasoningFromCodexBody(requestContext.transformedBody) || chainedBaseline)
+					) {
+						strippedRetryAvailable = false;
+						logger.debug(
+							"[codex] codex compaction foreign encrypted reasoning rejected; retrying with encrypted reasoning stripped",
+							{ provider: model.provider, model: model.id, transport: "sse" },
+						);
+						if (websocketState) resetCodexWebSocketAppendState(websocketState);
+						await events.return(undefined);
+						const replay = await openCodexSseTransport(
+							model,
+							requestContext,
+							requestSetup,
+							options,
+							websocketState,
+						);
+						if (websocketState) websocketState.lastTransport = replay.transport;
+						events = replay.eventStream;
+						switched = true;
+						break;
+					}
+					applyCodexCompactionResponseMetadata(requestContext, event);
+					yield event;
+				}
+				if (!switched) break;
+			}
 		}
 		completed = true;
 	} finally {
@@ -3123,7 +3186,7 @@ class CodexStreamProcessor {
 			this.requestContext.strippedForeignEncryptedReasoning === true ||
 			this.output.content.length > 0 ||
 			this.options?.signal?.aborted ||
-			!isForeignEncryptedReasoningError(error) ||
+			!isForeignEncryptedReasoningStreamFailure(error) ||
 			!codexRequestMayCarryForeignEncryptedReasoning(this.requestContext) ||
 			!(await rebuildStrippedCodexRequestBody(this.model, this.requestContext, this.options))
 		) {
@@ -3470,7 +3533,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 				if (
 					options?.signal?.aborted ||
 					requestSetup.requestSignal.aborted ||
-					!isForeignEncryptedReasoningError(error) ||
+					!isForeignEncryptedReasoningStreamFailure(error) ||
 					!codexRequestMayCarryForeignEncryptedReasoning(requestContext) ||
 					!(await rebuildStrippedCodexRequestBody(model, requestContext, options))
 				) {

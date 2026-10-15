@@ -450,6 +450,16 @@ interface OpenAIResponsesChainState {
 	staleFailures: number;
 	/** Set once chaining is judged unsupported for this session (circuit breaker). */
 	disabled: boolean;
+	/**
+	 * The stored history holds `encrypted_content` blobs foreign to the
+	 * serving credential below, learned from a foreign-caller 400: keep
+	 * stripping on every rebuild while it serves the session, or every
+	 * turn pays a 400 and chaining can never re-engage (rebuilt inputs
+	 * would keep diverging from the stripped baseline).
+	 */
+	stripForeignEncryptedReasoning?: boolean;
+	/** Credential row the history blobs are foreign to, when known. */
+	strippedForeignReasoningCredentialId?: number;
 }
 
 function createOpenAIResponsesProviderSessionState(
@@ -778,6 +788,13 @@ const streamOpenAIResponsesOnce = (
 					resetOpenAIResponsesChainState(chainState);
 				}
 			}
+			// A prior stripped retry in this session proved the stored history
+			// holds blobs foreign to the serving credential: keep stripping on
+			// every rebuild while it serves, so later turns neither re-400 nor
+			// diverge from the stripped chain baseline.
+			const stripForeignEncryptedForSession =
+				chainState?.stripForeignEncryptedReasoning === true &&
+				chainState.strippedForeignReasoningCredentialId === options?.credentialId;
 			const builtParams = buildParams(
 				model,
 				context,
@@ -786,6 +803,7 @@ const streamOpenAIResponsesOnce = (
 				strictToolsScope,
 				false,
 				chainState?.canAppend ? chainState.lastParams?.input : undefined,
+				stripForeignEncryptedForSession,
 			);
 			const { params, trailingScaffoldingItems } = builtParams;
 			let activeParams = params;
@@ -900,6 +918,7 @@ const streamOpenAIResponsesOnce = (
 			let activeStrictToolsApplied = builtParams.strictToolsApplied;
 			let forceDisableStrictTools = false;
 			let foreignEncryptedReasoningRetryAvailable = true;
+			let strippedForeignEncryptedRetryAttempted = false;
 			const openResponsesStreamWithFallbacks = async (): Promise<AsyncIterable<ResponseStreamEvent>> => {
 				let openaiStream: AsyncIterable<ResponseStreamEvent>;
 				while (true) {
@@ -971,6 +990,7 @@ const streamOpenAIResponsesOnce = (
 								strictToolsScope,
 								true,
 								chainState?.canAppend ? chainState.lastParams?.input : undefined,
+								stripForeignEncryptedForSession,
 							);
 							const fallbackParams = fallbackBuilt.params;
 							if (chainState && !chainState.disabled) fallbackParams.store = true;
@@ -1005,6 +1025,7 @@ const streamOpenAIResponsesOnce = (
 							isForeignEncryptedReasoningError(error)
 						) {
 							foreignEncryptedReasoningRetryAvailable = false;
+							strippedForeignEncryptedRetryAttempted = true;
 							logger.debug(
 								"OpenAI responses foreign encrypted reasoning rejected; retrying with encrypted reasoning stripped",
 								{ provider: model.provider, model: model.id },
@@ -1021,6 +1042,11 @@ const streamOpenAIResponsesOnce = (
 							);
 							const strippedParams = strippedBuilt.params;
 							if (chainState && !chainState.disabled) strippedParams.store = true;
+							// Deliberately no `previous_response_id`: the
+							// server-held prefix may itself hold the foreign
+							// blob, so only a full stripped transcript is a
+							// safe retry. `store: true` keeps the retry
+							// chainable, so the next turn chains again.
 							const strippedChained = {
 								params: await applyPayloadReplacement(strippedParams),
 							};
@@ -1064,6 +1090,8 @@ const streamOpenAIResponsesOnce = (
 							providerSessionState,
 							strictToolsScope,
 							forceDisableStrictTools,
+							undefined,
+							stripForeignEncryptedForSession,
 						);
 						const currentParams = currentBuilt.params;
 						// Only ZDR forces `store: false` (the org never persists responses). A
@@ -1340,6 +1368,14 @@ const streamOpenAIResponsesOnce = (
 							: activeParams,
 					);
 					chainState.lastPromptCacheBreakpointPolicy = promptCacheBreakpointPolicy;
+					// A stripped retry just proved the stored history holds
+					// blobs foreign to the serving credential: remember to
+					// keep stripping while it serves, or every later turn
+					// re-400s and chaining can never re-engage.
+					if (strippedForeignEncryptedRetryAttempted) {
+						chainState.stripForeignEncryptedReasoning = true;
+						chainState.strippedForeignReasoningCredentialId = options?.credentialId;
+					}
 					if (output.responseId && replayableResponseItems.length === nativeOutputItems.length) {
 						chainState.lastResponseId = output.responseId;
 						chainState.lastResponseItems = replayableResponseItems;

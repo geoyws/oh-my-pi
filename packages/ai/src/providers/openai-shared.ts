@@ -2122,6 +2122,63 @@ export function isForeignEncryptedReasoningError(error: unknown): boolean {
 	return texts.some(text => text.includes("encrypted_content") && /not issued to this caller/i.test(text));
 }
 
+/**
+ * Whether `error` is the caller-bound-`encrypted_content` rejection delivered
+ * as an in-stream failure rather than an HTTP status. Codex WebSocket (and
+ * mid-stream SSE) failures arrive as `response.failed`/`error` frames whose
+ * `response.status` is the lifecycle enum (`"failed"`), never a numeric
+ * status — so the rejection is identified by the structured
+ * `response.error` the server actually sends for this case (`code:
+ * "invalid_request_error"`, message `reasoning encrypted_content was not
+ * issued to this caller`, t-af8e8aa4): the message text must match in full,
+ * and a present code must be the incident's code. The HTTP transports keep
+ * using {@link isForeignEncryptedReasoningError} with its status-400 gate.
+ */
+export function isForeignEncryptedReasoningStreamFailure(error: unknown): boolean {
+	if (typeof error !== "object" || error === null) return false;
+	if (!("message" in error) || typeof error.message !== "string") return false;
+	const message = error.message;
+	if (!(message.includes("encrypted_content") && /not issued to this caller/i.test(message))) return false;
+	if (!("code" in error) || error.code === undefined) return true;
+	return error.code === "invalid_request_error";
+}
+
+/**
+ * Whether a raw `response.failed`/`error` frame is the
+ * caller-bound-`encrypted_content` rejection, read off the structured
+ * `response.error` (or `error`) detail. Content deltas and unrelated failures
+ * never match: only failure frames are inspected, the message text must match
+ * in full, and a present code must be the incident's code.
+ */
+export function isForeignEncryptedReasoningFailureEvent(event: unknown): boolean {
+	if (typeof event !== "object" || event === null) return false;
+	if (!("type" in event) || (event.type !== "response.failed" && event.type !== "error")) return false;
+	let message: string | undefined;
+	let code: string | undefined;
+	const readDetail = (node: unknown): void => {
+		if (typeof node !== "object" || node === null) return;
+		if ("message" in node && typeof node.message === "string" && message === undefined) {
+			message = node.message;
+		}
+		if ("code" in node && typeof node.code === "string" && code === undefined) {
+			code = node.code;
+		}
+	};
+	if ("response" in event && typeof event.response === "object" && event.response !== null) {
+		const response = event.response;
+		if ("error" in response) readDetail(response.error);
+		readDetail(response);
+	}
+	if ("error" in event) readDetail(event.error);
+	readDetail(event);
+	return (
+		message !== undefined &&
+		message.includes("encrypted_content") &&
+		/not issued to this caller/i.test(message) &&
+		(code === undefined || code === "invalid_request_error")
+	);
+}
+
 export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInputOptions<TApi>): ResponseInput {
 	const messages: ResponseInput = [];
 	const systemPrompts = options.systemRole ? normalizeSystemPrompts(options.context.systemPrompt) : [];
@@ -2207,7 +2264,16 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 				}) ??
 					false);
 			if (historyItems && shouldReplayPayloadItems) {
-				const sanitizedItems = sanitizeOpenAIResponsesHistoryItemsForReplay(filterReasoning(historyItems), {
+				// The strip-everything recovery covers user/developer history
+				// too: same reasoning-only drop, every other native item
+				// (messages, compaction summaries, tool calls) still replays.
+				const replaySourceItems =
+					options.stripEncryptedReasoning === true
+						? historyItems.filter(
+								item => item?.type !== "reasoning" || typeof item?.encrypted_content !== "string",
+							)
+						: historyItems;
+				const sanitizedItems = sanitizeOpenAIResponsesHistoryItemsForReplay(filterReasoning(replaySourceItems), {
 					supportsImageDetailOriginal,
 					supportsComputerUse: options.model.supportsComputerUse === true,
 				});
