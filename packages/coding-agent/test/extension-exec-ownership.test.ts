@@ -222,6 +222,50 @@ describe("extension exec ownership", () => {
 		}
 	}, 120_000);
 
+	it("a session_shutdown handler outliving its cap cannot spawn past the dispose kill", async () => {
+		if (process.platform === "win32") return;
+		const tag = `${process.pid}_${Math.random().toString(36).slice(2, 8)}`;
+		const markerLate = `EXTEXEC_LATE_${tag}`;
+		const gate = Promise.withResolvers<void>();
+		let pendingLate: Promise<ExecResult> | undefined;
+
+		const runner = await makeRunner("ext-exec-late", pi => {
+			pi.on("session_shutdown", async () => {
+				// The git-status-then-exec shape: an awaited step that outlasts
+				// the 2s handler cap, then a second exec after dispose's kill.
+				await gate.promise;
+				const [command, args] = trapLoop(markerLate);
+				pendingLate = pi.exec(command, args);
+				pendingLate.catch(() => {});
+			});
+		});
+		const sid = runner.sessionId;
+
+		try {
+			// Same ordering as a handler past its cap, without waiting the cap
+			// out: the handler is still parked when dispose's one kill snapshot
+			// for this owner runs, and only resumes afterwards.
+			const emitted = emitSessionShutdownEvent(runner);
+			await shutdownExecCommands(sid);
+			gate.resolve();
+			await emitted;
+			expect(pendingLate).toBeDefined();
+			// One macrotask turn, not a clock wait: a refused call has settled
+			// by now, while fail-before's spawned TERM-ignoring loop has not, so
+			// it fails here instead of hanging on the await below.
+			const turn = Promise.withResolvers<void>();
+			setImmediate(turn.resolve);
+			await turn.promise;
+			expect(Bun.peek.status(pendingLate!)).toBe("fulfilled");
+			expect((await pendingLate!).killed).toBe(true);
+			expect(live(markerLate)).toEqual([]);
+		} finally {
+			gate.resolve();
+			await shutdownExecCommands();
+			killSweep(markerLate);
+		}
+	}, 120_000);
+
 	it("shortcut handlers own pi.exec via the real input-controller path", async () => {
 		if (process.platform === "win32") return;
 		const tag = `${process.pid}_${Math.random().toString(36).slice(2, 8)}`;

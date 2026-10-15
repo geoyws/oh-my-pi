@@ -32,8 +32,20 @@ export interface ExecOptions {
  */
 const execOwnerStorage = new AsyncLocalStorage<string>();
 
+/**
+ * Owners whose session has run its dispose-time `shutdownExecCommands(owner)`.
+ * A `session_shutdown` handler that outlives its 2s cap keeps running inside
+ * the owner scope; a `pi.exec` it starts after that single kill snapshot would
+ * otherwise run unkilled until process exit. Such calls are refused instead.
+ * A fresh `runWithExecOwner` entry reopens the owner, so a session id that is
+ * resumed in-process after dispose spawns normally again.
+ */
+const closedExecOwners = new Set<string>();
+
 export function runWithExecOwner<T>(owner: string | undefined, fn: () => T): T {
-	return owner === undefined ? fn() : execOwnerStorage.run(owner, fn);
+	if (owner === undefined) return fn();
+	closedExecOwners.delete(owner);
+	return execOwnerStorage.run(owner, fn);
 }
 
 /**
@@ -107,6 +119,7 @@ function execShutdownDeadline(ms: number): Promise<void> {
  * to PID 1. Abandoned callers observe the kill as `killed: true`.
  */
 export async function shutdownExecCommands(owner?: string, timeoutMs = EXEC_SHUTDOWN_WAIT_MS): Promise<void> {
+	if (owner !== undefined) closedExecOwners.add(owner);
 	const live =
 		owner === undefined ? [...liveExecCommands] : [...liveExecCommands].filter(entry => entry.owner === owner);
 	if (live.length === 0) return;
@@ -129,6 +142,12 @@ export async function execCommand(
 	options?: ExecOptions,
 ): Promise<ExecResult> {
 	ensureExecCleanupRegistered();
+	// Explicit `sessionKey` wins; otherwise the ambient `runWithExecOwner`
+	// scope names the invoking session. Unowned entries die only in the
+	// postmortem all-kill — never by another session's dispose.
+	const owner = options?.sessionKey ?? execOwnerStorage.getStore();
+	// The owner already ran its dispose kill: spawning now would escape it.
+	if (owner !== undefined && closedExecOwners.has(owner)) return { stdout: "", stderr: "", code: -1, killed: true };
 	// Spawned (not `ptree.exec`) so the child handle can join the live-group
 	// registry below; the wait options match `ptree.exec` exactly.
 	const child = ptree.spawn([command, ...args], {
@@ -146,10 +165,7 @@ export async function execCommand(
 	const settled = new Promise<void>(resolve => {
 		markSettled = resolve;
 	});
-	// Explicit `sessionKey` wins; otherwise the ambient `runWithExecOwner`
-	// scope names the invoking session. Unowned entries die only in the
-	// postmortem all-kill — never by another session's dispose.
-	const entry: LiveExecCommand = { child, settled, owner: options?.sessionKey ?? execOwnerStorage.getStore() };
+	const entry: LiveExecCommand = { child, settled, owner };
 	liveExecCommands.add(entry);
 	// Pre-handle the exit rejection: a kill can settle `#exited` while
 	// `wait()` below is still blocked on pipe EOF (a live grandchild holding
