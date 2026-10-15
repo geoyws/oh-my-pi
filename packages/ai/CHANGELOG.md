@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Bounded the shared Anthropic keepalive pool (128 sockets per host, twice that process-wide, `PI_ANTHROPIC_MAX_SOCKETS` to change it) and made cancelling a request that is waiting for a socket take effect immediately instead of after the wait ([#12868](https://github.com/can1357/oh-my-pi/pull/12868)).
+
 ## [18.9.2] - 2026-10-11
 
 ### Breaking Changes
