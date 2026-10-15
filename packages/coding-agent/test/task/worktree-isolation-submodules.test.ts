@@ -545,6 +545,52 @@ describe("isolation with commondir escapes (review round 2)", () => {
 	});
 });
 
+describe("isolation with a linked worktree inside a submodule (review round 4)", () => {
+	it.skipIf(process.platform !== "darwin")(
+		"hands out a copy whose nested linked worktree is private when a submodule is off-pin",
+		async () => {
+			const { wt, aixDir } = await makeOffPinTwoDepthSource();
+			// A git-created layout: a linked worktree nested inside the
+			// middle submodule. Off-pin, the hand-out gate used to run
+			// before the nested-repo detach pass and refuse this copy.
+			await runGit(aixDir, ["worktree", "add", "-q", ".atmux/worktrees/d2", "-b", "feature/d2", "HEAD"]);
+			const nestedSrc = path.join(aixDir, ".atmux/worktrees/d2");
+			expect(await runGit(nestedSrc, ["rev-parse", "HEAD"])).not.toBe("");
+			const beforeAix = await sourceGitIdentity(aixDir);
+			const beforeNested = await sourceGitIdentity(nestedSrc);
+			mockBackend(natives.IsoBackendKind.Apfs);
+			await withIsolationEnv(async () => {
+				const handle = await ensureIsolation(wt, "nested-worktree-off-pin");
+				try {
+					await assertNoExternalGitfiles(handle.mergedDir);
+					const isoNested = path.join(handle.mergedDir, "packages/aix-root/.atmux/worktrees/d2");
+					expect((await fs.lstat(path.join(isoNested, ".git"))).isDirectory()).toBe(true);
+					const baseline = await captureIsolationBaseline(handle.mergedDir, wt);
+					expect(baseline.nested.map(n => n.relativePath)).toContain("packages/aix-root/.atmux/worktrees/d2");
+					// Task git operations stay inside the copy.
+					await runGit(isoNested, ["checkout", "-q", "-b", "feature/task-d2"]);
+					await fs.writeFile(path.join(isoNested, "tracked.txt"), "isolated d2 edit\n");
+					await runGit(isoNested, [
+						"-c",
+						"user.email=iso@example.com",
+						"-c",
+						"user.name=Isolated User",
+						"commit",
+						"-q",
+						"-am",
+						"isolated d2 commit",
+					]);
+				} finally {
+					await cleanupIsolation(handle);
+				}
+				expect(await sourceGitIdentity(aixDir)).toBe(beforeAix);
+				expect(await sourceGitIdentity(nestedSrc)).toBe(beforeNested);
+				expect(await runGit(nestedSrc, ["branch", "--format=%(refname:short)"])).not.toContain("feature/task-d2");
+			});
+		},
+	);
+});
+
 describe("isolation with a submodule checkout as cwd (t-debc251e)", () => {
 	it.skipIf(process.platform !== "darwin")("cwd is a submodule inside a linked worktree", async () => {
 		const allow = ["-c", "protocol.file.allow=always"];

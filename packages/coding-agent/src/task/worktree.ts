@@ -750,9 +750,12 @@ export async function gitAdminEscapes(copyRoot: string, dotGitPath: string): Pro
  * source checkout's module dir) is re-pointed at the source submodule's own
  * admin — read, never written — and {@link vcs.detachGitDir} snapshots that
  * live state (HEAD, index, refs) into a private admin that borrows the source
- * objects through alternates. A failing submodule is skipped so one exotic
- * shape never blocks the rest; the verification below reports anything still
- * shared.
+ * objects through alternates. Repair failures throw and fail the isolation:
+ * nothing is left half-repaired. Entries that need no repair are left alone —
+ * a missing admin (uninitialized in the copy), an already-private admin, an
+ * exotic entry git cannot use, or a source entry that is not itself a
+ * repository — and the fail-closed hand-out gate after every detach pass
+ * refuses anything still shared.
  */
 async function detachOffPinSubmodules(sourceRoot: string, copyRoot: string): Promise<void> {
 	const [realSourceRoot, realCopyRoot] = await Promise.all([fs.realpath(sourceRoot), fs.realpath(copyRoot)]);
@@ -822,20 +825,23 @@ async function detachOffPinSubmodules(sourceRoot: string, copyRoot: string): Pro
 		await fs.writeFile(gitEntry, `gitdir: ${sourceAdmin.gitDir}\n`);
 		await vcs.detachGitDir(copySub, sourceAdmin.commonDir);
 	}
-	await verifyCopiedSubmodulesDetached(sourceRoot, realCopyRoot, relativePaths);
 }
 
 /**
  * Fail closed when any copied submodule still shares the source checkout's
  * git metadata: handing out that copy would let task git operations mutate
- * the source. Writes through a detached admin's alternates only read source
- * objects, so private admins pass. Every `.git` entry at every depth under
- * each submodule path is judged with {@link gitAdminEscapes} by lstat —
- * independently of `submodulePaths()`, which never names unlisted nested
- * directory admins — so a pointer the repair loop never reached still
- * blocks hand-out. Admin-directory interiors are read only for `commondir`;
- * the walk never descends into a `.git` directory. Dependency trees are not
- * repositories by construction.
+ * the source. This runs once, on the final copy after every repair and
+ * detach pass (submodule repair, then the nested-repo pass that privatizes
+ * linked worktrees living inside submodules), so a nested pointer an
+ * earlier pass had not reached yet never trips the gate. Writes through a
+ * detached admin's alternates only read source objects, so private admins
+ * pass. Every `.git` entry at every depth under each submodule path is
+ * judged with {@link gitAdminEscapes} by lstat — independently of
+ * `submodulePaths()`, which never names unlisted nested directory admins —
+ * so a pointer no repair pass reached still blocks hand-out.
+ * Admin-directory interiors are read only for `commondir`; the walk never
+ * descends into a `.git` directory. Dependency trees are not repositories
+ * by construction.
  */
 async function verifyCopiedSubmodulesDetached(
 	sourceRoot: string,
@@ -945,6 +951,17 @@ export async function ensureIsolation(
 			await natives.isoStart(candidate, repoRoot, mergedDir);
 			await detachCopiedRepo(repoRoot, mergedDir, sourceCommonDir);
 			await detachNestedGitfileRepos(repoRoot, mergedDir);
+			// The one fail-closed hand-out gate, on the final copy: the
+			// nested-repo pass above privatizes linked worktrees living
+			// inside submodules, so judging only now never trips on a
+			// pointer a later pass would still have detached. An
+			// unresolvable copy root throws here and fails the isolation
+			// rather than verifying vacuously.
+			await verifyCopiedSubmodulesDetached(
+				repoRoot,
+				await fs.realpath(mergedDir),
+				await vcs.requireGit(repoRoot).submodulePaths(),
+			);
 			return {
 				mergedDir,
 				backend: candidate,
