@@ -5,6 +5,7 @@ import {
 } from "@oh-my-pi/pi-ai/providers/azure-openai-responses";
 import type { Context, FetchImpl, Model, ModelSpec, Tool } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { createOpenAIResponsesHistoryPayload } from "@oh-my-pi/pi-ai/utils";
 
 const azureModel: Model<"azure-openai-responses"> = buildModel({
 	id: "gpt-5-mini",
@@ -473,5 +474,79 @@ describe("azure openai responses streaming", () => {
 			},
 			{ role: "user", content: [{ type: "input_text", text: "follow-up" }] },
 		]);
+	});
+});
+
+describe("azure openai responses credential binding", () => {
+	function credentialTurn(credentialId: number | undefined) {
+		return {
+			role: "assistant" as const,
+			content: [{ type: "text" as const, text: "working on it" }],
+			api: "azure-openai-responses" as const,
+			provider: "azure" as const,
+			model: "gpt-5-mini",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop" as const,
+			...(credentialId !== undefined ? { credentialId } : {}),
+			providerPayload: createOpenAIResponsesHistoryPayload("azure", [
+				{
+					type: "message",
+					role: "assistant",
+					content: [{ type: "output_text", text: "working on it" }],
+				},
+				{ type: "reasoning", id: "rs_azure", summary: [], encrypted_content: "enc_azure_11" },
+				{ type: "function_call", call_id: "call_azure", name: "read", arguments: "{}" },
+			]),
+			timestamp: Date.now(),
+		};
+	}
+
+	function hasEncryptedReasoning(input: unknown): boolean {
+		return (
+			Array.isArray(input) &&
+			input.some(
+				item =>
+					typeof item === "object" &&
+					item !== null &&
+					"encrypted_content" in item &&
+					typeof item.encrypted_content === "string",
+			)
+		);
+	}
+
+	function hasFunctionCall(input: unknown, callId: string): boolean {
+		return (
+			Array.isArray(input) &&
+			input.some(
+				item =>
+					typeof item === "object" &&
+					item !== null &&
+					"type" in item &&
+					item.type === "function_call" &&
+					"call_id" in item &&
+					item.call_id === callId,
+			)
+		);
+	}
+
+	it("passes the request credentialId through buildParams", async () => {
+		const context: Context = {
+			messages: [credentialTurn(11), { role: "user", content: "continue", timestamp: Date.now() }],
+		};
+
+		const switched = await captureAzurePayload(context, azureModel, { credentialId: 7 });
+		expect(hasEncryptedReasoning(switched.input)).toBe(false);
+		expect(hasFunctionCall(switched.input, "call_azure")).toBe(true);
+
+		const same = await captureAzurePayload(context, azureModel, { credentialId: 11 });
+		expect(hasEncryptedReasoning(same.input)).toBe(true);
+		expect(hasFunctionCall(same.input, "call_azure")).toBe(true);
 	});
 });

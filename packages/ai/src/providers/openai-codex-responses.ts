@@ -1576,7 +1576,7 @@ export async function buildTransformedCodexRequestBody(
 	promptCacheKey = getOpenAIPromptCacheKey(options),
 	inputPrefix?: InputItem[],
 ): Promise<RequestBody> {
-	const input = convertMessages(model, context);
+	const input = convertMessages(model, context, { currentCredentialId: options?.credentialId });
 	const params: RequestBody = {
 		model: model.requestModelId ?? model.id,
 		input: inputPrefix?.length ? [...inputPrefix, ...input] : input,
@@ -4991,7 +4991,11 @@ export function resolveCodexResponsesUrl(baseUrl: string | undefined): string {
 	return `${normalized}/codex/responses`;
 }
 
-function convertMessages(model: Model<"openai-codex-responses">, context: Context): ResponseInput {
+function convertMessages(
+	model: Model<"openai-codex-responses">,
+	context: Context,
+	credential?: { currentCredentialId?: number; stripEncryptedReasoning?: boolean },
+): ResponseInput {
 	const messages: ResponseInput = [];
 
 	const normalizeToolCallId = (id: string): string => {
@@ -5025,8 +5029,21 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
 			const historyItems = getOpenAIResponsesHistoryItems(providerPayload, model.provider) as
 				| Array<ResponseInput[number]>
 				| undefined;
-			if (historyItems) {
-				const redactedHistoryItems = redactSensitiveInObject(historyItems).result as Array<ResponseInput[number]>;
+			// The strip-everything recovery covers user/developer history too:
+			// those turns name no credential row, so only the explicit flag
+			// can drop their caller-bound reasoning blobs.
+			const replaySourceItems =
+				credential?.stripEncryptedReasoning === true && historyItems
+					? historyItems.filter(
+							item =>
+								item.type !== "reasoning" ||
+								!("encrypted_content" in item && typeof item.encrypted_content === "string"),
+						)
+					: historyItems;
+			if (replaySourceItems) {
+				const redactedHistoryItems = redactSensitiveInObject(replaySourceItems).result as Array<
+					ResponseInput[number]
+				>;
 				const sanitizedHistoryItems = dropMalformedOpenAIResponsesToolCalls(redactedHistoryItems);
 				const clampedHistoryItems = clampOpenAIResponsesImageDetailForReplay(
 					sanitizedHistoryItems,
@@ -5066,7 +5083,24 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
 				assistantMsg.api === model.api && assistantMsg.model === model.id
 					? getOpenAIResponsesHistoryPayload(assistantMsg.providerPayload, model.provider, assistantMsg.provider)
 					: undefined;
-			const historyItems = providerPayload?.items as Array<Record<string, unknown>> | undefined;
+			// Encrypted reasoning is caller-bound, exactly like the
+			// openai-responses path: a stored turn whose `credentialId` names a
+			// different row had its `encrypted_content` issued to another
+			// caller, so those reasoning items are dropped while every other
+			// native item still replays. Either side unknown keeps existing
+			// behavior; `stripEncryptedReasoning` drops every encrypted blob
+			// for the single-shot legacy recovery.
+			const credentialMismatch =
+				credential?.currentCredentialId !== undefined &&
+				assistantMsg.credentialId !== undefined &&
+				assistantMsg.credentialId !== credential.currentCredentialId;
+			const stripEncryptedReasoning = credential?.stripEncryptedReasoning === true;
+			const historyItems =
+				(credentialMismatch || stripEncryptedReasoning) && providerPayload?.items
+					? (providerPayload.items as Array<Record<string, unknown>>).filter(
+							item => item?.type !== "reasoning" || typeof item?.encrypted_content !== "string",
+						)
+					: (providerPayload?.items as Array<Record<string, unknown>> | undefined);
 			let suppressHiddenEmptyFallback = false;
 			if (historyItems) {
 				const sanitizedHistoryItems = sanitizeOpenAIResponsesAssistantHistoryItemsForReplay(historyItems, {
@@ -5104,7 +5138,7 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
 				model,
 				msgIndex,
 				knownCallIds,
-				!suppressHiddenEmptyFallback,
+				!suppressHiddenEmptyFallback && !credentialMismatch && !stripEncryptedReasoning,
 				customCallIds,
 				false,
 				true,

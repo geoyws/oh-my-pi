@@ -1957,6 +1957,16 @@ export interface BuildResponsesInputOptions<TApi extends Api> {
 	 * message/function_call/output items still replay.
 	 */
 	currentCredentialId?: number;
+	/**
+	 * Drop every replayed `reasoning` item carrying `encrypted_content`,
+	 * regardless of recorded credential, and retire the thinking-signature
+	 * fallback (it embeds `encrypted_content` too). Single-shot recovery for
+	 * legacy turns stored before `credentialId` was recorded: the server
+	 * rejected the encrypted blob as foreign
+	 * ({@link isForeignEncryptedReasoningError}), so the retry replays the
+	 * surviving message/function_call/output items only.
+	 */
+	stripEncryptedReasoning?: boolean;
 	includeThinkingSignatures?: boolean;
 	developerStringContent?: boolean;
 	repairOrphanOutputs?: boolean;
@@ -2083,6 +2093,33 @@ function isColdReplayableResponsesTurn(items: ResponseInput): boolean {
 		hasReasoning = true;
 	}
 	return hasReasoning;
+}
+/**
+ * Whether `error` is the HTTP 400 Meta returns when replayed reasoning
+ * `encrypted_content` was issued to another caller (`reasoning
+ * 'encrypted_content' was not issued to this caller`). The per-credential
+ * drop ({@link BuildResponsesInputOptions.currentCredentialId}) prevents this
+ * for turns that recorded their credential; turns stored before that field
+ * existed still hit it, and the owning stream function retries those exactly
+ * once with {@link BuildResponsesInputOptions.stripEncryptedReasoning}.
+ * Both halves must match: 400 alone (or the caller wording without an
+ * `encrypted_content` blob) is some other rejection and must not retry.
+ */
+export function isForeignEncryptedReasoningError(error: unknown): boolean {
+	if (typeof error !== "object" || error === null) return false;
+	if (!("status" in error) || error.status !== 400) return false;
+	const texts: string[] = [];
+	if (error instanceof Error && typeof error.message === "string") texts.push(error.message);
+	if ("captured" in error && typeof error.captured === "object" && error.captured !== null) {
+		const captured = error.captured;
+		if ("bodyText" in captured && typeof captured.bodyText === "string") texts.push(captured.bodyText);
+		if ("bodyJson" in captured && captured.bodyJson !== undefined) {
+			try {
+				texts.push(JSON.stringify(captured.bodyJson));
+			} catch {}
+		}
+	}
+	return texts.some(text => text.includes("encrypted_content") && /not issued to this caller/i.test(text));
 }
 
 export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInputOptions<TApi>): ResponseInput {
@@ -2229,8 +2266,12 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 				options.currentCredentialId !== undefined &&
 				assistantMsg.credentialId !== undefined &&
 				assistantMsg.credentialId !== options.currentCredentialId;
+			// Single-shot recovery after a foreign-`encrypted_content` 400:
+			// legacy turns predate `credentialId`, so strip every replayed
+			// reasoning blob instead of comparing callers.
+			const stripEncryptedReasoning = options.stripEncryptedReasoning === true;
 			const historyItems =
-				credentialMismatch && providerPayload?.items
+				(credentialMismatch || stripEncryptedReasoning) && providerPayload?.items
 					? providerPayload.items.filter(
 							item => item?.type !== "reasoning" || typeof item?.encrypted_content !== "string",
 						)
@@ -2288,12 +2329,15 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 
 			// A credential switch also retires the thinking-signature fallback:
 			// its embedded `encrypted_content` was issued to the old caller too.
+			// The strip-everything recovery retires it for the same reason.
 			const convertedOutputItems = convertResponsesAssistantMessage(
 				assistantMsg,
 				options.model,
 				msgIndex,
 				knownCallIds,
-				suppressHiddenEmptyFallback || credentialMismatch ? false : includeThinkingSignatures,
+				suppressHiddenEmptyFallback || credentialMismatch || stripEncryptedReasoning
+					? false
+					: includeThinkingSignatures,
 				customCallIds,
 				options.preserveAssistantMessageIds,
 				supportsCustomToolCalls,
