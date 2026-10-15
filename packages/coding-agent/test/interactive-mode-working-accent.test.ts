@@ -248,4 +248,35 @@ describe("InteractiveMode working activity", () => {
 			Reflect.deleteProperty(mode.session, "runStartedAt");
 		}
 	});
+
+	it("shows Working again after a focus switch drops a provider retry countdown", async () => {
+		const { mode } = await createHarness("Provider wait focus session");
+		// The harness session has no slash-command surface; skip `init()` so
+		// the real event controller dispatches straight to its handler.
+		mode.isInitialized = true;
+		try {
+			mode.ensureLoadingAnimation();
+			await mode.eventController.handleEvent({
+				type: "provider_retry_wait_start",
+				waitId: 1,
+				role: "main",
+				delayMs: 30_000,
+				model: "probe-model",
+				provider: "probe",
+				api: "anthropic-messages",
+			});
+			expect(stripVTControlCharacters(renderLoader(mode))).toContain("Provider retrying");
+
+			// Focus/session switch: the old session's `_end` never arrives here.
+			mode.clearTransientSessionUi();
+			mode.ensureLoadingAnimation();
+
+			expect(mode.providerRetryLoader).toBeUndefined();
+			expect(stripVTControlCharacters(renderLoader(mode))).toContain("Working");
+		} finally {
+			mode.loadingAnimation?.stop();
+			mode.providerRetryLoader?.stop();
+			mode.isInitialized = false;
+		}
+	});
 });
