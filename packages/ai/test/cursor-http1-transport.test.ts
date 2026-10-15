@@ -2,6 +2,9 @@ import { expect, it } from "bun:test";
 import type { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { streamCursor } from "@oh-my-pi/pi-ai/providers/cursor";
 import type { Context, Model } from "@oh-my-pi/pi-ai/types";
+import { ProviderRequestTelemetry } from "@oh-my-pi/pi-ai/utils/request-telemetry";
+import { transportFetch } from "@oh-my-pi/pi-ai/utils/transport-fetch";
+import { logger } from "@oh-my-pi/pi-utils";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import {
 	AgentClientMessageSchema,
@@ -245,3 +248,91 @@ it(
 	},
 	SETTLE_TIMEOUT_MS,
 );
+
+it("counts only native RunSSE attempts and exact bytes across a retry, excluding BidiAppend", async () => {
+	const lines: Array<{ message: string; fields: Record<string, unknown> }> = [];
+	const dispose = logger.registerLogSink(event => {
+		if (event.message.startsWith("provider request")) {
+			lines.push({ message: event.message, fields: event.context ?? {} });
+		}
+	});
+	const success = Buffer.concat([textDeltaFrame("雪🌊"), turnEndedFrame()]);
+	// A clean Connect end before turnEnded forces the existing incomplete-stream retry.
+	const failure = frameConnectMessage(Buffer.from("{}"), CONNECT_END_STREAM_FLAG);
+	let requests = 0;
+	let appends = 0;
+	let fetchCalls = 0;
+	let streamReady = Promise.withResolvers<ReadableStreamDefaultController<Uint8Array>>();
+	const server = Bun.serve({
+		port: 0,
+		async fetch(request) {
+			await request.arrayBuffer();
+			if (new URL(request.url).pathname.endsWith("/RunSSE")) {
+				requests++;
+				return new Response(new ReadableStream<Uint8Array>({
+					start(controller) { streamReady.resolve(controller); },
+				}), { headers: { "content-type": "application/connect+proto" } });
+			}
+			appends++;
+			const controller = await streamReady.promise;
+			streamReady = Promise.withResolvers<ReadableStreamDefaultController<Uint8Array>>();
+			controller.enqueue(requests === 1 ? failure : success);
+			controller.close();
+			return new Response("auxiliary body must not count".repeat(100), { headers: { "content-type": "application/proto" } });
+		},
+	});
+	try {
+		const model = makeModel(server.url.toString());
+		const telemetry = new ProviderRequestTelemetry(model, "native-http1");
+		const fetch = transportFetch(model, async () => {
+			fetchCalls++;
+			throw new Error("native HTTP/1 must retain its existing fetch path");
+		}, telemetry);
+		const response = streamCursor(model, context, { apiKey: "test-token", transport: "http1", fetch, maxRetryDelayMs: 1 });
+		telemetry.observe(response);
+		const { result } = await drain(response);
+		await Promise.resolve();
+		expect(result.stopReason).toBe("stop");
+		expect(requests).toBe(2);
+		expect(appends).toBeGreaterThanOrEqual(1);
+		expect(fetchCalls).toBe(0);
+		const end = lines.find(line => line.message === "provider request end")!;
+		expect(end.fields).toMatchObject({ attempts: 2, bytesIn: failure.byteLength + success.byteLength, status: 200, outcome: "ok" });
+		expect(typeof end.fields.ttfbMs).toBe("number");
+		const attempts = lines.filter(line => line.message === "provider request attempt");
+		expect(attempts).toHaveLength(1);
+		expect(attempts[0].fields).toMatchObject({ attempt: 2, previousStatus: 200, requestId: end.fields.requestId });
+		expect(attempts[0].fields.previousError).toBeDefined();
+	} finally {
+		dispose();
+		server.stop(true);
+	}
+}, 5_000);
+
+it("records native RunSSE HTTP failure headers without inventing received bytes", async () => {
+	const lines: Array<{ message: string; fields: Record<string, unknown> }> = [];
+	const dispose = logger.registerLogSink(event => {
+		if (event.message.startsWith("provider request")) lines.push({ message: event.message, fields: event.context ?? {} });
+	});
+	const server = Bun.serve({
+		port: 0,
+		fetch: request => new Response(null, { status: new URL(request.url).pathname.endsWith("/RunSSE") ? 401 : 200 }),
+	});
+	try {
+		const model = makeModel(server.url.toString());
+		const telemetry = new ProviderRequestTelemetry(model, "native-http-failure");
+		const response = streamCursor(model, context, {
+			apiKey: "test-token", transport: "http1", fetch: transportFetch(model, undefined, telemetry),
+		});
+		telemetry.observe(response);
+		const { result } = await drain(response);
+		await Promise.resolve();
+		expect(result.stopReason).toBe("error");
+		const end = lines.find(line => line.message === "provider request end")!;
+		expect(end.fields).toMatchObject({ attempts: 1, bytesIn: 0, status: 401, outcome: "error" });
+		expect(typeof end.fields.ttfbMs).toBe("number");
+	} finally {
+		dispose();
+		server.stop(true);
+	}
+});

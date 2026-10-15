@@ -117,13 +117,26 @@ export class ProviderRequestTelemetry {
 	}
 
 	/**
+	 * Records first actual inference response timing. HTTP transports supply their
+	 * observed status; non-HTTP transports omit it rather than inventing one.
+	 */
+	noteResponseHeaders(status?: number): void {
+		this.#status = status;
+		this.#ttfbMs ??= elapsedMs(this.#startedAt);
+	}
+
+	/** Counts received transport payload bytes, including protocol envelopes, without estimating content size. */
+	noteBytes(byteLength: number): void {
+		this.#bytesIn += byteLength;
+	}
+
+	/**
 	 * Counts the inference body and records when its first headers arrived.
 	 * The body is wrapped in a pull-through reader: no buffering or copying,
 	 * one accumulator per chunk.
 	 */
 	observeResponse(response: Response): Response {
-		this.#status = response.status;
-		this.#ttfbMs ??= elapsedMs(this.#startedAt);
+		this.noteResponseHeaders(response.status);
 		const body = response.body;
 		if (!body) return response;
 		const reader = body.getReader();
@@ -135,7 +148,7 @@ export class ProviderRequestTelemetry {
 						controller.close();
 						return;
 					}
-					this.#bytesIn += value.byteLength;
+					this.noteBytes(value.byteLength);
 					controller.enqueue(value);
 				} catch (error) {
 					controller.error(error);

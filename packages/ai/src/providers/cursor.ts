@@ -1,4 +1,5 @@
-import { auxiliaryFetch } from "../utils/transport-fetch";
+import type { ProviderRequestTelemetry } from "../utils/request-telemetry";
+import { auxiliaryFetch, getProviderRequestTelemetry } from "../utils/transport-fetch";
 import * as fs from "node:fs/promises";
 import http2 from "node:http2";
 import { cursorModelParameters } from "@oh-my-pi/pi-catalog/compat/behavior";
@@ -686,7 +687,14 @@ interface CursorRunTransport extends CursorMessageWriter {
 	onError(listener: (error: unknown) => void): void;
 }
 
-function wrapHttp2RunTransport(request: http2.ClientHttp2Stream): CursorRunTransport {
+function wrapHttp2RunTransport(
+	request: http2.ClientHttp2Stream,
+	telemetry: ProviderRequestTelemetry | undefined,
+): CursorRunTransport {
+	if (telemetry) {
+		request.on("response", headers => telemetry.noteResponseHeaders(Number(headers[":status"])));
+		request.on("data", (chunk: Buffer) => telemetry.noteBytes(chunk.byteLength));
+	}
 	return {
 		get closed() {
 			return request.closed;
@@ -723,6 +731,7 @@ interface CursorHttp1RunTransportOptions {
 	headers: Record<string, string>;
 	requestId: string;
 	signal?: AbortSignal;
+	telemetry?: ProviderRequestTelemetry;
 }
 
 interface CursorPendingAppend {
@@ -816,12 +825,14 @@ function createHttp1RunTransport(options: CursorHttp1RunTransportOptions): Curso
 
 	const run = async (): Promise<void> => {
 		try {
+			options.telemetry?.noteCall();
 			const response = await fetchImpl(new URL(CURSOR_RUN_SSE_PATH, options.baseUrl), {
 				method: "POST",
 				headers: options.headers,
 				body: frameConnectMessage(toBinary(BidiRequestIdSchema, requestId)),
 				signal,
 			});
+			options.telemetry?.noteResponseHeaders(response.status);
 			const responseHeaders: http2.IncomingHttpHeaders = { ":status": String(response.status) };
 			response.headers.forEach((value, name) => {
 				responseHeaders[name] = value;
@@ -836,6 +847,7 @@ function createHttp1RunTransport(options: CursorHttp1RunTransportOptions): Curso
 				});
 			}
 			for await (const chunk of response.body) {
+				options.telemetry?.noteBytes(chunk.byteLength);
 				if (closed) return;
 				dataListener(Buffer.from(chunk));
 			}
@@ -1043,6 +1055,8 @@ function streamCursorWithWireMode(
 		const retryContext = timing?.retry;
 		const transportMode = timing?.transport ?? (options?.transport === "http1" ? "http1" : "http2");
 		const startTime = timing?.startTime ?? performance.now();
+		const telemetry = getProviderRequestTelemetry(options?.fetch);
+		let nativeAttemptOpened = false;
 		let firstTokenTime = retryContext?.firstTokenTime;
 
 		const output: AssistantMessage =
@@ -1302,6 +1316,8 @@ function streamCursorWithWireMode(
 				: undefined;
 
 			if (transportMode === "http2") {
+				nativeAttemptOpened = true;
+				telemetry?.noteCall();
 				const proxyUrl = getProxyForUrl(model.provider, new URL(baseUrl));
 				let client: http2.ClientHttp2Session;
 				if (proxyUrl) {
@@ -1317,13 +1333,15 @@ function streamCursorWithWireMode(
 				}
 				h2Client = client;
 				client.on("error", error => settleH2(mapH2TransportError(error, baseUrl)));
-				runTransport = wrapHttp2RunTransport(client.request(requestHeaders));
+				runTransport = wrapHttp2RunTransport(client.request(requestHeaders), telemetry);
 			} else {
+				nativeAttemptOpened = true;
 				runTransport = createHttp1RunTransport({
 					baseUrl,
 					headers: requestHeaders,
 					requestId,
 					signal: options?.signal,
+					telemetry,
 				});
 			}
 
@@ -1609,6 +1627,7 @@ function streamCursorWithWireMode(
 			});
 			stream.end();
 		} catch (caughtError) {
+			if (nativeAttemptOpened) telemetry?.noteCallError(caughtError);
 			let error = caughtError;
 			const h2Unavailable = transportMode === "http2" && isHttp2Unavailable(error);
 			if (

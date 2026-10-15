@@ -8,7 +8,12 @@ import type { ProviderRequestTelemetry } from "./request-telemetry";
 
 const TRANSPORT_FETCH = Symbol("omp.transportFetch");
 const AUXILIARY_FETCH = Symbol("omp.auxiliaryFetch");
-type TransportFetch = FetchImpl & { [TRANSPORT_FETCH]?: true; [AUXILIARY_FETCH]?: FetchImpl };
+const REQUEST_TELEMETRY = Symbol("omp.requestTelemetry");
+type TransportFetch = FetchImpl & {
+	[TRANSPORT_FETCH]?: true;
+	[AUXILIARY_FETCH]?: FetchImpl;
+	[REQUEST_TELEMETRY]?: ProviderRequestTelemetry;
+};
 
 /** Transport policy stays identical for inference and auxiliary calls; only inference emits request telemetry. */
 export function transportFetch(
@@ -41,6 +46,7 @@ export function transportFetch(
 		};
 		if (base.preconnect) wrapped.preconnect = base.preconnect;
 		wrapped[TRANSPORT_FETCH] = true;
+		if (record) wrapped[REQUEST_TELEMETRY] = record;
 		return wrapped;
 	};
 	const inference = buildFetch(telemetry);
@@ -51,6 +57,11 @@ export function transportFetch(
 /** Auth, routing and append calls retain proxy/CA/debug policy without becoming inference attempts. */
 export function auxiliaryFetch(fetchImpl: FetchImpl = globalThis.fetch): FetchImpl {
 	return (fetchImpl as TransportFetch)[AUXILIARY_FETCH] ?? fetchImpl;
+}
+
+/** Native inference transports share the logical record without invoking wrapped fetch. */
+export function getProviderRequestTelemetry(fetchImpl: FetchImpl | undefined): ProviderRequestTelemetry | undefined {
+	return (fetchImpl as TransportFetch | undefined)?.[REQUEST_TELEMETRY];
 }
 
 export function withTransportFetch<T extends { fetch?: FetchImpl }>(

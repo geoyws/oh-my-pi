@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { streamSimple } from "@oh-my-pi/pi-ai/stream";
 import type { AssistantMessage, AssistantMessageEvent, Context, FetchImpl, Model } from "@oh-my-pi/pi-ai/types";
 import { ProviderRequestTelemetry } from "@oh-my-pi/pi-ai/utils/request-telemetry";
-import { auxiliaryFetch, transportFetch } from "@oh-my-pi/pi-ai/utils/transport-fetch";
+import { auxiliaryFetch, getProviderRequestTelemetry, transportFetch } from "@oh-my-pi/pi-ai/utils/transport-fetch";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { logger } from "@oh-my-pi/pi-utils";
 
@@ -75,6 +75,41 @@ afterEach(() => {
 });
 
 describe("provider request telemetry", () => {
+	it("records response timing without inventing an HTTP status for native transports", () => {
+		const { lines } = captureTelemetry();
+		const telemetry = new ProviderRequestTelemetry(model, "native-statusless");
+		telemetry.noteCall();
+		telemetry.noteResponseHeaders();
+		telemetry.noteBytes(9);
+		telemetry.failed(new Error("native failure"));
+		const end = lines.find(line => line.message === "provider request end")!;
+		expect(end.fields).toMatchObject({ attempts: 1, bytesIn: 9, outcome: "error" });
+		expect(end.fields.status).toBeUndefined();
+		expect(typeof end.fields.ttfbMs).toBe("number");
+	});
+
+	it("exposes native accounting only on inference fetch and shares header timing and bytes", async () => {
+		const { lines } = captureTelemetry();
+		const telemetry = new ProviderRequestTelemetry(model, "native");
+		const fetch = transportFetch(model, async () => sseResponse(), telemetry);
+		expect(getProviderRequestTelemetry(fetch)).toBe(telemetry);
+		expect(getProviderRequestTelemetry(auxiliaryFetch(fetch))).toBeUndefined();
+		expect(getProviderRequestTelemetry(undefined)).toBeUndefined();
+		expect(getProviderRequestTelemetry(globalThis.fetch)).toBeUndefined();
+		telemetry.noteCall();
+		telemetry.noteResponseHeaders(503);
+		telemetry.noteBytes(7);
+		telemetry.noteCallError(new Error("native disconnected"));
+		await (await fetch("https://x/stream")).arrayBuffer();
+		telemetry.failed(new Error("terminal"));
+		const attempts = lines.filter(line => line.message === "provider request attempt");
+		expect(attempts).toHaveLength(1);
+		expect(attempts[0].fields).toMatchObject({ attempt: 2, previousStatus: 503, previousError: "native disconnected" });
+		const end = lines.find(line => line.message === "provider request end")!;
+		expect(end.fields).toMatchObject({ attempts: 2, status: 200, bytesIn: 7 + Buffer.byteLength(SSE_BODY), outcome: "error" });
+		expect(typeof end.fields.ttfbMs).toBe("number");
+	});
+
 	it("emits one start/end pair per request with duration, bytes, and token counts", async () => {
 		const { lines } = captureTelemetry();
 		const fetchImpl = (async () => sseResponse()) as unknown as FetchImpl;
