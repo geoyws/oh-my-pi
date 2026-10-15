@@ -446,6 +446,23 @@ describe("createSettingsAwareStreamFn", () => {
 			expect(ends).toEqual([{ aborted: false, waitId: 1 }]);
 		});
 
+		it("reports a jittered fractional delay as whole milliseconds while sleeping the exact delay", async () => {
+			const settings = Settings.isolated({});
+			const { fn: base, calls } = captureBase();
+			const { starts, observer } = captureObserver();
+			const wrapped = createSettingsAwareStreamFn(settings, base, undefined, observer);
+
+			wrapped(stubAnthropicModel, stubContext, { apiKey: "k" });
+			const waitSpy = mockSchedulerWaitWithClock();
+			// Anthropic backoff jitter: `sleepSeconds * jitter * 1000`.
+			await calls[0]!.options!.providerRetryWait!(437.5021);
+
+			expect(waitSpy.mock.calls[0]?.[0]).toBe(437.5021);
+			// The RPC wire declares `delayMs` an integer (Go int64, Rust i64,
+			// Python decode_int); rounding up never shows less wait than remains.
+			expect(starts[0]?.delayMs).toBe(438);
+		});
+
 		it("leaves a caller-supplied providerRetryWait untouched", async () => {
 			const settings = Settings.isolated({});
 			const { fn: base, calls } = captureBase();
