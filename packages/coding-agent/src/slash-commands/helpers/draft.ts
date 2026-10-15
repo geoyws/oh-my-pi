@@ -31,6 +31,29 @@ export function restoreDetachedDraft(
 }
 
 /**
+ * Hand back a refused line whose images Enter left in the editor (`!`/`$`,
+ * `/compact`, `/handoff`). While those images are still the live prefix of
+ * `pendingImages` they already sit at the indices the refused text's
+ * `[Image #N]` markers name, and any draft typed since already counts them in
+ * its own markers: the refused text goes back ahead of it and the images stay
+ * where they are. Otherwise the images are re-added through
+ * {@link restoreDetachedDraft}.
+ */
+export function restoreRefusedLine(
+	editor: CustomEditor,
+	text: string,
+	images?: ImageContent[],
+	imageLinks?: (string | undefined)[],
+): void {
+	if (images?.length && images.every((image, index) => editor.pendingImages[index] === image)) {
+		const laterText = editor.getExpandedText();
+		editor.setCollapsedText(laterText.trim() ? `${text}\n\n${laterText}` : text);
+		return;
+	}
+	restoreDetachedDraft(editor, text, images, imageLinks);
+}
+
+/**
  * Gate user-authored slash text that a command persists or sends to a model
  * outside `prompt()` (`/tan` work, `/omfg` complaint, `/cleanse` request,
  * `/ratchet` flow). A refusal merges the original slash line (and its

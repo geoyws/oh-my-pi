@@ -54,6 +54,8 @@ function createContext(options: {
 	promptCustomMessage: (message: unknown, opts: unknown) => Promise<boolean>;
 	prompt: (text: string, opts?: PromptOptions) => Promise<boolean>;
 	gateUserMessage?: (text: string) => Promise<void>;
+	/** Extra context members a command under test calls (e.g. `handleCompactCommand`). */
+	extra?: Record<string, unknown>;
 }) {
 	const sessionManager = SessionManager.inMemory(process.cwd());
 	vi.spyOn(sessionManager, "putBlob").mockImplementation(async (data: Buffer): Promise<BlobPutResult> => {
@@ -63,6 +65,8 @@ function createContext(options: {
 	const showError = vi.fn();
 	const session = {
 		extensionRunner: undefined,
+		customCommands: [],
+		promptTemplates: [],
 		isStreaming: false,
 		isCompacting: false,
 		isBashRunning: false,
@@ -105,6 +109,7 @@ function createContext(options: {
 		handlePythonCommand: vi.fn(),
 		withLocalSubmission: async <T>(_text: string, submit: () => Promise<T>) => submit(),
 		isGuidedGoalInterviewActive: () => false,
+		...options.extra,
 	} as unknown as InteractiveModeContext;
 	const controller = new InputController(ctx);
 	controller.setupEditorSubmitHandler();
@@ -236,6 +241,48 @@ describe("refused interactive submissions preserve a newer draft", () => {
 		expect(restored).toContain("newer draft");
 		expect(editor.pendingImages).toEqual([newerImage]);
 	});
+
+	for (const name of ["compact", "handoff"]) {
+		it(`Enter /${name} refusal keeps each image marker on its own image beside a newer draft`, async () => {
+			const editor = new CustomEditor(getEditorTheme());
+			const { commands } = await createSkillCommands();
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const refuse = vi.fn(async () => {
+				entered.resolve();
+				await release.promise;
+				throw new UserMessageRefusedError(NOTICE);
+			});
+			const { showError, pressEnter } = createContext({
+				editor,
+				skillCommands: commands,
+				promptCustomMessage: async () => true,
+				prompt: async () => true,
+				extra: { handleCompactCommand: refuse, handleHandoffCommand: refuse },
+			});
+
+			editor.setText(`/${name} keep ${SECRET} [Image #1]`);
+			// Enter resets only the text: the submitted image stays in the editor.
+			editor.pendingImages.push(refusedImage);
+			editor.pendingImageLinks.push(undefined);
+			const submitting = pressEnter();
+			await entered.promise;
+			// Typed into the emptied composer while the gate awaited; its own
+			// attachment is the second live image, so its marker is #2.
+			editor.setText("newer draft [Image #2]");
+			editor.pendingImages.push(newerImage);
+			editor.pendingImageLinks.push(undefined);
+			release.resolve();
+			await submitting;
+
+			expect(refuse).toHaveBeenCalledTimes(1);
+			expect(showError).toHaveBeenCalledWith(NOTICE);
+			const restored = editor.getExpandedText();
+			expect(restored).toContain(`/${name} keep ${SECRET} [Image #1]`);
+			expect(restored).toContain("newer draft [Image #2]");
+			expect(editor.pendingImages).toEqual([refusedImage, newerImage]);
+		});
+	}
 
 	it("refused /queue follow-up merges text and images ahead of a newer draft", async () => {
 		const editor = new CustomEditor(getEditorTheme());

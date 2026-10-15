@@ -47,7 +47,7 @@ import { USER_INTERRUPT_LABEL } from "../../session/messages";
 import { PINNED_HUD_TOGGLE_ID } from "@oh-my-pi/pi-tui/prompt/composer";
 import { pickRecentFocusableAgentId } from "./session-focus-controller";
 import { executeBuiltinSlashCommand, lookupBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
-import { restoreDetachedDraft } from "../../slash-commands/helpers/draft";
+import { restoreDetachedDraft, restoreRefusedLine } from "../../slash-commands/helpers/draft";
 import { parseSlashCommand, parseSubcommand } from "../../slash-commands/helpers/parse";
 import { isTinyLocalModelKey } from "../../tiny/models";
 import { tinyTitleClient } from "../../tiny/title-client";
@@ -910,25 +910,7 @@ export class InputController {
 		return compacted.text.trim();
 	}
 
-	/**
-	 * Hand back a refused `!`/`$` line whose images Enter left in the editor.
-	 * While those images are still the live prefix of `pendingImages`, they
-	 * already sit at the indices the refused text's `[Image #N]` markers name,
-	 * and any draft typed since already counts them in its own markers: put the
-	 * refused text back ahead of it and leave the images where they are.
-	 * Returns false when the prefix no longer matches (the caller falls back to
-	 * re-adding the images through {@link restoreDetachedDraft}).
-	 */
-	#restoreRefusedInPlace(text: string, images: ImageContent[] | undefined): boolean {
-		if (!images?.length) return false;
-		const editor = this.ctx.editor;
-		if (!images.every((image, index) => editor.pendingImages[index] === image)) return false;
-		const laterText = editor.getExpandedText();
-		editor.setCollapsedText(laterText.trim() ? `${text}\n\n${laterText}` : text);
-		return true;
-	}
-
-	/** Refusal hand-back for a `!`/`$` line: in place when its images are still the live prefix. */
+	/** Refusal hand-back for a `!`/`$` line: in place while its images are still the live prefix. */
 	#handBackRefusedCommandLine(
 		error: unknown,
 		text: string,
@@ -936,11 +918,8 @@ export class InputController {
 		imageLinks: (string | undefined)[] | undefined,
 	): boolean {
 		if (!(error instanceof UserMessageRefusedError)) return false;
-		if (this.#restoreRefusedInPlace(text, images)) {
-			this.ctx.showError(error.notice);
-		} else {
-			this.#restoreRefusedSubmission(error, text, images, imageLinks);
-		}
+		restoreRefusedLine(this.ctx.editor, text, images, imageLinks);
+		this.ctx.showError(error.notice);
 		this.ctx.updatePendingMessagesDisplay();
 		this.ctx.ui.requestRender();
 		return true;
