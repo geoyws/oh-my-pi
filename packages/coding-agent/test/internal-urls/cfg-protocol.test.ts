@@ -14,6 +14,15 @@ import { cfgEditFuzzyMatch } from "@oh-my-pi/pi-coding-agent/edit/settings";
 import { cfgModelRoles } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { cfgSearxngEndpoint } from "@oh-my-pi/pi-coding-agent/web/settings";
 import type { InternalWriteResult } from "@oh-my-pi/pi-coding-agent/internal-urls/types";
+import type { Api, Model } from "@oh-my-pi/pi-ai";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import {
+	getExhaustiveRetryFallbackRoles,
+	getRetryFallbackChains,
+	resolveRetryFallbackChainKey,
+	type RetryFallbackResolutionContext,
+} from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
+import { TurnRecovery, type TurnRecoveryHost } from "@oh-my-pi/pi-coding-agent/session/turn-recovery";
 
 function sessionWith(settings: Settings, caller: Partial<ToolSession> = {}): ToolSession {
 	return { settings, hasUI: true, settingsApproval: true, taskDepth: 0, ...caller } as unknown as ToolSession;
@@ -267,5 +276,77 @@ describe("CfgProtocolHandler", () => {
 		await expect(write("cfg://advisor/syncBacklog", "7", settings)).rejects.toThrow("Valid values: off, 1, 3, 5");
 		await expect(write("cfg://advisr/enabled", "true", settings)).rejects.toThrow("Similar: advisor.enabled");
 		expect(asked).toEqual([]);
+	});
+
+	it("refuses cfg:// writes and saves of the internal exhaustive-roles marker", async () => {
+		const FIRST = "scout-a/first";
+		const settings = Settings.isolated({
+			"retry.fallbackChains": {
+				default: ["scout-b/second"],
+				"scout-a/first": ["outside/other"],
+			},
+		});
+		const persistent = Settings.isolated();
+		const asked: CfgChangeRequest[] = [];
+		setCfgApprovalHost({
+			approve: async request => (asked.push(request), "once"),
+			applied: () => {},
+			persistentSettings: persistent,
+		});
+
+		await expect(write("cfg://retry/exhaustiveFallbackRoles", '["default"]', settings)).rejects.toThrow();
+		await expect(write("cfg://retry/exhaustiveFallbackRoles/save", '["default"]', settings)).rejects.toThrow();
+		expect(asked).toEqual([]);
+
+		const scout = (provider: string, id: string): Model<Api> =>
+			buildModel({
+				provider,
+				id,
+				name: id,
+				api: "openai-completions",
+				baseUrl: `https://${provider}.example.test`,
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128000,
+				maxTokens: 8192,
+			});
+		const models = [scout("scout-a", "first"), scout("scout-b", "second")];
+		const lookup = {
+			find: (provider: string, id: string) => models.find(entry => entry.provider === provider && entry.id === id),
+			hasProvider: (provider: string) => models.some(entry => entry.provider === provider),
+		};
+		const recoverFor = (scope: Settings) =>
+			new TurnRecovery(
+				{
+					settings: scope,
+					modelRegistry: lookup,
+					model: () => undefined,
+					sessionManager: {},
+				} as unknown as TurnRecoveryHost,
+				{ deferFallbackChainValidation: true },
+			);
+		const contextFor = (scope: Settings): RetryFallbackResolutionContext => ({
+			chains: getRetryFallbackChains(scope),
+			getModelRole: (role: string) => scope.getModelRole(role),
+			modelLookup: lookup,
+			exhaustiveRoles: getExhaustiveRetryFallbackRoles(scope),
+		});
+
+		// Main-session chain keys unchanged: the pinned default still walks into the model-keyed chain.
+		expect(getExhaustiveRetryFallbackRoles(settings).size).toBe(0);
+		expect(resolveRetryFallbackChainKey(contextFor(settings), FIRST)).toBe("scout-a/first");
+		expect(recoverFor(settings).retryFallbackChainKeys(FIRST, undefined, { pinnedRole: "default" })).toEqual([
+			"default",
+			"scout-a/first",
+		]);
+
+		// A child overlay inherits the same routing.
+		const child = settings.overlay();
+		expect(resolveRetryFallbackChainKey(contextFor(child), FIRST)).toBe("scout-a/first");
+		expect(recoverFor(child).retryFallbackChainKeys(FIRST, undefined, { pinnedRole: "default" })).toEqual([
+			"default",
+			"scout-a/first",
+		]);
 	});
 });

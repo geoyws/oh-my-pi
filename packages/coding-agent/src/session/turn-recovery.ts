@@ -58,6 +58,7 @@ import {
 	findRetryFallbackCandidates,
 	formatRetryFallbackBaseSelector,
 	formatRetryFallbackSelector,
+	getExhaustiveRetryFallbackRoles,
 	getRetryFallbackChains,
 	getRetryFallbackRevertPolicy,
 	parseRetryFallbackSelector,
@@ -1722,6 +1723,7 @@ export class TurnRecovery {
 			chains: this.#getRetryFallbackChains(),
 			getModelRole: role => this.#host.settings.getModelRole(role),
 			modelLookup: this.#host.modelRegistry,
+			exhaustiveRoles: getExhaustiveRetryFallbackRoles(this.#host.settings),
 		};
 	}
 	#getRetryFallbackChains(): RetryFallbackChains {
@@ -1855,6 +1857,11 @@ export class TurnRecovery {
 	 * Two keys is the whole walk per attempt. Chains that point at each other
 	 * alternate models instead of looping in place, and every hop still spends a
 	 * retry attempt, so the budget terminates either way.
+	 *
+	 * An exhaustive installed chain (`subagent:<id>` from an explicit
+	 * multi-entry override list) walks alone: when either the pinned or the
+	 * current key is exhaustive, only that key is consulted, so the walk ends
+	 * with the list instead of hopping into a model-keyed chain.
 	 */
 	retryFallbackChainKeys(
 		currentSelector: string,
@@ -1862,9 +1869,12 @@ export class TurnRecovery {
 		options?: { pinnedRole?: string; roleHint?: string },
 	): string[] {
 		const pinned = options?.pinnedRole ?? this.#activeRetryFallback?.role;
+		const exhaustive = getExhaustiveRetryFallbackRoles(this.#host.settings);
+		if (pinned && exhaustive.has(pinned)) return [pinned];
 		const current = this.resolveRetryFallbackRole(currentSelector, currentModel, options?.roleHint);
 		if (!pinned) return current ? [current] : [];
-		return current && current !== pinned ? [pinned, current] : [pinned];
+		if (current && current !== pinned) return exhaustive.has(current) ? [current] : [pinned, current];
+		return [pinned];
 	}
 
 	/** Live session role for chain lookup, provided its assignment still matches the active model. */

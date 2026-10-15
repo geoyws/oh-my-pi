@@ -24,6 +24,7 @@ import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
+import { getRetryFallbackRole } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
 import {
 	cfgCompactionModelThresholds,
 	cfgCompactionModelThresholdsEnabled,
@@ -1207,6 +1208,26 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		}
 	});
 
+	test("marks a deferred multi-entry subagent list exhaustive", async () => {
+		const { session } = await createAgentSession({
+			...buildSessionOptions(["runtime-provider/runtime-model", "runtime-provider/runtime-fallback-model"]),
+			modelPatternFallbackRole: "subagent:deferred-exhaustive",
+			modelPatternFallbackExhaustive: true,
+		});
+
+		try {
+			expect(session.model?.provider).toBe("runtime-provider");
+			expect(session.model?.id).toBe("runtime-model");
+			expect(session.settings.getModelRole("subagent:deferred-exhaustive")).toBe("runtime-provider/runtime-model");
+			expect(cfgRetryFallbackChains.get(session.settings)["subagent:deferred-exhaustive"]).toEqual([
+				"runtime-provider/runtime-fallback-model",
+			]);
+			expect(getRetryFallbackRole(session.settings, "subagent:deferred-exhaustive")?.exhaustive).toBe(true);
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	test("installs an inherited fallback chain for a deferred singleton modelPattern", async () => {
 		const settings = Settings.isolated({
 			"retry.fallbackChains": {
@@ -1228,6 +1249,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			expect(cfgRetryFallbackChains.get(session.settings)["subagent:deferred-default"]).toEqual([
 				"runtime-provider/runtime-fallback-model",
 			]);
+			expect(getRetryFallbackRole(session.settings, "subagent:deferred-default")?.exhaustive).toBeUndefined();
 		} finally {
 			await session.dispose();
 		}

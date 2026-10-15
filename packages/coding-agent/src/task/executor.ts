@@ -146,7 +146,12 @@ import {
 	cfgDefaultThinkingLevel,
 } from "../session/settings";
 import { cfgDisabledProviders } from "../config/model-settings";
-import { getRetryFallbackRole, installRetryFallbackRole } from "../session/retry-fallback-chains";
+import {
+	getExhaustiveRetryFallbackRoles,
+	getRetryFallbackRole,
+	installRetryFallbackRole,
+	restoreExhaustiveRetryFallbackRoles,
+} from "../session/retry-fallback-chains";
 import {
 	cfgCompactionModelThresholdsEnabled,
 	cfgCompactionThresholdPercent,
@@ -316,6 +321,8 @@ function installSubagentRetryFallbackChain(args: {
 	);
 	if (selectedIndex < 0) return undefined;
 	const fallbackSelectors = candidates.slice(selectedIndex + 1).map(candidate => candidate.selector);
+	// An explicit multi-entry override list is its own complete retry chain: mark
+	// it exhaustive so the runtime never leaves it for a model-keyed chain.
 	// A single configured model may reuse its role's (or the default) configured chain, but never an implicit parent fallback.
 	const fallbackChain = fallbackSelectors.length > 0 ? fallbackSelectors : inheritedFallbackChain;
 	if (
@@ -327,7 +334,11 @@ function installSubagentRetryFallbackChain(args: {
 	}
 
 	const role = subagentRetryFallbackRole(id);
-	installRetryFallbackRole(settings, role, { primary: candidates[selectedIndex].selector, chain: fallbackChain });
+	installRetryFallbackRole(settings, role, {
+		primary: candidates[selectedIndex].selector,
+		chain: fallbackChain,
+		...(fallbackSelectors.length > 0 ? { exhaustive: true as const } : {}),
+	});
 	return role;
 }
 
@@ -3757,19 +3768,31 @@ async function refreshSubagentIrcRoot(
 }
 
 /** Recipe for a subagent's settings overlay: its parent plus the overlay's own writes. */
-interface SubagentSettingsRecipe {
+export interface SubagentSettingsRecipe {
 	parent: Settings;
 	layers: OverlayLayers;
 	rootThresholds: RootCompactionThresholds | undefined;
+	/**
+	 * Installed exhaustive fallback chains the overlay layers cannot carry
+	 * (the mark lives outside settings, where no user entry point can write
+	 * it). Snapshotted at capture, reinstalled at restore.
+	 */
+	exhaustiveRetryFallbackRoles: string[];
 }
 
-function captureSubagentSettings(parent: Settings, settings: SubagentChainSettings): SubagentSettingsRecipe {
-	return { parent, layers: settings.overlayLayers(), rootThresholds: settings[kRootCompactionThresholds] };
+export function captureSubagentSettings(parent: Settings, settings: SubagentChainSettings): SubagentSettingsRecipe {
+	return {
+		parent,
+		layers: settings.overlayLayers(),
+		rootThresholds: settings[kRootCompactionThresholds],
+		exhaustiveRetryFallbackRoles: [...getExhaustiveRetryFallbackRoles(settings)],
+	};
 }
 
-function restoreSubagentSettings(recipe: SubagentSettingsRecipe): Settings {
+export function restoreSubagentSettings(recipe: SubagentSettingsRecipe): Settings {
 	const settings: SubagentChainSettings = recipe.parent.restoreOverlay(recipe.layers);
 	settings[kRootCompactionThresholds] = recipe.rootThresholds;
+	restoreExhaustiveRetryFallbackRoles(settings, recipe.exhaustiveRetryFallbackRoles);
 	return settings;
 }
 
@@ -4318,6 +4341,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						model || modelOverride === undefined ? undefined : options.parentActiveModelPattern,
 					modelPatternFallbackRole:
 						model || modelOverride === undefined ? undefined : subagentRetryFallbackRole(id),
+					// An explicit multi-entry list is its own complete retry chain:
+					// tell the SDK installer to mark it exhaustive, matching the
+					// immediate install above. Singleton and @role patterns leave
+					// this unset and keep inheriting their (default) chain.
+					modelPatternFallbackExhaustive:
+						model || modelOverride === undefined || modelPatterns.length <= 1 ? undefined : true,
 					modelPatternDefaultFallbackChain:
 						model || modelOverride === undefined ? undefined : inheritedRetryFallbackChain,
 					thinkingLevel: effectiveThinkingLevel,
