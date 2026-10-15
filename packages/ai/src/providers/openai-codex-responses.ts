@@ -2079,6 +2079,9 @@ async function openCodexWebSocketTransport(
 	requestBodyForState: RequestBody;
 	transport: CodexTransport;
 }> {
+	// The operation's first transport is its initial attempt; any later open is a
+	// retry or recovery and re-checks abort/timeout/budget across every await.
+	const firstOperationTransport = !requestSetup.transportStarted;
 	requestSetup.transportStarted = true;
 	const steered = websocketState.acceptedSteering;
 	websocketState.acceptedSteering = undefined;
@@ -2098,6 +2101,7 @@ async function openCodexWebSocketTransport(
 		await getCodexAttestationHeader(requestContext.accountId),
 		requestContext.transformedBody,
 	);
+	if (!firstOperationTransport) assertCodexTransportAttemptAllowed(options, requestSetup);
 	let websocketConnection = await getOrCreateCodexWebSocketConnection(
 		websocketState,
 		requestContext.turnState,
@@ -2106,6 +2110,7 @@ async function openCodexWebSocketTransport(
 		model.provider,
 		requestSetup.requestSignal,
 	);
+	if (!firstOperationTransport) assertCodexTransportAttemptAllowed(options, requestSetup);
 	const timeouts: CodexWebSocketRequestTimeouts = {
 		idleTimeoutMs: requestSetup.websocketIdleTimeoutMs,
 		firstEventTimeoutMs: requestSetup.websocketFirstEventTimeoutMs,
@@ -2138,6 +2143,7 @@ async function openCodexWebSocketTransport(
 		} else {
 			// The server continues from input this request cannot line up with; a
 			// fresh socket drops its queue and the full transcript carries the input.
+			if (!firstOperationTransport) assertCodexTransportAttemptAllowed(options, requestSetup);
 			websocketConnection.close("steering-discard");
 			websocketState.connection = undefined;
 			resetCodexWebSocketAppendState(websocketState);
@@ -2172,6 +2178,7 @@ async function openCodexWebSocketTransport(
 	if (replacementWebsocketRequest !== undefined) {
 		websocketRequest = replacementWebsocketRequest as typeof websocketRequest;
 	}
+	if (!firstOperationTransport) assertCodexTransportAttemptAllowed(options, requestSetup);
 	recordCodexTurnRequestDiagnostics(websocketState, websocketRequest, "websocket", canAppendBeforeRequest);
 	const requestBodyForState = cloneJsonTree(requestContext.transformedBody);
 	// `onPayload` may rewrite the outgoing frame (e.g. drop `stream_options` or
