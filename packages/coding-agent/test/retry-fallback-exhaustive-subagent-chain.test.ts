@@ -3,7 +3,11 @@ import type { Api, Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
-import { cfgExhaustiveRetryFallbackRoles } from "@oh-my-pi/pi-coding-agent/session/settings";
+import {
+	captureSubagentSettings,
+	restoreSubagentSettings,
+	runSubprocess,
+} from "@oh-my-pi/pi-coding-agent/task/executor";
 import {
 	findRetryFallbackCandidates,
 	getExhaustiveRetryFallbackRoles,
@@ -14,7 +18,6 @@ import {
 	resolveRetryFallbackChainKey,
 } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
 import { TurnRecovery, type TurnRecoveryHost } from "@oh-my-pi/pi-coding-agent/session/turn-recovery";
-import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { createSessionDefaults } from "./helpers/session-defaults";
@@ -258,10 +261,10 @@ describe("exhaustive subagent fallback chains", () => {
 		const parent = scoutSettings();
 		const child = parent.overlay();
 		installScoutChain(child, true);
-		// Warm revival parks the live session, captures its overlay layers, and
-		// rebuilds settings from them on the same parent — the rebuilt object
+		// Warm revival parks the live session, captures its overlay recipe, and
+		// rebuilds settings from it on the same parent — the rebuilt object
 		// must keep the exhaustive flag, not just the selectors.
-		const restored = parent.restoreOverlay(child.overlayLayers());
+		const restored = restoreSubagentSettings(captureSubagentSettings(parent, child));
 		expect(getRetryFallbackRole(restored, SCOUT_ROLE)?.exhaustive).toBe(true);
 		const models = [model("scout-a", "first"), model("scout-b", "second"), model("scout-c", "third")];
 		const context: RetryFallbackResolutionContext = {
@@ -338,22 +341,12 @@ describe("exhaustive subagent fallback chains", () => {
 		expect(fallbackExhaustive).toBe(true);
 	});
 
-	it("ignores exhaustive roles supplied through user config", () => {
-		const settings = scoutSettings();
-		// `omp config set` / config file: global layer, never the runtime override.
-		// No subagent install ever runs on a main session, so nothing shadows it.
-		cfgExhaustiveRetryFallbackRoles.set(settings, [SCOUT_ROLE]);
-		expect(getExhaustiveRetryFallbackRoles(settings).size).toBe(0);
-		// A user flag alone installs no chain.
-		expect(getRetryFallbackRole(settings, SCOUT_ROLE)).toBeUndefined();
-		const models = [model("scout-a", "first"), model("scout-b", "second"), model("scout-c", "third")];
-		const context = contextFor(settings, models, [...getExhaustiveRetryFallbackRoles(settings)]);
-		// A main-session lookup still follows the model-keyed chain, never the named role alone.
-		expect(resolveRetryFallbackChainKey(context, FIRST)).toBe("scout-a/first");
-		const recovery = recoveryFor(settings, models);
-		expect(recovery.retryFallbackChainKeys(FIRST, undefined)).toEqual(["scout-a/first"]);
-		expect(
-			recovery.findRetryFallbackCandidates("scout-a/first", FIRST, undefined).map(candidate => candidate.raw),
-		).toEqual([OUTSIDE]);
+	it("has no user-config surface for the exhaustive marker", () => {
+		// The mark lives outside settings: every user entry point (constructor
+		// overrides, cfg://, `omp config set`, config files) rejects the id as
+		// unknown instead of accepting an inert value.
+		expect(() => Settings.isolated({ "retry.exhaustiveFallbackRoles": ["subagent:scout"] })).toThrow(
+			"Unknown setting",
+		);
 	});
 });

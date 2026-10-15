@@ -13,12 +13,7 @@ import {
 import { resolveConfiguredModelPatterns, resolveModelRoleValue } from "../config/model-resolver";
 import { getRoleInfo, isKindRole } from "../config/model-roles";
 
-import {
-	cfgExhaustiveRetryFallbackRoles,
-	cfgRetryFallbackChains,
-	cfgRetryFallbackRevertPolicy,
-	type RetrySettings,
-} from "./settings";
+import { cfgRetryFallbackChains, cfgRetryFallbackRevertPolicy, type RetrySettings } from "./settings";
 
 /** Configured fallback chains keyed by role or model selector. */
 export type RetryFallbackChains = Record<string, string[]>;
@@ -199,23 +194,38 @@ export interface RetryFallbackRole {
 }
 
 /**
- * Installed exhaustive chains per session settings. The flag rides the same
- * overlay layers as the installed chains (see `cfgExhaustiveRetryFallbackRoles`),
- * so a rebuilt Settings keeps it: `session_init` persists it for cold revival
- * and overlay capture/restore carries it for warm revival. Session-scoped like
- * the overrides themselves.
- *
- * The mark can only come from {@link installRetryFallbackRole} at runtime:
- * readers honor the runtime-override layer alone, so the same id in user
- * config (global/project files, `--config`, `omp config set`) never takes
- * effect. Arrays replace wholesale across layers, so a runtime-provenanced
- * read is exactly the installed value.
+ * Installed exhaustive chains per session settings. Deliberately NOT a
+ * registered setting: with no setting id, no user entry point (`omp config
+ * set`, cfg:// reads/writes/saves, config files, `--config`, constructor
+ * overrides) can write or persist it — only {@link installRetryFallbackRole}
+ * at runtime. The trade-off is that a rebuilt Settings starts empty, so
+ * every restore path must reinstall: cold revival via the persisted
+ * `session_init` role, warm revival via {@link restoreExhaustiveRetryFallbackRoles}
+ * from the overlay recipe, and deferred spawn via the SDK installer.
+ * Session-scoped like the installed overrides themselves.
  */
+const exhaustiveRetryFallbackRoles = new WeakMap<Settings, Set<string>>();
 
 /** Names of installed exhaustive chains for `settings` (empty when none). */
 export function getExhaustiveRetryFallbackRoles(settings: Settings): ReadonlySet<string> {
-	if (settings.getProvenance(cfgExhaustiveRetryFallbackRoles) !== "runtime") return new Set();
-	return new Set(cfgExhaustiveRetryFallbackRoles.get(settings) ?? []);
+	return exhaustiveRetryFallbackRoles.get(settings) ?? new Set();
+}
+
+/**
+ * Reinstall a warm-revival snapshot (see `captureSubagentSettings`) onto
+ * rebuilt settings whose installed chains already came back through the
+ * overlay layers. Names without an installed chain are skipped, so a stale
+ * snapshot can never conjure routing.
+ */
+export function restoreExhaustiveRetryFallbackRoles(settings: Settings, roles: readonly string[]): void {
+	const installed = roles.filter(role => getRetryFallbackRole(settings, role) !== undefined);
+	if (installed.length === 0) return;
+	let existing = exhaustiveRetryFallbackRoles.get(settings);
+	if (!existing) {
+		existing = new Set();
+		exhaustiveRetryFallbackRoles.set(settings, existing);
+	}
+	for (const role of installed) existing.add(role);
 }
 
 /** Reads the primary and non-empty chain installed for `role`, if any. */
@@ -224,7 +234,7 @@ export function getRetryFallbackRole(settings: Settings, role: string): RetryFal
 	const chain = cfgRetryFallbackChains.get(settings)[role];
 	if (!primary || !Array.isArray(chain) || chain.length === 0) return undefined;
 	const roleState: RetryFallbackRole = { primary, chain };
-	if (getExhaustiveRetryFallbackRoles(settings).has(role)) roleState.exhaustive = true;
+	if (exhaustiveRetryFallbackRoles.get(settings)?.has(role)) roleState.exhaustive = true;
 	return roleState;
 }
 
@@ -238,17 +248,16 @@ export function installRetryFallbackRole(
 	role: string,
 	{ primary, chain, exhaustive }: RetryFallbackRole,
 ): void {
-	// Read-modify-write the runtime layer alone: starting from the merged view
-	// would promote user-configured entries into the runtime layer, where they
-	// would take effect.
-	const current =
-		settings.getProvenance(cfgExhaustiveRetryFallbackRoles) === "runtime"
-			? (cfgExhaustiveRetryFallbackRoles.get(settings) ?? [])
-			: [];
-	cfgExhaustiveRetryFallbackRoles.override(
-		settings,
-		exhaustive ? (current.includes(role) ? current : [...current, role]) : current.filter(entry => entry !== role),
-	);
+	if (exhaustive) {
+		let roles = exhaustiveRetryFallbackRoles.get(settings);
+		if (!roles) {
+			roles = new Set();
+			exhaustiveRetryFallbackRoles.set(settings, roles);
+		}
+		roles.add(role);
+	} else {
+		exhaustiveRetryFallbackRoles.get(settings)?.delete(role);
+	}
 	const modelRoles: Record<string, string> = {};
 	const existingRoles = settings.getModelRoles();
 	for (const key in existingRoles) {
