@@ -2266,6 +2266,7 @@ async function openCodexSseTransport(
 				requestSetup.requestSignal,
 				requestSetup.firstEventTimeoutMs,
 				options?.codexSseMaxAttempts,
+				() => assertCodexTransportAttemptAllowed(options, requestSetup),
 				event => options?.onSseEvent?.(event, model),
 				options?.fetch,
 			),
@@ -5056,6 +5057,7 @@ async function openCodexSseEventStream(
 	signal: AbortSignal | undefined,
 	firstEventTimeoutMs: number | undefined,
 	codexSseMaxAttempts: number | undefined,
+	assertAttemptAllowed: () => void,
 	onSseEvent?: OpenAICodexResponsesOptions["onSseEvent"],
 	fetchOverride?: FetchImpl,
 ): Promise<AsyncGenerator<Record<string, unknown>>> {
@@ -5081,6 +5083,8 @@ async function openCodexSseEventStream(
 	const fetchAttempt: FetchImpl = async (input, init) => {
 		let response: Response | undefined;
 		try {
+			// prepareInit is awaited by fetchWithRetry; recheck at the actual send.
+			assertAttemptAllowed();
 			response = await (fetchOverride ?? fetch)(input, init);
 			return response;
 		} finally {
@@ -5118,6 +5122,9 @@ async function openCodexSseEventStream(
 			body: requestBody,
 			signal,
 			prepareInit: () => {
+				// Covers every nested HTTP retry and the plain-JSON encoding replay.
+				// Throw outside fetchWithRetry's network-error catch to stop recovery.
+				assertAttemptAllowed();
 				// A retried non-2xx attempt leaves its guard armed for the retry-status
 				// body read; disarm it before arming the next attempt's guard.
 				clearPreResponseTimeout?.();

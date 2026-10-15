@@ -7818,7 +7818,7 @@ describe("openai-codex recovery attempt gate", () => {
 						// Explicit zero delay covers the immediate retry path too.
 						return new Response("temporary failure", { status, headers: { "retry-after": "0" } });
 					}
-					return new Response(createCompletedCodexSse("Recovered"), { headers: SSE_HEADERS });
+					return new Response(createStatefulCodexSse("Recovered", "resp_nested_retry"), { headers: SSE_HEADERS });
 				};
 				const result = await streamOpenAICodexResponses(
 					{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
@@ -7863,7 +7863,9 @@ describe("openai-codex recovery attempt gate", () => {
 								},
 							}), { status });
 						}
-						return new Response(createCompletedCodexSse("Uncompressed"), { headers: SSE_HEADERS });
+						return new Response(createStatefulCodexSse("Uncompressed", "resp_encoding_replay"), {
+							headers: SSE_HEADERS,
+						});
 					};
 					const result = await streamOpenAICodexResponses(
 						{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },

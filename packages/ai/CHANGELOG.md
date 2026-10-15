@@ -5,7 +5,7 @@
 ### Fixed
 
 - Bounded the shared Anthropic keepalive pool (128 sockets per host, twice that process-wide, `PI_ANTHROPIC_MAX_SOCKETS` to change it) and made cancelling a request that is waiting for a socket take effect immediately instead of after the wait ([#12868](https://github.com/can1357/oh-my-pi/pull/12868)).
-- Every OpenAI Codex retry or recovery that opens a new websocket or SSE attempt now checks `operationTimeoutMs` first, also when it would not sleep: the SSE fallback after a failed websocket open, access-program and stripped-reasoning replays, stale `previous_response_id` reconnects, websocket-to-SSE replays (turns and remote compaction), and the SSE fallback of a failed websocket reopen. A spent budget fails with `ProviderOperationDeadlineError` instead of paying for one more handshake or HTTP open.
+- Every OpenAI Codex retry or recovery that opens a new websocket or SSE attempt now checks `operationTimeoutMs` first, also when it would not sleep: the SSE fallback after a failed websocket open, access-program and stripped-reasoning replays, stale `previous_response_id` reconnects, websocket-to-SSE replays (turns and remote compaction), the SSE fallback of a failed websocket reopen, nested network and HTTP 408/429/5xx retries, and plain-JSON replay after a zstd encoding rejection. A spent budget fails with `ProviderOperationDeadlineError` instead of paying for one more handshake or HTTP open.
 - OpenAI Codex SSE idle and first-event timeouts now surface as `StreamTimeoutError` with the watchdog message. Previously the internal timeout abort was misreported as a caller cancellation ("Request was aborted"), or as `ProviderOperationDeadlineError` when the stalled gap outlived the operation budget.
 
 ### Added
