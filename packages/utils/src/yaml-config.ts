@@ -1,5 +1,5 @@
 import { YAML } from "bun";
-import type { Node, Pair } from "yaml";
+import type { Node, Pair, YAMLMap } from "yaml";
 import { Document, isAlias, isMap, isNode, isScalar, isSeq, parseDocument } from "yaml";
 
 const YAML_MAPPING_HEADER_TRAILING_SPACE = /: +$/gm;
@@ -21,7 +21,8 @@ function isMapping(value: unknown): value is Record<string, unknown> {
 
 /** Reconcile the locked source by node ranges, retaining untouched source bytes. */
 export function reconcileYamlConfig(source: string, value: unknown): string {
-	const document = parseDocument(source, { keepSourceTokens: true });
+	// Match Bun.YAML.parse, which expands `<<` merge keys into the desired value.
+	const document = parseDocument(source, { keepSourceTokens: true, merge: true });
 	if (document.errors.length > 0) throw document.errors[0];
 	const edits: SourceEdit[] = [];
 	const newline = source.includes("\r\n") ? "\r\n" : "\n";
@@ -71,6 +72,24 @@ export function reconcileYamlConfig(source: string, value: unknown): string {
 		if (source.slice(node.range[0], node.range[1]).endsWith("\n")) text += newline;
 		edits.push({ start: node.range[0], end: node.range[1], text });
 	};
+	const isMergePair = (pair: Pair): boolean =>
+		isScalar(pair.key) && typeof pair.key.value === "symbol" && pair.key.value.description === "<<";
+	// Earlier merge sources win; explicit keys override every merged value.
+	const inheritedValues = (node: YAMLMap): Map<string, unknown> => {
+		const inherited = new Map<string, unknown>();
+		for (const pair of node.items) {
+			if (!isMergePair(pair)) continue;
+			const value = isAlias(pair.value) ? pair.value.resolve(document) : pair.value;
+			for (const item of isSeq(value) ? value.items : [value]) {
+				const mergeSource = isAlias(item) ? item.resolve(document) : item;
+				if (!isMap(mergeSource)) throw new Error("YAML merge sources must be mappings");
+				const values: unknown = mergeSource.toJS(document);
+				if (!isMapping(values)) throw new Error("YAML merge sources must be mappings");
+				for (const [key, merged] of Object.entries(values)) if (!inherited.has(key)) inherited.set(key, merged);
+			}
+		}
+		return inherited;
+	};
 	const reconcile = (node: Node, next: unknown): void => {
 		if (Bun.deepEquals(node.toJS(document), next)) return;
 		if (!isMap(node) || !isMapping(next)) {
@@ -82,21 +101,31 @@ export function reconcileYamlConfig(source: string, value: unknown): string {
 			replace(node, next);
 			return;
 		}
+		const present = (key: string): boolean => Object.hasOwn(next, key) && next[key] !== undefined;
+		const inherited = inheritedValues(node);
+		// YAML cannot unset an inherited key, so removing one replaces this map's merges with explicit keys.
+		const materialize = [...inherited.keys()].some(key => !present(key));
+		const kept = (pair: Pair): boolean =>
+			isMergePair(pair) ? !materialize : isScalar(pair.key) && present(String(pair.key.value));
 		for (let index = 0; index < node.items.length; index++) {
 			const pair: Pair = node.items[index];
 			if (!isScalar(pair.key) || !pair.key.range) throw new Error("Settings YAML keys must be scalars");
-			const key = String(pair.key.value);
-			keys.add(key);
 			const child = isNode(pair.value) ? pair.value : null;
-			if (Object.hasOwn(next, key) && next[key] !== undefined) {
-				if (child) reconcile(child, next[key]);
-				else
-					edits.push({
-						start: pair.key.range[1] + 1,
-						end: pair.key.range[1] + 1,
-						text: " " + render(next[key], undefined, true),
-					});
-				continue;
+			if (isMergePair(pair)) {
+				if (!materialize) continue;
+			} else {
+				const key = String(pair.key.value);
+				keys.add(key);
+				if (present(key)) {
+					if (child) reconcile(child, next[key]);
+					else
+						edits.push({
+							start: pair.key.range[1] + 1,
+							end: pair.key.range[1] + 1,
+							text: " " + render(next[key], undefined, true),
+						});
+					continue;
+				}
 			}
 			const end = child?.range?.[node.flow ? 1 : 2] ?? pair.key.range[2];
 			let start = pair.key.range[0];
@@ -120,23 +149,21 @@ export function reconcileYamlConfig(source: string, value: unknown): string {
 			}
 			edits.push({ start, end: finish, text: "" });
 		}
-		const added = Object.entries(next).filter(([key, item]) => !keys.has(key) && item !== undefined);
+		// Retained merges already supply equal inherited values; differing ones need an explicit override.
+		const added = Object.entries(next).filter(
+			([key, item]) =>
+				!keys.has(key) &&
+				item !== undefined &&
+				(materialize || !inherited.has(key) || !Bun.deepEquals(inherited.get(key), item)),
+		);
 		if (added.length === 0) return;
 		if (!node.range) throw new Error("YAML mapping has no source range");
 		if (node.flow) {
 			let offset = node.range[1] - 1;
-			const retained = node.items.some(
-				pair =>
-					isScalar(pair.key) &&
-					Object.hasOwn(next, String(pair.key.value)) &&
-					next[String(pair.key.value)] !== undefined,
-			);
+			const retained = node.items.some(kept);
 			const last = node.items.at(-1);
 			const lastValue = isNode(last?.value) ? last.value : null;
-			const lastRetained =
-				isScalar(last?.key) &&
-				Object.hasOwn(next, String(last.key.value)) &&
-				next[String(last.key.value)] !== undefined;
+			const lastRetained = !!last && kept(last);
 			const lastRange = lastValue?.range;
 			const trailingComma = !!lastRange && commaBetween(lastRange[1], offset) >= 0;
 			// Insert before an authored trailing comma, retaining its whitespace and comments.

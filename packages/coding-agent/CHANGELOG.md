@@ -18,7 +18,7 @@
 
 ### Fixed
 
-- Preserve authored global and project settings YAML when changing a setting or model role, including comments, quotes, whitespace, line endings, external edits, and symlink targets; alias values survive anchor edits/deletion, trailing-comma flow maps stay writable, and nested migrations retain valid key ordering.
+- Preserve authored global and project settings YAML when changing a setting or model role, including comments, quotes, whitespace, line endings, external edits, and symlink targets; alias values survive anchor edits/deletion, `<<` merge keys survive unrelated edits and gain explicit overrides when an inherited value changes, trailing-comma flow maps stay writable, and nested migrations retain valid key ordering.
 - Fixed global read-only protection for missing config targets reached through directory aliases or dangling symlink chains, while retaining writes to distinct project configs.
 - Fixed native judges ignoring configured `headers`: the judge chain now resolves model headers and passes them to the System One transport, so gateway-authenticated and header-routed judge providers work without extra configuration.
 - Added support for buffered cloud transcription using OpenAI-compatible models

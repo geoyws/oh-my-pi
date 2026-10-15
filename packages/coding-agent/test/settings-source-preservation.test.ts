@@ -236,6 +236,66 @@ describe("settings YAML source preservation", () => {
 		}
 	}
 
+	describe("merge keys", () => {
+		const source =
+			"x-common: &common\n    enabled: true\n    contextBefore: 2\ngrep:\n    <<: *common # shared\n    contextAfter: 3\ntheme:\n    dark: titanium\n";
+
+		it("keeps merge syntax and inherited keys when editing an unrelated leaf", async () => {
+			await Bun.write(config, source);
+			const settings = await Settings.init({ cwd, agentDir });
+			settings.set("theme.dark", "midnight");
+			await settings.flush();
+			const output = await Bun.file(config).text();
+			expect(output).toBe(source.replace("titanium", "midnight"));
+			const reopened = await Settings.loadIsolated({ cwd, agentDir });
+			expect(reopened.get("theme.dark")).toBe("midnight");
+			expect(reopened.get("grep.enabled")).toBe(true);
+			expect(reopened.get("grep.contextBefore")).toBe(2);
+			expect(reopened.get("grep.contextAfter")).toBe(3);
+		});
+
+		it("overrides an edited inherited leaf without changing its shared anchor", async () => {
+			await Bun.write(config, source);
+			const settings = await Settings.init({ cwd, agentDir });
+			settings.set("grep.contextBefore", 5);
+			await settings.flush();
+			const output = await Bun.file(config).text();
+			expect(output).toBe(source.replace("    contextAfter: 3\n", "    contextAfter: 3\n    contextBefore: 5\n"));
+			expect(YAML.parse(output)).toEqual({
+				"x-common": { enabled: true, contextBefore: 2 },
+				grep: { enabled: true, contextBefore: 5, contextAfter: 3 },
+				theme: { dark: "titanium" },
+			});
+			const reopened = await Settings.loadIsolated({ cwd, agentDir });
+			expect(reopened.get("grep.enabled")).toBe(true);
+			expect(reopened.get("grep.contextBefore")).toBe(5);
+			expect(reopened.get("grep.contextAfter")).toBe(3);
+		});
+
+		it("materializes a merge when deleting an inherited role", async () => {
+			const roles =
+				"role-defaults: &roles\n    default: shared/default\n    smol: shared/smol\nmodelRoles:\n    <<: *roles # inherited roles\n    slow: local/slow\n";
+			await Bun.write(config, roles);
+			const settings = await Settings.init({ cwd, agentDir });
+			settings.setModelRole("smol", undefined);
+			await settings.flush();
+			const output = await Bun.file(config).text();
+			expect(output).toBe(
+				roles
+					.replace("    <<: *roles # inherited roles\n", "")
+					.replace("    slow: local/slow\n", "    slow: local/slow\n    default: shared/default\n"),
+			);
+			expect(YAML.parse(output)).toEqual({
+				"role-defaults": { default: "shared/default", smol: "shared/smol" },
+				modelRoles: { default: "shared/default", slow: "local/slow" },
+			});
+			const reopened = await Settings.loadIsolated({ cwd, agentDir });
+			expect(reopened.getModelRole("smol")).toBeUndefined();
+			expect(reopened.getModelRole("default")).toBe("shared/default");
+			expect(reopened.getModelRole("slow")).toBe("local/slow");
+		});
+	});
+
 	for (const project of [false, true]) {
 		it("changes only a role leaf in " + (project ? "project" : "global") + " YAML", async () => {
 			const source =
