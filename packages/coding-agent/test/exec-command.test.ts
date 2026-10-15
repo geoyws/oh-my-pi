@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "bun:test";
-import { execCommand } from "../src/exec/exec";
+import { execCommand, runWithExecOwner, shutdownExecCommands } from "../src/exec/exec";
 
 const HANG = ["-e", "setTimeout(() => {}, 30_000)"];
 
@@ -34,7 +34,16 @@ describe("execCommand", () => {
 			// The child signals readiness after installing its handler; its timer never fires.
 			const script = `process.on("SIGTERM", () => process.exit(0)); await Bun.write(${JSON.stringify(marker)}, "ready"); setTimeout(() => {}, 30_000);`;
 			const pending = execCommand(process.execPath, ["-e", script], process.cwd(), { signal: controller.signal });
-			await ready.promise;
+			// Wait for the child's readiness signal. The watcher event is the
+			// fast path; the existence poll is the fallback — fs.watch
+			// delivery is unreliable in some environments (FSEvents), and the
+			// test must wait on the child, not hang on the watcher.
+			const fallBack = (async () => {
+				const start = Date.now();
+				while (!fs.existsSync(marker) && Date.now() - start < 4000) await Bun.sleep(20);
+			})();
+			await Promise.race([ready.promise, fallBack]);
+			expect(fs.existsSync(marker)).toBe(true);
 			controller.abort();
 			const result = await pending;
 			expect(result.killed).toBe(true);
@@ -43,5 +52,191 @@ describe("execCommand", () => {
 			watcher.close();
 			await fs.promises.rm(dir, { recursive: true, force: true });
 		}
-	});
+	}, 60_000);
+
+	it("abort kills the TERM-ignoring grandchild's whole group", async () => {
+		if (process.platform === "win32") return;
+		// NOTE: real-clock `Bun.sleep` polls await a kernel condition (process
+		// liveness via `pgrep`) with no event handle; signals only run on the
+		// real clock. Bounded; exits as soon as the condition holds.
+		const marker = `EXECCMD_ABORT_${process.pid}_${Math.random().toString(36).slice(2, 8)}`;
+		const pattern = `[${marker[0]}]${marker.slice(1)}`;
+		const live = (): number[] =>
+			Bun.spawnSync(["pgrep", "-f", pattern])
+				.stdout.toString()
+				.trim()
+				.split("\n")
+				.filter(Boolean)
+				.map(Number)
+				.filter(pid => Number.isInteger(pid) && pid > 0);
+		const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "exec-pgkill-"));
+		const script = path.join(dir, "spawn.sh");
+		// The direct child installs no trap; only the grandchild ignores TERM,
+		// so a direct-child-only kill leaves the grandchild running while a
+		// whole-group TERM→KILL escalation reaps it.
+		await fs.promises.writeFile(
+			script,
+			`#!/bin/sh\nsh -c 'trap "" TERM; while :; do sleep 0.2; done' ${marker} & wait\n`,
+		);
+		try {
+			const controller = new AbortController();
+			const pending = execCommand("/bin/sh", [script], dir, { signal: controller.signal });
+			const start = Date.now();
+			while (live().length === 0 && Date.now() - start < 10_000) await Bun.sleep(20);
+			expect(live().length).toBeGreaterThan(0);
+			controller.abort();
+			const result = await pending;
+			expect(result.killed).toBe(true);
+			const deadline = Date.now() + 10_000;
+			let survivors = live();
+			while (survivors.length > 0 && Date.now() < deadline) {
+				await Bun.sleep(50);
+				survivors = live();
+			}
+			expect(survivors).toEqual([]);
+		} finally {
+			// Marker-keyed (never a bare pid list): if the assertion above
+			// fails, a TERM-ignoring `while :` loop would otherwise leak here.
+			for (const pid of live()) {
+				try {
+					process.kill(pid, "SIGKILL");
+				} catch {}
+			}
+			await fs.promises.rm(dir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
+	it("signal-less child dies as a group when exec shutdown runs", async () => {
+		if (process.platform === "win32") return;
+		// The child below installs no abort and gets no timeout: without the
+		// live-group registry + shutdown path it would orphan to PID 1 when
+		// the pane closes or the session disposes. Bounded sleeps await the
+		// kernel condition (process liveness via pgrep), which has no event
+		// handle and cannot run on fake timers.
+		const marker = `EXECCMD_NOSIG_${process.pid}_${Math.random().toString(36).slice(2, 8)}`;
+		const pattern = `[${marker[0]}]${marker.slice(1)}`;
+		const live = (): number[] =>
+			Bun.spawnSync(["pgrep", "-f", pattern])
+				.stdout.toString()
+				.trim()
+				.split("\n")
+				.filter(Boolean)
+				.map(Number)
+				.filter(pid => Number.isInteger(pid) && pid > 0);
+		const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "exec-pgkill-"));
+		const script = path.join(dir, "spawn.sh");
+		await fs.promises.writeFile(
+			script,
+			`#!/bin/sh\nsh -c 'trap "" TERM; while :; do sleep 0.2; done' ${marker} & wait\n`,
+		);
+		try {
+			const pending = execCommand("/bin/sh", [script], dir);
+			const start = Date.now();
+			while (live().length === 0 && Date.now() - start < 10_000) await Bun.sleep(20);
+			expect(live().length).toBeGreaterThan(0);
+			await shutdownExecCommands();
+			const result = await pending;
+			expect(result.killed).toBe(true);
+			// Shutdown awaited the whole-group TERM→KILL escalation, so the
+			// group is already gone: a short confirmation bound, not a leak
+			// window — without the shutdown the loop below would time out.
+			const deadline = Date.now() + 5_000;
+			let survivors = live();
+			while (survivors.length > 0 && Date.now() < deadline) {
+				await Bun.sleep(50);
+				survivors = live();
+			}
+			expect(survivors).toEqual([]);
+		} finally {
+			for (const pid of live()) {
+				try {
+					process.kill(pid, "SIGKILL");
+				} catch {}
+			}
+			await fs.promises.rm(dir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
+	it("session shutdown kills only its own exec children; exit teardown kills the rest", async () => {
+		if (process.platform === "win32") return;
+		// Three signal-less children with different owners: two explicit
+		// `sessionKey`s and one ambient `runWithExecOwner` scope (the path
+		// hook/tool runners use). Disposing session A must not touch B or C;
+		// the owner-less postmortem shutdown kills everything remaining.
+		// Bounded sleeps await kernel liveness via pgrep, which has no event
+		// handle and cannot run on fake timers.
+		const tag = `${process.pid}_${Math.random().toString(36).slice(2, 8)}`;
+		const markerA = `EXECCMD_OWNA_${tag}`;
+		const markerB = `EXECCMD_OWNB_${tag}`;
+		const markerC = `EXECCMD_OWNC_${tag}`;
+		const live = (marker: string): number[] =>
+			Bun.spawnSync(["pgrep", "-f", `[${marker[0]}]${marker.slice(1)}`])
+				.stdout.toString()
+				.trim()
+				.split("\n")
+				.filter(Boolean)
+				.map(Number)
+				.filter(pid => Number.isInteger(pid) && pid > 0);
+		const spawnOwned = (marker: string, sessionKey?: string) =>
+			execCommand(
+				"/bin/sh",
+				["-c", `sh -c 'trap "" TERM; while :; do sleep 0.2; done' ${marker} & wait`],
+				process.cwd(),
+				sessionKey === undefined ? undefined : { sessionKey },
+			);
+		try {
+			const pendingA = spawnOwned(markerA, "owner-a");
+			const pendingB = spawnOwned(markerB, "owner-b");
+			const pendingC = runWithExecOwner("owner-c", () => spawnOwned(markerC));
+			for (const marker of [markerA, markerB, markerC]) {
+				const start = Date.now();
+				while (live(marker).length === 0 && Date.now() - start < 10_000) await Bun.sleep(20);
+				expect(live(marker).length).toBeGreaterThan(0);
+			}
+			await shutdownExecCommands("owner-a");
+			expect((await pendingA).killed).toBe(true);
+			expect(live(markerA)).toEqual([]);
+			// B and C are untouched: still alive and their calls unsettled.
+			// A short settle check (not a leak window): a wrongful kill would
+			// settle them near-instantly, while the loops below would spin
+			// for the full script lifetime without the shutdown.
+			expect(live(markerB).length).toBeGreaterThan(0);
+			expect(live(markerC).length).toBeGreaterThan(0);
+			let settledB = false;
+			let settledC = false;
+			void pendingB.then(
+				() => {
+					settledB = true;
+				},
+				() => {
+					settledB = true;
+				},
+			);
+			void pendingC.then(
+				() => {
+					settledC = true;
+				},
+				() => {
+					settledC = true;
+				},
+			);
+			await Bun.sleep(500);
+			expect(settledB).toBe(false);
+			expect(settledC).toBe(false);
+			// The owner-less (postmortem) shutdown kills everything remaining.
+			await shutdownExecCommands();
+			expect((await pendingB).killed).toBe(true);
+			expect((await pendingC).killed).toBe(true);
+			expect(live(markerB)).toEqual([]);
+			expect(live(markerC)).toEqual([]);
+		} finally {
+			for (const marker of [markerA, markerB, markerC]) {
+				for (const pid of live(marker)) {
+					try {
+						process.kill(pid, "SIGKILL");
+					} catch {}
+				}
+			}
+		}
+	}, 60_000);
 });

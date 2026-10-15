@@ -138,6 +138,7 @@ import type { PythonResult } from "../eval/py/executor";
 import { formatEvalStateContext } from "../eval/state";
 import { WorkPoolRegistry } from "../task/workpool";
 import { type BashPtyOptions, type BashResult, releaseShellSessions } from "../exec/bash-executor";
+import { reopenExecOwner, runWithExecOwner, shutdownExecCommands } from "../exec/exec";
 import type { TtsrManager } from "../export/ttsr";
 import type { LoadedCustomCommand } from "../extensibility/custom-commands";
 import type { CustomTool } from "../extensibility/custom-tools/types";
@@ -1647,6 +1648,8 @@ export class AgentSession implements SettingsScope {
 		);
 		this.#codeModeState = config.codeModeState ?? {};
 		this.sessionManager = config.sessionManager;
+		// A session revived in-process under a previously disposed id spawns again.
+		reopenExecOwner(this.sessionManager.getSessionId());
 		this.settings = config.settings;
 		this.#skillDescriptions = config.skillDescriptions ?? new SkillDescriptionCatalog();
 		this.memoryEnabled = config.memoryEnabled ?? true;
@@ -5714,7 +5717,18 @@ export class AgentSession implements SettingsScope {
 			logger.warn("Session dispose: Sharpshooter release failed", { error: String(error) });
 		}
 		const advisorRecorderClosed = this.#advisors.recorderClosed();
-		releaseShellSessions(this.sessionManager.getSessionId());
+		// Awaited: return means every bash-tool process group owned by this
+		// session is dead — nothing outlives dispose into a PPID-1 orphan.
+		// Live `execCommand` groups owned by this session (hook/extension/
+		// custom-tool children, often signal-less) are shut down alongside:
+		// they run detached, so the kernel SIGHUP path cannot reap them.
+		// Only this session's entries are killed — other sessions' in-flight
+		// children (e.g. the parent's, when a subagent disposes) are spared;
+		// the postmortem teardown kills whatever remains at process exit.
+		await Promise.allSettled([
+			releaseShellSessions(this.sessionManager.getSessionId()),
+			shutdownExecCommands(this.sessionManager.getSessionId()),
+		]);
 		const results = await Promise.allSettled([
 			this.#disposeOwnedAsyncJobs(),
 			this.#eval.disposeKernels(),
@@ -8102,7 +8116,11 @@ export class AgentSession implements SettingsScope {
 		const ctx = this.#extensionRunner.createCommandContext();
 
 		try {
-			await this.#extensionRunner.runScoped(() => command.handler(args, ctx));
+			// Attribute `pi.exec` children the command starts to this session,
+			// like custom commands and every other extension entry point.
+			await this.#extensionRunner.runScoped(() =>
+				runWithExecOwner(this.sessionManager.getSessionId(), () => command.handler(args, ctx)),
+			);
 			return true;
 		} catch (err) {
 			// Emit error via extension runner
@@ -8226,7 +8244,11 @@ export class AgentSession implements SettingsScope {
 
 		try {
 			const args = parseCommandArgs(argsString);
-			const result = await loaded.command.execute(args, ctx, argsString);
+			// Attribute `pi.exec` children the command starts to this session,
+			// like hook and tool invocations above.
+			const result = await runWithExecOwner(this.sessionManager.getSessionId(), () =>
+				loaded.command.execute(args, ctx, argsString),
+			);
 			// If result is a string, it's a prompt to send to LLM
 			// If void/undefined, command handled everything
 			return result ?? "";
@@ -11522,6 +11544,7 @@ export class AgentSession implements SettingsScope {
 			// switch rolled back via restoreState); re-read it on the next model call either way.
 			this.#sessionInit = undefined;
 			await this.sessionManager.setSessionFile(sessionPath);
+			reopenExecOwner(this.sessionManager.getSessionId());
 			this.#bash.markSessionTransition(bashTransition);
 			const newCwd = this.sessionManager.getCwd();
 			const recordedCwd = this.sessionManager.getRecordedCwd() ?? previousSessionState.cwd;

@@ -479,6 +479,20 @@ export declare class Shell {
    */
   abort(): Promise<void>
   /**
+   * Terminate leftover background jobs (`&`/`nohup` children) with awaited
+   * TERM→KILL escalation. The host calls this at the end of a run whose
+   * background jobs must not outlive the call, and at session dispose.
+   * A no-op when no session core is materialized or no jobs are tracked.
+   */
+  terminateBackgroundJobs(): Promise<void>
+  /**
+   * Abort any in-flight run and terminate leftover background jobs.
+   * Session dispose path: never blocks on a wedged run holding the session
+   * lock — the run's own cancel bridge owns its tree; this catches
+   * leftovers from already-completed runs before the host drops the session.
+   */
+  shutdown(): Promise<void>
+  /**
    * Count live background jobs (`&`/`nohup` children still running) on this
    * session. Completed jobs are reaped first. The host uses this to retain a
    * per-call shell whose background processes are still running instead of

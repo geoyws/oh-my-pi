@@ -259,6 +259,30 @@ impl Shell {
 		self.abort_state.abort().await;
 	}
 
+	/// Terminate leftover background jobs (`&`/`nohup` children) with awaited
+	/// TERM→KILL escalation. The host calls this at the end of a run whose
+	/// background jobs must not outlive the call, and at session dispose. A
+	/// no-op when no session core is materialized or no jobs are tracked.
+	pub async fn terminate_background_jobs(&self) {
+		let mut guard = self.session.lock().await;
+		if let Some(core) = guard.as_mut() {
+			terminate_background_jobs(&mut core.shell).await;
+		}
+	}
+
+	/// Abort any in-flight run and terminate leftover background jobs. Session
+	/// dispose path: never blocks on a wedged run holding the session lock —
+	/// the run's own cancel bridge owns its tree; this catches leftovers from
+	/// already-completed runs before the host drops the session.
+	pub async fn shutdown(&self) {
+		self.abort().await;
+		if let Ok(mut guard) = self.session.try_lock() {
+			if let Some(core) = guard.as_mut() {
+				terminate_background_jobs(&mut core.shell).await;
+			}
+		}
+	}
+
 	/// Pids of the processes spawned by the in-flight [`Shell::run`] that are
 	/// still alive, in spawn order. Covers every external child the run
 	/// started — foreground commands, pipeline stages, and `&` background
@@ -1413,7 +1437,7 @@ async fn run_shell_command_once(
 	drop(diagnostics);
 
 	if cancel_token.is_cancelled() {
-		terminate_background_jobs(&mut session.shell);
+		terminate_background_jobs(&mut session.shell).await;
 	}
 
 	drop(params);
@@ -1562,7 +1586,7 @@ async fn run_shell_command_streams_in_filesystem(
 	drop(diagnostics);
 
 	if cancel_token.is_cancelled() {
-		terminate_background_jobs(&mut session.shell);
+		terminate_background_jobs(&mut session.shell).await;
 	}
 
 	if env_scope_pushed {
@@ -1742,11 +1766,16 @@ async fn terminate_run(registry: &process::SpawnRegistry) {
 	}
 }
 
-fn terminate_background_jobs(shell: &mut BrushShell) {
+/// Grace between the polite (TERM) and hard (KILL) background-job waves, so a
+/// job with a TERM handler can clean up before the hard wave.
+const BACKGROUND_JOB_KILL_GRACE: Duration = Duration::from_millis(150);
+/// Upper bound on the post-KILL exit wait. KILL delivery is asynchronous, so
+/// without this a caller that just signalled could observe a still-dying
+/// process; an unkillable (D-state) job must not stall teardown forever.
+const BACKGROUND_JOB_EXIT_WAIT: Duration = Duration::from_secs(2);
+
+fn collect_background_targets(shell: &BrushShell) -> process::TerminationTargets {
 	let mut targets = process::TerminationTargets::new();
-	for job in &mut shell.jobs_mut().jobs {
-		job.abort_internal_tasks();
-	}
 	for job in &shell.jobs().jobs {
 		if let Some(pgid) = job.process_group_id() {
 			targets.add_pgid(pgid);
@@ -1755,18 +1784,45 @@ fn terminate_background_jobs(shell: &mut BrushShell) {
 			targets.add_pid(pid);
 		}
 	}
-	if targets.is_empty() {
+	targets
+}
+
+/// Escalating TERM→KILL over the shell's tracked background jobs, awaited.
+///
+/// Unlike the detached KILL task this replaces, returning means the recorded
+/// groups are dead (or the bounded exit wait elapsed): call-end and dispose
+/// paths assert exactly that, and a host exit racing a fire-and-forget KILL
+/// was one way TERM-ignoring grandchildren outlived their session.
+async fn terminate_background_jobs(shell: &mut BrushShell) {
+	for job in &mut shell.jobs_mut().jobs {
+		job.abort_internal_tasks();
+	}
+	if collect_background_targets(shell).is_empty() {
 		// Shell-internal jobs were aborted above. Pure descendant cleanup is
 		// handled by `process_cancel_bridge` while the cancel was in flight;
 		// without job-tracked pgids or pids there is nothing else to signal here.
 		return;
 	}
 
-	targets.signal(process::TERM_SIGNAL);
-	tokio::spawn(async move {
-		time::sleep(Duration::from_millis(150)).await;
-		targets.signal(process::KILL_SIGNAL);
-	});
+	collect_background_targets(shell).signal(process::TERM_SIGNAL);
+	time::sleep(BACKGROUND_JOB_KILL_GRACE).await;
+	// Re-collect: jobs may have spawned or exited during the grace window.
+	collect_background_targets(shell).signal(process::KILL_SIGNAL);
+	let deadline = time::Instant::now() + BACKGROUND_JOB_EXIT_WAIT;
+	loop {
+		// Reap exit statuses first: a signalled child lingers as a zombie —
+		// still matching signal-0 probes and holding its group alive — until
+		// the job table reaps it. Fail closed: a poll error keeps the table
+		// as-is and the liveness check below governs the wait.
+		let _ = shell.jobs_mut().poll();
+		if collect_background_targets(shell).all_exited() {
+			break;
+		}
+		if time::Instant::now() >= deadline {
+			break;
+		}
+		time::sleep(Duration::from_millis(10)).await;
+	}
 }
 
 /// Apply per-command environment variables onto a freshly pushed

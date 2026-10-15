@@ -19,6 +19,7 @@ import {
 	resolveApprovalFromContext,
 	truncateForPrompt,
 } from "../../tools/approval";
+import { runWithExecOwner } from "../../exec/exec";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { withFileMutationSession } from "../../tools/file-write-fallback";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
@@ -439,7 +440,9 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			// a runner exists.
 			result = await this.runner.runScoped(() =>
 				withFileMutationSession(this.runner.sessionId, () =>
-					this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, context),
+					runWithExecOwner(this.runner.sessionId, () =>
+						this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, context),
+					),
 				),
 			);
 		} catch (err) {
