@@ -177,6 +177,23 @@ export interface SteeringQueueState {
 }
 
 /**
+ * What the loop would do, right now, with a steering message queued at this
+ * instant. Reported through {@link AgentLoopConfig.onQueuedSteerOutcome} as
+ * the loop moves between windows, from the same gates the interrupt machinery
+ * uses, so a host can tell the user what will actually happen.
+ * - "interrupt-model-call": a model call (or its preparation) has produced no
+ *   output and the steer watch is armed; the call is cancelled and re-issued
+ *   with the steer folded in.
+ * - "interrupt-wait": a tool batch still has an unfinished interruptible wait
+ *   that queued steering cuts short; the steer injects once the batch's other
+ *   tools finish.
+ * - "after-tools": a tool batch is running with nothing steering would cut
+ *   short; the steer injects at the batch boundary.
+ * - "after-response": the steer waits for the current response to finish.
+ */
+export type QueuedSteerOutcome = "interrupt-model-call" | "interrupt-wait" | "after-tools" | "after-response";
+
+/**
  * Configuration for the agent loop.
  */
 export interface AgentLoopConfig extends SimpleStreamOptions {
@@ -343,6 +360,13 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * unrecorded for the host to requeue.
 	 */
 	onLiveSteeringTaken?: (messages: AgentMessage[]) => void;
+
+	/**
+	 * Notified whenever the outcome a newly queued steer would get changes
+	 * (see {@link QueuedSteerOutcome}). Synchronous and side-effect free on the
+	 * loop's side; hosts store the latest value for their queue acknowledgement.
+	 */
+	onQueuedSteerOutcome?: (outcome: QueuedSteerOutcome) => void;
 
 	/**
 	 * Peeks whether IRC messages should interrupt an interruptible waiting tool.

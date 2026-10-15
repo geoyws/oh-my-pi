@@ -2,9 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `AgentLoopConfig.onQueuedSteerOutcome` and `Agent.queuedSteerOutcome`, reporting what a steer queued right now would get — cancel an output-less model call, cut an interruptible wait short, or wait for the running tools or current response — from the same gates the interrupt machinery uses.
+
 ### Fixed
 
 - A steering message sent while a model request has not produced any output is applied immediately instead of waiting for the response, subject to `interruptMode`; the session shows whether a queued steer will interrupt or wait. ([#12787](https://github.com/can1357/oh-my-pi/pull/12787) by [@geoyws](https://github.com/geoyws))
+- Fixed a steer queued while the loop synced context, prepared the provider request or ran `beforeModelCall` being folded into the steer watch's baseline: the request went out without it and was never cancelled. The watch now arms before that preparation, so the call is cancelled before it produces output and re-issued with the steer.
 
 ## [18.9.2] - 2026-10-11
 

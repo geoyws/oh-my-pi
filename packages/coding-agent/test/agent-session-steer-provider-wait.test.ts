@@ -3,12 +3,16 @@
  * is open but has streamed nothing — is never silently parked.
  *
  *  1. The session acknowledges the queue immediately with a `notice` event
- *     (rendered as a status line in interactive mode). The copy discriminates:
- *     "Queued — interrupting the current step" when the loop can still cancel
- *     the output-less request, "Queued — will apply after the current
- *     response" once output has started or `interruptMode` is `"wait"`. Every
- *     user-attributed steer path (typed text, collab guest prompts, skill
- *     commands) emits it; hidden companions stay silent.
+ *     (rendered as a status line in interactive mode). The copy follows the
+ *     loop's actual decision: "Queued — interrupting the current step" when
+ *     the loop can still cancel the output-less request, "Queued —
+ *     interrupting the current wait" when a tool batch still has an
+ *     interruptible wait the steer cuts short (in either `interruptMode`),
+ *     "Queued — will apply after the running tools finish" during any other
+ *     tool batch, and "Queued — will apply after the current response" once
+ *     output has started or `interruptMode` is `"wait"`. Every user-attributed
+ *     steer path (typed text, collab guest prompts, skill commands) emits it;
+ *     hidden companions stay silent.
  *  2. The agent loop cancels the output-less request, folds the steer in and
  *     re-issues the model call, so the user's correction reaches the model that
  *     turn instead of after it — companions (magic-keyword notices) travelling
@@ -21,7 +25,8 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Agent } from "@oh-my-pi/pi-agent-core";
+import { type } from "@oh-my-pi/omptype";
+import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import { createMockModel, type MockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -31,7 +36,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { COLLAB_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/collab/protocol";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
+import { removeSyncWithRetries, Snowflake, withTimeout } from "@oh-my-pi/pi-utils";
 
 describe("AgentSession steering during the provider wait", () => {
 	let tempDir: string;
@@ -261,5 +266,86 @@ describe("AgentSession steering during the provider wait", () => {
 					).includes("actually, do X instead"),
 			),
 		).toBe(true);
+	});
+
+	/**
+	 * Run a tool batch whose single `hold` call blocks until released or
+	 * aborted, queue a user steer while it runs, and return the queued notices
+	 * plus whether the steer aborted the tool.
+	 */
+	async function steerDuringToolBatch(options: {
+		interruptible: boolean;
+		interruptMode: "immediate" | "wait";
+	}): Promise<{ notices: string[]; aborted: boolean }> {
+		const { session } = await createSession([
+			{ content: [{ type: "toolCall", id: "hold-1", name: "hold", arguments: {} }] },
+			{ content: ["answer after the steer"] },
+		]);
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const abortedWait = Promise.withResolvers<void>();
+		let aborted = false;
+		const schema = type({});
+		const tool: AgentTool<typeof schema> = {
+			name: "hold",
+			label: "Hold",
+			description: "Block until released or aborted",
+			parameters: schema,
+			interruptible: options.interruptible,
+			async execute(_id, _params, signal) {
+				const onAbort = () => {
+					aborted = true;
+					abortedWait.resolve();
+				};
+				signal?.addEventListener("abort", onAbort, { once: true });
+				started.resolve();
+				try {
+					await Promise.race([release.promise, abortedWait.promise]);
+				} finally {
+					signal?.removeEventListener("abort", onAbort);
+				}
+				return { content: [{ type: "text", text: "held" }], details: {} };
+			},
+		};
+		session.agent.setTools([tool]);
+		session.setInterruptMode(options.interruptMode, false);
+
+		const notices: string[] = [];
+		session.subscribe(event => {
+			if (event.type === "notice") notices.push(event.message);
+		});
+
+		const run = session.prompt("hello");
+		try {
+			await withTimeout(started.promise, 2_000, "The tool did not start");
+			await session.steer("actually, do X instead");
+			// The steer itself must cut an interruptible wait short; anything else
+			// runs until released below.
+			if (options.interruptible) await withTimeout(abortedWait.promise, 2_000, "The steer did not cut the wait");
+		} finally {
+			release.resolve();
+			await run;
+		}
+		await session.waitForIdle();
+		return { notices: notices.filter(notice => notice.startsWith("Queued")), aborted };
+	}
+
+	it("says it interrupts the wait when a tool batch has an interruptible wait", async () => {
+		const { notices, aborted } = await steerDuringToolBatch({ interruptible: true, interruptMode: "immediate" });
+		expect(notices).toEqual(["Queued — interrupting the current wait"]);
+		expect(aborted).toBe(true);
+	});
+
+	it("says it waits for the running tools when nothing in the batch is interruptible", async () => {
+		const { notices, aborted } = await steerDuringToolBatch({ interruptible: false, interruptMode: "immediate" });
+		expect(notices).toEqual(["Queued — will apply after the running tools finish"]);
+		// Non-interruptible work is never hard-aborted by a steer.
+		expect(aborted).toBe(false);
+	});
+
+	it("says it interrupts the wait in wait mode, which still cuts interruptible waits short", async () => {
+		const { notices, aborted } = await steerDuringToolBatch({ interruptible: true, interruptMode: "wait" });
+		expect(notices).toEqual(["Queued — interrupting the current wait"]);
+		expect(aborted).toBe(true);
 	});
 });

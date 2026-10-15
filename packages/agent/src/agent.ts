@@ -60,6 +60,7 @@ import type {
 	AgentTurnEndContext,
 	AsideMessage,
 	PrepareQueuedMessages,
+	QueuedSteerOutcome,
 	SpeculativeToolExecutionConfig,
 	StreamFn,
 	ToolCallContext,
@@ -448,6 +449,7 @@ export class Agent {
 	#steeringMode: "all" | "one-at-a-time";
 	#followUpMode: "all" | "one-at-a-time";
 	#interruptMode: "immediate" | "wait";
+	#queuedSteerOutcome: QueuedSteerOutcome = "after-response";
 	#sessionId?: string;
 	#deadline?: number;
 	#promptCacheKey?: string;
@@ -1273,6 +1275,16 @@ export class Agent {
 		return this.#interruptMode;
 	}
 
+	/**
+	 * What the running loop would do with a steer queued now — cancel an
+	 * output-less model call, cut an interruptible wait short, or wait for the
+	 * running tools / current response. Reported by the loop from the gates its
+	 * interrupt machinery actually uses; `"after-response"` when idle.
+	 */
+	get queuedSteerOutcome(): QueuedSteerOutcome {
+		return this.#queuedSteerOutcome;
+	}
+
 	setTools(t: AgentTool<any>[]) {
 		this.#state.tools = t;
 	}
@@ -1756,6 +1768,7 @@ export class Agent {
 		this.#state.isStreaming = true;
 		this.#state.streamMessage = null;
 		this.#state.error = undefined;
+		this.#queuedSteerOutcome = "after-response";
 
 		// Clear Cursor tool result buffer at start of each run
 		this.#cursorToolResultBuffer = [];
@@ -1856,6 +1869,9 @@ export class Agent {
 			serviceTier: this.#serviceTier,
 			hideThinkingSummary: this.#hideThinkingSummary,
 			interruptMode: this.#interruptMode,
+			onQueuedSteerOutcome: outcome => {
+				this.#queuedSteerOutcome = outcome;
+			},
 			sessionId: this.#sessionId,
 			deadline: this.#deadline,
 			promptCacheKey: this.#promptCacheKey,

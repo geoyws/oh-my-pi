@@ -449,6 +449,36 @@ function watchSteeringQueue(
 }
 
 /**
+ * The pre-output steering window of one model call: armed by runLoopBody
+ * before context sync, provider preparation and the pre-call gate, and closed
+ * by `streamAssistantResponse` at the first stream event. Arming at the
+ * dispatch instead would let the watch's baseline peek swallow a steer queued
+ * during those awaits, so the call prepared without it would go out and never
+ * be cancelled.
+ */
+interface ProviderSteerWindow {
+	readonly watch: SteeringWatch;
+	/** False once output arrived or the steer cancelled the call. */
+	open: boolean;
+	/** True once the watch accepted a queued steer while the window was open. */
+	detected: boolean;
+}
+
+function openProviderSteerWindow(
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+): ProviderSteerWindow | undefined {
+	const state = { open: true, detected: false };
+	const watch = watchSteeringQueue(config, signal, () => {
+		if (!state.open || signal?.aborted) return false;
+		state.detected = true;
+		return true;
+	});
+	if (!watch) return undefined;
+	return Object.assign(state, { watch });
+}
+
+/**
  * Close a provider stream the loop abandoned — steering cancelled the request
  * before it produced anything, so the response (if the provider still hands one
  * back) has no reader. Cancellation failures are irrelevant to a discarded
@@ -1634,6 +1664,18 @@ async function runLoopBody(
 					pendingMessages = [];
 				}
 
+				// Open the steer window before context sync, provider preparation and
+				// the pre-call gate, not when the request is issued: a steer queued
+				// during those awaits must cancel the call prepared without it, so the
+				// watch's baseline is the queue as it stands here. Disarmed after an
+				// empty drain (host peek/dequeue disagreement) or once the re-issue
+				// cap is hit, so a further steer waits for the turn boundary.
+				const steerWindow =
+					!steerInterruptDrainedNothing && steerReissueCount < MAX_STEER_REISSUES
+						? openProviderSteerWindow(config, signal)
+						: undefined;
+				config.onQueuedSteerOutcome?.(steerWindow ? "interrupt-model-call" : "after-response");
+
 				let preparedProviderCall: PreparedProviderCall;
 				let gateResult: AgentPreModelCallResult;
 				try {
@@ -1671,6 +1713,7 @@ async function runLoopBody(
 					preparedProviderCall.liveSteering = openLiveSteering(config, signal, preparedProviderCall);
 					gateResult = (await config.beforeModelCall?.(preparedProviderCall.context, signal)) || undefined;
 				} catch (error) {
+					steerWindow?.watch.stop();
 					if (!turnOpen) {
 						stream.push({ type: "turn_start" });
 						emitInputMessages(stream, turnMessages);
@@ -1682,6 +1725,7 @@ async function runLoopBody(
 					gateResult = { stop: true };
 				}
 				if (gateResult?.stop) {
+					steerWindow?.watch.stop();
 					if (gateResult.reason) {
 						logger.debug("Agent loop stopped before the model call", { reason: gateResult.reason });
 					}
@@ -1764,10 +1808,7 @@ async function runLoopBody(
 								)
 							);
 						},
-						// Disarmed after an empty drain (host peek/dequeue
-						// disagreement) or once the re-issue cap is hit, so a
-						// further steer waits for the turn boundary.
-						!steerInterruptDrainedNothing && steerReissueCount < MAX_STEER_REISSUES,
+						steerWindow,
 						steerCredential,
 					);
 					harmonyRetryAttempt = 0;
@@ -1875,6 +1916,9 @@ async function runLoopBody(
 						throw err;
 					}
 				} finally {
+					// Idempotent: streamAssistantResponse closes the window on its
+					// own paths; this covers anything that escaped before it did.
+					steerWindow?.watch.stop();
 					const channel = preparedProviderCall.liveSteering;
 					if (channel) {
 						liveAccepted.push(...channel.accepted);
@@ -2374,8 +2418,12 @@ async function streamAssistantResponse(
 	forcedToolChoice?: ToolChoice,
 	prepared?: PreparedProviderCall,
 	canDispatchFinalToolCalls?: (message: AssistantMessage) => boolean,
-	/** False after a steer interrupt whose dequeue came back empty (see runLoopBody). */
-	allowSteerInterrupt = true,
+	/**
+	 * Pre-output steering window runLoopBody armed before preparing this call;
+	 * absent when steering may not cancel it (no queue, "wait" mode, or
+	 * disarmed after an empty drain / the re-issue cap).
+	 */
+	steerWindow?: ProviderSteerWindow,
 	/** Credential resolved by the immediately interrupted attempt, reusable only for the same model and session. */
 	credential?: ResolvedRequestCredential,
 ): Promise<AssistantMessage> {
@@ -2414,12 +2462,9 @@ async function streamAssistantResponse(
 	// message until the turn ends. Merged into the provider signal ONLY (like the
 	// prompt-tool controller above), so the loop's external-abort handling never
 	// sees it and a steer is never mistaken for a user interrupt.
-	// Gated here too (not just inside `watchSteeringQueue`) so a host without a
-	// steering queue pays no controller and no extra `AbortSignal.any` member.
-	const steerInterruptController =
-		allowSteerInterrupt && config.hasSteeringMessages && (config.interruptMode ?? "immediate") !== "wait"
-			? new AbortController()
-			: undefined;
+	// The steer window (and its gate) is armed by runLoopBody, so a host without
+	// a steering queue pays no controller and no extra `AbortSignal.any` member.
+	const steerInterruptController = steerWindow ? new AbortController() : undefined;
 	if (steerInterruptController) providerAbortSignals.push(steerInterruptController.signal);
 	const finalRequestSignal =
 		providerAbortSignals.length === 0
@@ -2427,20 +2472,13 @@ async function streamAssistantResponse(
 			: providerAbortSignals.length === 1
 				? providerAbortSignals[0]!
 				: AbortSignal.any(providerAbortSignals);
-	// Open the pre-output window before credential selection: OAuth refresh can
-	// be the longest part of a request, and a steer queued there must rebuild the
-	// context before anything reaches the provider. The refresh itself settles
-	// and is carried into the immediate replacement so account selection and
-	// other mutating resolver work do not run twice.
-	let steerWindowOpen = true;
-	let steerDetected = false;
-	const steerWatch = steerInterruptController
-		? watchSteeringQueue(config, requestSignal, () => {
-				if (!steerWindowOpen || requestSignal?.aborted) return false;
-				steerDetected = true;
-				return true;
-			})
-		: undefined;
+	// The window was opened before context sync and provider preparation and
+	// stays open through credential selection: OAuth refresh can be the longest
+	// part of a request, and a steer queued there must rebuild the context
+	// before anything reaches the provider. The refresh itself settles and is
+	// carried into the immediate replacement so account selection and other
+	// mutating resolver work do not run twice.
+	const steerWatch = steerWindow?.watch;
 	const steerRace = steerWatch?.fired.then((): typeof STEER_INTERRUPTED => STEER_INTERRUPTED);
 	// The baseline must precede both credential work and provider dispatch.
 	// The baseline peek is async even for a synchronous host, so issuing
@@ -2459,7 +2497,7 @@ async function streamAssistantResponse(
 	 * run error.
 	 */
 	const abortForSteer = (): void => {
-		steerWindowOpen = false;
+		if (steerWindow) steerWindow.open = false;
 		steerWatch?.stop();
 		steerInterruptController?.abort(STEER_INTERRUPT_ABORT_REASON);
 	};
@@ -2492,7 +2530,7 @@ async function streamAssistantResponse(
 		resolvedApiKey,
 		resolvedSeed,
 	};
-	if (steerDetected && !requestSignal?.aborted) {
+	if (steerWindow?.detected && !requestSignal?.aborted) {
 		abortForSteer();
 		throw new SteerInterruption(resolvedCredential);
 	}
@@ -2573,7 +2611,7 @@ async function streamAssistantResponse(
 			// An event-driven watch is woken by the arrival itself and gets no
 			// extra peek, so its dispatch timing is unchanged.
 			if (!config.waitForSteeringMessages) await steerWatch?.refresh();
-			if (steerDetected && !requestSignal?.aborted) {
+			if (steerWindow?.detected && !requestSignal?.aborted) {
 				abortForSteer();
 				throw new SteerInterruption(resolvedCredential);
 			}
@@ -2741,7 +2779,7 @@ async function streamAssistantResponse(
 					// Three-way race only while the steer window is open — i.e. for the
 					// first event alone, so steady-state streaming keeps the original
 					// two-promise (or bare) path and its per-event allocation profile.
-					if (steerRace && steerWindowOpen) {
+					if (steerRace && steerWindow?.open) {
 						// The waiter this race abandons is rejected moments later by the
 						// cancel below (pi-ai `fail()`s the stream with the abort reason).
 						// `Promise.race` keeps its own handler attached to every input for
@@ -2771,9 +2809,10 @@ async function streamAssistantResponse(
 					}
 					// The provider answered: from here on a queued steer waits for the
 					// turn boundary rather than throwing away output the user is reading.
-					if (steerWindowOpen) {
-						steerWindowOpen = false;
-						steerWatch?.stop();
+					if (steerWindow?.open) {
+						steerWindow.open = false;
+						steerWindow.watch.stop();
+						config.onQueuedSteerOutcome?.("after-response");
 					}
 					if (next.done) {
 						providerStreamSettled = true;
@@ -3884,6 +3923,20 @@ async function executeToolCalls(
 		};
 	});
 
+	// What a steer queued right now gets from this batch: while an
+	// interruptible wait is unfinished and no interrupt has fired yet, the
+	// steering watch cuts it short (in either interruptMode); otherwise every
+	// remaining tool finishes and the steer injects at the batch boundary.
+	const reportSteerOutcome = (): void => {
+		if (!config.onQueuedSteerOutcome) return;
+		const cutsWait =
+			hasSteeringMessages !== undefined &&
+			!interruptState.triggered &&
+			records.some(record => record.interruptible && !record.resultEmitted);
+		config.onQueuedSteerOutcome(cutsWait ? "interrupt-wait" : "after-tools");
+	};
+	reportSteerOutcome();
+
 	const checkAsideInterrupts = async (): Promise<void> => {
 		// Asides only fire once: an interrupt already recorded on interruptState
 		// must not re-abort, and (unlike steering) never re-consumes a queue.
@@ -3905,6 +3958,7 @@ async function executeToolCalls(
 			interruptState.triggered = true;
 			interruptState.source = source;
 			ircAbortController.abort(TOOL_INTERRUPT_ABORT_REASON);
+			reportSteerOutcome();
 		}
 		// Only an urgent aside raises the cooperative signal that makes
 		// backgroundable foreground work (auto-background bash/eval) detach
@@ -3946,6 +4000,7 @@ async function executeToolCalls(
 				interruptState.source = steeringSource ?? "unknown";
 				steeringAbortController.abort(TOOL_INTERRUPT_ABORT_REASON);
 				if (softInterrupts) steeringSoftController.abort();
+				reportSteerOutcome();
 			}
 			return;
 		}
@@ -3999,6 +4054,7 @@ async function executeToolCalls(
 		record.isError = isError;
 		record.toolResultMessage = toolResultMessage;
 		record.resultEmitted = true;
+		reportSteerOutcome();
 		flushResultMessages();
 	};
 

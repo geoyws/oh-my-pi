@@ -8727,20 +8727,33 @@ export class AgentSession implements SettingsScope {
 	 * (`#queueUserMessage` for typed/steered text, `#queueCustomMessage` for
 	 * collab guest prompts and skill commands). Hidden companions queued ahead
 	 * of the user's text (magic-keyword notices) stay silent — the submission's
-	 * own notice covers them. The copy discriminates: while the model call has
-	 * streamed nothing and `interruptMode` is not `"wait"`, the loop cancels it
-	 * and the steer interrupts instead of waiting for the boundary.
+	 * own notice covers them. The copy follows the loop's live decision
+	 * (`Agent.queuedSteerOutcome`): an output-less model call is cancelled and
+	 * re-issued with the steer, an unfinished interruptible wait is cut short
+	 * (in either `interruptMode`), otherwise the steer waits for the running
+	 * tools or the current response.
 	 */
 	#emitQueuedSteerNotice(
 		deliverAs: "steer" | "followUp" | "aside",
 		attribution: MessageAttribution | undefined,
 	): void {
 		if (deliverAs !== "steer" || attribution !== "user" || !this.isStreaming) return;
-		const willInterrupt = this.interruptMode !== "wait" && this.agent.state.streamMessage === null;
-		this.emitNotice(
-			"info",
-			willInterrupt ? "Queued — interrupting the current step" : "Queued — will apply after the current response",
-		);
+		let notice: string;
+		switch (this.agent.queuedSteerOutcome) {
+			case "interrupt-model-call":
+				notice = "Queued — interrupting the current step";
+				break;
+			case "interrupt-wait":
+				notice = "Queued — interrupting the current wait";
+				break;
+			case "after-tools":
+				notice = "Queued — will apply after the running tools finish";
+				break;
+			case "after-response":
+				notice = "Queued — will apply after the current response";
+				break;
+		}
+		this.emitNotice("info", notice);
 	}
 
 	async #queueUserMessage(
