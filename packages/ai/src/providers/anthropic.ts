@@ -43,6 +43,7 @@ import type {
 	Model,
 	ProviderInputTransformation,
 	ProviderPayload,
+	ProviderRetryWaitFn,
 	ProviderSessionState,
 	RawSseEvent,
 	RedactedThinkingContent,
@@ -1366,6 +1367,8 @@ export type AnthropicClientOptionsArgs = {
 	 */
 	dropPromptCacheBetas?: boolean;
 	fetch?: FetchImpl;
+	/** Forwarded to the client so its own retry sleeps are observable too. */
+	providerRetryWait?: ProviderRetryWaitFn;
 	maxRetryDelayMs?: number;
 	sessionId?: string;
 	/** Working-identity cache key for this credential+host; undefined off the Copilot path. */
@@ -2612,6 +2615,7 @@ const streamAnthropicOnce = (
 					thinkingEnabled: options?.thinkingEnabled,
 					thinkingDisplay: options?.thinkingDisplay,
 					fetch: options?.fetch,
+					providerRetryWait: options?.providerRetryWait,
 					maxRetryDelayMs: options?.maxRetryDelayMs,
 					copilotCacheKey,
 					copilotCacheSnapshot: copilotCached ?? null,
@@ -3915,7 +3919,10 @@ const streamAnthropicOnce = (
 						throw streamFailure;
 					}
 					const delayMs = headerDelayMs !== undefined ? Math.max(headerDelayMs, backoffDelayMs) : backoffDelayMs;
-					await waitForRetry(options?.providerRetryWait, delayMs, options?.signal);
+					await waitForRetry(options?.providerRetryWait, delayMs, options?.signal, {
+						attempt: providerRetryAttempt,
+						maxAttempts: PROVIDER_MAX_RETRIES,
+					});
 					output.content.length = 0;
 					output.model = model.id;
 					output.responseId = undefined;
@@ -4303,7 +4310,9 @@ function createClient(
 	args: AnthropicClientOptionsArgs,
 ): { client: AnthropicMessagesClient; isOAuthToken: boolean; defaultHeaders?: Record<string, string> } {
 	const { isOAuthToken: oauthToken, ...clientOptions } = buildAnthropicClientOptions({ ...args, model });
-	const client = new AnthropicMessagesClient(clientOptions);
+	// The hook is pure observation, so it stays out of the request fingerprint
+	// `buildAnthropicClientOptions` builds (and out of its assertions).
+	const client = new AnthropicMessagesClient({ ...clientOptions, providerRetryWait: args.providerRetryWait });
 	return { client, isOAuthToken: oauthToken, defaultHeaders: clientOptions.defaultHeaders };
 }
 

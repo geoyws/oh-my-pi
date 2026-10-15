@@ -134,6 +134,7 @@ export interface GuestSnapshotActivityReconcilerCtx extends GuestIdleReconcilerC
 	ensureLoadingAnimation: InteractiveModeContext["ensureLoadingAnimation"];
 	autoCompactionLoader: InteractiveModeContext["autoCompactionLoader"];
 	retryLoader: InteractiveModeContext["retryLoader"];
+	providerRetryLoader: InteractiveModeContext["providerRetryLoader"];
 }
 
 /** Status-area state which cannot outlive removal of its child components. */
@@ -141,6 +142,7 @@ export interface GuestTransientStatusCtx {
 	statusContainer: Pick<InteractiveModeContext["statusContainer"], "clear">;
 	autoCompactionLoader: InteractiveModeContext["autoCompactionLoader"];
 	retryLoader: InteractiveModeContext["retryLoader"];
+	providerRetryLoader: InteractiveModeContext["providerRetryLoader"];
 }
 
 /** Stop and forget status-area loaders before detaching their components. */
@@ -159,7 +161,7 @@ export function clearGuestTransientStatus(ctx: GuestTransientStatusCtx): void {
 export function reconcileGuestSnapshotHostState(ctx: GuestSnapshotActivityReconcilerCtx, isStreaming: boolean): void {
 	if (isStreaming) {
 		ctx.statusLine.markActivityStart();
-		if (!ctx.autoCompactionLoader && !ctx.retryLoader) ctx.ensureLoadingAnimation();
+		if (!ctx.autoCompactionLoader && !ctx.retryLoader && !ctx.providerRetryLoader) ctx.ensureLoadingAnimation();
 		return;
 	}
 	reconcileGuestIdleHostState(ctx, false);

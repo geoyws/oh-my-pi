@@ -149,6 +149,7 @@ describe("reconcileGuestSnapshotHostState", () => {
 			ensureLoadingAnimation,
 			autoCompactionLoader: undefined,
 			retryLoader: undefined,
+			providerRetryLoader: undefined,
 		};
 		reconcileGuestSnapshotHostState(ctx, false);
 		const stoppedAt = statusLine.getActiveMs();
@@ -172,6 +173,7 @@ describe("reconcileGuestSnapshotHostState", () => {
 			ensureLoadingAnimation,
 			autoCompactionLoader: undefined,
 			retryLoader: undefined,
+			providerRetryLoader: undefined,
 		};
 		reconcileGuestSnapshotHostState(ctx, true);
 		expect(markActivityStart).toHaveBeenCalledTimes(1);
@@ -199,6 +201,7 @@ describe("reconcileGuestSnapshotHostState", () => {
 			autoCompactionLoader:
 				staleMaintenanceLoader as unknown as GuestSnapshotActivityReconcilerCtx["autoCompactionLoader"],
 			retryLoader: undefined,
+			providerRetryLoader: undefined,
 		};
 
 		clearGuestTransientStatus(ctx);
@@ -220,6 +223,7 @@ describe("reconcileGuestSnapshotHostState", () => {
 			ensureLoadingAnimation,
 			autoCompactionLoader: undefined,
 			retryLoader: {} as GuestSnapshotActivityReconcilerCtx["retryLoader"],
+			providerRetryLoader: undefined,
 		};
 		reconcileGuestSnapshotHostState(ctx, true);
 		expect(ensureLoadingAnimation).not.toHaveBeenCalled();
@@ -234,6 +238,7 @@ describe("reconcileGuestSnapshotHostState", () => {
 			ensureLoadingAnimation,
 			autoCompactionLoader: {} as GuestSnapshotActivityReconcilerCtx["autoCompactionLoader"],
 			retryLoader: undefined,
+			providerRetryLoader: undefined,
 		};
 		reconcileGuestSnapshotHostState(ctx, true);
 		expect(ensureLoadingAnimation).not.toHaveBeenCalled();

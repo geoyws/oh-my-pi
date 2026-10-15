@@ -245,6 +245,16 @@ export class EventController {
 	// mid-retry blip or the final settle — only the retry lifecycle events
 	// (never deferred) can tell them apart.
 	#retryPending = false;
+	// `waitId` of the wait that mounted the countdown: only that wait's `_end`
+	// may take it down. The Loader itself lives on `ctx.providerRetryLoader`
+	// (never `ctx.retryLoader`, whose overlay must not be clobbered) so the
+	// collab guest's host-state reconcile and `ensureLoadingAnimation()` can
+	// see that the status row is already owned.
+	#providerRetryWaitId: number | undefined;
+	// True between a replicated `agent_start` and its `agent_end`. Only a collab
+	// guest reads it (see `#turnIsStreaming`): its replica session never streams,
+	// so the host's turn lifecycle is the only local record that one is running.
+	#hostTurnActive = false;
 	#idleCompactionTimer?: NodeJS.Timeout;
 	#idleRecapTimer?: NodeJS.Timeout;
 	// True from `agent_end` until this idle window's recap timer fires, so a live
@@ -361,6 +371,8 @@ export class EventController {
 			auto_compaction_end: e => this.#handleAutoCompactionEnd(e),
 			auto_retry_start: e => this.#handleAutoRetryStart(e),
 			auto_retry_end: e => this.#handleAutoRetryEnd(e),
+			provider_retry_wait_start: e => this.#handleProviderRetryWaitStart(e),
+			provider_retry_wait_end: e => this.#handleProviderRetryWaitEnd(e),
 			cache_warming_start: async () => {},
 			cache_warming_end: async () => {},
 			retry_fallback_applied: e => this.#handleRetryFallbackApplied(e),
@@ -1038,7 +1050,7 @@ export class EventController {
 	}
 
 	async #handleAgentStart(_event: Extract<AgentSessionEvent, { type: "agent_start" }>): Promise<void> {
-		this.#runEpoch += 1;
+		this.#hostTurnActive = true;
 		// A run with no user prompt in it (synthetic-only: `/goal` kickoff,
 		// approved-plan execution) must not measure prompt→yield from an unrelated
 		// earlier prompt. Normal user turns reseed via message_start before
@@ -1083,6 +1095,16 @@ export class EventController {
 		if (this.ctx.retryLoader) {
 			this.ctx.retryLoader.stop();
 			this.ctx.retryLoader = undefined;
+			this.ctx.statusContainer.disposeChildren();
+		}
+		// A new turn can never be inside the previous turn's provider backoff. A
+		// `provider_retry_wait_end` dropped en route (a collab reconnect, a
+		// renderer exception) would otherwise pin the countdown — and, because
+		// `ensureLoadingAnimation` yields to it, suppress "Working…" for every
+		// later turn.
+		if (this.ctx.providerRetryLoader) {
+			this.ctx.providerRetryLoader.stop();
+			this.ctx.providerRetryLoader = undefined;
 			this.ctx.statusContainer.disposeChildren();
 		}
 		this.#cancelIdleCompaction();
@@ -2317,7 +2339,7 @@ export class EventController {
 	}
 
 	async #finishAgentEnd(event: Extract<AgentSessionEvent, { type: "agent_end" }>): Promise<void> {
-		this.#setTerminalProgress(false);
+		this.#hostTurnActive = false;
 		this.ctx.statusLine.markActivityEnd();
 		this.#lastAgentEndAt = Date.now();
 		this.#streamingReveal.stop();
@@ -2325,6 +2347,14 @@ export class EventController {
 		if (this.ctx.loadingAnimation) {
 			this.ctx.loadingAnimation.stop();
 			this.ctx.loadingAnimation = undefined;
+			this.ctx.statusContainer.disposeChildren();
+		}
+		// The turn is over, so any backoff it was sleeping in is over too: clear a
+		// countdown whose `provider_retry_wait_end` never arrived rather than leave
+		// it ticking over an idle session.
+		if (this.ctx.providerRetryLoader) {
+			this.ctx.providerRetryLoader.stop();
+			this.ctx.providerRetryLoader = undefined;
 			this.ctx.statusContainer.disposeChildren();
 		}
 		await this.ctx.flushPendingModelSwitch();
@@ -2377,12 +2407,26 @@ export class EventController {
 	}
 
 	/**
+	 * True while the turn these events describe is running. A collab guest
+	 * replays the HOST's events into a replica session that never streams
+	 * locally, so its equivalent is the host turn it is currently replaying:
+	 * the `agent_start` it already handled. The host's `state` frames carry
+	 * the same fact but land on their own debounce, which is too late for a
+	 * backoff that begins with the turn's first request — the first wait would
+	 * be gated off and the guest would sit on "Working…" through it.
+	 */
+	#turnIsStreaming(): boolean {
+		if (this.ctx.viewSession.isStreaming) return true;
+		return this.ctx.collabGuest !== undefined && this.#hostTurnActive;
+	}
+
+	/**
 	 * Restore the live "Working…" loader when a streaming event lands after a
 	 * transient status overlay cleared the container. Focus mode dispatches events
 	 * for `viewSession`, so key the reconciler on that session, not the main one.
 	 */
 	#ensureWorkingLoaderWhileStreaming(): void {
-		if (!this.ctx.viewSession.isStreaming) return;
+		if (!this.#turnIsStreaming()) return;
 		if (this.ctx.autoCompactionLoader || this.ctx.retryLoader) return;
 		this.ctx.ensureLoadingAnimation();
 	}
@@ -2582,6 +2626,85 @@ export class EventController {
 			() => this.ctx.interruptFromPointer(),
 		);
 		this.ctx.statusContainer.addChild(this.ctx.retryLoader);
+		this.ctx.ui.requestRender();
+	}
+
+	/**
+	 * A provider-internal retry backoff started. This is a pause inside the SAME
+	 * turn — pi-ai will re-issue the request itself — so unlike
+	 * `#handleAutoRetryStart` it must not set `#retryPending`, retract synthetic
+	 * failure cards, or touch the pinned error: nothing has been superseded.
+	 * Only the status line changes, so the wait stops looking like a freeze.
+	 */
+	async #handleProviderRetryWaitStart(
+		event: Extract<AgentSessionEvent, { type: "provider_retry_wait_start" }>,
+	): Promise<void> {
+		// A session-level retry/compaction overlay owns the status container and
+		// carries the more important message; leave it alone.
+		if (this.ctx.retryLoader || this.ctx.autoCompactionLoader) return;
+		// Background waits are not this turn's story: advisor turns and side
+		// streams (title generation, idle recap, handoff summaries) share the
+		// session, and side streams also run while idle — where the row holds
+		// e.g. the F5 retry hint. Only the main turn's wait mounts a countdown,
+		// and only while the turn is actually streaming.
+		if (event.role !== undefined && event.role !== "main") return;
+		if (!this.#turnIsStreaming()) return;
+		// A newer wait supersedes the mounted one: the newest wait is what the
+		// user is waiting on, so only its `_end` clears the countdown. Detach
+		// just the loaders this controller owns — never `disposeChildren()`,
+		// which would unmount a retry/compaction overlay mounted afterwards or
+		// a hint row the countdown never owned.
+		const previous = this.ctx.providerRetryLoader;
+		const working = this.ctx.loadingAnimation;
+		previous?.stop();
+		this.#stopWorkingLoader();
+		for (const loader of [previous, working]) {
+			if (loader && this.ctx.statusContainer.children.includes(loader)) {
+				this.ctx.statusContainer.removeChild(loader);
+			}
+		}
+		const waitStartMs = Date.now();
+		// Only the loops that count their retries send the counters; without them
+		// the label stays bare rather than claiming a made-up attempt.
+		const attemptLabel =
+			event.attempt !== undefined && event.maxAttempts !== undefined
+				? ` (${event.attempt}/${event.maxAttempts})`
+				: "";
+		const loader = new Loader(
+			this.ctx.ui,
+			spinner => theme.fg("warning", spinner),
+			text => theme.fg("muted", text),
+			() => {
+				const remaining = Math.max(0, event.delayMs - (Date.now() - waitStartMs));
+				return `Provider retrying${attemptLabel} in ${formatDuration(remaining)}…`;
+			},
+			getSymbolTheme().spinnerFrames,
+		);
+		this.ctx.providerRetryLoader = loader;
+		this.#providerRetryWaitId = event.waitId;
+		this.ctx.statusContainer.addChild(loader);
+		this.ctx.ui.requestRender();
+	}
+
+	async #handleProviderRetryWaitEnd(
+		event: Extract<AgentSessionEvent, { type: "provider_retry_wait_end" }>,
+	): Promise<void> {
+		const loader = this.ctx.providerRetryLoader;
+		if (!loader) return;
+		// Only the mounted wait's `_end` takes the countdown down. A stale end —
+		// an earlier wait superseded by a newer one, or a background wait that
+		// ended while a session-level overlay owns the row — must never unmount
+		// someone else's loader.
+		if (event.waitId !== this.#providerRetryWaitId) return;
+		this.ctx.providerRetryLoader = undefined;
+		this.#providerRetryWaitId = undefined;
+		loader.stop();
+		if (this.ctx.statusContainer.children.includes(loader)) {
+			this.ctx.statusContainer.removeChild(loader);
+		}
+		// The turn never ended: put "Working…" back so the stream keeps its
+		// indicator whether the retry succeeds or the wait was aborted.
+		this.#ensureWorkingLoaderWhileStreaming();
 		this.ctx.ui.requestRender();
 	}
 

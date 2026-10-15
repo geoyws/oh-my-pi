@@ -1271,6 +1271,10 @@ const streamOpenAIResponsesOnce = (
 						options?.providerRetryWait,
 						OPENAI_RESPONSES_TRANSIENT_STREAM_RETRY_DELAY_MS,
 						options?.signal,
+						{
+							attempt: transientStreamRetryAttempt,
+							maxAttempts: OPENAI_RESPONSES_MAX_TRANSIENT_STREAM_RETRIES,
+						},
 					);
 					if (abortTracker.wasCallerAbort()) throw new AIError.AbortError();
 					openaiStream = await openResponsesStreamWithFallbacks();

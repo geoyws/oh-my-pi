@@ -3965,6 +3965,93 @@ func (v AutoRetryEndEvent) MarshalJSON() ([]byte, error) {
 	return encodeObject(plain(v), `"type":"auto_retry_end"`, nil)
 }
 
+type ProviderRetryWaitStartEvent struct {
+	WaitID      int64                           `json:"waitId"`
+	Role        ProviderRetryWaitStartEventRole `json:"role"`
+	DelayMs     int64                           `json:"delayMs"`
+	Model       string                          `json:"model"`
+	Provider    string                          `json:"provider"`
+	API         string                          `json:"api"`
+	Attempt     *int64                          `json:"attempt,omitempty"`
+	MaxAttempts *int64                          `json:"maxAttempts,omitempty"`
+}
+
+func (v *ProviderRetryWaitStartEvent) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "ProviderRetryWaitStartEvent", v.decodeFrom)
+}
+
+func (v *ProviderRetryWaitStartEvent) decodeFrom(raw map[string]json.RawMessage) error {
+	var out ProviderRetryWaitStartEvent
+	d := fieldDecoder{raw: raw, owner: "ProviderRetryWaitStartEvent"}
+	d.constant("type", "provider_retry_wait_start")
+	d.required("waitId", &out.WaitID)
+	d.required("role", &out.Role)
+	d.required("delayMs", &out.DelayMs)
+	d.required("model", &out.Model)
+	d.required("provider", &out.Provider)
+	d.required("api", &out.API)
+	d.optional("attempt", &out.Attempt)
+	d.optional("maxAttempts", &out.MaxAttempts)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v ProviderRetryWaitStartEvent) MarshalJSON() ([]byte, error) {
+	type plain ProviderRetryWaitStartEvent
+	return encodeObject(plain(v), `"type":"provider_retry_wait_start"`, nil)
+}
+
+type ProviderRetryWaitStartEventRole string
+
+const (
+	ProviderRetryWaitStartEventRoleMain    ProviderRetryWaitStartEventRole = "main"
+	ProviderRetryWaitStartEventRoleAdvisor ProviderRetryWaitStartEventRole = "advisor"
+	ProviderRetryWaitStartEventRoleSide    ProviderRetryWaitStartEventRole = "side"
+)
+
+func (v *ProviderRetryWaitStartEventRole) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "ProviderRetryWaitStartEventRole")
+	if err != nil {
+		return err
+	}
+	switch value := ProviderRetryWaitStartEventRole(s); value {
+	case ProviderRetryWaitStartEventRoleMain, ProviderRetryWaitStartEventRoleAdvisor, ProviderRetryWaitStartEventRoleSide:
+		*v = value
+		return nil
+	}
+	return unknownValue("ProviderRetryWaitStartEventRole", s)
+}
+
+type ProviderRetryWaitEndEvent struct {
+	Aborted bool  `json:"aborted"`
+	WaitID  int64 `json:"waitId"`
+}
+
+func (v *ProviderRetryWaitEndEvent) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "ProviderRetryWaitEndEvent", v.decodeFrom)
+}
+
+func (v *ProviderRetryWaitEndEvent) decodeFrom(raw map[string]json.RawMessage) error {
+	var out ProviderRetryWaitEndEvent
+	d := fieldDecoder{raw: raw, owner: "ProviderRetryWaitEndEvent"}
+	d.constant("type", "provider_retry_wait_end")
+	d.required("aborted", &out.Aborted)
+	d.required("waitId", &out.WaitID)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v ProviderRetryWaitEndEvent) MarshalJSON() ([]byte, error) {
+	type plain ProviderRetryWaitEndEvent
+	return encodeObject(plain(v), `"type":"provider_retry_wait_end"`, nil)
+}
+
 // A prompt-cache refresh was handed to the provider.
 type CacheWarmingStartEvent struct {
 	Phase    CacheWarmingPhase `json:"phase"`
@@ -4427,6 +4514,8 @@ func (AutoCompactionStartEvent) isRpcAgentEvent()    {}
 func (AutoCompactionEndEvent) isRpcAgentEvent()      {}
 func (AutoRetryStartEvent) isRpcAgentEvent()         {}
 func (AutoRetryEndEvent) isRpcAgentEvent()           {}
+func (ProviderRetryWaitStartEvent) isRpcAgentEvent() {}
+func (ProviderRetryWaitEndEvent) isRpcAgentEvent()   {}
 func (CacheWarmingStartEvent) isRpcAgentEvent()      {}
 func (CacheWarmingEndEvent) isRpcAgentEvent()        {}
 func (RetryFallbackAppliedEvent) isRpcAgentEvent()   {}
@@ -4494,6 +4583,10 @@ func (v *RpcAgentEvent) decodeFrom(raw map[string]json.RawMessage) error {
 		value, err = decodeVariant[AutoRetryStartEvent](raw)
 	case "auto_retry_end":
 		value, err = decodeVariant[AutoRetryEndEvent](raw)
+	case "provider_retry_wait_start":
+		value, err = decodeVariant[ProviderRetryWaitStartEvent](raw)
+	case "provider_retry_wait_end":
+		value, err = decodeVariant[ProviderRetryWaitEndEvent](raw)
 	case "cache_warming_start":
 		value, err = decodeVariant[CacheWarmingStartEvent](raw)
 	case "cache_warming_end":
@@ -6463,6 +6556,8 @@ func (AutoCompactionStartEvent) isRpcNotification()     {}
 func (AutoCompactionEndEvent) isRpcNotification()       {}
 func (AutoRetryStartEvent) isRpcNotification()          {}
 func (AutoRetryEndEvent) isRpcNotification()            {}
+func (ProviderRetryWaitStartEvent) isRpcNotification()  {}
+func (ProviderRetryWaitEndEvent) isRpcNotification()    {}
 func (CacheWarmingStartEvent) isRpcNotification()       {}
 func (CacheWarmingEndEvent) isRpcNotification()         {}
 func (RetryFallbackAppliedEvent) isRpcNotification()    {}
@@ -6561,6 +6656,10 @@ func (v *RpcNotification) UnmarshalJSON(data []byte) error {
 		value, err = decodeVariant[AutoRetryStartEvent](raw)
 	case "auto_retry_end":
 		value, err = decodeVariant[AutoRetryEndEvent](raw)
+	case "provider_retry_wait_start":
+		value, err = decodeVariant[ProviderRetryWaitStartEvent](raw)
+	case "provider_retry_wait_end":
+		value, err = decodeVariant[ProviderRetryWaitEndEvent](raw)
 	case "cache_warming_start":
 		value, err = decodeVariant[CacheWarmingStartEvent](raw)
 	case "cache_warming_end":
@@ -6653,6 +6752,8 @@ func (AutoCompactionStartEvent) isRpcServerFrame()     {}
 func (AutoCompactionEndEvent) isRpcServerFrame()       {}
 func (AutoRetryStartEvent) isRpcServerFrame()          {}
 func (AutoRetryEndEvent) isRpcServerFrame()            {}
+func (ProviderRetryWaitStartEvent) isRpcServerFrame()  {}
+func (ProviderRetryWaitEndEvent) isRpcServerFrame()    {}
 func (CacheWarmingStartEvent) isRpcServerFrame()       {}
 func (CacheWarmingEndEvent) isRpcServerFrame()         {}
 func (RetryFallbackAppliedEvent) isRpcServerFrame()    {}
@@ -6761,6 +6862,10 @@ func (v *RpcServerFrame) UnmarshalJSON(data []byte) error {
 		value, err = decodeVariant[AutoRetryStartEvent](raw)
 	case "auto_retry_end":
 		value, err = decodeVariant[AutoRetryEndEvent](raw)
+	case "provider_retry_wait_start":
+		value, err = decodeVariant[ProviderRetryWaitStartEvent](raw)
+	case "provider_retry_wait_end":
+		value, err = decodeVariant[ProviderRetryWaitEndEvent](raw)
 	case "cache_warming_start":
 		value, err = decodeVariant[CacheWarmingStartEvent](raw)
 	case "cache_warming_end":
