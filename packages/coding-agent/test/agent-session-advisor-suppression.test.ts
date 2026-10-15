@@ -20,7 +20,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
-import type { ToolCall } from "@oh-my-pi/pi-ai";
+import { AssistantMessageEventStream, type ToolCall } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -49,7 +49,7 @@ interface ParkedHarness {
 	session: AgentSession;
 	sessionManager: SessionManager;
 	mock: MockModel;
-	/** Resolves when the first turn is parked in a running tool after model output. */
+	/** Resolves after the agent consumes visible output from the parked first stream. */
 	streamStarted: Promise<void>;
 }
 
@@ -90,42 +90,41 @@ describe("AgentSession advisor auto-resume suppression", () => {
 
 	/**
 	 * Park after visible model output, not in a pre-output provider delay: new
-	 * steering deliberately cancels and reissues a silent provider request. A
-	 * running tool keeps these abort/settle tests at their intended queued-input
-	 * boundary without racing that independent provider-wait behavior.
+	 * steering deliberately cancels and reissues a silent provider request. Hold
+	 * the first stream open before its terminal event, so abort settles that same
+	 * request rather than completing a tool batch and entering its next model call.
 	 */
 	async function createParkedSession(tailResponses: MockResponse[] = []): Promise<ParkedHarness> {
 		const started = Promise.withResolvers<void>();
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
-		const mock = createMockModel({
-			responses: [
-				{ content: ["working", { type: "toolCall", id: "park", name: "park", arguments: {} }] },
-				...tailResponses,
-			],
-		});
+		const mock = createMockModel({ responses: [{ content: ["working"] }, ...tailResponses] });
 		const agent = new Agent({
 			getApiKey: () => "test-key",
-			initialState: {
-				model,
-				systemPrompt: ["Test"],
-				tools: [
-					{
-						name: "park",
-						label: "Park",
-						description: "Wait for the test interrupt",
-						parameters: type({}),
-						execute: async (_id, _params, signal) => {
-							started.resolve();
-							await new Promise<void>(resolve => {
-								if (signal?.aborted) resolve();
-								else signal?.addEventListener("abort", () => resolve(), { once: true });
-							});
-							return { content: [{ type: "text", text: "Interrupted" }], details: {} };
-						},
-					},
-				],
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: (model, context, options) => {
+				const source = mock.stream(model, context, options);
+				if (mock.calls.length !== 1) return source;
+				const stream = new AssistantMessageEventStream();
+				void (async () => {
+					for await (const event of source) {
+						if (event.type !== "done") {
+							stream.push(event);
+							continue;
+						}
+						const signal = options?.signal;
+						if (!signal) throw new Error("Parked stream requires an abort signal");
+						const aborted = Promise.withResolvers<void>();
+						if (signal.aborted) aborted.resolve();
+						else signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+						await aborted.promise;
+						stream.push({ type: "error", reason: "aborted", error: { ...event.message, stopReason: "aborted" } });
+					}
+				})().catch(error => stream.fail(error));
+				return stream;
 			},
-			streamFn: mock.stream,
+		});
+		agent.subscribe(event => {
+			if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") started.resolve();
 		});
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated({ "compaction.enabled": false });
