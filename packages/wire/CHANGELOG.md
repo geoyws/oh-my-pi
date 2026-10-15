@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `provider_retry_wait_start`/`provider_retry_wait_end` agent events to the collab wire and bumped `COLLAB_PROTO` to 4, so guests that cannot dispatch them are refused at hello ([#12785](https://github.com/can1357/oh-my-pi/pull/12785))
+
 ## [18.8.8] - 2026-10-10
 
 ### Added

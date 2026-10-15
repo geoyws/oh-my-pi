@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Fixed a turn looking frozen while a provider sleeps through its own retry backoff: the session emits `provider_retry_wait_start`/`provider_retry_wait_end` (with `waitId` and stream role) and the TUI, RPC clients, task progress and collab guests show a countdown for main-turn waits; side and advisor waits (including auto-learn capture) never replace it. A lost `wait_end` is retired by the next turn, the end of the turn, an idle collab host frame or `/handoff` cleanup, and an event type a guest has no handler for is ignored instead of crashing it ([#12785](https://github.com/can1357/oh-my-pi/pull/12785))
 - Fixed a subagent whose `task.agentModelOverrides` entry is an explicit multi-entry list (e.g. scout) escaping its list on retry: the installed `subagent:<id>` chain used to lose to the current model's model-keyed chain, spending expensive models on readers. The list is now the session's complete retry chain — recovery walks it alone and stops with the normal exhausted-retry error when it runs out.
 
 ## [18.10.1] - 2026-10-12

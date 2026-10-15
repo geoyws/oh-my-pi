@@ -4327,9 +4327,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const withSessionCredentialRedaction =
 			(bound: StreamFn): StreamFn =>
 			(streamModel, context, streamOptions) =>
-				withCredentialRedaction(cfgSecretsEnabled.get(settings), () =>
-					bound(streamModel, context, streamOptions),
-				);
+				withCredentialRedaction(cfgSecretsEnabled.get(settings), () => bound(streamModel, context, streamOptions));
 		const settingsBoundStreamFn = makeRoleBoundStreamFn("main");
 		const settingsAwareStreamFn: StreamFn = withSessionCredentialRedaction(settingsBoundStreamFn);
 		// Primary-agent provider options read per request, so `/settings` changes
@@ -4354,9 +4352,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// work even while a main turn is streaming.
 		const sideSettingsAwareStreamFn: StreamFn = withSessionCredentialRedaction(makeRoleBoundStreamFn("side"));
 		const sidePrimaryStreamFn: StreamFn = withPrimaryProviderOptions(sideSettingsAwareStreamFn);
-		const advisorSettingsAwareStreamFn: StreamFn = withSessionCredentialRedaction(
-			makeRoleBoundStreamFn("advisor"),
-		);
+		const advisorSettingsAwareStreamFn: StreamFn = withSessionCredentialRedaction(makeRoleBoundStreamFn("advisor"));
 		// Prompt-cache warmer for the main agent loop only: replays the last
 		// request through the same primary wrapper just before the entry would
 		// expire, so idle gaps do not force a full-prefix cache re-write.

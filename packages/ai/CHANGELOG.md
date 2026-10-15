@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Reported every provider-internal retry sleep (Anthropic client backoff and 529 retries, OpenAI Responses and Codex transient retries, Google empty-stream and Gemini CLI backoff, empty-completion and thinking-loop retries) through `providerRetryWait` with its attempt count, so callers can show the wait instead of a frozen request ([#12785](https://github.com/can1357/oh-my-pi/pull/12785))
+
 ## [18.9.2] - 2026-10-11
 
 ### Breaking Changes

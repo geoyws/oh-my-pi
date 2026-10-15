@@ -195,6 +195,27 @@ export type AgentEvent =
 	| { type: "auto_compaction_end"; aborted: boolean; willRetry: boolean; errorMessage?: string; skipped?: boolean }
 	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
+	/**
+	 * A provider-internal retry backoff is sleeping inside the SAME turn (the
+	 * provider re-issues the request itself). Distinct from `auto_retry_start`:
+	 * nothing was superseded, so a guest only swaps its status line for the
+	 * countdown instead of retracting the turn.
+	 */
+	| {
+			type: "provider_retry_wait_start";
+			/** Correlation id pairing this start with its `_end`. Monotonic per session. */
+			waitId: number;
+			/** Stream role that observed the backoff; only `main` waits render a turn countdown. */
+			role: "main" | "advisor" | "side";
+			delayMs: number;
+			model: string;
+			provider: string;
+			api: string;
+			/** Retry position, when the waiting retry loop tracks one. */
+			attempt?: number;
+			maxAttempts?: number;
+	  }
+	| { type: "provider_retry_wait_end"; aborted: boolean; waitId: number }
 	| { type: "thinking_level_changed"; thinkingLevel?: string };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -397,8 +418,12 @@ export type WireFrame = GuestFrame | HostFrame;
  *   answered by the `ui-response` guest frame. Guests that predate the
  *   grammar would silently drop `ui-request` (asks hang forever on the
  *   host), so they must be rejected at hello.
+ * - `4`: hosts replicate `provider_retry_wait_start`/`provider_retry_wait_end`
+ *   agent events (a provider-internal retry backoff inside one turn). Guests
+ *   that predate them have no handler for the type, so they must be rejected
+ *   at hello rather than fed an event they cannot dispatch.
  */
-export const COLLAB_PROTO = 3;
+export const COLLAB_PROTO = 4;
 
 /** Parameter key used for intent tracing (e.g. prompt explanation/reasoning) */
 export const INTENT_FIELD = "i";
