@@ -944,8 +944,10 @@ describe("GitLab Duo Workflow native request telemetry", () => {
 			const { socket, payload, state } = harness();
 			const accounting = captureWorkflowTelemetry();
 			const failure = new Error("socket send failed");
+			let sendAttempts = 0;
 			if (mode !== "open")
 				socket.send = () => {
+					sendAttempts++;
 					throw failure;
 				};
 			const run = runGitLabDuoWorkflowSocket(
@@ -955,12 +957,15 @@ describe("GitLab Duo Workflow native request telemetry", () => {
 				{ fetch: accounting.fetch },
 				mode === "resume" ? { actionResponse: { requestID: "request-1" } } : undefined,
 			);
-			const rejected = expect(run).rejects.toThrow(mode === "open" ? "WebSocket error" : "socket send failed");
+			// Deliver the failure before invoking Bun's promise matcher: it can wait for
+			// settlement immediately, preventing a later synthetic event from firing.
 			if (mode === "open") socket.onerror?.(new Event("error"));
 			else if (mode === "start") socket.onopen?.(new Event("open"));
-			await rejected;
+			await expect(run).rejects.toThrow(mode === "open" ? "WebSocket error" : "socket send failed");
+			expect(sendAttempts).toBe(mode === "open" ? 0 : 1);
 			expect(accounting.calls).toHaveBeenCalledTimes(1);
 			expect(accounting.errors).toHaveBeenCalledTimes(1);
+			if (mode !== "open") expect(accounting.errors.mock.calls).toEqual([[failure]]);
 			expect(accounting.headers).not.toHaveBeenCalled();
 			expect(accounting.bytes).not.toHaveBeenCalled();
 		}
