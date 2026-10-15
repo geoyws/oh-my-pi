@@ -8592,6 +8592,93 @@ describe("agentLoop steering during the provider wait", () => {
 		).toBe(false);
 	});
 
+	for (const hook of ["syncContextBeforeModelCall", "beforeModelCall"] as const) {
+		it(`applies a steer queued while ${hook} is pending to this model call`, async () => {
+			// The steer watch used to arm only once the request was being issued,
+			// so its baseline peek counted a steer queued during context sync,
+			// provider preparation or the pre-call gate as an old leftover: the
+			// call went out without it, was never cancelled, and the steer
+			// waited for the next turn boundary.
+			const context: AgentContext = { systemPrompt: [""], messages: [], tools: [] };
+			const queue = createSteeringQueue();
+			const mock = createMockModel();
+			const hookEntered = Promise.withResolvers<void>();
+			const releaseHook = Promise.withResolvers<void>();
+			const contexts: Context[] = [];
+			let staleRequests = 0;
+			let staleRequestsCancelled = 0;
+			let hookCalls = 0;
+			const blockFirstCall = async (): Promise<undefined> => {
+				hookCalls++;
+				if (hookCalls > 1) return undefined;
+				hookEntered.resolve();
+				await releaseHook.promise;
+				return undefined;
+			};
+			const carriesSteer = (llmContext: Context): boolean =>
+				llmContext.messages.some(m => m.role === "user" && m.content === "actually, do X instead");
+
+			const streamFn: StreamFn = (_model, llmContext, options) => {
+				contexts.push(llmContext);
+				const response = new AssistantMessageEventStream();
+				if (carriesSteer(llmContext)) {
+					queueMicrotask(() => pushAnswer(response, "answer with steer"));
+					return response;
+				}
+				// A request built without the steer answers one macrotask after
+				// dispatch — later than an armed watch needs to cancel it, so
+				// only a watch that missed the steer lets this answer through.
+				staleRequests++;
+				let cancelled = false;
+				options?.signal?.addEventListener(
+					"abort",
+					() => {
+						cancelled = true;
+						staleRequestsCancelled++;
+					},
+					{ once: true },
+				);
+				setImmediate(() => {
+					if (!cancelled) pushAnswer(response, "stale answer");
+				});
+				return response;
+			};
+			const config: AgentLoopConfig = {
+				model: mock.model,
+				convertToLlm: identityConverter,
+				interruptMode: "immediate",
+				[hook]: blockFirstCall,
+				...queue.config,
+			};
+
+			const run = (async (): Promise<AgentEvent[]> => {
+				const events: AgentEvent[] = [];
+				for await (const event of agentLoop([createUserMessage("start")], context, config, undefined, streamFn)) {
+					events.push(event);
+				}
+				return events;
+			})();
+
+			await hookEntered.promise;
+			queue.push("actually, do X instead");
+			releaseHook.resolve();
+			const events = await run;
+
+			// Whatever was prepared without the steer was cancelled before it
+			// answered (or never dispatched), and the call that answered carries it.
+			expect(staleRequestsCancelled).toBe(staleRequests);
+			const answered = contexts.at(-1);
+			expect(answered !== undefined && carriesSteer(answered)).toBe(true);
+			expect(assistantTexts(events)).toEqual(["answer with steer"]);
+			expect(queue.size).toBe(0);
+			expect(
+				events.some(
+					e => e.type === "message_end" && e.message.role === "assistant" && e.message.stopReason === "aborted",
+				),
+			).toBe(false);
+		});
+	}
+
 	it("cancels a request that streamed nothing and re-issues it with the steer", async () => {
 		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [] };
 		const queue = createSteeringQueue();
