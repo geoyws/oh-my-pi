@@ -218,6 +218,37 @@ describe("bash process-group kill", () => {
 		expect(result.cancelled).toBe(true);
 	}, 60_000);
 
+	it("session dispose cancels a run whose native session is still starting", async () => {
+		if (process.platform === "win32") return;
+		const marker = uniqueMarker("DISPOSESTART");
+		strayMarkers.push(marker);
+		const sessionId = `pgkill-disposestart-${marker}`;
+		// `onStart` fires as soon as the run is tracked, while the native shell
+		// is still creating its session (snapshot sourcing) and has stored no
+		// cancel token. Dispose landing there must still cancel the run.
+		const cleanup = new AbortController();
+		let disposed: Promise<void> | undefined;
+		const promise = executeBash(termIgnoringGrandchild(marker), {
+			cwd: tempDir,
+			timeout: 0,
+			signal: cleanup.signal,
+			sessionKey: sessionId,
+			onStart: () => {
+				disposed ??= releaseShellSessions(sessionId);
+			},
+		});
+		try {
+			const settled = await Promise.race([promise.then(() => "settled" as const), Bun.sleep(8_000)]);
+			expect(settled).toBe("settled");
+			expect((await promise).cancelled).toBe(true);
+			await disposed;
+			expect(livePids(marker)).toEqual([]);
+		} finally {
+			cleanup.abort();
+			await promise.catch(() => undefined);
+		}
+	}, 60_000);
+
 	it("session dispose waits for a run older than the leak bound", async () => {
 		if (process.platform === "win32") return;
 		const marker = uniqueMarker("OLDRUN");

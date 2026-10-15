@@ -828,7 +828,16 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		const runSettled = new Promise<void>(resolve => {
 			markRunSettled = resolve;
 		});
-		const inFlightRun: InFlightShellRun = { key: sessionKey, abort: abortShell, settled: runSettled };
+		// Dispose aborts through the run's own signal as well as the shell:
+		// `Shell.abort()` reaches only a run that has stored its native cancel
+		// token, which happens after session creation (snapshot sourcing). A
+		// dispose landing in that window would otherwise be a no-op, while the
+		// signal feeds the run's cancel token whenever it starts waiting.
+		const abortForDispose = (): Promise<void> => {
+			if (!runAbortController.signal.aborted) runAbortController.abort();
+			return abortShell();
+		};
+		const inFlightRun: InFlightShellRun = { key: sessionKey, abort: abortForDispose, settled: runSettled };
 		inFlightShellRuns.add(inFlightRun);
 		// Leak bound for a wedged run that never settles after an abort
 		// (mirrors the quarantine window, #10308). Armed only by the first
