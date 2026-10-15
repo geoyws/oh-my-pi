@@ -16,6 +16,7 @@
 
 ### Fixed
 
+- Preserve authored global and project settings YAML when changing a setting or model role, including comments, quotes, whitespace, line endings, external edits, and symlink targets; aliased role mappings remain writable without modifying their shared defaults.
 - Fixed native judges ignoring configured `headers`: the judge chain now resolves model headers and passes them to the System One transport, so gateway-authenticated and header-routed judge providers work without extra configuration.
 - Added support for buffered cloud transcription using OpenAI-compatible models
 - Added visual change detection capabilities for video processing using FFMPEG and SVG overlaying

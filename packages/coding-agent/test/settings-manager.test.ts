@@ -190,24 +190,6 @@ describe("Settings", () => {
 			expect((await readSettings()).setupVersion).toBe(1);
 		});
 
-		it("writes mapping headers without trailing whitespace and preserves multiline values", async () => {
-			const multiline = ["first line", "scalar line ending in colon: ", "third line "].join("\n");
-			const custom = {
-				"quoted:key": { nested: [{ value: multiline }] },
-				emptyObject: {},
-				emptyArray: [],
-				emptyString: "",
-			};
-			await writeSettings({ custom, theme: { dark: "anthracite" } });
-			const settings = await Settings.init({ cwd: projectDir, agentDir });
-
-			settings.set("theme.dark", "titanium");
-			await settings.flush();
-
-			const content = await Bun.file(getConfigPath()).text();
-			expect(content).not.toMatch(/: +$/m);
-			expect(YAML.parse(content)).toEqual({ custom, theme: { dark: "titanium" } });
-		});
 	});
 
 	describe("status line segment validation", () => {

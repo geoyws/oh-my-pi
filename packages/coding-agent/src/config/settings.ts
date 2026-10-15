@@ -54,7 +54,7 @@ import {
 import { replaceFileAtomically } from "../utils/atomic-file";
 import { type EditMode } from "@oh-my-pi/pi-tui/tools/edit";
 import { normalizeEditMode } from "../utils/edit-mode";
-import { stringifyYamlConfig } from "@oh-my-pi/pi-utils/yaml-config";
+import { reconcileYamlConfig, stringifyYamlConfig } from "@oh-my-pi/pi-utils/yaml-config";
 import { validateAgentServiceTierOverrides } from "./service-tier";
 import { STATUS_LINE_SEGMENT_IDS } from "@oh-my-pi/pi-tui/status-line/schema";
 import {
@@ -2990,14 +2990,17 @@ export class Settings {
 	// Saving
 	// ─────────────────────────────────────────────────────────────────────────
 
-	async #writeYamlAtomically(filePath: string, settings: RawSettings): Promise<void> {
+	async #writeYamlAtomically(filePath: string, settings: RawSettings, source?: string): Promise<void> {
 		const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
 		let removeTemp = false;
 		try {
 			const handle = await fs.promises.open(tempPath, "wx", 0o600);
 			removeTemp = true;
 			try {
-				await handle.writeFile(stringifyYamlConfig(settings), "utf8");
+				await handle.writeFile(
+					source === undefined ? stringifyYamlConfig(settings) : reconcileYamlConfig(source, settings),
+					"utf8",
+				);
 				await handle.sync();
 			} finally {
 				await handle.close();
@@ -3143,7 +3146,11 @@ export class Settings {
 				// Update our global with any external changes we preserved.
 				this.#global = current;
 				if (shouldWrite) {
-					await this.#writeYamlAtomically(writePath, this.#global);
+					await this.#writeYamlAtomically(
+						writePath,
+						this.#global,
+						loaded.generation.kind === "content" ? loaded.generation.source : undefined,
+					);
 				}
 				this.#quarantinedYamlTargets.delete(configPath);
 				// These pending roles were included in this write. Remove each
@@ -3251,12 +3258,19 @@ export class Settings {
 					(this.#quarantinedYamlTargets.has(projectConfigPath) ? structuredClone(this.#projectFileSettings) : {});
 
 				const projectRoles = getByPath(this.#project, ["modelRoles"]);
+				// Detach the edited role mapping from any YAML anchor aliases.
+				const storedRoles = getByPath(projectSettings, ["modelRoles"]);
+				if (isRecord(storedRoles)) setByPath(projectSettings, ["modelRoles"], { ...storedRoles });
 				for (const role of modifiedModelRoles) {
 					const value = isRecord(projectRoles) ? projectRoles[role] : undefined;
 					setByPath(projectSettings, ["modelRoles", role], value);
 				}
 
-				await this.#writeYamlAtomically(writePath, projectSettings);
+				await this.#writeYamlAtomically(
+					writePath,
+					projectSettings,
+					loaded.generation.kind === "content" ? loaded.generation.source : undefined,
+				);
 				this.#projectFileSettings = structuredClone(projectSettings);
 				this.#quarantinedYamlTargets.delete(projectConfigPath);
 			});

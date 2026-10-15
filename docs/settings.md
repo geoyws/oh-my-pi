@@ -33,6 +33,8 @@ The canonical global file is YAML at `config.yml`; `config.yaml` is accepted as 
 - `.json` and `.jsonc` configs are read as-is, with no migration.
 - A settings YAML file whose top level is not a mapping is invalid. On writable startup, `omp` moves an invalid persistent settings file to a uniquely named `.broken-*` backup and exits with the original error and backup path. A `--config` overlay with a bare array/scalar is also a hard error, but is not moved.
 
+Persistent global and project settings writes preserve the authored YAML source: unrelated comments, quoting, blank lines, collection indentation, line endings, and the final newline stay unchanged. Writes re-read the resolved target under the existing file lock before merging pending changes, including when the config is a symlink. Editing an aliased model-role mapping detaches only that occurrence; the anchor and other aliases retain their values. New files and recovery after malformed-file quarantine use the normal YAML serialization format. Schema migrations still remove retired keys on the next write.
+
 ## Reading and writing settings
 
 Use the interactive `/settings` panel inside a session, or the `omp config` command from a shell. Both read merged effective settings. Ordinary persistent writes land in the **global** file; model-selector role changes are the exception when `modelRoleStorage: project` (see [Where writes go](#where-writes-go)).
