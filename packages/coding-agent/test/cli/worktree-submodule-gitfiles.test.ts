@@ -8,10 +8,18 @@ import { cfgWorktreeClone } from "@oh-my-pi/pi-coding-agent/task/settings";
 import { initWorktreeSubmodules } from "@oh-my-pi/pi-coding-agent/task/worktree";
 const tempRoots: string[] = [];
 const ALLOW_FILE = ["-c", "protocol.file.allow=always"];
+/** Commits also happen in trees omp creates (no local identity); pin it so the suite never reads the host's global config. */
+const GIT_IDENTITY = {
+	GIT_AUTHOR_NAME: "wt-test",
+	GIT_AUTHOR_EMAIL: "wt-test@example.com",
+	GIT_COMMITTER_NAME: "wt-test",
+	GIT_COMMITTER_EMAIL: "wt-test@example.com",
+};
 
 async function runGit(dir: string, args: string[]): Promise<string> {
 	const proc = Bun.spawn(["git", ...args], {
 		cwd: dir,
+		env: { ...process.env, ...GIT_IDENTITY },
 		stdout: "pipe",
 		stderr: "pipe",
 		windowsHide: true,
