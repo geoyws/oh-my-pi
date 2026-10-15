@@ -909,6 +909,42 @@ export class InputController {
 		return compacted.text.trim();
 	}
 
+	/**
+	 * Hand back a refused `!`/`$` line whose images Enter left in the editor.
+	 * While those images are still the live prefix of `pendingImages`, they
+	 * already sit at the indices the refused text's `[Image #N]` markers name,
+	 * and any draft typed since already counts them in its own markers: put the
+	 * refused text back ahead of it and leave the images where they are.
+	 * Returns false when the prefix no longer matches (the caller falls back to
+	 * re-adding the images through {@link restoreDetachedDraft}).
+	 */
+	#restoreRefusedInPlace(text: string, images: ImageContent[] | undefined): boolean {
+		if (!images?.length) return false;
+		const editor = this.ctx.editor;
+		if (!images.every((image, index) => editor.pendingImages[index] === image)) return false;
+		const laterText = editor.getExpandedText();
+		editor.setCollapsedText(laterText.trim() ? `${text}\n\n${laterText}` : text);
+		return true;
+	}
+
+	/** Refusal hand-back for a `!`/`$` line: in place when its images are still the live prefix. */
+	#handBackRefusedCommandLine(
+		error: unknown,
+		text: string,
+		images: ImageContent[] | undefined,
+		imageLinks: (string | undefined)[] | undefined,
+	): boolean {
+		if (!(error instanceof UserMessageRefusedError)) return false;
+		if (this.#restoreRefusedInPlace(text, images)) {
+			this.ctx.showError(error.notice);
+		} else {
+			this.#restoreRefusedSubmission(error, text, images, imageLinks);
+		}
+		this.ctx.updatePendingMessagesDisplay();
+		this.ctx.ui.requestRender();
+		return true;
+	}
+
 	#dropSubmittedPending(images: ImageContent[] | undefined, links: (string | undefined)[] | undefined): void {
 		if (!images?.length) return;
 		const pending = this.ctx.editor.pendingImages;
@@ -1169,16 +1205,7 @@ export class InputController {
 					try {
 						await this.ctx.session.gateUserMessage(text, inputImages, "interactive");
 					} catch (error) {
-						if (error instanceof UserMessageRefusedError) {
-							// Enter left the submitted images in the editor (only the text
-							// was reset): take them out first so the restore adds them once.
-							this.#dropSubmittedPending(inputImages, inputImageLinks);
-							if (this.#restoreRefusedSubmission(error, text, inputImages, inputImageLinks)) {
-								this.ctx.updatePendingMessagesDisplay();
-								this.ctx.ui.requestRender();
-								return;
-							}
-						}
+						if (this.#handBackRefusedCommandLine(error, text, inputImages, inputImageLinks)) return;
 						throw error;
 					}
 					if (this.ctx.session.isBashRunning) {
@@ -1209,15 +1236,7 @@ export class InputController {
 					try {
 						await this.ctx.session.gateUserMessage(text, inputImages, "interactive");
 					} catch (error) {
-						if (error instanceof UserMessageRefusedError) {
-							// Same as `!`: the submitted images are still the live prefix.
-							this.#dropSubmittedPending(inputImages, inputImageLinks);
-							if (this.#restoreRefusedSubmission(error, text, inputImages, inputImageLinks)) {
-								this.ctx.updatePendingMessagesDisplay();
-								this.ctx.ui.requestRender();
-								return;
-							}
-						}
+						if (this.#handBackRefusedCommandLine(error, text, inputImages, inputImageLinks)) return;
 						throw error;
 					}
 					if (this.ctx.session.isEvalRunning) {

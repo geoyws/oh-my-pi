@@ -185,8 +185,9 @@ describe("refused interactive submissions preserve a newer draft", () => {
 		editor.pendingImageLinks.push(undefined);
 		const submitting = pressEnter();
 		await entered.promise;
-		// Typed into the emptied composer while the gate awaited.
-		editor.setText("newer draft");
+		// Typed into the emptied composer while the gate awaited; its own
+		// attachment is the second live image, so its marker is #2.
+		editor.setText("newer draft [Image #2]");
 		editor.pendingImages.push(newerImage);
 		editor.pendingImageLinks.push(undefined);
 		release.resolve();
@@ -195,11 +196,11 @@ describe("refused interactive submissions preserve a newer draft", () => {
 		expect(ctx.handleBashCommand).not.toHaveBeenCalled();
 		expect(showError).toHaveBeenCalledWith(NOTICE);
 		const restored = editor.getExpandedText();
-		expect(restored).toContain(`!echo ${SECRET}`);
-		expect(restored).toContain("newer draft");
-		expect(editor.pendingImages.filter(image => image === refusedImage)).toHaveLength(1);
-		expect(editor.pendingImages).toContain(newerImage);
-		expect(editor.pendingImages).toHaveLength(2);
+		expect(restored).toContain(`!echo ${SECRET} [Image #1]`);
+		expect(restored).toContain("newer draft [Image #2]");
+		// Each marker still names its own image: the refused line's #1 is the
+		// refused image, the newer draft's #2 stays the newer image.
+		expect(editor.pendingImages).toEqual([refusedImage, newerImage]);
 	});
 
 	it("Enter $ refusal merges the full line back ahead of a newer draft", async () => {

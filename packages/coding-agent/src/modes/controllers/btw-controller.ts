@@ -403,14 +403,15 @@ export class BtwController {
 			}
 			// The question is persisted to the BTW history sidecar and sent
 			// to a provider: gate it before any checkpoint or dispatch. A
-			// refusal merges the original `/btw` line back into the composer
-			// (already emptied by Enter) ahead of any newer draft and reports
-			// only the handler's notice; nothing opens.
+			// refusal reports only the handler's notice and opens nothing.
+			// An Enter-originated `/btw` already left the main composer, so its
+			// line merges back there ahead of any newer draft; a history-panel
+			// follow-up never touched the main composer and keeps its own draft.
 			try {
 				await viewSession.gateUserMessage(trimmedQuestion, undefined, "interactive");
 			} catch (error) {
 				if (error instanceof UserMessageRefusedError) {
-					restoreDetachedDraft(this.ctx.editor, `/btw ${trimmedQuestion}`);
+					if (recordId === undefined) restoreDetachedDraft(this.ctx.editor, `/btw ${trimmedQuestion}`);
 					this.ctx.showError(error.notice);
 					this.ctx.ui.requestRender();
 					return false;
