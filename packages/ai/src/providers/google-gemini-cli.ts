@@ -1,3 +1,4 @@
+import { auxiliaryFetch } from "../utils/transport-fetch";
 /**
  * Google Gemini CLI / Antigravity provider.
  * Shared implementation for both google-gemini-cli and google-antigravity providers.
@@ -580,7 +581,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 			}
 			// The backend gates newer models on the client version; a process that
 			// skipped discovery (fresh model cache) must still send the current one.
-			if (isAntigravity) await ensureAntigravityVersion(options?.fetch ?? fetch, options?.signal);
+			if (isAntigravity) await ensureAntigravityVersion(auxiliaryFetch(options?.fetch), options?.signal);
 			const headers = isAntigravity ? { "User-Agent": getAntigravityUserAgent() } : getGeminiCliHeaders(model.id);
 
 			const requestHeaders = {

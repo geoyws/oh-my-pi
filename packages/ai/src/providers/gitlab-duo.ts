@@ -1,3 +1,4 @@
+import { auxiliaryFetch } from "../utils/transport-fetch";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { apiRouteFor } from "@oh-my-pi/pi-catalog/compat/behavior";
 import { getGitLabDuoModels, resolveGitLabDuoModelIdentity } from "@oh-my-pi/pi-catalog/provider-models";
@@ -117,7 +118,7 @@ export function streamGitLabDuo(
 				throw new AIError.ConfigurationError(`Missing GitLab Duo API route for model: ${model.id}`);
 			}
 
-			const directAccess = await getDirectAccessToken(apiKey, options.fetch);
+			const directAccess = await getDirectAccessToken(apiKey, auxiliaryFetch(options.fetch));
 			const headers = {
 				...directAccess.headers,
 				...options.headers,

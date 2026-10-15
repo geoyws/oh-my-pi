@@ -61,7 +61,7 @@ function outcomeFromFlags(flags: number): ProviderRequestOutcome {
 	return "error";
 }
 
-/** Record for one logical provider request; opened by the pi-ai entry point that owns it. */
+/** Record for one logical provider request. Auxiliary provider calls bypass this record. */
 export class ProviderRequestTelemetry {
 	readonly requestId = nextRequestId();
 	readonly #provider: string;
@@ -92,8 +92,8 @@ export class ProviderRequestTelemetry {
 		});
 	}
 
-	/** Opens an outbound attempt. Attempts after the first log an attempt-boundary line. */
-	noteAttempt(): void {
+	/** Opens an inference attempt; auxiliary calls never reach this method. */
+	noteCall(): void {
 		this.#attempts += 1;
 		if (this.#attempts === 1) return;
 		logger.info("provider request attempt", {
@@ -111,15 +111,15 @@ export class ProviderRequestTelemetry {
 		this.#lastAttemptError = undefined;
 	}
 
-	/** Records a transport-level failure so the next attempt boundary can name it. */
-	noteAttemptError(error: unknown): void {
+	/** Records a transport-level failure so the next call opens an attempt that names it. */
+	noteCallError(error: unknown): void {
 		this.#lastAttemptError = error;
 	}
 
 	/**
-	 * Counts the response body and records when the first response headers of
-	 * the request arrived. The body is wrapped in a pull-through reader — no
-	 * buffering and no copy, one accumulator per chunk.
+	 * Counts the inference body and records when its first headers arrived.
+	 * The body is wrapped in a pull-through reader: no buffering or copying,
+	 * one accumulator per chunk.
 	 */
 	observeResponse(response: Response): Response {
 		this.#status = response.status;

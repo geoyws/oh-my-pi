@@ -1,3 +1,4 @@
+import { auxiliaryFetch } from "../utils/transport-fetch";
 import * as fs from "node:fs/promises";
 import http2 from "node:http2";
 import { cursorModelParameters } from "@oh-my-pi/pi-catalog/compat/behavior";
@@ -783,7 +784,7 @@ function createHttp1RunTransport(options: CursorHttp1RunTransportOptions): Curso
 		const timeoutMs =
 			CURSOR_HTTP1_APPEND_BASE_TIMEOUT_MS +
 			Math.ceil(append.data.byteLength / CURSOR_HTTP1_APPEND_BYTES_PER_SECOND) * 1_000;
-		const response = await fetchImpl(new URL(CURSOR_BIDI_APPEND_PATH, options.baseUrl), {
+		const response = await auxiliaryFetch(fetchImpl)(new URL(CURSOR_BIDI_APPEND_PATH, options.baseUrl), {
 			method: "POST",
 			headers: { ...options.headers, "content-type": "application/proto" },
 			body: toBinary(BidiAppendRequestSchema, body),

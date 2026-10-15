@@ -1,3 +1,4 @@
+import { auxiliaryFetch } from "../utils/transport-fetch";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -979,7 +980,7 @@ async function runGitLabDuoWorkflow(
 	const apiKey = options.apiKey;
 	if (!apiKey) throw new AIError.MissingApiKeyError("gitlab-duo-agent");
 	const baseUrl = normalizeGitLabBaseUrl(model.baseUrl || DEFAULT_GITLAB_BASE_URL);
-	const fetchImpl = options.fetch ?? fetch;
+	const fetchImpl = auxiliaryFetch(options.fetch);
 	const providerSessionState = getGitLabDuoWorkflowProviderSessionState(
 		options.providerSessionState,
 		baseUrl,

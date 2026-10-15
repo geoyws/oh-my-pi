@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { streamSimple } from "@oh-my-pi/pi-ai/stream";
-import type { AssistantMessageEvent, Context, FetchImpl, Model } from "@oh-my-pi/pi-ai/types";
+import type { AssistantMessage, AssistantMessageEvent, Context, FetchImpl, Model } from "@oh-my-pi/pi-ai/types";
+import { ProviderRequestTelemetry } from "@oh-my-pi/pi-ai/utils/request-telemetry";
+import { auxiliaryFetch, transportFetch } from "@oh-my-pi/pi-ai/utils/transport-fetch";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { logger } from "@oh-my-pi/pi-utils";
 
@@ -209,5 +211,88 @@ describe("provider request telemetry", () => {
 		await settle();
 
 		expect(lines.find(l => l.message === "provider request end")!.fields.outcome).toBe("aborted");
+	});
+
+	describe("auxiliary HTTP calls through the same transport", () => {
+		// Devin (GetUserJwt, AssignModel), GitLab (direct-access token) and Cursor
+		// (BidiAppend frames) send non-inference calls through the request's
+		// transport fetch. They are HTTP calls, not attempts.
+		const json = (status = 200) =>
+			new Response(JSON.stringify({ ok: status < 400, metadata: "x".repeat(4096) }), {
+				status,
+				headers: { "content-type": "application/json" },
+			});
+		const done = { stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 } };
+
+		async function call(fetch: FetchImpl, url: string): Promise<void> {
+			await (await fetch(url, { method: "POST" })).arrayBuffer();
+		}
+
+		it("counts successful auxiliary calls before the model stream as one attempt, timed on the stream", async () => {
+			const { lines } = captureTelemetry();
+			const telemetry = new ProviderRequestTelemetry(model, "s");
+			const base = (async (input: string | URL | Request) => {
+				if (String(input).endsWith("/stream")) {
+					await Bun.sleep(40);
+					return sseResponse();
+				}
+				return json();
+			}) as unknown as FetchImpl;
+			const fetch = transportFetch(model, base, telemetry);
+
+			await call(auxiliaryFetch(fetch), "https://x/auth/GetUserJwt");
+			await call(auxiliaryFetch(fetch), "https://x/AssignModel");
+			await call(fetch, "https://x/stream");
+			telemetry.completed(done as unknown as AssistantMessage);
+
+			expect(lines.filter(l => l.message === "provider request attempt")).toEqual([]);
+			const end = lines.find(l => l.message === "provider request end")!;
+			expect(end.fields).toMatchObject({
+				outcome: "ok",
+				attempts: 1,
+				status: 200,
+				bytesIn: Buffer.byteLength(SSE_BODY),
+			});
+			expect(end.fields.ttfbMs as number).toBeGreaterThanOrEqual(40);
+		});
+
+		it("opens an attempt only after a failed call, even when an auxiliary call comes between", async () => {
+			const { lines } = captureTelemetry();
+			const telemetry = new ProviderRequestTelemetry(model, "s");
+			let streamCalls = 0;
+			const base = (async (input: string | URL | Request) => {
+				if (!String(input).endsWith("/stream")) return json();
+				streamCalls += 1;
+				return streamCalls === 1 ? json(429) : sseResponse();
+			}) as unknown as FetchImpl;
+			const fetch = transportFetch(model, base, telemetry);
+
+			await call(fetch, "https://x/stream");
+			await call(auxiliaryFetch(fetch), "https://x/auth/GetUserJwt");
+			await call(fetch, "https://x/stream");
+			telemetry.completed(done as unknown as AssistantMessage);
+
+			const attempts = lines.filter(l => l.message === "provider request attempt");
+			expect(attempts.map(l => [l.fields.attempt, l.fields.previousStatus])).toEqual([[2, 429]]);
+			const end = lines.find(l => l.message === "provider request end")!;
+			expect(end.fields).toMatchObject({ attempts: 2, status: 200 });
+		});
+
+		it("does not count concurrent append frames beside the stream as attempts", async () => {
+			const { lines } = captureTelemetry();
+			const telemetry = new ProviderRequestTelemetry(model, "s");
+			const base = (async (input: string | URL | Request) =>
+				String(input).endsWith("/RunSSE") ? sseResponse() : json()) as unknown as FetchImpl;
+			const fetch = transportFetch(model, base, telemetry);
+
+			await Promise.all([
+				call(fetch, "https://x/RunSSE"),
+				...Array.from({ length: 5 }, () => call(auxiliaryFetch(fetch), "https://x/BidiAppend")),
+			]);
+			telemetry.completed(done as unknown as AssistantMessage);
+
+			const end = lines.find(l => l.message === "provider request end")!;
+			expect(end.fields).toMatchObject({ attempts: 1, bytesIn: Buffer.byteLength(SSE_BODY) });
+		});
 	});
 });

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Every provider request now logs `provider request start`, one `provider request attempt` per retried attempt, and `provider request end` under a shared `requestId`, carrying duration, time-to-first-byte of the model response, time-to-first-token, attempt and HTTP call counts, bytes received, input/output/cache token counts and the failure class — so a hung or retry-storming request is diagnosable from the log file without a special build ([#12319](https://github.com/can1357/oh-my-pi/issues/12319)). Auxiliary calls a provider makes through the same transport (auth tokens, model assignment, Cursor append frames) count as HTTP calls, not attempts; an attempt opens only after a failed call.
+
 ## [18.9.2] - 2026-10-11
 
 ### Breaking Changes
@@ -18,9 +22,6 @@
 ### Changed
 
 - Improved Anthropic prompt caching for long conversations, reducing memory usage while selecting cache breakpoints.
-### Added
-
-- Every provider request now logs `provider request start`, one `provider request attempt` per retried attempt, and `provider request end` under a shared `requestId`, carrying duration, time-to-first-byte/token, attempt count, bytes received, input/output/cache token counts and the failure class — so a hung or retry-storming request is diagnosable from the log file without a special build ([#12319](https://github.com/can1357/oh-my-pi/issues/12319)).
 
 ### Fixed
 

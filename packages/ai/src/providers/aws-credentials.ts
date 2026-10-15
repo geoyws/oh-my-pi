@@ -1,3 +1,4 @@
+import { auxiliaryFetch } from "../utils/transport-fetch";
 /**
  * AWS credential resolution for the Bedrock provider.
  *
@@ -104,7 +105,7 @@ export async function resolveAwsCredentials(opts: CredentialResolveOptions = {})
 	const existing = inflight.get(cacheKey);
 	if (existing) return raceWithSignal(existing, opts.signal);
 
-	const fetchImpl = opts.fetch ?? (globalThis.fetch as FetchImpl);
+	const fetchImpl = auxiliaryFetch(opts.fetch);
 	const promise = (async () => {
 		try {
 			const creds = await resolveFresh(
