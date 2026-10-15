@@ -1726,6 +1726,7 @@ export class Agent {
 			resolve();
 			if (this.#abortController === continuationAbortController) {
 				this.#state.isStreaming = false;
+				this.#queuedSteerOutcome = "after-response";
 				this.#state.streamMessage = null;
 				this.#state.pendingToolCalls.clear();
 				this.#abortController = undefined;
@@ -2194,6 +2195,7 @@ export class Agent {
 			resolveRun?.();
 			if (this.#abortController === loopAbortController) {
 				this.#state.isStreaming = false;
+				this.#queuedSteerOutcome = "after-response";
 				this.#state.streamMessage = null;
 				this.#state.pendingToolCalls.clear();
 				this.#abortController = undefined;
