@@ -161,6 +161,7 @@ Environment variables are **not** a single settings layer. Each is read by the f
 | `OMP_AUTH_BROKER_TOKEN` | `auth.broker.token`         | Env value takes precedence over config.                                                           |
 | `PI_CODING_AGENT_DIR`   | (relocates agent dir)       | Moves `config.yml`, `agent.db`, and the whole agent base.                                         |
 | `PI_CONFIG_FILES`       | CLI config overlays         | Platform path-list (`:` on Unix, `;` on Windows); files load in order before `--config` overlays. |
+| `PI_CONFIG_READONLY=1`  | `config.readOnly`           | Only `1`, at startup; project roles, `agent.db` still write; [policy](#global-read-only-policy).  |
 
 Provider API keys are resolved separately (stored auth, OAuth, `models.yml`, environment, and `.env` files); see [Providers](./providers.md) and the full [Environment variables](./environment-variables.md) reference.
 
