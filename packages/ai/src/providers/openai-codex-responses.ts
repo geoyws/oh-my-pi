@@ -1433,6 +1433,9 @@ function resetOutputState(output: AssistantMessage): void {
 	output.stopDetails = undefined;
 }
 
+const CODEX_SSE_FIRST_EVENT_TIMEOUT_MESSAGE = "OpenAI Codex SSE stream timed out while waiting for the first event";
+const CODEX_SSE_IDLE_TIMEOUT_MESSAGE = "OpenAI Codex SSE stream stalled while waiting for the next event";
+
 function createRequestSetup(options: OpenAICodexResponsesOptions | undefined): CodexRequestSetup {
 	const requestAbortController = new AbortController();
 	const requestSignal = options?.signal
@@ -1448,10 +1451,14 @@ function createRequestSetup(options: OpenAICodexResponsesOptions | undefined): C
 		iterateWithIdleTimeout(source, {
 			idleTimeoutMs,
 			firstItemTimeoutMs: firstEventTimeoutMs,
-			firstItemErrorMessage: "OpenAI Codex SSE stream timed out while waiting for the first event",
-			errorMessage: "OpenAI Codex SSE stream stalled while waiting for the next event",
-			onIdle: () => requestAbortController.abort(),
-			onFirstItemTimeout: () => requestAbortController.abort(),
+			firstItemErrorMessage: CODEX_SSE_FIRST_EVENT_TIMEOUT_MESSAGE,
+			errorMessage: CODEX_SSE_IDLE_TIMEOUT_MESSAGE,
+			// The reason marks the internal abort as a timeout, so every guard
+			// that later sees the aborted request signal surfaces the timeout
+			// instead of mistaking it for a caller cancellation.
+			onIdle: () => requestAbortController.abort(new AIError.StreamTimeoutError(CODEX_SSE_IDLE_TIMEOUT_MESSAGE)),
+			onFirstItemTimeout: () =>
+				requestAbortController.abort(new AIError.StreamTimeoutError(CODEX_SSE_FIRST_EVENT_TIMEOUT_MESSAGE)),
 			abortSignal: options?.signal,
 			isProgressItem: isCodexStreamProgressEvent,
 		});
@@ -1463,6 +1470,28 @@ function createRequestSetup(options: OpenAICodexResponsesOptions | undefined): C
 		websocketIdleTimeoutMs,
 		websocketFirstEventTimeoutMs,
 	};
+}
+
+/**
+ * Gate one new Codex transport attempt (websocket handshake or SSE open) made
+ * by a retry or recovery, before any `delayMs` backoff sleep. Order matters:
+ * a caller abort wins and surfaces as itself; an internal idle/first-event
+ * timeout then surfaces its own `StreamTimeoutError` (the idle gap may have
+ * outlived the operation budget, which must not mask it); only then does the
+ * operation budget refuse an attempt whose sleep would land past the deadline.
+ * Called with no delay too, so a spent budget never pays for another open.
+ */
+function assertCodexTransportAttemptAllowed(
+	options: OpenAICodexResponsesOptions | undefined,
+	requestSetup: CodexRequestSetup,
+	delayMs = 0,
+): void {
+	const callerSignal = options?.signal;
+	if (callerSignal?.aborted) throw callerSignal.reason;
+	const internalSignal = requestSetup.requestAbortController.signal;
+	if (internalSignal.aborted) throw internalSignal.reason;
+	const deadlineError = operationDeadlineExceeded(options, delayMs);
+	if (deadlineError) throw deadlineError;
 }
 
 function createCodexRequestContext(
@@ -1780,14 +1809,7 @@ async function openInitialCodexEventStream(
 				if (!activateFallback) {
 					websocketRetries += 1;
 					const websocketRetryDelayMs = CODEX_WEBSOCKET_RETRY_DELAY_MS * Math.max(1, websocketRetries);
-					// A caller abort wins over the budget, as in the in-class recoveries:
-					// an already-cancelled request must not read as a budget exhaustion.
-					// Re-throw the abort reason itself rather than a fresh AbortError,
-					// so a timeout abort keeps its timeout classification (and a plain
-					// cancellation stays distinct from one).
-					if (requestSetup.requestSignal.aborted) throw requestSetup.requestSignal.reason;
-					const deadlineError = operationDeadlineExceeded(options, websocketRetryDelayMs);
-					if (deadlineError) throw deadlineError;
+					assertCodexTransportAttemptAllowed(options, requestSetup, websocketRetryDelayMs);
 					// The hook only observes: same delay, same signal, same abort rejection.
 					if (options?.providerRetryWait)
 						await options.providerRetryWait(websocketRetryDelayMs, requestSetup.requestSignal, {
@@ -1800,6 +1822,8 @@ async function openInitialCodexEventStream(
 				break;
 			}
 		}
+		// The websocket attempt failed over to SSE: a fresh HTTP open is a retry.
+		assertCodexTransportAttemptAllowed(options, requestSetup);
 	} else if (websocketState) {
 		releaseIdleCodexWebSocket(websocketState);
 	}
@@ -1807,6 +1831,7 @@ async function openInitialCodexEventStream(
 		return await openCodexSseTransport(model, requestContext, requestSetup, options, websocketState, transformedBody);
 	} catch (error) {
 		if (!dropRejectedCodexAccessPrograms(transformedBody, model, requestContext.accountId, error)) throw error;
+		assertCodexTransportAttemptAllowed(options, requestSetup);
 		return openCodexSseTransport(model, requestContext, requestSetup, options, websocketState, transformedBody);
 	}
 }
@@ -1860,6 +1885,7 @@ export async function openCodexCompactionEventStream(
 			);
 			const websocketState = requestContext.websocketState;
 			if (websocketState) resetCodexWebSocketAppendState(websocketState);
+			assertCodexTransportAttemptAllowed(options, requestSetup);
 			initial = await openInitialCodexEventStream(model, options, requestSetup, requestContext);
 		}
 	} catch (error) {
@@ -1891,6 +1917,11 @@ async function* streamCodexCompactionEvents(
 	const websocketState = requestContext.websocketState;
 	const previousTurnState = requestContext.turnState.value;
 	const previousModelsEtag = websocketState?.modelsEtag;
+	// Every replay below is a fresh SSE attempt and passes the attempt gate.
+	const openSseReplay = () => {
+		assertCodexTransportAttemptAllowed(options, requestSetup);
+		return openCodexSseTransport(model, requestContext, requestSetup, options, websocketState);
+	};
 	try {
 		if (initial.transport === "websocket") {
 			// Do not expose a WebSocket attempt until it finishes: an SSE replay
@@ -1902,10 +1933,9 @@ async function* streamCodexCompactionEvents(
 				if (options.signal?.aborted || !(error instanceof CodexWebSocketTransportError)) {
 					throw error;
 				}
-				const state = requestContext.websocketState;
-				if (state) recordCodexWebSocketFailure(state, true);
-				const fallback = await openCodexSseTransport(model, requestContext, requestSetup, options, state);
-				if (state) state.lastTransport = fallback.transport;
+				if (websocketState) recordCodexWebSocketFailure(websocketState, true);
+				const fallback = await openSseReplay();
+				if (websocketState) websocketState.lastTransport = fallback.transport;
 				yield* drainCodexCompactionEvents(fallback.eventStream, requestContext);
 				completed = true;
 				return;
@@ -1926,7 +1956,7 @@ async function* streamCodexCompactionEvents(
 					{ provider: model.provider, model: model.id, transport: "websocket" },
 				);
 				if (websocketState) resetCodexWebSocketAppendState(websocketState);
-				const replay = await openCodexSseTransport(model, requestContext, requestSetup, options, websocketState);
+				const replay = await openSseReplay();
 				if (websocketState) websocketState.lastTransport = replay.transport;
 				yield* drainCodexCompactionEvents(replay.eventStream, requestContext);
 				completed = true;
@@ -1942,7 +1972,7 @@ async function* streamCodexCompactionEvents(
 					createCodexProviderStreamError(failure),
 				)
 			) {
-				const replay = await openCodexSseTransport(model, requestContext, requestSetup, options, websocketState);
+				const replay = await openSseReplay();
 				if (websocketState) websocketState.lastTransport = replay.transport;
 				yield* drainCodexCompactionEvents(replay.eventStream, requestContext);
 				completed = true;
@@ -1985,13 +2015,7 @@ async function* streamCodexCompactionEvents(
 						);
 						if (websocketState) resetCodexWebSocketAppendState(websocketState);
 						await events.return(undefined);
-						const replay = await openCodexSseTransport(
-							model,
-							requestContext,
-							requestSetup,
-							options,
-							websocketState,
-						);
+						const replay = await openSseReplay();
 						if (websocketState) websocketState.lastTransport = replay.transport;
 						events = replay.eventStream;
 						switched = true;
@@ -3110,8 +3134,7 @@ class CodexStreamProcessor {
 		resetOutputState(this.output);
 		this.firstTokenTime = undefined;
 		const whitespaceRetryDelayMs = CODEX_WHITESPACE_LOOP_RETRY_DELAY_MS * this.runtime.whitespaceLoopRetries;
-		const whitespaceDeadlineError = operationDeadlineExceeded(this.options, whitespaceRetryDelayMs);
-		if (whitespaceDeadlineError) throw whitespaceDeadlineError;
+		assertCodexTransportAttemptAllowed(this.options, this.requestSetup, whitespaceRetryDelayMs);
 		// The hook only observes: same delay, same signal, same abort rejection.
 		if (this.options?.providerRetryWait)
 			await this.options.providerRetryWait(whitespaceRetryDelayMs, this.requestSetup.requestSignal, {
@@ -3202,8 +3225,7 @@ class CodexStreamProcessor {
 		}
 		this.runtime.websocketStreamRetries += 1;
 		const reconnectDelayMs = CODEX_WEBSOCKET_RETRY_DELAY_MS * Math.max(1, this.runtime.websocketStreamRetries);
-		const reconnectDeadlineError = operationDeadlineExceeded(this.options, reconnectDelayMs);
-		if (reconnectDeadlineError) throw reconnectDeadlineError;
+		assertCodexTransportAttemptAllowed(this.options, this.requestSetup, reconnectDelayMs);
 		// The hook only observes: same delay, same signal, same abort rejection.
 		if (this.options?.providerRetryWait)
 			await this.options.providerRetryWait(reconnectDelayMs, this.requestSetup.requestSignal, {
@@ -3363,8 +3385,7 @@ class CodexStreamProcessor {
 			this.runtime.resetAccumulators();
 			this.firstTokenTime = undefined;
 			const replayDelayMs = CODEX_WEBSOCKET_RETRY_DELAY_MS * Math.max(1, this.runtime.websocketStreamRetries);
-			const replayDeadlineError = operationDeadlineExceeded(this.options, replayDelayMs);
-			if (replayDeadlineError) throw replayDeadlineError;
+			assertCodexTransportAttemptAllowed(this.options, this.requestSetup, replayDelayMs);
 			// The hook only observes: same delay, same signal, same abort rejection.
 			if (this.options?.providerRetryWait)
 				await this.options.providerRetryWait(replayDelayMs, this.requestSetup.requestSignal, {
@@ -3463,8 +3484,7 @@ class CodexStreamProcessor {
 		resetOutputState(this.output);
 		this.firstTokenTime = undefined;
 		const providerRetryDelayMs = CODEX_RETRY_DELAY_MS * this.runtime.providerRetryAttempt;
-		const providerDeadlineError = operationDeadlineExceeded(this.options, providerRetryDelayMs);
-		if (providerDeadlineError) throw providerDeadlineError;
+		assertCodexTransportAttemptAllowed(this.options, this.requestSetup, providerRetryDelayMs);
 		// The hook only observes: same delay, same signal, same abort rejection.
 		if (this.options?.providerRetryWait)
 			await this.options.providerRetryWait(providerRetryDelayMs, this.requestSetup.requestSignal, {
@@ -3483,6 +3503,7 @@ class CodexStreamProcessor {
 	}
 
 	async #reopenWebSocketStream(state: CodexWebSocketSessionState): Promise<void> {
+		assertCodexTransportAttemptAllowed(this.options, this.requestSetup);
 		try {
 			const next = await openCodexWebSocketTransport(
 				this.model,
@@ -3513,6 +3534,7 @@ class CodexStreamProcessor {
 	}
 
 	async #reopenSseStream(state: CodexWebSocketSessionState | undefined): Promise<void> {
+		assertCodexTransportAttemptAllowed(this.options, this.requestSetup);
 		const next = await openCodexSseTransport(this.model, this.requestContext, this.requestSetup, this.options, state);
 		this.runtime.eventStream = next.eventStream;
 		this.runtime.requestBodyForState = next.requestBodyForState;
@@ -3604,6 +3626,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 				);
 				const websocketState = requestContext.websocketState;
 				if (websocketState) resetCodexWebSocketAppendState(websocketState);
+				assertCodexTransportAttemptAllowed(options, requestSetup);
 				initialTransport = await openInitialCodexEventStream(model, options, requestSetup, requestContext);
 			}
 			const runtime = new CodexStreamRuntime({
