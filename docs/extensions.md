@@ -548,8 +548,15 @@ persists it. It fires at submission for `prompt`, `steer`, `followUp`, and
 `sendUserMessage`, and again at queued/aside delivery for messages enqueued
 before extensions finished registering — so a late-registered handler still
 faces every message. Each message passes the handlers once: already-gated
-messages skip the delivery recheck. Synthetic prompts (agent continuations) and
-skill/custom messages are not user input and skip the gate.
+messages skip the delivery recheck. Synthetic prompts (agent continuations)
+and non-skill custom messages are not user input and skip the gate.
+
+User-invoked `/skill:` expansions are gated too: the handler runs once on the
+raw invocation (the typed draft/args) and once on the rendered skill text
+before either is persisted or sent, on every ingress (interactive Enter,
+RPC, ACP, compaction drain). A skill refusal behaves like any other refusal
+for its ingress — the interactive draft (the raw `/skill:` text) is handed
+back for editing, RPC/ACP fail with only the notice.
 
 | Submission | `source` |
 |---|---|

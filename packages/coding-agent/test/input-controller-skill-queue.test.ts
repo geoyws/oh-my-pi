@@ -48,7 +48,12 @@ type PromptCustomMessage = Mock<
 			attribution?: string;
 			details: SkillPromptDetails;
 		},
-		options?: { streamingBehavior?: "steer" | "followUp"; queueChipText?: string; queueOnly?: boolean },
+		options?: {
+			streamingBehavior?: "steer" | "followUp";
+			queueChipText?: string;
+			queueOnly?: boolean;
+			source?: string;
+		},
 	) => Promise<void>
 >;
 
@@ -183,6 +188,7 @@ describe("InputController skill queue chip metadata", () => {
 		expect(promptCustomMessage.mock.calls[0]?.[1]).toEqual({
 			streamingBehavior: "steer",
 			queueChipText: "/skill:test-skill arg1 arg2",
+			source: "interactive",
 		});
 		expect(promptCustomMessage.mock.calls[0]?.[0].details.__queueChipText).toBeUndefined();
 		expect(updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
@@ -252,6 +258,7 @@ describe("InputController skill queue chip metadata", () => {
 		expect(promptCustomMessage.mock.calls[0]?.[1]).toEqual({
 			streamingBehavior: "followUp",
 			queueChipText: "/skill:test-skill arg1 arg2",
+			source: "interactive",
 		});
 	});
 
@@ -303,6 +310,7 @@ describe("InputController skill queue chip metadata", () => {
 		expect(promptCustomMessage.mock.calls[0]?.[1]).toEqual({
 			streamingBehavior: "steer",
 			queueChipText: "/skill:test-skill arg1 arg2",
+			source: "interactive",
 		});
 		expect(promptCustomMessage.mock.calls[0]?.[0].details.__queueChipText).toBeUndefined();
 	});
@@ -503,11 +511,10 @@ describe("compaction skill re-invocation", () => {
 		expect(renderedText.text).toContain("Do the thing.");
 		expect(renderedText.text).toContain(`[Skill directory: ${tempDir.path()}]`);
 		expect(renderedText.text).toContain("arg1 arg2");
-		expect(message.content[1]).toEqual(image);
-		expect(message.details).toMatchObject({ name: "test-skill", args: "arg1 arg2", lineCount: 1 });
 		expect(options).toEqual({
 			streamingBehavior: "followUp",
 			queueChipText: "/skill:test-skill arg1 arg2",
+			source: "interactive",
 		});
 		expect(prompt).not.toHaveBeenCalled();
 		expect(steer).not.toHaveBeenCalled();

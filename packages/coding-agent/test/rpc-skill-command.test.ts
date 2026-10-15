@@ -20,7 +20,9 @@ describe("tryRunRpcSkillCommand", () => {
 		);
 
 		let message: Pick<CustomMessage, "attribution" | "content" | "customType" | "details" | "display"> | undefined;
-		let options: { streamingBehavior?: "steer" | "followUp" | "aside"; queueChipText?: string } | undefined;
+		let options:
+			| { streamingBehavior?: "steer" | "followUp" | "aside"; queueChipText?: string; source?: string }
+			| undefined;
 
 		const handled = await tryRunRpcSkillCommand(
 			{
@@ -44,7 +46,11 @@ describe("tryRunRpcSkillCommand", () => {
 		expect(message?.content).toContain("focus on risks");
 		expect(message?.display).toBe(true);
 		expect(message?.attribution).toBe("user");
-		expect(options).toEqual({ streamingBehavior: "steer", queueChipText: "/skill:reviewer focus on risks" });
+		expect(options).toEqual({
+			streamingBehavior: "steer",
+			queueChipText: "/skill:reviewer focus on risks",
+			source: "rpc",
+		});
 
 		await removeWithRetries(dir);
 	});

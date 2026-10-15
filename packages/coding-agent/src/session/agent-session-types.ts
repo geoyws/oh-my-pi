@@ -455,6 +455,8 @@ export interface DroppedPrompt {
 	text: string;
 	/** Image attachments submitted with the prompt. */
 	images?: ImageContent[];
+	/** Display links paired with `images` (chip restoration on hand-back). */
+	imageLinks?: (string | undefined)[];
 }
 
 /** Options for AgentSession.followUp(). */

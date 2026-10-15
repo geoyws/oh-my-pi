@@ -1075,7 +1075,7 @@ export class AcpAgent implements Agent {
 				details: built.details,
 				attribution: "user",
 			},
-			{ streamingBehavior: "steer" },
+			{ streamingBehavior: "steer", source: "acp" },
 		);
 		return true;
 	}

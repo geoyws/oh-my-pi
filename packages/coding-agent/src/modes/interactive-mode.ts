@@ -150,6 +150,7 @@ import {
 import type { ShakeMode } from "../session/shake-types";
 import { BUILTIN_SLASH_COMMAND_RESERVED_NAMES, buildTuiBuiltinSlashCommands } from "../slash-commands/builtin-registry";
 import { buildStaticInlineHint } from "../slash-commands/builtin-completions";
+import { restoreRefusedDraft } from "../slash-commands/helpers/draft";
 import { formatCoarseDuration } from "@oh-my-pi/pi-tui/chrome/format";
 import { type DictationTarget, MicCursor, type SttCallbacks, STTController, type SttState } from "../stt";
 import type { SpaceHoldHandler } from "@oh-my-pi/pi-tui/space-hold";
@@ -3357,13 +3358,28 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	/**
 	 * Hands back a submission refused by a `before_user_message` handler. The
-	 * refused text was never sent or persisted; restore it for editing like
-	 * any other dropped prompt.
+	 * refused text was never sent or persisted. The refusal arrives
+	 * asynchronously, so merge it ahead of any newer draft typed while
+	 * dispatch was pending (mirrors cancelPendingSubmission) instead of
+	 * dropping it when the editor is no longer empty.
 	 */
 	restoreRefusedPrompt(prompt: DroppedPrompt): void {
-		this.#restoreDroppedPrompt(prompt);
+		this.clearOptimisticUserMessage();
+		this.#pendingWorkingMessage = undefined;
+		if (this.loadingAnimation) {
+			this.#stopLoadingAnimation(true);
+		}
+		this.rebuildChatFromMessages();
+		restoreRefusedDraft(this.editor, prompt.text, prompt.images, prompt.imageLinks);
+		this.ui.requestRender();
 	}
 
+	/**
+	 * Hands back a prompt the session dropped before dispatch (an Esc abort or
+	 * usage preflight denial raced turn setup). The message was never persisted,
+	 * so the tree/branch selectors cannot offer it — remove the optimistic
+	 * transcript row and put the typed text back in the editor for editing.
+	 */
 	#restoreDroppedPrompt(prompt: DroppedPrompt): void {
 		this.clearOptimisticUserMessage();
 		this.#pendingWorkingMessage = undefined;
@@ -5859,6 +5875,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			await invokeSkillCommandFromText(this, initialPrompt, "steer", {
 				images: input?.images,
 				propagateErrors: true,
+				source: "interactive",
 			});
 			return true;
 		}
@@ -5921,6 +5938,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					await invokeSkillCommandFromText(this, initialPrompt, "steer", {
 						images: input?.images,
 						propagateErrors: true,
+						source: "interactive",
 					});
 				} finally {
 					this.#vibeSkillInFlight--;

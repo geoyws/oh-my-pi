@@ -27,7 +27,7 @@ const extension = await loadExtensionFromFactory(
 			if (event.source !== "rpc" && event.source !== "queued" && event.source !== "aside") {
 				throw new Error(`unexpected before_user_message source ${event.source}`);
 			}
-			if (event.text.startsWith("refuse:")) {
+			if (event.text.includes("FAKE-SECRET")) {
 				return { refuse: true, notice: "RPC test refusal notice." };
 			}
 			return undefined;
@@ -45,11 +45,22 @@ const agent = new Agent({
 	initialState: { model: getBundledModel("anthropic", "claude-sonnet-4-5")!, systemPrompt: ["Test"], tools: [] },
 	streamFn: mock.stream,
 });
+const skillDir = path.join(path.dirname(import.meta.path), "refusal-skill");
 const session = new AgentSession({
 	agent,
 	sessionManager,
 	settings: Settings.isolated({ "compaction.enabled": false }),
 	modelRegistry,
 	extensionRunner,
+	skills: [
+		{
+			name: "reviewer",
+			description: "Review code",
+			filePath: path.join(skillDir, "SKILL.md"),
+			baseDir: skillDir,
+			source: "project",
+		},
+	],
+	skillsSettings: { enableSkillCommands: true },
 });
 await runRpcMode(session);

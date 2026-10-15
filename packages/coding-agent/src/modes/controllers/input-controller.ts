@@ -1721,6 +1721,7 @@ export class InputController {
 				imageLinks: draftImageLinks,
 				optimistic: true,
 				propagateErrors: true,
+				source: "interactive",
 			});
 			if (!dispatched) restoreDraft();
 			return dispatched;

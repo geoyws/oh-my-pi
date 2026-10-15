@@ -457,13 +457,22 @@ export async function submitInteractiveInput(
 			});
 		} else if (isKnownSkillCommand(skillHost, input.text)) {
 			// Resubmitted skill text must dispatch through the skill path, or the
-			// model receives a literal `/skill:` token.
-			await invokeSkillCommandFromText(skillHost, input.text, streamingBehavior, {
-				images: input.images,
-				imageLinks: input.imageLinks,
-				optimistic: true,
-				propagateErrors: true,
-			});
+			// model receives a literal `/skill:` token. A refusal hands the raw
+			// invocation back for editing, like a refused plain prompt.
+			try {
+				await invokeSkillCommandFromText(skillHost, input.text, streamingBehavior, {
+					images: input.images,
+					imageLinks: input.imageLinks,
+					optimistic: true,
+					propagateErrors: true,
+					source: "interactive",
+				});
+			} catch (error: unknown) {
+				if (error instanceof UserMessageRefusedError) {
+					mode.restoreRefusedPrompt?.({ text: input.text, images: input.images, imageLinks: input.imageLinks });
+				}
+				mode.showError(error instanceof Error ? error.message : "Unknown error occurred");
+			}
 		} else {
 			let forwarded = false;
 			try {
@@ -477,7 +486,7 @@ export async function submitInteractiveInput(
 				// back (never clobbering a newer draft) and show only the
 				// handler's safe notice.
 				if (error instanceof UserMessageRefusedError) {
-					mode.restoreRefusedPrompt?.({ text: input.text, images: input.images });
+					mode.restoreRefusedPrompt?.({ text: input.text, images: input.images, imageLinks: input.imageLinks });
 				}
 				mode.showError(error instanceof Error ? error.message : "Unknown error occurred");
 			}

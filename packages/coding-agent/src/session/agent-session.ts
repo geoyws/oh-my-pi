@@ -7635,6 +7635,8 @@ export class AgentSession implements SettingsScope {
 		options?: Pick<PromptOptions, "streamingBehavior" | "toolChoice" | "onPromptAdmitted"> & {
 			queueChipText?: string;
 			queueOnly?: boolean;
+			/** Where this message entered the session (for the `before_user_message` gate). Defaults to `"unknown"`. */
+			source?: UserMessageSource;
 		},
 	): Promise<boolean> {
 		return this.#admitSubmission(() => this.#promptCustomMessage(message, options));
@@ -7645,6 +7647,7 @@ export class AgentSession implements SettingsScope {
 		options?: Pick<PromptOptions, "streamingBehavior" | "toolChoice" | "onPromptAdmitted"> & {
 			queueChipText?: string;
 			queueOnly?: boolean;
+			source?: UserMessageSource;
 		},
 	): Promise<boolean> {
 		// Same barrier/claim protocol as prompt(): skill invocations, collab peer
@@ -7666,6 +7669,7 @@ export class AgentSession implements SettingsScope {
 			| (Pick<PromptOptions, "streamingBehavior" | "toolChoice" | "onPromptAdmitted"> & {
 					queueChipText?: string;
 					queueOnly?: boolean;
+					source?: UserMessageSource;
 			  })
 			| undefined,
 		outcome: PromptDispatchOutcome,
@@ -7686,6 +7690,18 @@ export class AgentSession implements SettingsScope {
 				skillArgs = details.args;
 			}
 			keywordNotices = this.#createMagicKeywordNotices(skillArgs);
+			// User-invoked skill expansions carry user-authored content to the
+			// provider and the session JSONL: gate the raw invocation and the
+			// rendered text before either is persisted or queued.
+			const skillImages = Array.isArray(message.content)
+				? message.content.filter((part): part is ImageContent => part.type === "image")
+				: undefined;
+			await this.#checkSkillPromptRefusal(
+				message,
+				textContent,
+				skillImages && skillImages.length > 0 ? skillImages : undefined,
+				options?.source ?? "unknown",
+			);
 		}
 
 		if (options?.queueOnly || this.isStreaming) {
@@ -7788,6 +7804,36 @@ export class AgentSession implements SettingsScope {
 		const { refused, notice } = await runner.emitBeforeUserMessage(text, images, source);
 		if (refused) throw new UserMessageRefusedError(notice);
 		return true;
+	}
+
+	/**
+	 * Pre-persistence gate for a user-invoked skill expansion. User-authored
+	 * content reaches the provider and the session JSONL inside the rendered
+	 * custom message, so it faces the `before_user_message` handlers twice:
+	 * once on the raw invocation (the typed draft / args from details, which
+	 * rendering could trim) and once on the rendered text (which merges the
+	 * args into the skill template). Either refusal throws
+	 * {@link UserMessageRefusedError} before anything is persisted or queued.
+	 */
+	async #checkSkillPromptRefusal(
+		message: Pick<CustomMessage<unknown>, "content" | "details">,
+		renderedText: string,
+		images: ImageContent[] | undefined,
+		source: UserMessageSource,
+	): Promise<void> {
+		const details = message.details;
+		const raw =
+			details && typeof details === "object" && "prompt" in details && typeof details.prompt === "string"
+				? details.prompt
+				: details && typeof details === "object" && "args" in details && typeof details.args === "string"
+					? details.args
+					: "";
+		if (raw.trim() && raw !== renderedText) {
+			await this.#checkUserMessageRefusal(raw, images, source);
+		}
+		if (renderedText.trim()) {
+			await this.#checkUserMessageRefusal(renderedText, images, source);
+		}
 	}
 
 	/** Split a queued user message into gate input (text plus image parts). */

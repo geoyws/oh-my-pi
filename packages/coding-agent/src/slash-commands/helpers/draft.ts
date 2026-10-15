@@ -28,3 +28,25 @@ export function restoreDetachedDraft(
 	}
 	editor.setCollapsedText([restoredText, currentText].filter(part => part.trim()).join("\n\n"));
 }
+
+/**
+ * Hand back a refused submission that already left the editor: the refused
+ * text goes ahead of any newer draft typed while dispatch was pending (its
+ * `[Image #N]` markers shift to match), refused attachments merge ahead of
+ * newer ones, and the newer draft is never clobbered. Mirrors
+ * `InteractiveMode.cancelPendingSubmission`.
+ */
+export function restoreRefusedDraft(
+	editor: CustomEditor,
+	text: string,
+	images?: ImageContent[],
+	imageLinks?: (string | undefined)[],
+): void {
+	const laterText = editor.getExpandedText();
+	const refusedImages = images ?? [];
+	const recoveredText = laterText ? `${text}\n${shiftImageMarkers(laterText, refusedImages.length)}` : text;
+	editor.pendingImages = [...refusedImages, ...editor.pendingImages];
+	editor.pendingImageLinks = [...(imageLinks ?? refusedImages.map(() => undefined)), ...editor.pendingImageLinks];
+	editor.imageLinks = editor.pendingImageLinks;
+	editor.setCollapsedText(recoveredText);
+}

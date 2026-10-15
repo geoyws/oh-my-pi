@@ -290,7 +290,7 @@ export async function runRpcSkillCommand(
 			details: built.details,
 			attribution: "user",
 		},
-		{ streamingBehavior, queueChipText: invocation.queueChipText, onPromptAdmitted },
+		{ streamingBehavior, queueChipText: invocation.queueChipText, onPromptAdmitted, source: "rpc" },
 	);
 }
 
