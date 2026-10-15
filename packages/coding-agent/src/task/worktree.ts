@@ -649,6 +649,89 @@ async function detachCopiedRepo(sourceRoot: string, copyRoot: string, sourceComm
 }
 
 /**
+ * Whether the git admin reached through `dotGitPath` (a `.git` entry inside
+ * the isolated copy rooted at `copyRoot`) can let git writes escape the
+ * copy. Every entry kind resolves to one effective admin directory:
+ * - a real directory is the admin itself;
+ * - a symlink is fully resolved first, then judged by what it points at (a
+ *   directory is the admin; a file is parsed as a gitfile, below);
+ * - a gitfile's `gitdir:` target is resolved like git resolves it (an
+ *   absolute target stands alone, a relative one joins the gitfile's own
+ *   directory), following one chained file pointer when the target is
+ *   itself a file.
+ * The admin escapes when its realpath lies outside the copy, or when its
+ * `commondir` file (resolved relative to the admin when relative, as git
+ * writes it) realpaths outside the copy: a directory admin with such a
+ * pointer shares HEAD/refs with the source, so `git checkout -b` in the
+ * copy writes the source. A missing `commondir` means the admin is its own
+ * common dir and is private when contained. Anything unresolvable,
+ * unparseable, or of an unrecognized kind escapes (fail closed).
+ * `objects/info/alternates` is deliberately NOT judged here: a detached
+ * private admin borrows source objects through alternates read-only, and
+ * that borrowing must keep passing.
+ */
+export async function gitAdminEscapes(copyRoot: string, dotGitPath: string): Promise<boolean> {
+	let realCopyRoot: string;
+	try {
+		realCopyRoot = await fs.realpath(copyRoot);
+	} catch {
+		return true;
+	}
+	const underCopy = (realPath: string): boolean =>
+		realPath === realCopyRoot || realPath.startsWith(`${realCopyRoot}${path.sep}`);
+	const parseGitdirTarget = (firstLine: string): string | null => {
+		const match = /^gitdir:[ \t]*(.+?)\s*$/.exec(firstLine);
+		return match ? match[1]! : null;
+	};
+	// Resolve one gitfile's content to the admin directory it names.
+	const resolveGitfile = async (gitfileRealPath: string): Promise<string | null> => {
+		let current = gitfileRealPath;
+		for (let depth = 0; depth < 2; depth++) {
+			const content = await fs.readFile(current, "utf8").catch(() => null);
+			if (content === null) return null;
+			const rawTarget = parseGitdirTarget(content.split("\n", 1)[0] ?? "");
+			if (rawTarget === null) return null;
+			const target = path.isAbsolute(rawTarget) ? rawTarget : path.join(path.dirname(current), rawTarget);
+			const realTarget = await fs.realpath(target).catch(() => null);
+			if (realTarget === null) return null;
+			const targetStat = await fs.stat(realTarget).catch(() => null);
+			if (targetStat === null) return null;
+			if (targetStat.isDirectory()) return realTarget;
+			if (!targetStat.isFile()) return null;
+			current = realTarget;
+		}
+		return null;
+	};
+	const stat = await fs.lstat(dotGitPath).catch(() => null);
+	if (stat === null) return false;
+	let gitDir: string | null = null;
+	if (stat.isSymbolicLink()) {
+		const real = await fs.realpath(dotGitPath).catch(() => null);
+		if (real === null) return true;
+		const realStat = await fs.stat(real).catch(() => null);
+		if (realStat === null) return true;
+		if (realStat.isDirectory()) gitDir = real;
+		else if (realStat.isFile()) gitDir = await resolveGitfile(real);
+		else return true;
+	} else if (stat.isDirectory()) {
+		gitDir = await fs.realpath(dotGitPath).catch(() => null);
+	} else if (stat.isFile()) {
+		gitDir = await resolveGitfile(dotGitPath);
+	} else {
+		return true;
+	}
+	if (gitDir === null || !underCopy(gitDir)) return true;
+	const commonRaw = await fs.readFile(path.join(gitDir, "commondir"), "utf8").catch(() => null);
+	if (commonRaw === null) return false;
+	const trimmed = commonRaw.trim();
+	if (trimmed === "") return true;
+	const commonAbs = path.isAbsolute(trimmed) ? trimmed : path.join(gitDir, trimmed);
+	const realCommon = await fs.realpath(commonAbs).catch(() => null);
+	if (realCommon === null) return true;
+	return !underCopy(realCommon);
+}
+
+/**
  * Give every initialized submodule in a copied isolation private metadata one
  * at a time, after the batch rebind refused an off-pin layout.
  *
@@ -675,38 +758,22 @@ async function detachOffPinSubmodules(sourceRoot: string, copyRoot: string): Pro
 			if (err.code === "ENOENT") return null;
 			throw err;
 		});
-		// A missing admin means uninitialized in the copy; a real directory is
-		// already a private admin, physically contained. Anything else is a
-		// pointer of some kind. A gitfile counts as private only when it
-		// opens as this exact directory with an admin that lives under the
-		// copy (compared by realpath: lexical prefixes lie across symlinked
-		// parents). Discovery walks upward, so a dangling gitfile would
-		// otherwise fall through to the parent repo and look private while
-		// every git command inside the submodule fails.
+		// Judge every entry kind with the shared predicate: a directory
+		// admin (or a symlink to an in-copy directory) whose `commondir`
+		// points at the source admin shares HEAD/refs with the source, so
+		// it needs the same re-point-and-detach repair as a stale gitfile.
+		// A missing entry means uninitialized in the copy. An exotic entry
+		// (fifo, socket) escapes by predicate but git cannot use it, so it
+		// is left for the verification below to fail closed on.
 		if (!copyGitStat) continue;
-		if (copyGitStat.isDirectory()) continue;
-		if (copyGitStat.isSymbolicLink()) {
-			// A link into the source admin hands every write in the copy
-			// straight through to the source checkout. It is rebuilt as a
-			// private admin below once repair is committed; the link itself
-			// is removed there, never its target.
-		} else if (copyGitStat.isFile()) {
-			let copyPrivate = false;
-			try {
-				const info = vcs.requireGit(copySub).info();
-				const commonDir = await fs.realpath(info.commonDir);
-				copyPrivate =
-					(await fs.realpath(info.repoRoot)) === (await fs.realpath(copySub)) &&
-					(commonDir === realCopyRoot || commonDir.startsWith(`${realCopyRoot}${path.sep}`));
-			} catch {
-				// A dangling pointer needs repair.
-			}
-			if (copyPrivate) continue;
-		} else {
-			// Exotic entry (fifo, socket): git cannot use it; the
-			// verification below fails closed on it.
-			continue;
+		if (!copyGitStat.isDirectory() && !copyGitStat.isSymbolicLink() && !copyGitStat.isFile()) continue;
+		let escapes = true;
+		try {
+			escapes = await gitAdminEscapes(realCopyRoot, path.join(copySub, ".git"));
+		} catch {
+			escapes = true;
 		}
+		if (!escapes) continue;
 		// Never follow the copy's stale pointer: open the source submodule
 		// directly (read-only) for its admin dirs. A source entry that is not
 		// itself a repository (e.g. a linked worktree nested inside the
@@ -732,6 +799,12 @@ async function detachOffPinSubmodules(sourceRoot: string, copyRoot: string): Pro
 			// Remove the link itself (never its target): a writeFile here
 			// would follow the link and land in the source admin.
 			await fs.rm(gitEntry);
+		} else if (copyGitStat.isDirectory()) {
+			// An escaping directory admin lives inside the copy (the entry
+			// itself), so removing it cannot touch the source; the shared
+			// state it pointed at is re-snapshotted from the source admin
+			// below, read-only.
+			await fs.rm(gitEntry, { recursive: true, force: true });
 		}
 		// Re-point the copy's gitfile at the source submodule admin, then
 		// detach: the snapshot reads the live state while the materialized
@@ -748,19 +821,19 @@ async function detachOffPinSubmodules(sourceRoot: string, copyRoot: string): Pro
  * Fail closed when any copied submodule still shares the source checkout's
  * git metadata: handing out that copy would let task git operations mutate
  * the source. Writes through a detached admin's alternates only read source
- * objects, so private admins pass. Every `.git` kind is judged — regular
- * gitfile, symlink (to a directory or a gitfile), or real directory — and
- * the check walks the copy below each submodule path rather than trusting
- * the native list alone, so a nested pointer the repair loop never reached
- * still blocks hand-out.
+ * objects, so private admins pass. Every `.git` entry at every depth under
+ * each submodule path is judged with {@link gitAdminEscapes} by lstat —
+ * independently of `submodulePaths()`, which never names unlisted nested
+ * directory admins — so a pointer the repair loop never reached still
+ * blocks hand-out. Admin-directory interiors are read only for `commondir`;
+ * the walk never descends into a `.git` directory. Dependency trees are not
+ * repositories by construction.
  */
 async function verifyCopiedSubmodulesDetached(
 	sourceRoot: string,
 	realCopyRoot: string,
 	relativePaths: readonly string[],
 ): Promise<void> {
-	const underCopy = (realPath: string): boolean =>
-		realPath === realCopyRoot || realPath.startsWith(`${realCopyRoot}${path.sep}`);
 	// One lockstep failure shape for every shared-metadata verdict below;
 	// `throw` sites narrow afterwards, which a `never`-returning closure
 	// does not reliably provide.
@@ -770,67 +843,49 @@ async function verifyCopiedSubmodulesDetached(
 				`${sourceRoot} (${detail.trim()}); refusing to hand out a checkout whose git ` +
 				`operations could mutate the source.`,
 		);
+	// Human-readable pointer for the failure message; the verdict itself
+	// comes from the shared predicate above.
+	const describeEntry = async (dotGitPath: string): Promise<string> => {
+		const stat = await fs.lstat(dotGitPath).catch(() => null);
+		if (stat?.isSymbolicLink()) return fs.readlink(dotGitPath).catch(() => "<unreadable>");
+		if (stat?.isDirectory()) {
+			const real = await fs.realpath(dotGitPath).catch(() => null);
+			const common =
+				real === null ? null : await fs.readFile(path.join(real, "commondir"), "utf8").catch(() => null);
+			return common === null ? "<unreadable>" : `commondir: ${common.trim()}`;
+		}
+		if (stat?.isFile()) return fs.readFile(dotGitPath, "utf8").catch(() => "<unreadable>");
+		return "unrecognized .git entry kind";
+	};
 	for (const relativePath of relativePaths) {
 		const copySub = path.join(realCopyRoot, relativePath);
-		const gitEntry = path.join(copySub, ".git");
-		const copyGitStat = await fs.lstat(gitEntry).catch((err: NodeJS.ErrnoException) => {
-			if (err.code === "ENOENT") return null;
-			throw err;
-		});
-		if (!copyGitStat) continue;
-		if (copyGitStat.isDirectory()) {
-			// Already a private admin, physically contained — but keep
-			// walking below for nested pointers.
-		} else if (copyGitStat.isSymbolicLink()) {
-			const real = await fs.realpath(gitEntry).catch(() => null);
-			if (real === null || !underCopy(real))
-				throw failure(relativePath, await fs.readlink(gitEntry).catch(() => "<unreadable>"));
-		} else if (copyGitStat.isFile()) {
-			// Same upward-discovery trap as the repair loop above: only this
-			// exact directory with an admin under the copy counts as private.
-			let copyPrivate = false;
-			try {
-				const info = vcs.requireGit(copySub).info();
-				const commonDir = await fs.realpath(info.commonDir);
-				copyPrivate = (await fs.realpath(info.repoRoot)) === (await fs.realpath(copySub)) && underCopy(commonDir);
-			} catch {
-				// A dangling pointer is still shared (with nothing).
-			}
-			if (!copyPrivate) throw failure(relativePath, await fs.readFile(gitEntry, "utf8").catch(() => "<unreadable>"));
-		} else {
-			throw failure(relativePath, "unrecognized .git entry kind");
-		}
-		// Walk the copy below the submodule root for nested `.git` entries
-		// the submodule lists never mention. Admin-directory interiors and
-		// dependency trees are not repositories by construction.
+		// Walk the copy below the submodule root for every `.git` entry,
+		// including the submodule's own and any nested pointer the
+		// submodule lists never mention.
 		const stack = [copySub];
 		while (stack.length > 0) {
 			const dir = stack.pop()!;
-			for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+			let entries;
+			try {
+				entries = await fs.readdir(dir, { withFileTypes: true });
+			} catch (err) {
+				if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+				throw err;
+			}
+			for (const entry of entries) {
 				const full = path.join(dir, entry.name);
-				if (entry.isDirectory()) {
-					if (entry.name !== ".git" && entry.name !== "node_modules") stack.push(full);
+				if (entry.name === ".git") {
+					const nestedRel = path.relative(realCopyRoot, full);
+					let escapes = true;
+					try {
+						escapes = await gitAdminEscapes(realCopyRoot, full);
+					} catch {
+						escapes = true;
+					}
+					if (escapes) throw failure(nestedRel, await describeEntry(full));
 					continue;
 				}
-				if (entry.name !== ".git") continue;
-				const nestedRel = path.relative(realCopyRoot, full);
-				const real = await fs.realpath(full).catch(() => null);
-				if (real === null || !underCopy(real)) throw failure(nestedRel, "resolves outside the copy");
-				const realStat = await fs.stat(real).catch(() => null);
-				if (realStat === null) throw failure(nestedRel, "resolves outside the copy");
-				if (realStat.isDirectory()) continue;
-				if (!realStat.isFile()) throw failure(nestedRel, "unrecognized .git entry kind");
-				// A gitfile target resolves like git resolves it: an
-				// absolute target stands alone, a relative one joins the
-				// gitfile's own directory. Unparseable content is a stray
-				// data file, not a git pointer.
-				const firstLine = (await fs.readFile(real, "utf8").catch(() => null))?.split("\n", 1)[0] ?? "";
-				const match = /^gitdir:[ \t]*(.+?)\s*$/.exec(firstLine);
-				if (!match) continue;
-				const rawTarget = match[1]!;
-				const target = path.isAbsolute(rawTarget) ? rawTarget : path.join(path.dirname(real), rawTarget);
-				const realTarget = await fs.realpath(target).catch(() => null);
-				if (realTarget === null || !underCopy(realTarget)) throw failure(nestedRel, target);
+				if (entry.isDirectory() && entry.name !== "node_modules") stack.push(full);
 			}
 		}
 	}

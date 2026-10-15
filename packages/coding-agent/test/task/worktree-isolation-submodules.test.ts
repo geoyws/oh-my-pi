@@ -8,6 +8,7 @@ import {
 	captureIsolationBaseline,
 	cleanupIsolation,
 	ensureIsolation,
+	gitAdminEscapes,
 } from "@oh-my-pi/pi-coding-agent/task/worktree";
 import * as natives from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
@@ -82,7 +83,7 @@ async function withIsolationEnv(fn: () => Promise<void>): Promise<void> {
 	}
 }
 
-/** Every `.git` entry under the copy must resolve inside the copy, never into the source checkout. */
+/** Every `.git` entry under the copy must be a private admin: same verdict as the hand-out gate. */
 async function assertNoExternalGitfiles(copyRoot: string): Promise<void> {
 	const realCopy = await fs.realpath(copyRoot);
 	const stack = [realCopy];
@@ -90,41 +91,16 @@ async function assertNoExternalGitfiles(copyRoot: string): Promise<void> {
 		const dir = stack.pop()!;
 		for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
 			const full = path.join(dir, entry.name);
-			const rel = path.relative(realCopy, full);
-			if (entry.isDirectory()) {
-				if (entry.name === ".git" || entry.name === "node_modules") continue;
-				stack.push(full);
+			if (entry.name === ".git") {
+				const rel = path.relative(realCopy, full);
+				// One shared predicate with repair and verify: a directory
+				// admin (or a symlink to one) whose `commondir` points at
+				// the source escapes even though its own path is inside the
+				// copy. `alternates` borrowing stays allowed: it is read-only.
+				expect(await gitAdminEscapes(realCopy, full), `${rel} escapes the copy`).toBe(false);
 				continue;
 			}
-			if (entry.name !== ".git") continue;
-			// Regular file, symlink (to a directory or a gitfile), or exotic
-			// entry: resolve fully first, then judge.
-			const real = await fs.realpath(full).catch(() => null);
-			expect(real, `${rel} dangles outside the copy`).not.toBeNull();
-			// Containment is compared by realpath with a trailing separator:
-			// lexical prefixes lie across symlinked parents, and `copy2`
-			// must not match `copy`.
-			expect(
-				real === realCopy || real!.startsWith(`${realCopy}${path.sep}`),
-				`${rel} resolves outside the copy: ${real}`,
-			).toBe(true);
-			const realStat = await fs.stat(real!).catch(() => null);
-			expect(realStat, `${rel} resolves outside the copy`).not.toBeNull();
-			if (realStat!.isDirectory()) continue;
-			expect(realStat!.isFile(), `${rel} is not a file or directory`).toBe(true);
-			// A gitfile target resolves like git resolves it; unparseable
-			// content is a stray data file, not a git pointer.
-			const firstLine = (await fs.readFile(real!, "utf8")).split("\n", 1)[0] ?? "";
-			const match = /^gitdir:[ \t]*(.+?)\s*$/.exec(firstLine);
-			if (!match) continue;
-			const rawTarget = match[1]!;
-			const target = path.isAbsolute(rawTarget) ? rawTarget : path.join(path.dirname(real!), rawTarget);
-			const realTarget = await fs.realpath(target).catch(() => null);
-			expect(realTarget, `${rel} points outside the copy: ${rawTarget}`).not.toBeNull();
-			expect(
-				realTarget === realCopy || realTarget!.startsWith(`${realCopy}${path.sep}`),
-				`${rel} points outside the copy: ${rawTarget}`,
-			).toBe(true);
+			if (entry.isDirectory() && entry.name !== "node_modules") stack.push(full);
 		}
 	}
 }
@@ -414,6 +390,159 @@ describe("isolation with a symlinked submodule admin (review)", () => {
 			});
 		},
 	);
+});
+
+/** Byte-identical snapshot of a checkout's refs, HEAD and branch list. */
+async function sourceGitIdentity(dir: string): Promise<string> {
+	const head = await runGit(dir, ["rev-parse", "HEAD"]);
+	const branches = await runGit(dir, ["branch", "--format=%(refname:short)"]);
+	const refs = await runGit(dir, ["for-each-ref", "--format=%(objectname) %(refname)"]);
+	return [head, branches, refs].join("\n");
+}
+
+/** Two-depth linked source with the intermediate submodule moved off its pin (fallback owns repairs). */
+async function makeOffPinTwoDepthSource(): Promise<{
+	wt: string;
+	aixDir: string;
+	pluginDir: string;
+	sourcePluginAdmin: string;
+}> {
+	const { wt } = await makeTwoDepthLinkedSource();
+	const aixDir = path.join(wt, "packages/aix-root");
+	const pluginDir = path.join(aixDir, "packages/plugin");
+	await fs.writeFile(path.join(aixDir, "tracked.txt"), "aix moved\n");
+	await runGit(aixDir, ["commit", "-q", "-am", "move aix off pin"]);
+	const sourcePluginAdmin = await runGit(pluginDir, ["rev-parse", "--absolute-git-dir"]);
+	return { wt, aixDir, pluginDir, sourcePluginAdmin };
+}
+
+/** Plant a worktree-style directory admin (HEAD plus a `commondir` pointer at the source admin). */
+async function plantLinkedDirAdmin(
+	workdir: string,
+	adminName: string,
+	sourceAdmin: string,
+	commondir: string,
+): Promise<void> {
+	const adminDir = path.join(workdir, adminName);
+	await fs.rm(adminDir, { recursive: true, force: true });
+	await fs.mkdir(adminDir, { recursive: true });
+	await fs.writeFile(path.join(adminDir, "HEAD"), await fs.readFile(path.join(sourceAdmin, "HEAD"), "utf8"));
+	await fs.writeFile(path.join(adminDir, "commondir"), `${commondir}\n`);
+}
+
+/**
+ * A planted escaping admin must come back either repaired (private admin
+ * dir, probe branch stays in the copy) or refused, with the source
+ * checkout byte-identical either way.
+ */
+async function runRepairedAdminCase(
+	taskId: string,
+	branch: string,
+	plant: (ctx: { pluginDir: string; sourcePluginAdmin: string }) => Promise<void>,
+): Promise<void> {
+	const { wt, pluginDir, sourcePluginAdmin } = await makeOffPinTwoDepthSource();
+	await plant({ pluginDir, sourcePluginAdmin });
+	expect(await runGit(pluginDir, ["rev-parse", "HEAD"])).not.toBe("");
+	const before = await sourceGitIdentity(pluginDir);
+	mockBackend(natives.IsoBackendKind.Apfs);
+	await withIsolationEnv(async () => {
+		const handle = await ensureIsolation(wt, taskId);
+		try {
+			await assertNoExternalGitfiles(handle.mergedDir);
+			const isoPlugin = path.join(handle.mergedDir, "packages/aix-root/packages/plugin");
+			expect((await fs.lstat(path.join(isoPlugin, ".git"))).isDirectory()).toBe(true);
+			await runGit(isoPlugin, ["checkout", "-q", "-b", branch]);
+			expect(await runGit(pluginDir, ["branch", "--format=%(refname:short)"])).not.toContain(branch);
+		} finally {
+			await cleanupIsolation(handle);
+		}
+		expect(await sourceGitIdentity(pluginDir)).toBe(before);
+	});
+}
+
+/**
+ * A planted escaping admin the repair loop never reaches (never named by
+ * `submodulePaths()`) must refuse hand-out, with the source byte-identical.
+ */
+async function runRefusedAdminCase(
+	taskId: string,
+	plant: (ctx: { pluginDir: string; sourcePluginAdmin: string }) => Promise<void>,
+): Promise<void> {
+	const { wt, pluginDir, sourcePluginAdmin } = await makeOffPinTwoDepthSource();
+	await plant({ pluginDir, sourcePluginAdmin });
+	const before = await sourceGitIdentity(pluginDir);
+	mockBackend(natives.IsoBackendKind.Apfs);
+	await withIsolationEnv(async () => {
+		await expect(ensureIsolation(wt, taskId)).rejects.toThrow(/still shares git metadata/);
+		expect(await sourceGitIdentity(pluginDir)).toBe(before);
+	});
+}
+
+describe("isolation with commondir escapes (review round 2)", () => {
+	it.skipIf(process.platform !== "darwin")(
+		"repairs a directory .git with an absolute commondir at the source admin",
+		async () => {
+			await runRepairedAdminCase(
+				"nested-dir-admin-abs",
+				"probe-dir-abs",
+				async ({ pluginDir, sourcePluginAdmin }) => {
+					await fs.rm(path.join(pluginDir, ".git"));
+					await plantLinkedDirAdmin(pluginDir, ".git", sourcePluginAdmin, sourcePluginAdmin);
+				},
+			);
+		},
+	);
+
+	it.skipIf(process.platform !== "darwin")(
+		"repairs a directory .git with a relative commondir escaping the copy",
+		async () => {
+			await runRepairedAdminCase(
+				"nested-dir-admin-rel",
+				"probe-dir-rel",
+				async ({ pluginDir, sourcePluginAdmin }) => {
+					await fs.rm(path.join(pluginDir, ".git"));
+					// Realpath both ends first: a relative `commondir` joins to
+					// the admin dir lexically, so symlinked parents (`/var` ->
+					// `/private/var`) would otherwise corrupt the pointer.
+					const parentDir = await fs.realpath(pluginDir);
+					const relative = path.relative(path.join(parentDir, ".git"), await fs.realpath(sourcePluginAdmin));
+					await plantLinkedDirAdmin(pluginDir, ".git", sourcePluginAdmin, relative);
+				},
+			);
+		},
+	);
+
+	it.skipIf(process.platform !== "darwin")(
+		"refuses a copy with an unlisted .git symlink to an in-copy admin dir",
+		async () => {
+			// Never named by `submodulePaths()`: the repair loop walks
+			// listed submodules only, and the old gate judged this private
+			// by realpath alone without reading `commondir`.
+			await runRefusedAdminCase("nested-link-dir-unlisted", async ({ pluginDir, sourcePluginAdmin }) => {
+				const nested = path.join(pluginDir, "vendor/nested");
+				await fs.mkdir(nested, { recursive: true });
+				await plantLinkedDirAdmin(nested, ".git-real", sourcePluginAdmin, sourcePluginAdmin);
+				await fs.symlink(".git-real", path.join(nested, ".git"));
+			});
+		},
+	);
+
+	it.skipIf(process.platform !== "darwin")("refuses a copy with an unlisted .git symlink to a gitfile", async () => {
+		await runRefusedAdminCase("nested-link-file-unlisted", async ({ pluginDir, sourcePluginAdmin }) => {
+			const nested = path.join(pluginDir, "vendor/nested");
+			await fs.mkdir(nested, { recursive: true });
+			await plantLinkedDirAdmin(nested, ".git-real", sourcePluginAdmin, sourcePluginAdmin);
+			await fs.writeFile(path.join(nested, "evil.gitfile"), "gitdir: .git-real\n");
+			await fs.symlink("evil.gitfile", path.join(nested, ".git"));
+		});
+	});
+
+	it.skipIf(process.platform !== "darwin")("refuses a copy with an unlisted nested directory admin", async () => {
+		await runRefusedAdminCase("nested-dir-admin-unlisted", async ({ pluginDir, sourcePluginAdmin }) => {
+			const nested = path.join(pluginDir, "vendor/nested");
+			await plantLinkedDirAdmin(nested, ".git", sourcePluginAdmin, sourcePluginAdmin);
+		});
+	});
 });
 
 describe("isolation with a submodule checkout as cwd (t-debc251e)", () => {
