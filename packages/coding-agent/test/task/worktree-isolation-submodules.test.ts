@@ -82,7 +82,7 @@ async function withIsolationEnv(fn: () => Promise<void>): Promise<void> {
 	}
 }
 
-/** Every `.git` file under the copy must resolve inside the copy, never into the source checkout. */
+/** Every `.git` entry under the copy must resolve inside the copy, never into the source checkout. */
 async function assertNoExternalGitfiles(copyRoot: string): Promise<void> {
 	const realCopy = await fs.realpath(copyRoot);
 	const stack = [realCopy];
@@ -90,21 +90,41 @@ async function assertNoExternalGitfiles(copyRoot: string): Promise<void> {
 		const dir = stack.pop()!;
 		for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
 			const full = path.join(dir, entry.name);
+			const rel = path.relative(realCopy, full);
 			if (entry.isDirectory()) {
 				if (entry.name === ".git" || entry.name === "node_modules") continue;
 				stack.push(full);
-			} else if (entry.isFile() && entry.name === ".git") {
-				const firstLine = (await fs.readFile(full, "utf8")).split("\n", 1)[0] ?? "";
-				const match = /^gitdir:[ \t]*(.+?)\s*$/.exec(firstLine);
-				expect(match, `${path.relative(realCopy, full)} is a gitfile`).not.toBeNull();
-				const target = match![1]!;
-				const resolved = path.isAbsolute(target) ? target : path.join(path.dirname(full), target);
-				const realTarget = await fs.realpath(resolved);
-				expect(
-					realTarget === realCopy || realTarget.startsWith(`${realCopy}${path.sep}`),
-					`${path.relative(realCopy, full)} points outside the copy: ${target}`,
-				).toBe(true);
+				continue;
 			}
+			if (entry.name !== ".git") continue;
+			// Regular file, symlink (to a directory or a gitfile), or exotic
+			// entry: resolve fully first, then judge.
+			const real = await fs.realpath(full).catch(() => null);
+			expect(real, `${rel} dangles outside the copy`).not.toBeNull();
+			// Containment is compared by realpath with a trailing separator:
+			// lexical prefixes lie across symlinked parents, and `copy2`
+			// must not match `copy`.
+			expect(
+				real === realCopy || real!.startsWith(`${realCopy}${path.sep}`),
+				`${rel} resolves outside the copy: ${real}`,
+			).toBe(true);
+			const realStat = await fs.stat(real!).catch(() => null);
+			expect(realStat, `${rel} resolves outside the copy`).not.toBeNull();
+			if (realStat!.isDirectory()) continue;
+			expect(realStat!.isFile(), `${rel} is not a file or directory`).toBe(true);
+			// A gitfile target resolves like git resolves it; unparseable
+			// content is a stray data file, not a git pointer.
+			const firstLine = (await fs.readFile(real!, "utf8")).split("\n", 1)[0] ?? "";
+			const match = /^gitdir:[ \t]*(.+?)\s*$/.exec(firstLine);
+			if (!match) continue;
+			const rawTarget = match[1]!;
+			const target = path.isAbsolute(rawTarget) ? rawTarget : path.join(path.dirname(real!), rawTarget);
+			const realTarget = await fs.realpath(target).catch(() => null);
+			expect(realTarget, `${rel} points outside the copy: ${rawTarget}`).not.toBeNull();
+			expect(
+				realTarget === realCopy || realTarget!.startsWith(`${realCopy}${path.sep}`),
+				`${rel} points outside the copy: ${rawTarget}`,
+			).toBe(true);
 		}
 	}
 }
@@ -336,6 +356,61 @@ describe("isolation with initialized nested submodules (t-254d92fd)", () => {
 				} finally {
 					await cleanupIsolation(handle3);
 				}
+			});
+		},
+	);
+});
+
+describe("isolation with a symlinked submodule admin (review)", () => {
+	it.skipIf(process.platform !== "darwin")(
+		"repairs a nested .git symlink into the source module dir when an earlier submodule is off-pin",
+		async () => {
+			const { wt, pins } = await makeTwoDepthLinkedSource();
+			const aixDir = path.join(wt, "packages/aix-root");
+			const pluginDir = path.join(aixDir, "packages/plugin");
+			// Move the intermediate submodule off its recorded pin first: the
+			// native batch rebind refuses off-pin layouts before it ever
+			// reaches the leaf's admin, so the per-submodule fallback owns
+			// both repairs.
+			await fs.writeFile(path.join(aixDir, "tracked.txt"), "aix moved\n");
+			await runGit(aixDir, ["commit", "-q", "-am", "move aix off pin"]);
+			expect(await runGit(wt, ["submodule", "status", "--recursive"])).not.toBe(pins);
+			// Replace the leaf's gitfile with a symlink into the source
+			// worktree's module dir: every write through it lands in the
+			// source admin until the copy gives the leaf private metadata.
+			const sourcePluginAdmin = await runGit(pluginDir, ["rev-parse", "--absolute-git-dir"]);
+			await fs.rm(path.join(pluginDir, ".git"));
+			await fs.symlink(sourcePluginAdmin, path.join(pluginDir, ".git"));
+			expect((await fs.lstat(path.join(pluginDir, ".git"))).isSymbolicLink()).toBe(true);
+			expect(await runGit(pluginDir, ["status", "--porcelain"])).toBe("");
+			const sourceHead = await runGit(pluginDir, ["rev-parse", "HEAD"]);
+			const sourceBranches = await runGit(pluginDir, ["branch", "--format=%(refname:short)"]);
+
+			mockBackend(natives.IsoBackendKind.Apfs);
+			await withIsolationEnv(async () => {
+				const handle = await ensureIsolation(wt, "nested-submodule-symlink");
+				try {
+					// Either a private repaired admin or no hand-out at all:
+					// a surviving symlink into the source fails here.
+					await assertNoExternalGitfiles(handle.mergedDir);
+					const isoPlugin = path.join(handle.mergedDir, "packages/aix-root/packages/plugin");
+					expect((await fs.lstat(path.join(isoPlugin, ".git"))).isDirectory()).toBe(true);
+					expect(await runGit(handle.mergedDir, ["status", "--porcelain"])).toBe("M packages/aix-root");
+					// The write probe: a branch created in the copy must stay
+					// in the copy.
+					await runGit(isoPlugin, ["checkout", "-q", "-b", "pwned-from-copy"]);
+					expect(await runGit(pluginDir, ["branch", "--format=%(refname:short)"])).toBe(sourceBranches);
+					expect(await runGit(pluginDir, ["rev-parse", "HEAD"])).toBe(sourceHead);
+				} finally {
+					await cleanupIsolation(handle);
+				}
+				// The source checkout is untouched: same symlink, same HEAD,
+				// no task branch leaked.
+				expect((await fs.lstat(path.join(pluginDir, ".git"))).isSymbolicLink()).toBe(true);
+				expect(await fs.readlink(path.join(pluginDir, ".git"))).toBe(sourcePluginAdmin);
+				expect(await runGit(pluginDir, ["rev-parse", "HEAD"])).toBe(sourceHead);
+				expect(await runGit(pluginDir, ["branch", "--format=%(refname:short)"])).toBe(sourceBranches);
+				expect(await runGit(pluginDir, ["branch", "--format=%(refname:short)"])).not.toContain("pwned-from-copy");
 			});
 		},
 	);
