@@ -45,9 +45,11 @@ describe("ptree kill without a usable native process handle", () => {
 			() => {
 				throw new Error("Value is not an instance of class `Process`");
 			},
+			false,
 		],
-		["the handle lookup finds no process", () => null],
-	])("kills a pipe-holding group after its leader dies to SIGTERM when %s", async (_name, fromPid) => {
+		["the handle lookup finds no process", () => null, false],
+		["the leader has already exited by signal", () => null, true],
+	])("kills a pipe-holding group after its leader dies to SIGTERM when %s", async (_name, fromPid, leaderExited) => {
 		// Real process lifecycle against the platform clock: fake timers cannot
 		// drive child exit or pipe EOF, so the deadlines below only bound failure.
 		const GRACE_MS = 100;
@@ -97,6 +99,10 @@ describe("ptree kill without a usable native process handle", () => {
 				code => ({ code }),
 				(error: unknown) => ({ error }),
 			);
+			if (leaderExited) {
+				process.kill(-child.pid, "SIGTERM");
+				await child.proc.exited;
+			}
 			child.kill(reason, GRACE_MS);
 
 			const outcome = await Promise.race([

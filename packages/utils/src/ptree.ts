@@ -333,17 +333,18 @@ export class ChildProcess<In extends InMask = InMask> {
 	}
 
 	kill(reason?: Exception, gracefulMs?: number) {
+		const rootExited = this.proc.exitCode !== null || this.proc.signalCode !== null;
 		if (reason && !this.#exitReasonPending) {
 			this.#exitReasonPending = reason;
 			// The normalized exit promise may already have resolved from a dead
 			// group leader; wait() still needs to report the later deadline.
-			if (this.proc.exitCode !== null) this.#exitReason = reason;
+			if (rootExited) this.#exitReason = reason;
 		}
 		// An AbortSignal can race a timeout after its hard subreaper sweep has
 		// started. Do not replace that sweep with a normal root termination: the
 		// root must stay alive until adopted descendants have been collected.
 		if (this.#hardKillSweep) return;
-		if (gracefulMs !== undefined && gracefulMs < 0 && this.#hardKillTree && this.proc.exitCode === null) {
+		if (gracefulMs !== undefined && gracefulMs < 0 && this.#hardKillTree && !rootExited) {
 			// Keep the subreaper alive while descendants are killed. A single
 			// killTree() snapshot can miss a worker whose parent exits during the
 			// walk and reparents it to the subreaper after that root was enumerated.
@@ -358,12 +359,7 @@ export class ChildProcess<In extends InMask = InMask> {
 				return;
 			}
 		}
-		if (
-			this.proc.exitCode !== null &&
-			this.#terminateGroup &&
-			this.#openPipeReaders > 0 &&
-			process.platform !== "win32"
-		) {
+		if (rootExited && this.#terminateGroup && this.#openPipeReaders > 0 && process.platform !== "win32") {
 			// Bun detached children are POSIX session/process-group leaders. If
 			// the leader has exited, the native Process handle cannot rediscover
 			// its PGID, but a pipe-holding descendant keeps that exact group alive.
@@ -373,7 +369,7 @@ export class ChildProcess<In extends InMask = InMask> {
 			this.#terminating = Promise.resolve();
 			return;
 		}
-		if (this.proc.exitCode !== null && this.#windowsRootProcess && this.#openPipeReaders > 0) {
+		if (rootExited && this.#windowsRootProcess && this.#openPipeReaders > 0) {
 			// The retained handle keeps the dead root PID reserved, making the
 			// Windows Toolhelp descendant walk identity-safe after root exit.
 			this.#windowsRootProcess.killTree();
@@ -416,9 +412,16 @@ export class ChildProcess<In extends InMask = InMask> {
 		};
 		if (gracefulMs >= 0) {
 			signal("SIGTERM");
-			await Promise.race([this.proc.exited, Bun.sleep(gracefulMs)]);
+			// A detached leader can exit before its pipe-holding group. Its exit
+			// must not end the group's grace period or suppress the hard signal.
+			if (this.#terminateGroup) await Bun.sleep(gracefulMs);
+			else await Promise.race([this.proc.exited, Bun.sleep(gracefulMs)]);
 		}
-		if (this.proc.exitCode === null && this.proc.signalCode === null) signal("SIGKILL");
+		if (
+			(this.proc.exitCode === null && this.proc.signalCode === null) ||
+			(this.#terminateGroup && this.#openPipeReaders > 0)
+		)
+			signal("SIGKILL");
 	}
 
 	async #hardKillSubreaperTree(root: Process): Promise<void> {
