@@ -8,7 +8,12 @@ import {
 	resolveOutputSinkArtifactMaxBytes,
 	resolveOutputSinkHeadBytes,
 } from "../tools/output-meta";
-import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP, isEvalTimeoutControlEvent } from "./bridge-timeout";
+import {
+	EVAL_TIMEOUT_PAUSE_OP,
+	EVAL_TIMEOUT_RESUME_OP,
+	rejectRuntimeTimeoutControl,
+	rejectTimeoutControlCollision,
+} from "./bridge-timeout";
 import type { JsStatusEvent } from "./js/shared/types";
 import type { KernelDisplayOutput } from "./py/display";
 import { registerPyToolBridge } from "./py/tool-bridge";
@@ -117,6 +122,8 @@ export interface GenericKernel<TEnv> {
 		kernelKilled?: boolean;
 		stdinRequested?: boolean;
 	}>;
+	/** Runner process id, when the kernel runs as a host child process. */
+	readonly pid?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +271,10 @@ function createBridgeAbortShield(source: AbortSignal | undefined): BridgeAbortSh
 		}
 		if (event.op !== EVAL_TIMEOUT_RESUME_OP || pauseDepth === 0) return;
 		pauseDepth--;
+		// A nested resume only releases its own level: the deferred abort is
+		// delivered once the outermost pause resumes, so an inner bridge
+		// return can never expose an outer critical phase to a mid-merge abort.
+		if (pauseDepth > 0) return;
 		if (shield.abortRequested && !controller.signal.aborted) controller.abort(abortReason);
 	};
 	shield.dispose = (): void => {
@@ -475,17 +486,54 @@ export async function executeWithKernelBase<
 			: (timeoutSignal ?? options?.signal);
 	const abortShield = createBridgeAbortShield(abortSource);
 
+	/**
+	 * Host-owned watchdog control. Reaching this function *is* the authority:
+	 * only this process's `withBridgeTimeoutPause` wrapper is handed it, so
+	 * nothing a runtime sends — and no tool status event that merely shares the
+	 * op string — can move the cell deadline or the abort shield's defer depth.
+	 *
+	 * Atomic-sink contract: the shield above is applied first and the observer
+	 * fanout below is best-effort. A throwing status observer must not unwind
+	 * this channel: the applied pause/resume state stands, the failure is
+	 * logged, and pause/resume pairing (including nested depths) stays intact.
+	 */
+	const handleTimeoutControl = (event: JsStatusEvent): void => {
+		abortShield.handleStatus?.(event);
+		try {
+			options?.onStatus?.(event);
+		} catch (error) {
+			logger.warn("eval timeout control observer failed; keeping the applied pause/resume state", {
+				op: event.op,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	};
+
+	/**
+	 * Generic host status (tool progress, tool errors). Its `op` is a tool name,
+	 * so an op colliding with timeout control is a *name*, never authority: drop
+	 * the collision and leave the deadline armed.
+	 */
+	const emitHostStatus = (event: JsStatusEvent): void => {
+		if (rejectTimeoutControlCollision(event, `${errorLogLabel} tool status`)) return;
+		options?.onStatus?.(event);
+		display.push({ type: "status", event });
+	};
+
+	/**
+	 * Kernel-originated display. Evaluated code can emit an
+	 * `application/x-omp-status` bundle, so a timeout pause/resume arriving here
+	 * is forged (or an echo) and is dropped: the deadline stays armed.
+	 */
 	const collectDisplay = (output: KernelDisplayOutput): void => {
 		if (output.type === "status") {
-			abortShield.handleStatus?.(output.event);
+			if (rejectRuntimeTimeoutControl(output.event, errorLogLabel)) return;
 			options?.onStatus?.(output.event);
-			if (isEvalTimeoutControlEvent(output.event)) return;
 		}
 		display.push(output);
 	};
 
-	const emitStatus: (event: JsStatusEvent) => void =
-		options?.emitStatus ?? (event => collectDisplay({ type: "status", event }));
+	const emitStatus: (event: JsStatusEvent) => void = options?.emitStatus ?? emitHostStatus;
 	const runId = `${runIdPrefix}-${crypto.randomUUID()}`;
 	// Two aborts cross the bridge, and conflating them is what let a cancelled
 	// turn keep working. Delegated work (above all the subagents `agent()`
@@ -503,6 +551,8 @@ export async function executeWithKernelBase<
 					signal: options.signal,
 					shieldedSignal: abortShield.signal,
 					emitStatus,
+					onTimeoutControl: handleTimeoutControl,
+					kernelPid: kernel.pid,
 					shadowCell: getActiveEvalShadowCell(),
 					abortRequested: () => {
 						return abortShield.abortRequested;

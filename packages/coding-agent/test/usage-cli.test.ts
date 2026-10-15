@@ -844,16 +844,47 @@ describe("formatUsageBreakdown", () => {
 
 		const accountAStart = text.indexOf("account-a@example.test");
 		const accountBStart = text.indexOf("account-b@example.test");
-		expect(text).toContain("Anthropic");
+		// This case protects sibling missing-limit behavior; the mixed-provider case below protects branding.
 		expect(accountAStart).toBeGreaterThan(-1);
 		expect(accountBStart).toBeGreaterThan(accountAStart);
-
 		const accountASection = text.slice(accountAStart, accountBStart);
 		const accountBSection = text.slice(accountBStart);
 		expect(accountASection).toContain("Claude 7 Day (Fable)");
 		expect(accountASection).toContain("not reported");
 		expect(accountBSection).toContain("Claude 7 Day (Fable)");
 		expect(accountBSection).toContain("60.0% used");
+	});
+
+	it("keeps Claude profiles and exhausted usage beside other providers in the command output", () => {
+		const exhausted = {
+			...makeLimit({ id: "Weekly", usedFraction: 1, windowId: "7d", provider: "anthropic" }),
+			status: "exhausted" as const,
+		};
+		const healthy = makeLimit({ id: "Weekly", usedFraction: 0.4, windowId: "7d", provider: "anthropic" });
+		const reports = [
+			{
+				...makeReport("anthropic", "shared@example.test", [exhausted]),
+				metadata: { email: "shared@example.test", orgName: "Primary profile", orgId: "primary" },
+			},
+			{
+				...makeReport("anthropic", "shared@example.test", [healthy]),
+				metadata: { email: "shared@example.test", orgName: "Backup profile", orgId: "backup" },
+			},
+			...(["openai-codex", "zai", "kimi-code", "cursor"] as const).map(provider =>
+				makeReport(provider, provider + "@example.test", [
+					makeLimit({ id: "Weekly", usedFraction: 0.3, windowId: "7d", provider }),
+				]),
+			),
+		];
+		const text = stripVTControlCharacters(formatUsageBreakdown(reports, [], Date.now()));
+		for (const brand of ["Claude", "Openai Codex", "Zai", "Kimi Code", "Cursor"]) expect(text).toContain(brand);
+		const primary = text.split("\n").findIndex(line => line.includes("Primary profile"));
+		const backup = text.split("\n").findIndex(line => line.includes("Backup profile"));
+		expect(primary).toBeGreaterThan(-1);
+		expect(backup).toBeGreaterThan(primary);
+		const lines = text.split("\n");
+		expect(lines.slice(primary, backup).join("\n")).toContain("100.0% used");
+		expect(lines.slice(backup).join("\n")).toContain("40.0% used");
 	});
 
 	it("aligns rows by window when accounts report the same window under different limit ids", () => {
@@ -1023,7 +1054,7 @@ describe("formatUsageBreakdown", () => {
 			},
 		];
 		const text = stripVTControlCharacters(formatUsageBreakdown([], [], Date.now(), undefined, disabled));
-		expect(text).toContain("Anthropic");
+		expect(text).toContain("Claude");
 		expect(text).toContain("✗ last@example.test — disabled: token endpoint said no (re-login to restore)");
 	});
 
@@ -1502,7 +1533,7 @@ describe("formatUsageHistory", () => {
 
 	it("renders one series per account window with latest and peak percentages", () => {
 		const text = stripVTControlCharacters(formatUsageHistory(entries, SINCE, NOW));
-		expect(text).toContain("Anthropic");
+		expect(text).toContain("Claude");
 		expect(text).toContain("dummy.primary@example.test");
 		// Window label is appended when the limit label doesn't carry it.
 		expect(text).toContain("Session (5 Hour)");

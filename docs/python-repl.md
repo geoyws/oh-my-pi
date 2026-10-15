@@ -86,7 +86,7 @@ The runner's source transformer rewrites IPython-style magics to plain Python ca
 
 | Magic                             | Effect                                                                                                                                                      |
 | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `%pip <args>`                     | `python -m pip <args>` with live streaming output; pauses the cell watchdog. Newly installed packages are evicted from `sys.modules` so the next `import` picks up the fresh install. |
+| `%pip <args>`                     | `python -m pip <args>` with live streaming output; the host pauses the cell watchdog while the verified pip child runs. Newly installed packages are evicted from `sys.modules` so the next `import` picks up the fresh install. |
 | `%cd <path>`                      | `os.chdir(path)` (with `~` expansion); emits status event.                                                                                                  |
 | `%pwd`                            | Returns `os.getcwd()`.                                                                                                                                      |
 | `%ls [path]`                      | Returns `sorted(os.listdir(path))`.                                                                                                                         |
@@ -169,7 +169,7 @@ The runner accepts a `{"type": "tool", "id", "op": "describe"|"call", ...}` requ
 
 `timeout` is in seconds and defaults to 30. `0` disables the cell timeout; nonzero values are clamped to `1..3600` seconds and by a positive `tools.maxTimeout` ceiling before being passed to `IdleTimeout`. The timeout is suspended while a host-side `wait()` on `agent()` / `completion()` handles is in flight: those calls emit reference-counted pause/resume events through `withBridgeTimeoutPause`, and a fresh timeout window begins when control returns.
 
-The pause/resume events are the sole mechanism that suspends the budget; `%pip` emits them while pip runs too. Compute, `stdout`/`stderr`, `log()`/`phase()`, and ordinary tool calls count against it. The tool combines caller, session, and watchdog abort signals with `AbortSignal.any(...)`; the backend does not arm a competing deadline. Backend availability discovery is also bounded by the cell's resolved timeout and cancellation signal.
+The pause/resume events are the sole mechanism that suspends the budget, and only the host emits them. For `%pip` the runner asks the host (reserved bridge call `__omp_pip_wait__`) to wait on the pip process it spawned; the host pauses only after `ps` shows that pid is a live direct child of the kernel, runs the kernel's executable, and was started as `<python> -m pip`, and resumes when it exits. Without that proof (no `ps`, an exited or foreign pid) nothing is paused. Compute, `stdout`/`stderr`, `log()`/`phase()`, and ordinary tool calls count against it. The tool combines caller, session, and watchdog abort signals with `AbortSignal.any(...)`; the backend does not arm a competing deadline. Backend availability discovery is also bounded by the cell's resolved timeout and cancellation signal.
 
 ### Auto-backgrounding
 
