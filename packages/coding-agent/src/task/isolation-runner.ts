@@ -203,6 +203,90 @@ async function assertNoRepoEscape(requested: string, repoRoot: string): Promise<
 		}
 	}
 }
+
+/**
+ * Find the checkout root the caller lexically named: the deepest ancestor of
+ * `normalized` (itself included) that is a real directory containing a `.git`
+ * file or directory. Ancestors are probed with `lstat`, so a symlink never
+ * counts as a checkout root even though the OS resolves it when probing for
+ * `.git` — `<target>/leak`, pointing at another repo, is skipped and the walk
+ * climbs to `<target>`. Symlinks strictly above the checkout root (e.g. macOS
+ * `/tmp` → `/private/tmp`) survive: they resolve to the real checkout dir,
+ * which still carries `.git`. Returns `undefined` when no ancestor qualifies
+ * (e.g. the whole checkout is named through a symlinked alias); callers then
+ * fall back to the resolved-root checks.
+ */
+async function findLexicalCheckoutRoot(normalized: string): Promise<string | undefined> {
+	let dir: string | undefined = normalized;
+	while (dir !== undefined) {
+		let stat: Stats | undefined;
+		try {
+			stat = await fs.lstat(dir);
+		} catch {
+			stat = undefined;
+		}
+		if (stat !== undefined && stat.isDirectory()) {
+			try {
+				await fs.lstat(path.join(dir, ".git"));
+				return dir;
+			} catch {
+				// No checkout marker here; keep climbing.
+			}
+		}
+		const parent = path.dirname(dir);
+		dir = parent === dir ? undefined : parent;
+	}
+	return undefined;
+}
+
+/**
+ * Refuse a `cwd` that reaches another repo through a symlink at or below the
+ * lexically named checkout root. `<target>/leak/sub` with `<target>/leak` →
+ * caller resolves into the caller repo, so the resolved-root checks alone
+ * accept it and the patch would merge into the caller. The lexical root here
+ * is `<target>` (a symlink is never a checkout root), whose realpath
+ * disagrees with the git root of the resolved path — and the `leak` component
+ * itself resolves outside the named checkout. Either condition refuses the
+ * path. Links inside the checkout that stay inside (e.g. `link` → `sub`) and
+ * aliases above the root keep working.
+ */
+async function assertLexicalCheckoutAgreement(normalized: string, repoRoot: string): Promise<void> {
+	const lexicalRoot = await findLexicalCheckoutRoot(normalized);
+	if (lexicalRoot === undefined) return;
+	const lexicalReal = await fs.realpath(lexicalRoot);
+	if (lexicalReal !== repoRoot) {
+		throw taskCwdError(
+			normalized,
+			`names checkout ${JSON.stringify(lexicalRoot)} but resolves into a different git repository ${JSON.stringify(repoRoot)} through a symlink that points outside its git repository; pass the canonical path inside the target checkout instead`,
+		);
+	}
+	const rel = path.relative(lexicalRoot, normalized);
+	if (rel === "") return;
+	let cursor = lexicalRoot;
+	for (const part of rel.split(path.sep).filter(Boolean)) {
+		cursor = path.join(cursor, part);
+		let stat: Stats;
+		try {
+			stat = await fs.lstat(cursor);
+		} catch {
+			return;
+		}
+		if (!stat.isSymbolicLink()) continue;
+		const target = await fs.readlink(cursor);
+		const absoluteTarget = path.resolve(path.dirname(cursor), target);
+		let targetReal = absoluteTarget;
+		try {
+			targetReal = await fs.realpath(absoluteTarget);
+		} catch {}
+		if (targetReal !== lexicalReal && path.relative(lexicalReal, targetReal).startsWith("..")) {
+			throw taskCwdError(
+				normalized,
+				`resolves through a symlink (${cursor} -> ${target}) that points outside its git repository ${JSON.stringify(lexicalReal)}; pass the canonical path inside the target checkout instead`,
+			);
+		}
+	}
+}
+
 /**
  * Refuse a path whose lexical checkout disagrees with its resolved repo: the
  * caller named a path inside one checkout but it resolves into another
@@ -289,6 +373,7 @@ export async function resolveTaskCwd(callerCwd: string, requestedCwd?: string): 
 	}
 	await assertNoRepoEscape(normalized, repoRoot);
 	await assertSameRepoThroughLexicalTree(normalized, repoRoot);
+	await assertLexicalCheckoutAgreement(normalized, repoRoot);
 	return { repoRoot, childCwd: real, workdirOffset: offset === "" ? "" : offset };
 }
 

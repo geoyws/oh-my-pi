@@ -56,8 +56,12 @@ async function tempDir(prefix: string): Promise<string> {
 	return dir;
 }
 
-async function makeRepo(prefix: string): Promise<string> {
-	const repo = await tempDir(prefix);
+async function makeRepo(prefix: string, parent?: string): Promise<string> {
+	const repo =
+		parent === undefined
+			? await tempDir(prefix)
+			: await fs.realpath(await fs.mkdtemp(path.join(await fs.realpath(parent), prefix)));
+	if (parent !== undefined) tempRoots.push(repo);
 	await git(repo, "init", "-q", "-b", "main");
 	await git(repo, "config", "user.email", "t@t");
 	await git(repo, "config", "user.name", "t");
@@ -379,5 +383,104 @@ describe("task cwd submodule caller", () => {
 		expect(await fs.readFile(path.join(subCheckout, "tracked.txt"), "utf8")).toBe("submodule edit\n");
 		expect(await fs.readFile(path.join(superRepo, "tracked.txt"), "utf8")).toBe("base\n");
 		expect(await git(superRepo, "rev-parse", "HEAD")).toBe(superHead);
+	});
+});
+
+describe("task cwd symlink routing", () => {
+	it("refuses target/leak/sub where leak points at the caller repo", async () => {
+		const caller = await makeRepo("omp-cwd-leak-caller-");
+		const target = await makeRepo("omp-cwd-leak-target-");
+		await fs.symlink(caller, path.join(target, "leak"));
+		const requested = path.join(target, "leak", "sub");
+		const callerBefore = await repoFingerprint(caller);
+		const targetBefore = await repoFingerprint(target);
+		const wtDir = await tempDir("omp-cwd-leak-wt-");
+		setWorktreesDir(wtDir);
+		mockRcopy();
+		mockDiscovery();
+		const runSpy = vi.spyOn(executorModule, "runSubprocess");
+
+		const error = await prepareIsolationContext(caller, requested).then(
+			() => null,
+			(err: unknown) => err,
+		);
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain(requested);
+		expect((error as Error).message).toContain("outside its git repository");
+
+		await expect(
+			runStructuredSubagent({
+				session: session(caller),
+				invocationKind: "task",
+				assignment: "Edit the assigned worktree.",
+				solutionSpace: "one fix",
+				agent: "worker",
+				cwd: requested,
+				isolation: { requested: true },
+			} satisfies StructuredSubagentRequest),
+		).rejects.toThrow("outside its git repository");
+		expect(runSpy).not.toHaveBeenCalled();
+		expect(await fs.readdir(wtDir)).toEqual([]);
+		expect(artifactsDirsFromRegistry()).toEqual([]);
+		expect(await repoFingerprint(caller)).toBe(callerBefore);
+		expect(await repoFingerprint(target)).toBe(targetBefore);
+	});
+
+	it("accepts a symlink inside the checkout pointing elsewhere in the same checkout", async () => {
+		const caller = await makeRepo("omp-cwd-link-caller-");
+		const target = await makeRepo("omp-cwd-link-target-");
+		await fs.symlink(path.join(target, "sub"), path.join(target, "link"));
+		const callerBefore = await repoFingerprint(caller);
+		const targetHead = await git(target, "rev-parse", "HEAD");
+		const wtDir = await tempDir("omp-cwd-link-wt-");
+		setWorktreesDir(wtDir);
+		mockRcopy();
+		mockDiscovery();
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			await fs.writeFile(path.join(options.worktree!, "nested.txt"), "link edit\n");
+			return childResult("LinkWriter");
+		});
+
+		const settled = await runStructuredSubagent({
+			session: session(caller),
+			invocationKind: "task",
+			assignment: "Edit the assigned worktree.",
+			solutionSpace: "one fix",
+			agent: "worker",
+			cwd: path.join(target, "link"),
+			isolation: { requested: true },
+		} satisfies StructuredSubagentRequest);
+
+		expect(settled.result.exitCode).toBe(0);
+		expect(settled.result.error).toBeUndefined();
+		expect(await fs.readFile(path.join(target, "sub", "nested.txt"), "utf8")).toBe("link edit\n");
+		expect(await git(target, "rev-parse", "HEAD")).toBe(targetHead);
+		expect(await repoFingerprint(caller)).toBe(callerBefore);
+	});
+
+	it("accepts a checkout reached through a symlinked parent (macOS /tmp alias)", async () => {
+		const caller = await makeRepo("omp-cwd-alias-caller-");
+		const target = await makeRepo("omp-cwd-alias-target-");
+		const linkBase = await tempDir("omp-cwd-alias-link-");
+		const alias = path.join(linkBase, "alias");
+		await fs.symlink(path.dirname(target), alias);
+		const requested = path.join(alias, path.basename(target), "sub");
+
+		const context = await prepareIsolationContext(caller, requested);
+		expect(context.repoRoot).toBe(target);
+		expect(context.workdirOffset).toBe("sub");
+		expect(context.childCwd).toBe(path.join(target, "sub"));
+
+		// The literal macOS alias: /tmp -> /private/tmp. Only testable where
+		// /tmp itself is a symlink to a writable directory.
+		const tmpStat = await fs.lstat("/tmp").catch(() => null);
+		if (tmpStat?.isSymbolicLink()) {
+			const realTmp = await fs.realpath("/tmp");
+			const tmpRepo = await makeRepo("omp-cwd-tmpalias-", "/tmp");
+			const tmpRequested = path.join("/tmp", path.relative(realTmp, tmpRepo), "sub");
+			const tmpContext = await prepareIsolationContext(caller, tmpRequested);
+			expect(tmpContext.repoRoot).toBe(tmpRepo);
+			expect(tmpContext.workdirOffset).toBe("sub");
+		}
 	});
 });
