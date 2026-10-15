@@ -73,6 +73,7 @@ import { AssistantMessageEventStream } from "./utils/event-stream";
 import { isFoundryEnabled } from "./utils/foundry";
 import { applyGlyphCodec } from "./utils/glyph-codec";
 import { wrapLeakedThinkingStream } from "./utils/leaked-thinking-stream";
+import { operationDeadlineExceeded, withOperationDeadline } from "./utils/operation-deadline";
 import { withThinkingLoopGuard } from "./utils/thinking-loop";
 import { withTransportFetch } from "./utils/transport-fetch";
 
@@ -921,9 +922,13 @@ function streamDispatch<TApi extends Api>(
 	options: OptionsForApi<TApi> | undefined,
 	limited: boolean,
 ): AssistantMessageEventStream {
-	const requestOptions = withSupportedSamplingParams(
-		model,
-		withTransportFetch(model, (options || {}) as StreamOptions),
+	// One stamp per operation, at whichever pi-ai entry the caller used: the
+	// budget starts when the request enters pi-ai and covers everything after,
+	// including any wait for a provider in-flight slot, because that wait is
+	// silence too. `withOperationDeadline` keeps the first stamp, so the
+	// `streamSimpleRequest` entry above does not restart the clock here.
+	const requestOptions = withOperationDeadline(
+		withSupportedSamplingParams(model, withTransportFetch(model, (options || {}) as StreamOptions)),
 	) as OptionsForApi<TApi>;
 	assertExplicitOpenAIResponsesPromptCacheSupport(model, requestOptions);
 
@@ -1106,6 +1111,9 @@ async function resolveWithThinkingLoopRetries(
 		// A caller abort surfaces as a thrown abort (never the stall, which would
 		// misclassify as a 502): throwIfAborted before backoff, and scheduler.wait
 		// rejects if the abort lands mid-delay.
+		// Not gated by the operation deadline: each `dispatch()` is a NEW operation
+		// that stamps its own budget, and these three attempts add at most 12s of
+		// backoff, so there is no nested-retry product to bound here.
 		signal?.throwIfAborted();
 		const delay = Math.min(THINKING_LOOP_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1), THINKING_LOOP_RETRY_MAX_DELAY_MS);
 		await scheduler.wait(delay, { signal });
@@ -1279,9 +1287,12 @@ function streamSimpleRequest<TApi extends Api>(
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
-	const requestOptions = withSupportedSamplingParams(
-		model,
-		withTransportFetch(model, (options || {}) as SimpleStreamOptions),
+	// Stamp the operation budget before any branch below: pi-native, custom
+	// APIs, GitLab Duo, Kimi Code and Synthetic dispatch without ever reaching
+	// `streamDispatch`, and the auth-retry wrapper re-enters this function per
+	// credential — all of those must share ONE budget, not restart it.
+	const requestOptions = withOperationDeadline(
+		withSupportedSamplingParams(model, withTransportFetch(model, (options || {}) as SimpleStreamOptions)),
 	);
 
 	const apiKeyResolver = isApiKeyResolver(requestOptions?.apiKey) ? requestOptions.apiKey : undefined;
@@ -1418,6 +1429,15 @@ function streamSimpleRequest<TApi extends Api>(
 					},
 				);
 				if (nextKey === undefined) break;
+				// The resolver may have yielded while refreshing or rotating credentials.
+				// Preserve caller-abort precedence, then refuse a replay whose shared
+				// operation budget expired while the resolver was working.
+				if (signal?.aborted) break;
+				const deadlineError = operationDeadlineExceeded(requestOptions, 0);
+				if (deadlineError) {
+					outer.fail(deadlineError);
+					return;
+				}
 				const next = await runAttempt(nextKey, nextCredentialId, nextOAuthIdentity);
 				if (!next) return;
 				failure = next;
@@ -1834,6 +1854,8 @@ function mapOptionsForApi<TApi extends Api>(
 		headers: options?.headers,
 		initiatorOverride: options?.initiatorOverride,
 		maxRetryDelayMs: options?.maxRetryDelayMs,
+		operationTimeoutMs: options?.operationTimeoutMs,
+		operationDeadlineAt: options?.operationDeadlineAt,
 		metadata: options?.metadata,
 		taskBudget: options?.taskBudget,
 		sessionId: options?.sessionId,

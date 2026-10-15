@@ -35,6 +35,7 @@ import {
 	cfgProvidersOpenaiLiveSteering,
 	cfgProvidersOpenaiWebsockets,
 	cfgProvidersOpenrouterVariant,
+	cfgProvidersOperationTimeoutSeconds,
 	cfgProvidersStreamFirstEventTimeoutSeconds,
 	cfgProvidersStreamIdleTimeoutSeconds,
 	cfgRetryMaxDelayMs,
@@ -104,6 +105,14 @@ export function createSettingsAwareStreamFn(
 		const cacheRetention = cacheRetentionSetting === "auto" ? undefined : cacheRetentionSetting;
 		const streamFirstEventTimeoutMs = timeoutSecondsToMs(cfgProvidersStreamFirstEventTimeoutSeconds.get(settings));
 		const streamIdleTimeoutMs = timeoutSecondsToMs(cfgProvidersStreamIdleTimeoutSeconds.get(settings));
+		// Whole-request budget across pi-ai's nested retries. Separate knob from
+		// the watchdogs above: those bound silence inside one live stream, this
+		// one bounds the wall clock a request may spend without producing output
+		// (output extends it). Negative values are explicitly off — unlike the
+		// sibling watchdogs, this knob has no provider default to fall back to,
+		// so -1 must not silently mean "no budget" without saying so.
+		const operationTimeoutSeconds = cfgProvidersOperationTimeoutSeconds.get(settings);
+		const operationTimeoutMs = operationTimeoutSeconds < 0 ? 0 : timeoutSecondsToMs(operationTimeoutSeconds);
 		// Server-side fallback (opt-in): when the user enables it, inject the
 		// catalog-owned `fallbacks` chain (`server-side-fallback-models` axis,
 		// authored for Fable/Mythos on first-party Anthropic). The provider
@@ -152,6 +161,7 @@ export function createSettingsAwareStreamFn(
 			cacheRetention: streamOptions?.cacheRetention ?? cacheRetention,
 			streamFirstEventTimeoutMs: streamOptions?.streamFirstEventTimeoutMs ?? streamFirstEventTimeoutMs,
 			streamIdleTimeoutMs: streamOptions?.streamIdleTimeoutMs ?? streamIdleTimeoutMs,
+			operationTimeoutMs: streamOptions?.operationTimeoutMs ?? operationTimeoutMs,
 			maxRetryDelayMs: streamOptions?.maxRetryDelayMs ?? cfgRetryMaxDelayMs.get(settings),
 			maxInFlightRequests: validateProviderMaxInFlightRequests(
 				streamOptions?.maxInFlightRequests ?? cfgProvidersMaxInFlightRequests.get(settings),

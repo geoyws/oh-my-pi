@@ -38,6 +38,7 @@ import {
 	iterateWithIdleTimeout,
 } from "../utils/idle-iterator";
 import { OpenAIHttpError, postOpenAIStream } from "../utils/openai-http";
+import { markOperationProgress, operationDeadlineExceeded } from "../utils/operation-deadline";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { waitForRetry } from "../utils/retry-wait";
 import {
@@ -1144,6 +1145,9 @@ const streamOpenAIResponsesOnce = (
 					for await (const event of timedOpenaiStream) {
 						if (isOpenAIResponsesReplayUnsafeEvent(event)) {
 							sawReplayUnsafeOutput = true;
+							// Producing output re-bases the operation deadline,
+							// so the budget bounds silence, not work.
+							markOperationProgress(options);
 							if (!forwardAttemptLive) {
 								forwardAttemptEvents();
 								forwardAttemptLive = true;
@@ -1341,6 +1345,13 @@ const streamOpenAIResponsesOnce = (
 					firstTokenTime = undefined;
 					nativeOutputItems.length = 0;
 
+					// Whole-operation budget: a retry whose sleep would land past it is
+					// refused now, with its own error, instead of adding to the silence.
+					const deadlineError = operationDeadlineExceeded(
+						options,
+						OPENAI_RESPONSES_TRANSIENT_STREAM_RETRY_DELAY_MS,
+					);
+					if (deadlineError) throw deadlineError;
 					await waitForRetry(
 						options?.providerRetryWait,
 						OPENAI_RESPONSES_TRANSIENT_STREAM_RETRY_DELAY_MS,
