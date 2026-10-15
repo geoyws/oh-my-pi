@@ -119,8 +119,8 @@ describe("resolveAutoQaConsent", () => {
 		let calls = 0;
 		setAutoQaConsentHandler(async () => {
 			calls += 1;
-			// Mirrors the `showHookSelector` ESC path (returns `undefined`,
-			// which `#promptAutoQaConsent` maps to `null`).
+			// Resolver contract only: a handler-supplied null leaves consent unanswered.
+			// The real InteractiveMode adapter is covered by its integration regression.
 			return null;
 		}, persistent);
 

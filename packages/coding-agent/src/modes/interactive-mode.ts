@@ -6730,7 +6730,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		const pool = InteractiveMode.#AUTOQA_CONSENT_PROMPTS;
 		const [headline, body] = pool[Math.floor(Math.random() * pool.length)];
 		const choice = await this.#extensionUiController.showCollabAwareSelector(`${headline}\n${body}`, ["Yes", "No"]);
-		return choice === "Yes";
+		return choice === undefined ? null : choice === "Yes";
 	}
 
 	/**
