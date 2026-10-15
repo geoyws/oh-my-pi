@@ -808,6 +808,8 @@ interface CodexRequestSetup {
 	firstEventTimeoutMs: number | undefined;
 	websocketIdleTimeoutMs: number | undefined;
 	websocketFirstEventTimeoutMs: number | undefined;
+	/** Set once any websocket or SSE transport begins for this logical operation. */
+	transportStarted: boolean;
 }
 
 interface CodexOpenItem {
@@ -1469,6 +1471,7 @@ function createRequestSetup(options: OpenAICodexResponsesOptions | undefined): C
 		firstEventTimeoutMs,
 		websocketIdleTimeoutMs,
 		websocketFirstEventTimeoutMs,
+		transportStarted: false,
 	};
 }
 
@@ -2076,6 +2079,7 @@ async function openCodexWebSocketTransport(
 	requestBodyForState: RequestBody;
 	transport: CodexTransport;
 }> {
+	requestSetup.transportStarted = true;
 	const steered = websocketState.acceptedSteering;
 	websocketState.acceptedSteering = undefined;
 	const canAppendBeforeRequest = websocketState.canAppend === true;
@@ -2247,6 +2251,10 @@ async function openCodexSseTransport(
 	requestBodyForState: RequestBody;
 	transport: CodexTransport;
 }> {
+	// Only the operation's very first transport may skip the deadline gate;
+	// claim it synchronously so a websocket-first fallback or recovery is gated.
+	const firstOperationTransport = !requestSetup.transportStarted;
+	requestSetup.transportStarted = true;
 	const open = async (wireBody: RequestBody) => {
 		// Keep the 400 dump honest: record the body actually sent on the wire.
 		requestContext.rawRequestDump.body = wireBody;
@@ -2267,6 +2275,7 @@ async function openCodexSseTransport(
 				requestSetup.firstEventTimeoutMs,
 				options?.codexSseMaxAttempts,
 				() => assertCodexTransportAttemptAllowed(options, requestSetup),
+				firstOperationTransport,
 				event => options?.onSseEvent?.(event, model),
 				options?.fetch,
 			),
@@ -5058,6 +5067,7 @@ async function openCodexSseEventStream(
 	firstEventTimeoutMs: number | undefined,
 	codexSseMaxAttempts: number | undefined,
 	assertAttemptAllowed: () => void,
+	firstOperationTransport: boolean,
 	onSseEvent?: OpenAICodexResponsesOptions["onSseEvent"],
 	fetchOverride?: FetchImpl,
 ): Promise<AsyncGenerator<Record<string, unknown>>> {
@@ -5087,7 +5097,7 @@ async function openCodexSseEventStream(
 		let response: Response | undefined;
 		try {
 			// prepareInit is awaited by fetchWithRetry; recheck at the actual send.
-			if (requestsStarted > 0) assertAttemptAllowed();
+			if (requestsStarted > 0 || !firstOperationTransport) assertAttemptAllowed();
 			requestsStarted += 1;
 			response = await (fetchOverride ?? fetch)(input, init);
 			return response;
@@ -5128,7 +5138,7 @@ async function openCodexSseEventStream(
 			prepareInit: () => {
 				// Covers every nested HTTP retry and the plain-JSON encoding replay.
 				// Throw outside fetchWithRetry's network-error catch to stop recovery.
-				if (requestsStarted > 0) assertAttemptAllowed();
+				if (requestsStarted > 0 || !firstOperationTransport) assertAttemptAllowed();
 				// A retried non-2xx attempt leaves its guard armed for the retry-status
 				// body read; disarm it before arming the next attempt's guard.
 				clearPreResponseTimeout?.();
