@@ -669,6 +669,14 @@ async function detachCopiedRepo(sourceRoot: string, copyRoot: string, sourceComm
  * `objects/info/alternates` is deliberately NOT judged here: a detached
  * private admin borrows source objects through alternates read-only, and
  * that borrowing must keep passing.
+ *
+ * Scope: this guards the layouts git itself creates for submodules (gitfiles,
+ * absorbed module dirs, linked worktrees, legacy in-tree `.git` dirs) plus
+ * `commondir` pointers. It is not a sandbox against git metadata planted by
+ * hand to reach outside the checkout, such as symlinked `refs/` or `objects/`
+ * inside an admin, or admins outside submodule paths or under node_modules;
+ * that hardening belongs with committed out-of-tree symlinks in the
+ * isolation copy as a whole.
  */
 export async function gitAdminEscapes(copyRoot: string, dotGitPath: string): Promise<boolean> {
 	let realCopyRoot: string;
