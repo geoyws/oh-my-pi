@@ -1944,10 +1944,15 @@ async function* streamCodexCompactionEvents(
 			// An SSE rejection arrives as a failure event mid-stream, not a
 			// throw. Intercept a foreign-`encrypted_content` rejection before
 			// it is yielded, strip the staged body once, and drain the
-			// reopened stream instead. A second failure (or a body with
-			// nothing to strip and no chain baseline) is yielded untouched.
+			// reopened stream instead. The replay replaces the whole stream,
+			// so it runs only when nothing reached the consumer yet: once an
+			// event has been yielded, a retry would fork the consumer's
+			// output (partial attempt plus full replay) and the failure is
+			// yielded untouched instead. A second failure (or a body with
+			// nothing to strip and no chain baseline) is likewise untouched.
 			let events = initial.eventStream;
 			let strippedRetryAvailable = true;
+			let yieldedAnyEvent = false;
 			while (true) {
 				let switched = false;
 				for await (const event of events) {
@@ -1955,6 +1960,7 @@ async function* streamCodexCompactionEvents(
 						websocketState?.canAppend === true && websocketState.lastResponseId !== undefined;
 					if (
 						strippedRetryAvailable &&
+						!yieldedAnyEvent &&
 						isForeignEncryptedReasoningFailureEvent(event) &&
 						(stripEncryptedReasoningFromCodexBody(requestContext.transformedBody) || chainedBaseline)
 					) {
@@ -1978,6 +1984,7 @@ async function* streamCodexCompactionEvents(
 						break;
 					}
 					applyCodexCompactionResponseMetadata(requestContext, event);
+					yieldedAnyEvent = true;
 					yield event;
 				}
 				if (!switched) break;

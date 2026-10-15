@@ -587,4 +587,47 @@ describe("openai-codex foreign encrypted reasoning transport retry", () => {
 		expect(events.some(event => event.type === "response.failed" || event.type === "error")).toBe(false);
 		expect(events.some(event => event.type === "response.completed")).toBe(true);
 	});
+
+	it("does not retry a mid-stream SSE compaction failure once an event was yielded", async () => {
+		useTempAgentDir();
+		let attempts = 0;
+		// A content event reaches the consumer before the foreign-caller
+		// rejection: the stripped replay would fork the output (partial
+		// attempt plus full replay), so the failure must surface instead.
+		const failedSse = [
+			`data: ${JSON.stringify({ type: "response.output_text.delta", delta: "partial" })}`,
+			`data: ${JSON.stringify({ type: "response.failed", response: { error: { code: "invalid_request_error", message: FOREIGN_CALLER_MESSAGE } } })}`,
+		].join("\n\n");
+		const fetchMock: FetchImpl = Object.assign(
+			async (): Promise<Response> => {
+				attempts += 1;
+				return new Response(`${failedSse}\n\n`, {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				});
+			},
+			{ preconnect: fetch.preconnect },
+		);
+
+		const body = await buildTransformedCodexRequestBody(createCodexModel("gpt-5.5"), legacyContext(), undefined);
+		const events: Array<Record<string, unknown>> = [];
+		for await (const event of await openCodexCompactionEventStream(
+			sseModel(),
+			{ model: "gpt-5.5", input: body.input },
+			{ apiKey: createCodexTestToken(), fetch: fetchMock },
+		)) {
+			events.push(event as Record<string, unknown>);
+		}
+
+		expect(attempts).toBe(1);
+		expect(events.some(event => event.type === "response.output_text.delta")).toBe(true);
+		expect(
+			events.some(
+				event =>
+					(event.type === "response.failed" || event.type === "error") &&
+					JSON.stringify(event).includes("not issued to this caller"),
+			),
+		).toBe(true);
+		expect(events.some(event => event.type === "response.completed")).toBe(false);
+	});
 });

@@ -20,6 +20,7 @@ import {
 import {
 	getOpenAIPromptCacheKey,
 	getOpenAIResponsesRoutingSessionId,
+	isForeignEncryptedReasoningError,
 	parseAzureDeploymentNameMap,
 	resolveOpenAIRequestSetup,
 } from "@oh-my-pi/pi-ai/providers/openai-shared";
@@ -364,14 +365,17 @@ async function attemptCompactionV2Streaming(
 		return collectCompactionV2Events(eventStream, request);
 	}
 
-	const response = await fetchImpl(endpoint, {
-		method: "POST",
-		headers: buildCompactionV2Headers(model, apiKey, request, options.codexMetadata),
-		body: stringifyJson(body),
-		signal,
-	});
-
-	if (!response.ok) {
+	const sendV2Compaction = (input: unknown[]): Promise<Response> =>
+		fetchImpl(endpoint, {
+			method: "POST",
+			headers: buildCompactionV2Headers(model, apiKey, request, options.codexMetadata),
+			body: stringifyJson({
+				...body,
+				input: [...input, COMPACTION_TRIGGER_ITEM],
+			}),
+			signal,
+		});
+	const failV2Compaction = async (response: Response): Promise<never> => {
 		const cause = await captureOpenAIHttpError(response);
 		logger.warn("V2 remote compaction failed", {
 			endpoint,
@@ -387,6 +391,43 @@ async function attemptCompactionV2Streaming(
 				cause,
 			},
 		);
+	};
+	let response = await sendV2Compaction(request.input);
+	// Turns stored before their credential was recorded still replay
+	// caller-bound `encrypted_content` no build-time comparison can drop.
+	// On the server's foreign-caller 400, resend once with every encrypted
+	// reasoning blob stripped — before any output is consumed, so the
+	// single response stream stays intact. A second failure (or any other
+	// error, or a request with nothing to strip) surfaces normally.
+	if (!response.ok) {
+		const cause = await captureOpenAIHttpError(response);
+		const failure = new AIError.ProviderHttpError(
+			`V2 remote compaction failed (${response.status} ${response.statusText})`,
+			response.status,
+			{
+				headers: response.headers,
+				cause,
+			},
+		);
+		const stripped = stripEncryptedReasoningResponseItems(request.input as Array<Record<string, unknown>>);
+		// Match the unwrapped capture: it carries the status, the decoded
+		// body, and the server's wording; the wrapper above has none of those.
+		if (!isForeignEncryptedReasoningError(cause) || stripped.length === request.input.length) {
+			logger.warn("V2 remote compaction failed", {
+				endpoint,
+				status: response.status,
+				statusText: response.statusText,
+				errorText: cause.captured.bodyText ?? "",
+			});
+			throw failure;
+		}
+		logger.debug("V2 remote compaction foreign encrypted reasoning rejected; retrying stripped", {
+			endpoint,
+			model: model.id,
+			provider: model.provider,
+		});
+		response = await sendV2Compaction(stripped);
+		if (!response.ok) await failV2Compaction(response);
 	}
 
 	return collectCompactionV2Output(response, request);
@@ -814,6 +855,38 @@ function truncateTextToTokenBudget(text: string, maxTokens: number): string {
 
 function approxTokenCount(text: string): number {
 	return Math.ceil(text.length / 4);
+}
+
+/**
+ * Drop caller-bound `reasoning` items (`encrypted_content` is issued to the
+ * credential that produced the turn) from already-serialized Responses
+ * history. Shared by the history builders and the V2/V1 stripped send
+ * retries. Message, function-call, and custom-tool items replay untouched.
+ */
+export function stripEncryptedReasoningResponseItems(
+	items: Array<Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+	return items.filter(item => {
+		if (!item || typeof item !== "object") return true;
+		return !(item.type === "reasoning" && typeof item.encrypted_content === "string");
+	});
+}
+
+/**
+ * Whether a preserved compaction prefix must lose its caller-bound reasoning
+ * before replaying under `servingCredentialId`. An unknown serving
+ * credential can never prove ownership of another caller's blobs, so it
+ * strips everything; a known one replays a prefix stored under the same row
+ * (or a prefix that never recorded its row) untouched.
+ */
+export function shouldStripCompactionPrefixItems(
+	servingCredentialId: number | undefined,
+	recordedCredentialId: number | undefined,
+): boolean {
+	return (
+		servingCredentialId === undefined ||
+		(recordedCredentialId !== undefined && recordedCredentialId !== servingCredentialId)
+	);
 }
 
 // ============================================================================
