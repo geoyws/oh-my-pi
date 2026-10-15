@@ -22,10 +22,11 @@
  *
  * Enforced in: the replay-safe stream retry (`empty-completion-retry`),
  * resolver-driven stream auth replays, the Anthropic provider loop and its
- * HTTP client backoff, the OpenAI Responses transient stream retry, the five
- * Codex Responses websocket/provider/whitespace retries, and the Google +
- * Gemini CLI empty-stream retries. A caller abort always wins: every site
- * keeps its existing abort check ahead of the budget check.
+ * HTTP client backoff, the OpenAI Responses transient stream retry, every
+ * Codex Responses retry or recovery that opens a new websocket/SSE attempt
+ * (also with no backoff sleep), and the Google + Gemini CLI empty-stream
+ * retries. A caller abort always wins: every site keeps its existing abort
+ * check ahead of the budget check.
  *
  * Deliberately NOT the stream-idle watchdog: that one bounds the gap between
  * events of a live stream and knows nothing about retries, while this one

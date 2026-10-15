@@ -7419,3 +7419,641 @@ describe("openai-codex SSE statelessness", () => {
 		expect(stats).toMatchObject({ fullContextRequests: 2, deltaRequests: 0 });
 	});
 });
+
+describe("openai-codex recovery attempt gate", () => {
+	const BUDGET_EXHAUSTED = "Provider operation budget exhausted";
+	const ACCESS_PROGRAM_REJECTION = {
+		code: "access_program_not_enabled",
+		message: "The requested Cyber access program is not authorized for this workspace.",
+	};
+	const SSE_HEADERS = { "content-type": "text/event-stream" };
+
+	/** Live budget the test spends at the moment it chooses. */
+	function createBudget(): { operationTimeoutMs: number; operationDeadlineAt: number } {
+		return { operationTimeoutMs: 60_000, operationDeadlineAt: Date.now() + 60_000 };
+	}
+
+	function spendBudget(options: { operationDeadlineAt?: number }): void {
+		options.operationDeadlineAt = Date.now() - 1;
+	}
+
+	function accessProgramModel(accountId: string, preferWebsockets: boolean): Model<"openai-codex-responses"> {
+		return {
+			...createCodexTestModel("https://chatgpt.com/backend-api"),
+			preferWebsockets,
+			accountAccess: { [accountId]: { cyberPrograms: ["standard", "daybreak_blue"] } },
+		};
+	}
+
+	/** SSE response that delivers `events`, then stalls until the request signal aborts. */
+	function createStalledCodexSse(signal: AbortSignal | undefined, events: Array<Record<string, unknown>>): Response {
+		const encoder = new TextEncoder();
+		let abortListener: (() => void) | undefined;
+		const stream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				for (const event of events) controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+				abortListener = () => {
+					const reason = signal?.reason;
+					controller.error(reason instanceof Error ? reason : new Error("request aborted"));
+				};
+				if (signal?.aborted) queueMicrotask(abortListener);
+				else signal?.addEventListener("abort", abortListener, { once: true });
+			},
+			cancel() {
+				if (abortListener) signal?.removeEventListener("abort", abortListener);
+			},
+		});
+		return new Response(stream, { status: 200, headers: SSE_HEADERS });
+	}
+
+	beforeEach(() => {
+		setAgentDir(TempDir.createSync("@pi-codex-attempt-gate-").path());
+	});
+
+	it("still sends the initial HTTP request when payload preparation spends the operation budget", async () => {
+		const fetchMock = vi.fn<FetchImpl>(async () =>
+			new Response(createStatefulCodexSse("Initial response", "resp_initial_budget"), { headers: SSE_HEADERS }),
+		);
+		const options = {
+			apiKey: createCodexTestToken(),
+			fetch: fetchMock,
+			...createBudget(),
+			onPayload: async () => {
+				spendBudget(options);
+				return undefined;
+			},
+		};
+
+		await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			options,
+		).result();
+
+		// The operation budget gates retries/recovery, not the first send.
+		// Its eventual result may still be bounded by the existing watchdog.
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("refuses the SSE fallback of a failed initial websocket open once the budget is spent", async () => {
+		const fetchMock = vi.fn<FetchImpl>(
+			async () => new Response(createCompletedCodexSse("late"), { headers: SSE_HEADERS }),
+		);
+		const options = {
+			fetch: fetchMock,
+			apiKey: createCodexTestToken(),
+			sessionId: "gate-initial-ws-fallback",
+			providerSessionState: new Map<string, ProviderSessionState>(),
+			...createBudget(),
+		};
+		class SpentHandshakeWebSocket extends MockWebSocket {
+			constructor(url: string, wsOptions?: WsOptions) {
+				super(url, wsOptions);
+				spendBudget(options);
+				setTimeout(() => {
+					this.readyState = MockWebSocket.CLOSED;
+					this.emit("error", new Event("error"));
+					this.emit("close", new Event("close"));
+				}, 0);
+			}
+		}
+		global.WebSocket = SpentHandshakeWebSocket as unknown as typeof WebSocket;
+
+		const result = await streamOpenAICodexResponses(
+			createCodexTestModel("https://chatgpt.com/backend-api"),
+			createCodexTestContext(),
+			options,
+		).result();
+
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain(BUDGET_EXHAUSTED);
+	});
+
+	it("refuses the initial SSE access-program replay once the budget is spent", async () => {
+		const accountId = "acct-gate-initial-sse";
+		const options = {
+			apiKey: createCodexTestToken(accountId),
+			fetch: undefined as FetchImpl | undefined,
+			...createBudget(),
+		};
+		const fetchMock = vi.fn<FetchImpl>(async () => {
+			spendBudget(options);
+			return new Response(JSON.stringify({ error: ACCESS_PROGRAM_REJECTION }), {
+				status: 403,
+				headers: { "content-type": "application/json" },
+			});
+		});
+		options.fetch = fetchMock;
+
+		const result = await streamOpenAICodexResponses(
+			accessProgramModel(accountId, false),
+			createCodexTestContext(),
+			options,
+		).result();
+
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain(BUDGET_EXHAUSTED);
+	});
+
+	it("refuses the SSE access-program replay when its payload preparation spends the budget", async () => {
+		const accountId = "acct-gate-replay-payload";
+		let payloads = 0;
+		const options = {
+			apiKey: createCodexTestToken(accountId),
+			fetch: undefined as FetchImpl | undefined,
+			...createBudget(),
+			onPayload: async () => {
+				payloads += 1;
+				// The replay's outer gate already passed against a live budget;
+				// spend it while the replay prepares its payload, before any send.
+				if (payloads === 2) spendBudget(options);
+				return undefined;
+			},
+		};
+		const fetchMock = vi.fn<FetchImpl>(async () => {
+			if (fetchMock.mock.calls.length > 1) {
+				return new Response(createStatefulCodexSse("late", "resp_replay_payload"), { headers: SSE_HEADERS });
+			}
+			return new Response(JSON.stringify({ error: ACCESS_PROGRAM_REJECTION }), {
+				status: 403,
+				headers: { "content-type": "application/json" },
+			});
+		});
+		options.fetch = fetchMock;
+
+		const result = await streamOpenAICodexResponses(
+			accessProgramModel(accountId, false),
+			createCodexTestContext(),
+			options,
+		).result();
+
+		expect(payloads).toBe(2);
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain(BUDGET_EXHAUSTED);
+	});
+
+	it("refuses the compaction websocket-to-SSE fallback once the budget is spent", async () => {
+		const fetchMock = vi.fn<FetchImpl>(
+			async () => new Response(createCompletedCodexSse("late"), { headers: SSE_HEADERS }),
+		);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const options = {
+			apiKey: createCodexTestToken(),
+			fetch: fetchMock,
+			sessionId: "gate-compaction-ws-fallback",
+			providerSessionState,
+			...createBudget(),
+		};
+		class DroppedCompactionWebSocket extends MockWebSocket {
+			constructor(url: string, wsOptions?: WsOptions) {
+				super(url, wsOptions);
+				this.scheduleOpen();
+			}
+
+			override send(): void {
+				spendBudget(options);
+				this.readyState = MockWebSocket.CLOSED;
+				this.emit("close", { code: 1011 } as CloseEvent);
+			}
+		}
+		global.WebSocket = DroppedCompactionWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		try {
+			const events = await openCodexCompactionEventStream(
+				model,
+				{ model: model.id, input: [{ type: "compaction_trigger" }] },
+				options,
+			);
+			const error = await events.next().then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(error).toBeInstanceOf(AIError.ProviderOperationDeadlineError);
+			expect(fetchMock).not.toHaveBeenCalled();
+		} finally {
+			for (const state of providerSessionState.values()) state.close();
+		}
+	});
+
+	it("refuses the compaction access-program replay once the budget is spent", async () => {
+		const accountId = "acct-gate-compaction";
+		const fetchMock = vi.fn<FetchImpl>(
+			async () => new Response(createCompletedCodexSse("late"), { headers: SSE_HEADERS }),
+		);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const options = {
+			apiKey: createCodexTestToken(accountId),
+			fetch: fetchMock,
+			sessionId: "gate-compaction-access-program",
+			providerSessionState,
+			...createBudget(),
+		};
+		class RejectingCompactionWebSocket extends MockWebSocket {
+			constructor(url: string, wsOptions?: WsOptions) {
+				super(url, wsOptions);
+				this.scheduleOpen();
+			}
+
+			override send(): void {
+				spendBudget(options);
+				this.sendJson({ type: "response.failed", response: { error: ACCESS_PROGRAM_REJECTION } });
+			}
+		}
+		global.WebSocket = RejectingCompactionWebSocket as unknown as typeof WebSocket;
+		const model = accessProgramModel(accountId, true);
+		try {
+			const events = await openCodexCompactionEventStream(
+				model,
+				{ model: model.id, input: [{ type: "compaction_trigger" }] },
+				options,
+			);
+			const error = await events.next().then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(error).toBeInstanceOf(AIError.ProviderOperationDeadlineError);
+			expect(fetchMock).not.toHaveBeenCalled();
+		} finally {
+			for (const state of providerSessionState.values()) state.close();
+		}
+	});
+
+	it.each([
+		[
+			"access-program rejection",
+			"acct-gate-ws-access",
+			{ type: "response.failed", response: { error: ACCESS_PROGRAM_REJECTION } },
+		],
+		[
+			"stale previous_response_id",
+			"acc_test",
+			{
+				type: "error",
+				code: "previous_response_not_found",
+				message: "Previous response with id 'resp_1' not found.",
+			},
+		],
+	] as const)(
+		"refuses the websocket reopen after a %s once the budget is spent",
+		async (_label, accountId, failure) => {
+			const fetchMock = vi.fn<FetchImpl>(
+				async () => new Response(createCompletedCodexSse("late"), { headers: SSE_HEADERS }),
+			);
+			const providerSessionState = new Map<string, ProviderSessionState>();
+			const options = {
+				fetch: fetchMock,
+				apiKey: createCodexTestToken(accountId),
+				sessionId: `gate-ws-reopen-${accountId}`,
+				providerSessionState,
+				...createBudget(),
+			};
+			let sendCount = 0;
+			class RejectingWebSocket extends MockWebSocket {
+				constructor(url: string, wsOptions?: WsOptions) {
+					super(url, wsOptions);
+					this.scheduleOpen();
+				}
+
+				override send(): void {
+					sendCount += 1;
+					spendBudget(options);
+					this.sendJson(failure);
+				}
+			}
+			global.WebSocket = RejectingWebSocket as unknown as typeof WebSocket;
+			try {
+				const result = await streamOpenAICodexResponses(
+					accessProgramModel(accountId, true),
+					createCodexTestContext(),
+					options,
+				).result();
+
+				expect(sendCount).toBe(1);
+				expect(fetchMock).not.toHaveBeenCalled();
+				expect(result.stopReason).toBe("error");
+				expect(result.errorMessage).toContain(BUDGET_EXHAUSTED);
+			} finally {
+				for (const state of providerSessionState.values()) state.close();
+			}
+		},
+	);
+
+	it("refuses the websocket access-program replay when its payload preparation spends the budget", async () => {
+		const accountId = "acct-gate-ws-replay-payload";
+		const fetchMock = vi.fn<FetchImpl>(
+			async () => new Response(createCompletedCodexSse("late"), { headers: SSE_HEADERS }),
+		);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		let payloads = 0;
+		const options = {
+			fetch: fetchMock,
+			apiKey: createCodexTestToken(accountId),
+			sessionId: "gate-ws-replay-payload",
+			providerSessionState,
+			...createBudget(),
+			onPayload: async () => {
+				payloads += 1;
+				// The replay's outer gate already passed against a live budget;
+				// spend it while the replay prepares its frame, before any send.
+				if (payloads === 2) spendBudget(options);
+				return undefined;
+			},
+		};
+		let responseCreates = 0;
+		class RejectThenCompleteWebSocket extends MockWebSocket {
+			constructor(url: string, wsOptions?: WsOptions) {
+				super(url, wsOptions);
+				this.scheduleOpen();
+			}
+
+			override send(data: string): void {
+				const frame: unknown = JSON.parse(data);
+				if (!frame || typeof frame !== "object" || !("type" in frame) || frame.type !== "response.create") return;
+				responseCreates += 1;
+				if (responseCreates === 1) {
+					this.sendJson({ type: "response.failed", response: { error: ACCESS_PROGRAM_REJECTION } });
+					return;
+				}
+				this.emitCodexResponse({
+					messageId: "msg_ws_replay_payload",
+					responseId: "resp_ws_replay_payload",
+					text: "late",
+				});
+			}
+		}
+		global.WebSocket = RejectThenCompleteWebSocket as unknown as typeof WebSocket;
+		try {
+			const result = await streamOpenAICodexResponses(
+				accessProgramModel(accountId, true),
+				createCodexTestContext(),
+				options,
+			).result();
+
+			expect(payloads).toBe(2);
+			expect(responseCreates).toBe(1);
+			expect(fetchMock).not.toHaveBeenCalled();
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain(BUDGET_EXHAUSTED);
+		} finally {
+			for (const state of providerSessionState.values()) state.close();
+		}
+	});
+
+	it("refuses the SSE replay of a websocket failure with buffered output once the budget is spent", async () => {
+		const fetchMock = vi.fn<FetchImpl>(
+			async () => new Response(createCompletedCodexSse("late"), { headers: SSE_HEADERS }),
+		);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const options = {
+			fetch: fetchMock,
+			apiKey: createCodexTestToken(),
+			sessionId: "gate-ws-replay-over-sse",
+			providerSessionState,
+			...createBudget(),
+		};
+		class PartialThenDroppedWebSocket extends MockWebSocket {
+			constructor(url: string, wsOptions?: WsOptions) {
+				super(url, wsOptions);
+				this.scheduleOpen();
+			}
+
+			override send(): void {
+				this.sendJson({
+					type: "response.output_item.added",
+					item: { type: "message", id: "msg_partial", role: "assistant", status: "in_progress", content: [] },
+				});
+				this.sendJson({ type: "response.content_part.added", part: { type: "output_text", text: "" } });
+				this.sendJson({ type: "response.output_text.delta", delta: "partial" });
+				// Spend the budget on the next macrotask, once the consumer drained
+				// (and re-based the budget on) the delta, then drop the socket.
+				setTimeout(() => {
+					spendBudget(options);
+					this.readyState = MockWebSocket.CLOSED;
+					this.emit("close", { code: 1011 } as CloseEvent);
+				}, 0);
+			}
+		}
+		global.WebSocket = PartialThenDroppedWebSocket as unknown as typeof WebSocket;
+		try {
+			const result = await streamOpenAICodexResponses(
+				createCodexTestModel("https://chatgpt.com/backend-api"),
+				createCodexTestContext(),
+				options,
+			).result();
+
+			expect(fetchMock).not.toHaveBeenCalled();
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain(BUDGET_EXHAUSTED);
+		} finally {
+			for (const state of providerSessionState.values()) state.close();
+		}
+	});
+
+	it("refuses the SSE fallback of a failed websocket reopen once the budget is spent", async () => {
+		const fetchMock = vi.fn<FetchImpl>(
+			async () => new Response(createCompletedCodexSse("late"), { headers: SSE_HEADERS }),
+		);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const options = {
+			fetch: fetchMock,
+			apiKey: createCodexTestToken(),
+			sessionId: "gate-ws-reopen-sse-fallback",
+			providerSessionState,
+			providerRetryWait: async () => {},
+			...createBudget(),
+		};
+		let constructorCount = 0;
+		class LimitThenRefusedWebSocket extends MockWebSocket {
+			constructor(url: string, wsOptions?: WsOptions) {
+				super(url, wsOptions);
+				constructorCount += 1;
+				if (constructorCount === 1) {
+					this.scheduleOpen();
+					return;
+				}
+				// The reconnect handshake fails after the budget ran out.
+				spendBudget(options);
+				setTimeout(() => {
+					this.readyState = MockWebSocket.CLOSED;
+					this.emit("error", new Event("error"));
+					this.emit("close", new Event("close"));
+				}, 0);
+			}
+
+			override send(): void {
+				this.sendJson({
+					type: "error",
+					code: "websocket_connection_limit_reached",
+					message: "connection limit reached",
+				});
+			}
+		}
+		global.WebSocket = LimitThenRefusedWebSocket as unknown as typeof WebSocket;
+		try {
+			const result = await streamOpenAICodexResponses(
+				createCodexTestModel("https://chatgpt.com/backend-api"),
+				createCodexTestContext(),
+				options,
+			).result();
+
+			expect(constructorCount).toBe(2);
+			expect(fetchMock).not.toHaveBeenCalled();
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain(BUDGET_EXHAUSTED);
+		} finally {
+			for (const state of providerSessionState.values()) state.close();
+		}
+	});
+
+	const NESTED_HTTP_FAILURES = [
+		["network failure", undefined],
+		["HTTP 408", 408],
+		["HTTP 429", 429],
+		["HTTP 500", 500],
+		["HTTP 503", 503],
+	] as const;
+
+	for (const [label, status] of NESTED_HTTP_FAILURES) {
+		it.each(["before wait", "during wait", "live budget", "caller abort"] as const)(
+			"gates nested " + label + " retries (%s)",
+			async mode => {
+				const caller = new AbortController();
+				const options = {
+					apiKey: createCodexTestToken(),
+					signal: caller.signal,
+					codexSseMaxAttempts: 2,
+					...createBudget(),
+				};
+				// Advance the live operation deadline deterministically, without
+				// racing watchdog timers or replacing the HTTP retry implementation.
+				vi.spyOn(scheduler, "wait").mockImplementation(async () => {
+					if (mode === "during wait" || mode === "caller abort") spendBudget(options);
+					if (mode === "caller abort") caller.abort();
+				});
+				let requests = 0;
+				const fetchMock: FetchImpl = async () => {
+					requests += 1;
+					if (requests === 1) {
+						if (mode === "before wait") spendBudget(options);
+						if (status === undefined) throw new TypeError("fetch failed");
+						// Explicit zero delay covers the immediate retry path too.
+						return new Response("temporary failure", { status, headers: { "retry-after": "0" } });
+					}
+					return new Response(createStatefulCodexSse("Recovered", "resp_nested_retry"), { headers: SSE_HEADERS });
+				};
+				const result = await streamOpenAICodexResponses(
+					{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+					createCodexTestContext(),
+					Object.assign(options, { fetch: fetchMock }),
+				).result();
+
+				expect(requests).toBe(mode === "live budget" ? 2 : 1);
+				if (mode === "live budget") {
+					expect(result.stopReason).toBe("stop");
+					expect(result.content.find(block => block.type === "text")?.text).toBe("Recovered");
+				} else if (mode === "caller abort") {
+					expect(result.stopReason).toBe("aborted");
+					expect(result.errorMessage).toBe("Request was aborted");
+				} else {
+					expect(result.stopReason).toBe("error");
+					expect(result.errorMessage).toContain(BUDGET_EXHAUSTED);
+				}
+			},
+		);
+	}
+
+	for (const status of [400, 415]) {
+		it.each(["spent budget", "caller abort", "live budget"] as const)(
+			"gates the uncompressed replay after HTTP " + status + " (%s)",
+			async mode => {
+				await withEnv({ PI_CODEX_ZSTD: "1" }, async () => {
+					const caller = new AbortController();
+					const options = { apiKey: createCodexTestToken(), signal: caller.signal, ...createBudget() };
+					const encodings: Array<string | null> = [];
+					let cancelled = false;
+					const fetchMock: FetchImpl = async (_input, init) => {
+						encodings.push(new Headers(init?.headers).get("content-encoding"));
+						if (encodings.length === 1) {
+							return new Response(new ReadableStream<Uint8Array>({
+								cancel() {
+									cancelled = true;
+									// Rejection cleanup is awaited before replay; spend the
+									// budget here to exercise that exact transport boundary.
+									if (mode !== "live budget") spendBudget(options);
+									if (mode === "caller abort") caller.abort();
+								},
+							}), { status });
+						}
+						return new Response(createStatefulCodexSse("Uncompressed", "resp_encoding_replay"), {
+							headers: SSE_HEADERS,
+						});
+					};
+					const result = await streamOpenAICodexResponses(
+						{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+						createCodexTestContext(),
+						Object.assign(options, { fetch: fetchMock }),
+					).result();
+
+					expect(cancelled).toBe(true);
+					expect(encodings).toEqual(mode === "live budget" ? ["zstd", null] : ["zstd"]);
+					if (mode === "live budget") {
+						expect(result.stopReason).toBe("stop");
+						expect(result.content.find(block => block.type === "text")?.text).toBe("Uncompressed");
+					} else if (mode === "caller abort") {
+						expect(result.stopReason).toBe("aborted");
+						expect(result.errorMessage).toBe("Request was aborted");
+					} else {
+						expect(result.stopReason).toBe("error");
+						expect(result.errorMessage).toContain(BUDGET_EXHAUSTED);
+					}
+				});
+			},
+		);
+	}
+
+	const IDLE_TIMEOUT = {
+		timeouts: { streamIdleTimeoutMs: 20, streamFirstEventTimeoutMs: 60_000 },
+		events: [{ type: "response.created", response: { id: "resp_idle" } }],
+		message: "OpenAI Codex SSE stream stalled while waiting for the next event",
+	};
+	const FIRST_EVENT_TIMEOUT = {
+		timeouts: { streamIdleTimeoutMs: 60_000, streamFirstEventTimeoutMs: 20 },
+		events: [],
+		message: "OpenAI Codex SSE stream timed out while waiting for the first event",
+	};
+	it.each([
+		["idle", "", IDLE_TIMEOUT, false],
+		["idle", " past the operation deadline", IDLE_TIMEOUT, true],
+		["first-event", "", FIRST_EVENT_TIMEOUT, false],
+		["first-event", " past the operation deadline", FIRST_EVENT_TIMEOUT, true],
+	] as const)("surfaces an SSE %s timeout%s as StreamTimeoutError", async (_label, _suffix, scenario, withBudget) => {
+		// Real 20 ms watchdogs: Bun fake timers misfire the production idle
+		// watchdog (see the pre-response deadline test above). The budgeted
+		// cases let the timed-out gap outlive a 10 ms operation budget.
+		const budget = withBudget ? { operationTimeoutMs: 10, operationDeadlineAt: Date.now() + 10 } : {};
+		let fetchCount = 0;
+		const fetchMock: FetchImpl = async (input, init) => {
+			fetchCount += 1;
+			return createStalledCodexSse(getRequestSignal(input, init), [...scenario.events]);
+		};
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{
+				apiKey: createCodexTestToken(),
+				fetch: fetchMock,
+				providerRetryWait: async () => {},
+				...scenario.timeouts,
+				...budget,
+			},
+		).result();
+
+		expect(fetchCount).toBe(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe(scenario.message);
+		expect(AIError.is(result.errorId, AIError.Flag.Timeout)).toBe(true);
+	});
+});
