@@ -1243,6 +1243,29 @@ export const cfgProvidersStreamIdleTimeoutSeconds = register({
 	},
 });
 
+export const cfgProvidersOperationTimeoutSeconds = register({
+	id: "providers.operationTimeoutSeconds",
+	type: "number",
+	default: 900,
+	ui: {
+		tab: "providers",
+		group: "Timeouts",
+		label: "Operation Budget",
+		description:
+			"Wall-clock budget for one provider request including every internal retry; producing output extends it, so it bounds time without progress rather than total duration. A retry that would sleep past it fails immediately instead of waiting. 0 disables the budget; negative values are treated as 0",
+		options: [
+			{
+				value: "0",
+				label: "Off",
+				description: "No aggregate budget; nested retries are bounded only by their own counts",
+			},
+			{ value: "300", label: "5 minutes" },
+			{ value: "900", label: "15 minutes" },
+			{ value: "1800", label: "30 minutes" },
+		],
+	},
+});
+
 export const cfgProvidersOpenrouterVariant = register({
 	id: "providers.openrouterVariant",
 	type: "enum",

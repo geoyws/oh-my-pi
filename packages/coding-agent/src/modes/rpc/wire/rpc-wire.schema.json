@@ -3854,6 +3854,71 @@
 				"attempt"
 			]
 		},
+		"ProviderRetryWaitStartEvent": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "provider_retry_wait_start"
+				},
+				"waitId": {
+					"type": "integer"
+				},
+				"role": {
+					"enum": [
+						"main",
+						"advisor",
+						"side"
+					],
+					"type": "string"
+				},
+				"delayMs": {
+					"type": "integer"
+				},
+				"model": {
+					"type": "string"
+				},
+				"provider": {
+					"type": "string"
+				},
+				"api": {
+					"type": "string"
+				},
+				"attempt": {
+					"type": "integer"
+				},
+				"maxAttempts": {
+					"type": "integer"
+				}
+			},
+			"required": [
+				"type",
+				"waitId",
+				"role",
+				"delayMs",
+				"model",
+				"provider",
+				"api"
+			]
+		},
+		"ProviderRetryWaitEndEvent": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "provider_retry_wait_end"
+				},
+				"aborted": {
+					"type": "boolean"
+				},
+				"waitId": {
+					"type": "integer"
+				}
+			},
+			"required": [
+				"type",
+				"aborted",
+				"waitId"
+			]
+		},
 		"CacheWarmingStartEvent": {
 			"type": "object",
 			"properties": {
@@ -4223,6 +4288,12 @@
 				},
 				{
 					"$ref": "#/$defs/AutoRetryEndEvent"
+				},
+				{
+					"$ref": "#/$defs/ProviderRetryWaitStartEvent"
+				},
+				{
+					"$ref": "#/$defs/ProviderRetryWaitEndEvent"
 				},
 				{
 					"$ref": "#/$defs/CacheWarmingStartEvent"

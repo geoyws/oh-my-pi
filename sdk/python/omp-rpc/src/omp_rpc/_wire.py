@@ -1076,6 +1076,26 @@ class AutoRetryEndEvent:
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
+class ProviderRetryWaitStartEvent:
+    type: Literal["provider_retry_wait_start"] = "provider_retry_wait_start"
+    wait_id: int
+    role: Literal["main", "advisor", "side"]
+    delay_ms: int
+    model: str
+    provider: str
+    api: str
+    attempt: int | None = None
+    max_attempts: int | None = None
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class ProviderRetryWaitEndEvent:
+    type: Literal["provider_retry_wait_end"] = "provider_retry_wait_end"
+    aborted: bool
+    wait_id: int
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
 class CacheWarmingStartEvent:
     """A prompt-cache refresh was handed to the provider."""
     type: Literal["cache_warming_start"] = "cache_warming_start"
@@ -1600,7 +1620,7 @@ UsageLimitState: TypeAlias = UsageLimitLowPriority | UsageLimitWrapUp
 """Provider-neutral state of an account past its usage limit, discriminated by `stage`."""
 
 
-RpcAgentEvent: TypeAlias = AgentStartEvent | AgentEndEvent | TurnStartEvent | TurnEndEvent | MessageStartEvent | MessageUpdateEvent | MessageEndEvent | ToolExecutionStartEvent | ToolExecutionUpdateEvent | ToolStreamUpdateEvent | ToolExecutionEndEvent | AutoCompactionStartEvent | AutoCompactionEndEvent | AutoRetryStartEvent | AutoRetryEndEvent | CacheWarmingStartEvent | CacheWarmingEndEvent | RetryFallbackAppliedEvent | RetryFallbackSucceededEvent | ModelChangedEvent | ConfigWarningsChangedEvent | AdvisorCostChangedEvent | AdvisorYieldedEvent | TtsrTriggeredEvent | TodoReminderEvent | TodoAutoClearEvent | IrcMessageEvent | NoticeEvent | ThinkingLevelChangedEvent | GoalUpdatedEvent | QueueUpdateEvent
+RpcAgentEvent: TypeAlias = AgentStartEvent | AgentEndEvent | TurnStartEvent | TurnEndEvent | MessageStartEvent | MessageUpdateEvent | MessageEndEvent | ToolExecutionStartEvent | ToolExecutionUpdateEvent | ToolStreamUpdateEvent | ToolExecutionEndEvent | AutoCompactionStartEvent | AutoCompactionEndEvent | AutoRetryStartEvent | AutoRetryEndEvent | ProviderRetryWaitStartEvent | ProviderRetryWaitEndEvent | CacheWarmingStartEvent | CacheWarmingEndEvent | RetryFallbackAppliedEvent | RetryFallbackSucceededEvent | ModelChangedEvent | ConfigWarningsChangedEvent | AdvisorCostChangedEvent | AdvisorYieldedEvent | TtsrTriggeredEvent | TodoReminderEvent | TodoAutoClearEvent | IrcMessageEvent | NoticeEvent | ThinkingLevelChangedEvent | GoalUpdatedEvent | QueueUpdateEvent
 """A session event, discriminated by `type`; `set_event_filter` selects which are sent."""
 
 
@@ -2410,6 +2430,30 @@ def parse_auto_retry_end_event(value: object, path: str = "AutoRetryEndEvent") -
     )
 
 
+def parse_provider_retry_wait_start_event(value: object, path: str = "ProviderRetryWaitStartEvent") -> ProviderRetryWaitStartEvent:
+    payload = expect_object(value, path)
+    required(payload, "type", cast('Decoder[Literal["provider_retry_wait_start"]]', literal(frozenset({"provider_retry_wait_start"}))), path)
+    return ProviderRetryWaitStartEvent(
+        wait_id=required(payload, "waitId", decode_int, path),
+        role=required(payload, "role", cast('Decoder[Literal["main", "advisor", "side"]]', literal(frozenset({"main", "advisor", "side"}))), path),
+        delay_ms=required(payload, "delayMs", decode_int, path),
+        model=required(payload, "model", decode_str, path),
+        provider=required(payload, "provider", decode_str, path),
+        api=required(payload, "api", decode_str, path),
+        attempt=optional(payload, "attempt", decode_int, path),
+        max_attempts=optional(payload, "maxAttempts", decode_int, path),
+    )
+
+
+def parse_provider_retry_wait_end_event(value: object, path: str = "ProviderRetryWaitEndEvent") -> ProviderRetryWaitEndEvent:
+    payload = expect_object(value, path)
+    required(payload, "type", cast('Decoder[Literal["provider_retry_wait_end"]]', literal(frozenset({"provider_retry_wait_end"}))), path)
+    return ProviderRetryWaitEndEvent(
+        aborted=required(payload, "aborted", decode_bool, path),
+        wait_id=required(payload, "waitId", decode_int, path),
+    )
+
+
 def parse_cache_warming_start_event(value: object, path: str = "CacheWarmingStartEvent") -> CacheWarmingStartEvent:
     payload = expect_object(value, path)
     required(payload, "type", cast('Decoder[Literal["cache_warming_start"]]', literal(frozenset({"cache_warming_start"}))), path)
@@ -3033,6 +3077,8 @@ _RPC_AGENT_EVENT_CASES: Final[dict[str, Decoder[RpcAgentEvent]]] = {
         "auto_compaction_end": parse_auto_compaction_end_event,
         "auto_retry_start": parse_auto_retry_start_event,
         "auto_retry_end": parse_auto_retry_end_event,
+        "provider_retry_wait_start": parse_provider_retry_wait_start_event,
+        "provider_retry_wait_end": parse_provider_retry_wait_end_event,
         "cache_warming_start": parse_cache_warming_start_event,
         "cache_warming_end": parse_cache_warming_end_event,
         "retry_fallback_applied": parse_retry_fallback_applied_event,
@@ -3087,6 +3133,8 @@ _RPC_NOTIFICATION_CASES: Final[dict[str, Decoder[RpcNotification]]] = {
         "auto_compaction_end": parse_rpc_agent_event,
         "auto_retry_start": parse_rpc_agent_event,
         "auto_retry_end": parse_rpc_agent_event,
+        "provider_retry_wait_start": parse_rpc_agent_event,
+        "provider_retry_wait_end": parse_rpc_agent_event,
         "cache_warming_start": parse_rpc_agent_event,
         "cache_warming_end": parse_rpc_agent_event,
         "retry_fallback_applied": parse_rpc_agent_event,
@@ -3643,6 +3691,14 @@ class WireClient:
         """Subscribe to `auto_retry_end` frames."""
         return self._listen("auto_retry_end", listener)
 
+    def on_provider_retry_wait_start(self, listener: Callable[[ProviderRetryWaitStartEvent], None]) -> Callable[[], None]:
+        """Subscribe to `provider_retry_wait_start` frames."""
+        return self._listen("provider_retry_wait_start", listener)
+
+    def on_provider_retry_wait_end(self, listener: Callable[[ProviderRetryWaitEndEvent], None]) -> Callable[[], None]:
+        """Subscribe to `provider_retry_wait_end` frames."""
+        return self._listen("provider_retry_wait_end", listener)
+
     def on_cache_warming_start(self, listener: Callable[[CacheWarmingStartEvent], None]) -> Callable[[], None]:
         """Subscribe to `cache_warming_start`: A prompt-cache refresh was handed to the provider."""
         return self._listen("cache_warming_start", listener)
@@ -3826,6 +3882,8 @@ __all__ = [
     "PromptError",
     "PromptResultEvent",
     "PromptStatus",
+    "ProviderRetryWaitEndEvent",
+    "ProviderRetryWaitStartEvent",
     "PythonExecutionMessage",
     "QueueMode",
     "QueueUpdateEvent",
@@ -3999,6 +4057,8 @@ __all__ = [
     "parse_prompt_ack",
     "parse_prompt_error",
     "parse_prompt_result_event",
+    "parse_provider_retry_wait_end_event",
+    "parse_provider_retry_wait_start_event",
     "parse_python_execution_message",
     "parse_queue_update_event",
     "parse_queued_messages_state",

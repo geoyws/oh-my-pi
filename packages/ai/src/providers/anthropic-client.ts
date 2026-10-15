@@ -20,13 +20,14 @@
  *   `retry-after`, otherwise exponential backoff (0.5s * 2^n, capped at 8s,
  *   with up to 25% jitter).
  */
-import { scheduler } from "node:timers/promises";
 import * as AIError from "../error";
 import { AnthropicApiError, AnthropicConnectionError, AnthropicConnectionTimeoutError } from "../error";
+import { type OperationDeadlineOptions, operationDeadlineExceeded } from "../utils/operation-deadline";
+import { waitForRetry } from "../utils/retry-wait";
 
 export { AnthropicApiError, AnthropicConnectionError, AnthropicConnectionTimeoutError };
 
-import type { FetchImpl } from "../types";
+import type { FetchImpl, ProviderRetryWaitFn } from "../types";
 import type { MessageCreateParams } from "./anthropic-wire";
 
 /** Default pre-response timeout, matching the SDK's 10-minute default. */
@@ -51,6 +52,13 @@ export interface AnthropicRequestOptions {
 	 * the original error is surfaced. Non-positive values disable the cap. Defaults to 60000.
 	 */
 	maxRetryDelayMs?: number;
+	/**
+	 * Whole-operation budget and its absolute deadline, forwarded by the caller
+	 * so client-level retries count against the same budget as the provider loop
+	 * that wraps them. Omitted disables the check.
+	 */
+	operationTimeoutMs?: number;
+	operationDeadlineAt?: number;
 	/** Per-request headers merged after client defaults. */
 	headers?: Record<string, string>;
 }
@@ -93,6 +101,12 @@ export interface AnthropicClientOptions {
 	defaultHeaders?: Record<string, string>;
 	fetch?: FetchImpl;
 	fetchOptions?: AnthropicFetchOptions;
+	/**
+	 * Reports this client's own retry sleeps (429/529/5xx and connection
+	 * errors). Without it the sleeps are invisible above the transport, so a
+	 * multi-second overload backoff reads as a hung request.
+	 */
+	providerRetryWait?: ProviderRetryWaitFn;
 }
 
 function createAbortError(): Error {
@@ -274,7 +288,7 @@ export class AnthropicHttpClient {
 			} catch (error) {
 				if (callerSignal?.aborted) throw createAbortError();
 				if (attempt < maxRetries) {
-					await this.#backoff(attempt, undefined, callerSignal);
+					await this.#backoff(attempt, maxRetries, undefined, callerSignal, options);
 					continue;
 				}
 				if (error instanceof AIError.AnthropicConnectionTimeoutError) throw error;
@@ -293,7 +307,7 @@ export class AnthropicHttpClient {
 					throw await AIError.AnthropicApiError.fromResponse(response, callerSignal);
 				}
 				await response.body?.cancel().catch(() => {});
-				await this.#backoff(attempt, response.headers, callerSignal);
+				await this.#backoff(attempt, maxRetries, response.headers, callerSignal, options);
 				continue;
 			}
 
@@ -337,12 +351,27 @@ export class AnthropicHttpClient {
 
 	async #backoff(
 		attempt: number,
+		maxRetries: number,
 		responseHeaders: Headers | undefined,
 		signal: AbortSignal | undefined,
+		deadline: OperationDeadlineOptions | undefined,
 	): Promise<void> {
 		const delayMs = retryDelayFromHeaders(responseHeaders) ?? calculateAnthropicRetryDelayMs(attempt);
+		// A caller abort wins over the budget: an already-cancelled request must
+		// surface as aborted, not as a budget exhaustion the session would replay.
+		if (signal?.aborted) throw createAbortError();
+		// Client retries nest inside the caller's provider retry loop, so they
+		// spend the same whole-operation budget: refuse a sleep that would cross
+		// it rather than stacking another wait under one the caller already took.
+		const deadlineError = operationDeadlineExceeded(deadline, delayMs);
+		if (deadlineError) throw deadlineError;
 		try {
-			await scheduler.wait(delayMs, { signal });
+			// The hook only observes the wait: same delay, same signal, and an
+			// abort still surfaces as the canonical abort error below.
+			await waitForRetry(this.#options.providerRetryWait, delayMs, signal, {
+				attempt: attempt + 1,
+				maxAttempts: maxRetries,
+			});
 		} catch {
 			throw createAbortError();
 		}

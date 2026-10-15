@@ -1935,13 +1935,19 @@ export class Agent {
 				}
 				return this.#dequeueSteeringMessagesAfterHooks(signal ?? loopSignal);
 			},
-			hasSteeringMessages: () =>
-				steeringQueueState(
+			hasSteeringMessages: () => ({
+				// `pending` is raw queue occupancy, not the one-at-a-time batch size
+				// below: the provider-wait watcher compares it against the count it
+				// saw when the request was issued, so it must move with every queued
+				// message even while only the first one would be injected.
+				...steeringQueueState(
 					this.#steeringQueue,
 					this.#steeringMode === "one-at-a-time"
 						? Math.min(1, this.#steeringQueue.length)
 						: this.#steeringQueue.length,
 				),
+				pending: this.#steeringQueue.length,
+			}),
 			waitForSteeringMessages: signal => this.#waitForSteeringMessages(signal),
 			onLiveSteeringTaken: messages => this.#adoptLiveSteering(messages),
 			hasIrcInterrupts: this.hasIrcInterrupts,

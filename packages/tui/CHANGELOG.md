@@ -5,6 +5,7 @@
 ### Fixed
 
 - The usage dashboard now labels Anthropic accounts as Claude.
+- Task progress shows a subagent's provider-internal retry wait (`provider retrying N/M in …`) instead of a stalled running row ([#12785](https://github.com/can1357/oh-my-pi/pull/12785))
 
 ## [18.10.1] - 2026-10-12
 

@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Bounded the shared Anthropic keepalive pool (128 sockets per host, twice that process-wide, `PI_ANTHROPIC_MAX_SOCKETS` to change it) and made cancelling a request that is waiting for a socket take effect immediately instead of after the wait ([#12868](https://github.com/can1357/oh-my-pi/pull/12868)).
+### Added
+
+- Added `operationTimeoutMs`, an aggregate wall-clock budget for one logical provider request that spans every nested pi-ai retry of that request. It is checked before each retry sleep: a retry whose backoff would land past the budget fails immediately with `ProviderOperationDeadlineError` naming the budget and the elapsed time, instead of sleeping and leaving the caller silent. Enforced in the shared replay-safe stream retry, the Anthropic provider loop and HTTP client backoff, the OpenAI Responses transient stream retry, the Codex Responses websocket/provider/whitespace retries, and the Google and Gemini CLI empty-stream retries; a caller abort still wins everywhere. Omitted or `0` disables it. Independent of `streamIdleTimeoutMs`, which bounds silence inside one live stream and never interrupts a stream that is producing output ([#12786](https://github.com/can1357/oh-my-pi/pull/12786) by [@geoyws](https://github.com/geoyws)).
+- `operationTimeoutMs` now bounds time without progress rather than total duration: every provider loop calls `markOperationProgress` when an attempt produces output, re-basing the deadline to now + budget, so a long productive stream keeps its in-place transient retry while a silent ladder is still cut. Resolver-driven auth replays also refuse a new request when key resolution spends the shared budget, while caller aborts retain precedence. The budget also crosses the pi-native wire (`operationTimeoutMs` only — the gateway stamps its own `operationDeadlineAt`, and the client never forwards its epoch stamp).
+- Reported every provider-internal retry sleep (Anthropic client backoff and 529 retries, OpenAI Responses and Codex transient retries, Google empty-stream and Gemini CLI backoff, empty-completion and thinking-loop retries) through `providerRetryWait` with its attempt count, so callers can show the wait instead of a frozen request ([#12785](https://github.com/can1357/oh-my-pi/pull/12785))
+
 ## [18.9.2] - 2026-10-11
 
 ### Breaking Changes

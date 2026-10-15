@@ -15,6 +15,7 @@ import {
 } from "@oh-my-pi/pi-catalog/wire/gemini-headers";
 import { extractHttpStatusFromError, fetchWithRetry, readSseJson } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
+import { ProviderOperationDeadlineError } from "../error/validation";
 import type {
 	Api,
 	AssistantMessage,
@@ -32,6 +33,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 import { extractGoogleValidationUrl, formatGoogleValidationRequiredMessage } from "../utils/google-validation";
 import type { RawHttpRequestDump } from "../utils/http-inspector";
 import { armPreResponseTimeout, getStreamFirstEventTimeoutMs, iterateWithIdleTimeout } from "../utils/idle-iterator";
+import { markOperationProgress, operationDeadlineExceeded } from "../utils/operation-deadline";
 // Refresh is the sole responsibility of AuthStorage (broker-aware, single-flighted);
 // the stream provider trusts the access token threaded through `options.apiKey`.
 import { normalizeSchemaForCCA } from "../utils/schema";
@@ -701,6 +703,9 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 					const block = startTextBlock();
 					block.text += delta;
 					block.textSignature = retainThoughtSignature(block.textSignature, thoughtSignature);
+					// Producing output re-bases the operation deadline, so the
+					// budget bounds silence, not work.
+					markOperationProgress(options);
 					stream.push({
 						type: "text_delta",
 						contentIndex: blockIndex(),
@@ -713,6 +718,9 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 					if (!delta) return;
 					const block = startThinkingBlock();
 					block.thinking += delta;
+					// Producing output re-bases the operation deadline, so the
+					// budget bounds silence, not work.
+					markOperationProgress(options);
 					stream.push({
 						type: "thinking_delta",
 						contentIndex: blockIndex(),
@@ -978,8 +986,20 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 
 						if (emptyAttempt > 0) {
 							const backoffMs = EMPTY_STREAM_BASE_DELAY_MS * 2 ** (emptyAttempt - 1);
+							// Whole-operation budget: a retry whose sleep would land past it
+							// is refused now, with its own error, instead of adding to the
+							// silence. The caller-abort check above still wins.
+							const deadlineError = operationDeadlineExceeded(options, backoffMs);
+							if (deadlineError) throw deadlineError;
 							try {
-								await scheduler.wait(backoffMs, { signal: options?.signal });
+								// The hook only observes: same delay, same signal, and the
+								// catch below still converts an abort into AbortError.
+								if (options?.providerRetryWait)
+									await options.providerRetryWait(backoffMs, options.signal, {
+										attempt: emptyAttempt,
+										maxAttempts: MAX_EMPTY_STREAM_RETRIES,
+									});
+								else await scheduler.wait(backoffMs, { signal: options?.signal });
 							} catch {
 								throw new AIError.AbortError("Request was aborted");
 							}
@@ -1078,9 +1098,12 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 					break;
 				} catch (error) {
 					const status = extractHttpStatusFromError(error);
+					// A spent operation budget is final: failing over would start a
+					// fresh request with its own unbudgeted retries.
 					if (
 						!isLastEndpoint &&
 						!started &&
+						!(error instanceof ProviderOperationDeadlineError) &&
 						(AIError.isTransientStatus(status) ||
 							(status === undefined &&
 								!(error instanceof AIError.ProviderResponseError && error.kind === "output") &&
