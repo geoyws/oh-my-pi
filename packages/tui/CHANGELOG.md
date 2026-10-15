@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The usage dashboard now labels Anthropic accounts as Claude.
+
 ## [18.10.1] - 2026-10-12
 
 ### Added

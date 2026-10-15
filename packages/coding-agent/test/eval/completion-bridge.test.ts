@@ -968,7 +968,7 @@ describe("runEvalCompletion", () => {
 				{
 					session: makeSession(),
 					signal: idle.signal,
-					emitStatus: event => {
+					onTimeoutControl: event => {
 						ops.push(event.op);
 						if (event.op === EVAL_TIMEOUT_PAUSE_OP) idle.pause();
 						if (event.op === EVAL_TIMEOUT_RESUME_OP) idle.resume();

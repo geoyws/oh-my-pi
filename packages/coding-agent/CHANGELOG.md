@@ -5,6 +5,10 @@
 ### Fixed
 
 - Fixed a subagent whose `task.agentModelOverrides` entry is an explicit multi-entry list (e.g. scout) escaping its list on retry: the installed `subagent:<id>` chain used to lose to the current model's model-keyed chain, spending expensive models on readers. The list is now the session's complete retry chain — recovery walks it alone and stops with the normal exhausted-retry error when it runs out.
+- Fixed an eval cell being able to disarm its own timeout: a cell could emit the bridge's `timeout-pause` status event itself (`__omp_emit_status__` in JS, an `application/x-omp-status` display bundle in Python) and run unbounded. Pause authority now travels on a dedicated host-only control channel, so neither a runtime-emitted event nor a tool that happens to be *named* `timeout-pause` can suspend the deadline. Genuine `agent()`/`completion()`/`judge()`/`tool.*` waits are still exempt from the budget for as long as they take, and a nested resume no longer releases a deferred abort while an outer critical phase is still paused.
+- Fixed an eval cell timeout leaving the JS worker's own child processes running: terminating the worker now sweeps the process group it leads, so anything the timed-out cell spawned is reaped with it.
+- Eval runtime termination now waits a bounded window for the runtime's exit and logs the surviving pid when it cannot be confirmed, instead of reporting a kill it never observed.
+- `/usage` and `omp usage` now label Anthropic accounts as Claude.
 
 ## [18.10.1] - 2026-10-12
 

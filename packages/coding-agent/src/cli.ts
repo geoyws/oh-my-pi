@@ -569,8 +569,7 @@ export async function runCli(argv: string[]): Promise<void> {
 	}
 }
 
-// Floating call instead of top-level await: TLA forces `--bytecode` (CJS
-// lowering) builds to fail, and the entrypoint needs nothing after this.
+// The entrypoint needs nothing after this floating call.
 // The catch mirrors what an unhandled TLA rejection produced: error dump to
 // stderr, exit code 1. A settled entry leaves the exit code to the command. An
 // entry still pending when the event loop drains (an await that can never

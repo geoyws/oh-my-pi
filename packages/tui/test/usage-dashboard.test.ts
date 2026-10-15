@@ -385,7 +385,7 @@ describe("UsageDashboardComponent", () => {
 		const component = dashboard([report("anthropic", "a@test", [limit("anthropic", "a", "7d", label, 0.4, "ok")])]);
 		try {
 			const lines = component.render(24).map(line => Bun.stripANSI(line));
-			const first = lines.findIndex(line => line.includes("Claude"));
+			const first = lines.findIndex(line => line.includes("Claude 7 Day"));
 			const bar = lines.findIndex(line => /[█░]/.test(line));
 			expect(bar - first).toBeLessThanOrEqual(2);
 			expect(
@@ -441,11 +441,39 @@ describe("UsageDashboardComponent", () => {
 		try {
 			const output = Bun.stripANSI(component.render(100).join("\n"));
 			const title = output.split("\n").find(line => line.includes("2 accts"));
-			expect(title?.replace(/^[│\s]+/, "")).toStartWith(`${theme.status.error} Anthropic`);
+			expect(title?.replace(/^[│\s]+/, "")).toStartWith(`${theme.status.error} Claude`);
 		} finally {
 			component.dispose();
 		}
 	});
+
+	it("shows Claude alongside every other reporting provider in the overview", () => {
+		const now = Date.now();
+		const reports = [
+			report("anthropic", "primary@example.test", [limit("anthropic", "primary", "7d", "Weekly", 1, "exhausted")]),
+			report("anthropic", "secondary@example.test", [limit("anthropic", "secondary", "7d", "Weekly", 0.4, "ok")]),
+			...(["openai-codex", "zai", "kimi-code", "cursor"] as const).map(provider =>
+				report(provider, provider + "@example.test", [limit(provider, provider, "7d", "Weekly", 0.3, "ok")]),
+			),
+		];
+		const cards = buildProviderCards(reports, now);
+		expect(cards.find(card => card.provider === "anthropic")).toMatchObject({
+			name: "Claude",
+			accounts: 2,
+			idle: false,
+			windows: [{ status: "warning" }],
+		});
+		const component = dashboard(reports);
+		try {
+			const overview = Bun.stripANSI(component.render(120).join("\n"));
+			for (const brand of ["Claude", "Openai Codex", "Zai", "Kimi Code", "Cursor"]) {
+				expect(overview).toContain(brand);
+			}
+		} finally {
+			component.dispose();
+		}
+	});
+
 	it("renders specific error reason when activity loading fails instead of generic DB read error", async () => {
 		const { promise: rendered, resolve: markRendered } = Promise.withResolvers<void>();
 		const component = new UsageDashboardComponent({

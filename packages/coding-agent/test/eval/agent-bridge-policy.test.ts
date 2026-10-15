@@ -5,7 +5,11 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 import { AsyncJobManager } from "../../src/async";
 import { Settings } from "../../src/config/settings";
 import { runEvalAgent, type EvalAgentBridgeOptions, type EvalAgentResult } from "../../src/eval/agent-bridge";
-import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP } from "../../src/eval/bridge-timeout";
+import {
+	EVAL_TIMEOUT_PAUSE_OP,
+	EVAL_TIMEOUT_RESUME_OP,
+	type EvalTimeoutControlSink,
+} from "../../src/eval/bridge-timeout";
 import { runEvalWait } from "../../src/eval/handle-bridge";
 import { IdleTimeout } from "../../src/eval/idle-timeout";
 import { disposeAllVmContexts } from "../../src/eval/js/context-manager";
@@ -56,7 +60,10 @@ function isEvalAgentResult(value: unknown): value is EvalAgentResult {
 	);
 }
 
-async function runEvalAgentAndWait(args: unknown, options: EvalAgentBridgeOptions): Promise<EvalAgentResult> {
+async function runEvalAgentAndWait(
+	args: unknown,
+	options: EvalAgentBridgeOptions & { onTimeoutControl?: EvalTimeoutControlSink },
+): Promise<EvalAgentResult> {
 	const handle = await runEvalAgent(args, options);
 	const waited = await runEvalWait({ items: [{ kind: "agent", id: handle.id }] }, options);
 	const snapshot = waited.items[0];
@@ -864,7 +871,7 @@ describe("agent() through eval runtimes", () => {
 			{
 				session,
 				signal: idle.signal,
-				emitStatus: event => {
+				onTimeoutControl: event => {
 					ops.push(event.op);
 					if (event.op === EVAL_TIMEOUT_PAUSE_OP) idle.pause();
 					if (event.op === EVAL_TIMEOUT_RESUME_OP) idle.resume();
@@ -946,10 +953,15 @@ describe("agent() through eval runtimes", () => {
 			{
 				session,
 				signal: idle.signal,
-				emitStatus: event => {
+				onTimeoutControl: event => {
 					ops.push(event.op);
 					if (event.op === EVAL_TIMEOUT_PAUSE_OP) idle.pause();
 					if (event.op === EVAL_TIMEOUT_RESUME_OP) idle.resume();
+				},
+				// Progress snapshots arrive on the generic status sink and must not
+				// re-arm the watchdog; only the control channel above may.
+				emitStatus: event => {
+					ops.push(event.op);
 				},
 			},
 		);
@@ -1159,7 +1171,7 @@ describe("runEvalAgent isolation", () => {
 			{ prompt: "migration", isolated: true },
 			{
 				session: isolatedSession(),
-				emitStatus: event => {
+				onTimeoutControl: event => {
 					if (event.op === EVAL_TIMEOUT_PAUSE_OP || event.op === EVAL_TIMEOUT_RESUME_OP) ops.push(event.op);
 				},
 			},
@@ -1208,7 +1220,7 @@ describe("runEvalAgent isolation", () => {
 			{ prompt: "scout", isolated: true },
 			{
 				session: isolatedSession(),
-				emitStatus: event => {
+				onTimeoutControl: event => {
 					if (event.op === EVAL_TIMEOUT_PAUSE_OP || event.op === EVAL_TIMEOUT_RESUME_OP) ops.push(event.op);
 				},
 			},

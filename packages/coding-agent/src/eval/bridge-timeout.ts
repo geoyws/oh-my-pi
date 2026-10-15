@@ -9,10 +9,36 @@
  * back in control, the watchdog starts a fresh timeout window.
  *
  * Bridge helpers express that handoff with synthetic pause/resume status events
- * on the existing `emitStatus → onStatus` path. Consumers MUST treat these as
- * timeout-control events only: update the watchdog and drop them from rendered
- * or persisted cell output.
+ * on a dedicated host-only control channel ({@link EvalTimeoutControlSink}).
+ * Consumers MUST treat these as timeout-control events only: update the
+ * watchdog and drop them from rendered or persisted cell output.
+ *
+ * ## Pause authority is host-owned
+ *
+ * These events are *control* messages for the parent's deadline, so only the
+ * parent may mint them. {@link withBridgeTimeoutPause} emits a pause before
+ * the operation and its matching resume once the operation settles — one
+ * pause site plus a resume on the operation-error path and a resume on the
+ * success path — which is what makes a pause lifecycle-coupled to a real
+ * in-flight bridge call instead of to a message an evaluated cell can send.
+ *
+ * The status *data* channel (`__omp_emit_status__` in JS, an
+ * `application/x-omp-status` display bundle in Python) is reachable by
+ * evaluated code, so a runtime can forge a `timeout-pause` and disarm its own
+ * deadline forever. Every runtime → host status boundary therefore drops these
+ * ops with {@link rejectRuntimeTimeoutControl} and fails closed (deadline stays
+ * armed).
+ *
+ * Host-side status is not trustworthy by origin either: a generic status sink
+ * carries `{ op: <tool name> }` events, and a tool may simply be *named*
+ * `timeout-pause`. Authority is therefore carried by the channel, not by the
+ * string: {@link withBridgeTimeoutPause} writes to a dedicated
+ * {@link EvalTimeoutControlSink} that nothing else can reach, and every generic
+ * host status sink rejects a colliding op with
+ * {@link rejectTimeoutControlCollision}. Legitimate — and arbitrarily long —
+ * bridge waits are unaffected.
  */
+import { logger } from "@oh-my-pi/pi-utils";
 import type { JsStatusEvent } from "./js/shared/types";
 
 /** Synthetic status op emitted when a bridge call leaves the cell runtime. */
@@ -24,6 +50,75 @@ export const EVAL_TIMEOUT_RESUME_OP = "timeout-resume";
 /** Whether a status event is pure eval-timeout control and should not render. */
 export function isEvalTimeoutControlEvent(event: JsStatusEvent): boolean {
 	return event.op === EVAL_TIMEOUT_PAUSE_OP || event.op === EVAL_TIMEOUT_RESUME_OP;
+}
+
+/**
+ * Dedicated host-only channel for {@link EVAL_TIMEOUT_PAUSE_OP} /
+ * {@link EVAL_TIMEOUT_RESUME_OP}.
+ *
+ * Separate from the generic `emitStatus` sink on purpose: reaching this
+ * function *is* the authority to move the cell watchdog, so no string on a
+ * shared channel can impersonate it.
+ */
+export type EvalTimeoutControlSink = (event: JsStatusEvent) => void;
+
+/**
+ * Warn once per source+op per window. A cell can emit forged control events in
+ * a loop, and an unthrottled warn per event turns a hostile (or merely
+ * enthusiastic) cell into a host log flood.
+ */
+const REJECT_LOG_INTERVAL_MS = 60_000;
+const rejectLogState = new Map<string, { lastLoggedAt: number; suppressed: number }>();
+
+function logRejectedTimeoutControl(key: string, message: string, op: string): void {
+	const now = Date.now();
+	const state = rejectLogState.get(key);
+	if (state && now - state.lastLoggedAt < REJECT_LOG_INTERVAL_MS) {
+		state.suppressed++;
+		logger.debug(message, { op, suppressed: state.suppressed });
+		return;
+	}
+	logger.warn(message, { op, suppressed: state?.suppressed ?? 0 });
+	rejectLogState.set(key, { lastLoggedAt: now, suppressed: 0 });
+}
+
+/**
+ * Boundary guard for a status event arriving *from* a language runtime.
+ *
+ * Returns true when the event claims host-owned timeout authority and must be
+ * discarded: evaluated code can reach the status data channel, and honouring a
+ * forged `timeout-pause` would suspend the cell deadline indefinitely. Dropping
+ * it fails closed — the watchdog keeps running — and a lost/echoed resume
+ * cannot decrement a pause the host never took.
+ */
+export function rejectRuntimeTimeoutControl(event: JsStatusEvent, runtimeLabel: string): boolean {
+	if (!isEvalTimeoutControlEvent(event)) return false;
+	logRejectedTimeoutControl(
+		`runtime:${runtimeLabel}:${event.op}`,
+		`${runtimeLabel} runtime emitted a host-owned eval timeout control event; ignoring it`,
+		event.op,
+	);
+	return true;
+}
+
+/**
+ * Boundary guard for a *generic host* status sink (tool progress, tool errors,
+ * bridge progress). Those events carry `{ op: <tool name> }`, so a tool named
+ * `timeout-pause` would otherwise be read as a deadline suspension that never
+ * resumes.
+ *
+ * Returns true when the op collides with host-owned timeout control and the
+ * event must not be treated as authority. Real control never arrives here: it
+ * travels on {@link EvalTimeoutControlSink}.
+ */
+export function rejectTimeoutControlCollision(event: JsStatusEvent, sourceLabel: string): boolean {
+	if (!isEvalTimeoutControlEvent(event)) return false;
+	logRejectedTimeoutControl(
+		`host:${sourceLabel}:${event.op}`,
+		`${sourceLabel} status event collides with a reserved eval timeout control op; not treating it as timeout control`,
+		event.op,
+	);
+	return true;
 }
 
 /** Optional behavior for a timeout pause around a host bridge call. */
@@ -40,26 +135,55 @@ export interface BridgeTimeoutPauseOptions {
 
 /**
  * Run {@link operation} while suspending the eval watchdog through
- * {@link emitStatus}. A no-op wrapper when no status sink is wired.
+ * {@link onTimeoutControl}. A no-op wrapper when no control sink is wired.
+ *
+ * The sink is the dedicated control channel, never the generic `emitStatus`
+ * one: reaching it is the authority, so an ordinary tool status event that
+ * happens to carry the same `op` string can never move the deadline.
+ *
+ * Atomic-sink contract: production control sinks apply the pause (watchdog
+ * and abort shield) before fanning out to status observers, and observer
+ * fanout failures never escape the channel — the applied state stands and
+ * the failure is logged. A pause therefore either throws before mutating
+ * anything or succeeds with the pause held, so this wrapper pairs one pause
+ * with one resume and never emits a compensating resume: an unmatched
+ * resume would decrement an outer pause depth it does not own. A throwing
+ * resume likewise never masks the operation's own error; it only propagates
+ * when the operation itself succeeded.
  */
 export async function withBridgeTimeoutPause<T>(
-	emitStatus: ((event: JsStatusEvent) => void) | undefined,
+	onTimeoutControl: EvalTimeoutControlSink | undefined,
 	operation: () => Promise<T>,
 	options?: BridgeTimeoutPauseOptions,
 ): Promise<T> {
-	if (!emitStatus) return operation();
-	emitStatus(
-		options?.deferExternalAbort
-			? { op: EVAL_TIMEOUT_PAUSE_OP, deferExternalAbort: true }
-			: { op: EVAL_TIMEOUT_PAUSE_OP },
-	);
+	if (!onTimeoutControl) return operation();
+	const pause: JsStatusEvent = options?.deferExternalAbort
+		? { op: EVAL_TIMEOUT_PAUSE_OP, deferExternalAbort: true }
+		: { op: EVAL_TIMEOUT_PAUSE_OP };
+	const resume: JsStatusEvent = options?.deferExternalAbort
+		? { op: EVAL_TIMEOUT_RESUME_OP, deferExternalAbort: true }
+		: { op: EVAL_TIMEOUT_RESUME_OP };
+	// A throwing pause propagates with the operation unrun and no resume: per
+	// the atomic-sink contract nothing was mutated, and a compensating resume
+	// here would steal a depth level from an outer in-flight pause.
+	onTimeoutControl(pause);
+	let result: T;
 	try {
-		return await operation();
-	} finally {
-		emitStatus(
-			options?.deferExternalAbort
-				? { op: EVAL_TIMEOUT_RESUME_OP, deferExternalAbort: true }
-				: { op: EVAL_TIMEOUT_RESUME_OP },
-		);
+		result = await operation();
+	} catch (operationError) {
+		try {
+			onTimeoutControl(resume);
+		} catch {
+			// The bridge call already failed: its error explains the failure,
+			// so the balancing failure is logged instead of masking it.
+			logger.warn("eval bridge timeout resume failed after an operation error; keeping the operation error", {
+				op: EVAL_TIMEOUT_RESUME_OP,
+			});
+		}
+		throw operationError;
 	}
+	// A throwing resume here propagates: the operation itself succeeded, so
+	// there is no operation error to protect.
+	onTimeoutControl(resume);
+	return result;
 }
