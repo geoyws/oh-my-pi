@@ -7576,6 +7576,17 @@ export class AgentSession implements SettingsScope {
 			? await this.#buildImageDescriptionNotice(normalizedImages)
 			: undefined;
 
+		// A handler may have registered during preprocessing. Recheck only if no
+		// handler ran at submission, before the final generation/busy checks so
+		// admission cannot suspend between the busy check and turn ownership.
+		if (preGated && !preGated.refusalChecked && this.#extensionRunner?.hasHandlers("before_user_message")) {
+			preGated.refusalChecked = await this.#checkUserMessageRefusal(
+				expandedText,
+				normalizedImages,
+				options?.source ?? "unknown",
+			);
+		}
+
 		// abort() bumps #promptGeneration and can land while normalization and the
 		// vision-description call above are still in flight. #promptWithMessage below
 		// captures its own generation fresh at entry, so it cannot see this race and
@@ -7666,7 +7677,7 @@ export class AgentSession implements SettingsScope {
 			dispatched = await this.#promptWithMessage(message, expandedText, {
 				...options,
 				images: normalizedImages,
-				refusalChecked: refusalChecked || undefined,
+				preGated,
 				prependMessages:
 					preludeMessages.length > 0 ||
 					keywordNotices.length > 0 ||
@@ -8217,8 +8228,8 @@ export class AgentSession implements SettingsScope {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
 			acceptTerminalEmptyStop?: boolean;
-			/** #dispatchPrompt already admitted this message pre-normalization: mark it instead of re-running handlers. */
-			refusalChecked?: boolean;
+			/** Completed admission, even without handlers; only a true result marks the message checked. */
+			preGated?: { refusalChecked: boolean };
 		},
 	): Promise<boolean> {
 		// Pre-persistence `before_user_message` gate for direct turns: runs
@@ -8228,11 +8239,10 @@ export class AgentSession implements SettingsScope {
 		// (The idle prompt path gates earlier — before image normalization and
 		// the vision-description call — and arrives pre-checked.)
 		if (message.role === "user") {
-			if (options?.refusalChecked) {
-				this.#userMessageRefusalChecked.add(message);
-			} else if (await this.#checkUserMessageRefusal(expandedText, options?.images, options?.source ?? "unknown")) {
-				this.#userMessageRefusalChecked.add(message);
-			}
+			const refusalChecked = options?.preGated
+				? options.preGated.refusalChecked
+				: await this.#checkUserMessageRefusal(expandedText, options?.images, options?.source ?? "unknown");
+			if (refusalChecked) this.#userMessageRefusalChecked.add(message);
 		}
 		// Returns false when the prompt was dropped before reaching the agent —
 		// every pre-dispatch bail (generation bump from abort, disposal, usage
