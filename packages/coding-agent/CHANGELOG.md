@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Fixed isolated task checkouts escaping the sandbox through the copy itself: a committed symlink resolving outside the checkout (e.g. at the caller tree) used to survive into the isolation, so live child writes landed in the caller, and hand-planted git metadata (an absolute `commondir`, symlinked `refs/`/`objects`, or an admin outside submodule prefixes or under `node_modules`) could let task git operations write the source checkout. Setup now walks the final copy once (about 0.2s on this repo) and either re-anchors source-internal links into the copy or refuses hand-out with a deterministic error naming the offending entry; in-copy links and detached private admins keep working.
 - Fixed a subagent whose `task.agentModelOverrides` entry is an explicit multi-entry list (e.g. scout) escaping its list on retry: the installed `subagent:<id>` chain used to lose to the current model's model-keyed chain, spending expensive models on readers. The list is now the session's complete retry chain — recovery walks it alone and stops with the normal exhausted-retry error when it runs out.
 
 ## [18.10.1] - 2026-10-12
