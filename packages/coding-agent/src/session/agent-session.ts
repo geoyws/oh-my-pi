@@ -158,6 +158,7 @@ import { extensionEventFromSessionEvent } from "../extensibility/extensions/life
 import { ManagedTimers } from "../extensibility/extensions/managed-timers";
 import { createExtensionModelQuery } from "../extensibility/extensions/model-api";
 import type { CompactOptions, ContextUsage } from "../extensibility/extensions/types";
+import type { UserMessageSource } from "../extensibility/extensions/types";
 import type { CustomCommandContext } from "../extensibility/custom-commands/types";
 import { SkillDescriptionCatalog } from "../extensibility/skill-descriptions";
 import type { Skill, SkillWarning } from "../extensibility/skills";
@@ -572,6 +573,23 @@ export class PromptDroppedError extends Error {
 }
 
 /**
+ * Rejection when a `before_user_message` extension handler refuses a user
+ * message. The message was NOT sent to the provider, NOT persisted, and NOT
+ * queued. {@link notice} (== {@link Error.message}) is the handler's safe
+ * notice verbatim — the only text any UI may display for the refusal. It
+ * never contains the message text.
+ */
+export class UserMessageRefusedError extends Error {
+	readonly notice: string;
+	constructor(notice?: string) {
+		const safe = notice?.trim() ? notice : "An extension refused to send this message.";
+		super(safe);
+		this.name = "UserMessageRefusedError";
+		this.notice = safe;
+	}
+}
+
+/**
  * A transcript snapshot ({@link AgentSession.fork} at an entry, a /btw branch) was
  * refused because a turn, user command, or maintenance pass could still write into
  * the transcript. RPC maps it to the `session_busy` error code.
@@ -849,6 +867,15 @@ export class AgentSession implements SettingsScope {
 	 * command.
 	 */
 	readonly #queuedMessageRawText = new WeakMap<AgentMessage, string>();
+
+	/**
+	 * User messages that already passed the `before_user_message` gate at
+	 * submission time (`#queueUserMessage`, `#promptWithMessage`). The
+	 * delivery-time rechecks (`#prepareQueuedUserMessages`,
+	 * `#resumeStrandedIrcAsides`) skip them so handlers run once per message;
+	 * they still check anything enqueued before handlers were registered.
+	 */
+	readonly #userMessageRefusalChecked = new WeakSet<AgentMessage>();
 
 	// Event subscription state
 	#unsubscribeAgent?: () => void;
@@ -1273,6 +1300,40 @@ export class AgentSession implements SettingsScope {
 		// Parked wake records resume alongside ordinary stranded asides; they were
 		// already decided wake-intended at deferral time.
 		const records = [...this.#irc.drainDeferredWakes(), ...this.#irc.drainPending()];
+		// Delivery-time recheck for asides enqueued before `before_user_message`
+		// handlers were registered. Already-gated records deliver synchronously
+		// below; unchecked user records are filtered asynchronously first.
+		if (
+			this.#extensionRunner?.hasHandlers("before_user_message") &&
+			records.some(record => isUserAuthoredQueuedMessage(record) && !this.#userMessageRefusalChecked.has(record))
+		) {
+			void this.#deliverStrandedAsidesAfterRefusalCheck(records).catch(error => {
+				logger.warn("Stranded aside refusal check failed; dropping drained records", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
+			return;
+		}
+		this.#deliverStrandedAsides(records);
+	}
+
+	/** Async leg of the aside delivery recheck: drop refused user records, then deliver the rest. */
+	async #deliverStrandedAsidesAfterRefusalCheck(records: AgentMessage[]): Promise<void> {
+		const userMessages = records.filter(isUserAuthoredQueuedMessage);
+		// Refused entries are removed from `records` in place (with their
+		// hidden companions when nothing user-authored survives); whatever
+		// remains is deliverable. A refusal is final and must never be restored.
+		await this.#dropRefusedDelivery(records, userMessages, "aside");
+		if (records.length === 0) return;
+		this.#deliverStrandedAsides(records);
+	}
+
+	/**
+	 * Deliver already-drained aside records: fold into context in plan mode or
+	 * under a user interrupt, otherwise wake a turn. Extracted from
+	 * `#resumeStrandedIrcAsides` so the async refusal recheck can reuse it.
+	 */
+	#deliverStrandedAsides(records: AgentMessage[]): void {
 		if (this.#planModeState?.enabled) {
 			// Plan mode: fold stranded IRC asides into context without waking an
 			// autonomous turn. Convergence to ask/resolve stays user-driven.
@@ -2021,25 +2082,49 @@ export class AgentSession implements SettingsScope {
 		// boundary injection would drain them. Foreground tools are unaffected.
 		this.agent.hasQueuedAsides = () => this.#irc.hasAsides();
 		this.agent.setAsideMessageProvider(() => {
-			const thunks: AsideMessage[] = this.#irc.drainPending().map(record => () => record);
-			thunks.push(...this.yieldQueue.drainLazy());
-			// Mid-run todo reconciliation — evaluated at injection time so a turn
-			// that flips a todo just before this poll suppresses the nudge.
-			thunks.push(() => this.#todo.takeMidRunNudge());
-			const contextNotesReminder = this.#experimentalContextNotesReminder;
-			if (contextNotesReminder) {
-				this.#experimentalContextNotesReminder = undefined;
-				if (contextNotesReminder.generation === this.#promptGeneration) {
-					thunks.push(() => ({
-						role: "custom",
-						customType: "experimental-context-notes-reminder",
-						content: contextNotesReminder.prompt,
-						display: false,
-						timestamp: Date.now(),
-					}));
+			const drained = this.#irc.drainPending();
+			const buildThunks = (): AsideMessage[] => {
+				const thunks: AsideMessage[] = drained.map(record => () => record);
+				thunks.push(...this.yieldQueue.drainLazy());
+				// Mid-run todo reconciliation — evaluated at injection time so a turn
+				// that flips a todo just before this poll suppresses the nudge.
+				thunks.push(() => this.#todo.takeMidRunNudge());
+				const contextNotesReminder = this.#experimentalContextNotesReminder;
+				if (contextNotesReminder) {
+					this.#experimentalContextNotesReminder = undefined;
+					if (contextNotesReminder.generation === this.#promptGeneration) {
+						thunks.push(() => ({
+							role: "custom",
+							customType: "experimental-context-notes-reminder",
+							content: contextNotesReminder.prompt,
+							display: false,
+							timestamp: Date.now(),
+						}));
+					}
 				}
+				return thunks;
+			};
+			// Delivery-time recheck for asides enqueued before `before_user_message`
+			// handlers were registered: refuse before step-boundary injection can
+			// reach the provider or persistence. Already-gated records skip the
+			// handler pass via #dropRefusedDelivery's checked set.
+			if (
+				this.#extensionRunner?.hasHandlers("before_user_message") &&
+				drained.some(record => isUserAuthoredQueuedMessage(record) && !this.#userMessageRefusalChecked.has(record))
+			) {
+				return (async () => {
+					try {
+						await this.#dropRefusedDelivery(drained, drained.filter(isUserAuthoredQueuedMessage), "aside");
+					} catch (error) {
+						logger.warn("Aside refusal check failed; dropping drained asides", {
+							error: error instanceof Error ? error.message : String(error),
+						});
+						drained.length = 0;
+					}
+					return buildThunks();
+				})();
 			}
-			return thunks;
+			return buildThunks();
 		});
 		this.#convertToLlm = config.convertToLlm ?? convertToLlm;
 		this.getXdevToolEntries = config.getXdevToolEntries ?? (() => []);
@@ -7367,6 +7452,7 @@ export class AgentSession implements SettingsScope {
 				attribution: promptAttribution,
 				prependMessages: keywordNotices,
 				rawText: typedText,
+				source: options?.source,
 				onPromptAdmitted: options?.onPromptAdmitted,
 				promptGeneration: queueGeneration,
 			});
@@ -7442,6 +7528,7 @@ export class AgentSession implements SettingsScope {
 				attribution: promptAttribution,
 				prependMessages: keywordNotices,
 				rawText: typedText,
+				source: options?.source,
 				preprocessed: {
 					images: normalizedImages,
 					descriptionNotice: imageDescriptionNotice,
@@ -7682,17 +7769,108 @@ export class AgentSession implements SettingsScope {
 		return images.length > 0 ? this.#buildImageDescriptionNotice(images) : undefined;
 	}
 
+	/**
+	 * Pre-persistence `before_user_message` gate. No-op (returns `false`) when
+	 * no extension handles the event. Otherwise runs every handler in order and
+	 * throws {@link UserMessageRefusedError} on the first refusal — the
+	 * message must then not reach the provider, the session JSONL, or any
+	 * queue, and only the handler's safe notice may be surfaced. Returns
+	 * `true` when the gate ran, so callers can mark the admitted message and
+	 * spare the delivery-time recheck a second handler pass.
+	 */
+	async #checkUserMessageRefusal(
+		text: string,
+		images: ImageContent[] | undefined,
+		source: UserMessageSource,
+	): Promise<boolean> {
+		const runner = this.#extensionRunner;
+		if (!runner?.hasHandlers("before_user_message")) return false;
+		const { refused, notice } = await runner.emitBeforeUserMessage(text, images, source);
+		if (refused) throw new UserMessageRefusedError(notice);
+		return true;
+	}
+
+	/** Split a queued user message into gate input (text plus image parts). */
+	#queuedUserMessageGateInput(message: AgentMessage): { text: string; images: ImageContent[] } {
+		const parts: string[] = [];
+		const images: ImageContent[] = [];
+		if ("content" in message) {
+			if (typeof message.content === "string") {
+				parts.push(message.content);
+			} else {
+				for (const part of message.content) {
+					if (part.type === "text") parts.push(part.text);
+					else if (part.type === "image") images.push(part);
+				}
+			}
+		}
+		return { text: parts.join(""), images };
+	}
+
+	/**
+	 * Fail-closed delivery recheck for already-queued user messages: anything
+	 * enqueued before `before_user_message` handlers were registered (never
+	 * marked by the submission-time gate) faces the check here, at the last
+	 * moment before provider dispatch. Refused messages are removed from the
+	 * dequeued batch in place so the agent loop cannot deliver or persist
+	 * them; when no user-authored message survives, their hidden companions
+	 * go too. Each refusal emits a `notice` event carrying only the handler's
+	 * safe notice. Returns the surviving user-authored messages.
+	 */
+	async #dropRefusedDelivery(
+		messages: readonly AgentMessage[],
+		userMessages: AgentMessage[],
+		source: "queued" | "aside",
+	): Promise<AgentMessage[]> {
+		const runner = this.#extensionRunner;
+		if (!runner?.hasHandlers("before_user_message")) return userMessages;
+		const mutable = messages as AgentMessage[];
+		const survivors: AgentMessage[] = [];
+		for (const message of userMessages) {
+			if (this.#userMessageRefusalChecked.has(message)) {
+				survivors.push(message);
+				continue;
+			}
+			const { text, images } = this.#queuedUserMessageGateInput(message);
+			const { refused, notice } = await runner.emitBeforeUserMessage(
+				text,
+				images.length > 0 ? images : undefined,
+				source,
+			);
+			this.#userMessageRefusalChecked.add(message);
+			if (!refused) {
+				survivors.push(message);
+				continue;
+			}
+			const index = mutable.indexOf(message);
+			if (index >= 0) mutable.splice(index, 1);
+			this.emitNotice("warning", notice ?? "An extension refused to send this message.", "before_user_message");
+		}
+		if (survivors.length === 0) {
+			for (let index = mutable.length - 1; index >= 0; index--) {
+				if (isHiddenUserCompanion(mutable[index])) mutable.splice(index, 1);
+			}
+		}
+		return survivors;
+	}
+
 	/** Queue ownership belongs to Agent; only actual user deliveries refresh submission policy. */
-	#prepareQueuedUserMessages = (
+	#prepareQueuedUserMessages = async (
 		messages: readonly AgentMessage[],
 		signal: AbortSignal,
-	): Promise<QueuedMessagePreparation> | undefined => {
+	): Promise<QueuedMessagePreparation | undefined> => {
 		const userMessages = messages.filter(isUserAuthoredQueuedMessage);
-		const first = userMessages[0];
+		if (userMessages.length === 0) return undefined;
+		// Delivery-time recheck: messages enqueued before `before_user_message`
+		// handlers were registered were never submission-gated. Refused entries
+		// are already removed from `messages` here; an emptied batch delivers
+		// nothing (the agent loop skips zero-length batches) and persists nothing.
+		const survivors = await this.#dropRefusedDelivery(messages, userMessages, "queued");
+		const first = survivors[0];
 		if (!first) return undefined;
 		const text: string[] = [];
 		const images: ImageContent[] = [];
-		for (const message of userMessages) {
+		for (const message of survivors) {
 			if (!("content" in message)) continue;
 			if (typeof message.content === "string") {
 				text.push(message.content);
@@ -7836,13 +8014,22 @@ export class AgentSession implements SettingsScope {
 		expandedText: string,
 		options?: Pick<
 			PromptOptions,
-			"toolChoice" | "images" | "skipCompactionCheck" | "solutionSpace" | "onPromptAdmitted"
+			"toolChoice" | "images" | "skipCompactionCheck" | "solutionSpace" | "onPromptAdmitted" | "source"
 		> & {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
 			acceptTerminalEmptyStop?: boolean;
 		},
 	): Promise<boolean> {
+		// Pre-persistence `before_user_message` gate for direct turns: runs
+		// before any provider dispatch, persistence, or queue insertion, so a
+		// refusal throws before the message exists anywhere but the caller.
+		// Custom/agent messages (skills, continuations) are not user input.
+		if (message.role === "user") {
+			if (await this.#checkUserMessageRefusal(expandedText, options?.images, options?.source ?? "unknown")) {
+				this.#userMessageRefusalChecked.add(message);
+			}
+		}
 		// Returns false when the prompt was dropped before reaching the agent —
 		// every pre-dispatch bail (generation bump from abort, disposal, usage
 		// preflight denial) exits silently, and prompt() uses the outcome to hand
@@ -8250,6 +8437,7 @@ export class AgentSession implements SettingsScope {
 			timestamp: submittedAt,
 			attribution: options?.attribution,
 			rawText: text,
+			source: options?.source,
 		});
 	}
 
@@ -8275,6 +8463,7 @@ export class AgentSession implements SettingsScope {
 				timestamp: submittedAt,
 				attribution: options?.attribution,
 				rawText: text,
+				source: options?.source,
 			});
 			return;
 		}
@@ -8358,6 +8547,8 @@ export class AgentSession implements SettingsScope {
 			};
 			/** Called synchronously once the message is pushed onto its queue. See {@link PromptOptions.onPromptAdmitted}. */
 			onPromptAdmitted?: () => void;
+			/** Where this message entered the session (for the `before_user_message` gate). */
+			source?: UserMessageSource;
 			/**
 			 * `#promptGeneration` captured when prompt() took this submission. abort() (or a
 			 * history rewrite) bumps it; if that lands while images are being prepared, the
@@ -8366,6 +8557,13 @@ export class AgentSession implements SettingsScope {
 			promptGeneration?: number;
 		},
 	): Promise<boolean> {
+		// Pre-persistence `before_user_message` gate for queued entries: runs
+		// before any state mutation or queue insertion, so a refusal throws
+		// before the message exists anywhere but the caller.
+		const refusalChecked = await this.#checkUserMessageRefusal(text, images, options?.source ?? "unknown");
+		const markRefusalChecked = (message: AgentMessage): void => {
+			if (refusalChecked) this.#userMessageRefusalChecked.add(message);
+		};
 		const attribution = options?.attribution ?? "user";
 		const timestamp = options?.timestamp;
 		const rawText = options?.rawText ?? text;
@@ -8409,6 +8607,7 @@ export class AgentSession implements SettingsScope {
 			if (imageDescriptionNotice) records.push(imageDescriptionNotice);
 			const userMessage: AgentMessage = { role: "user", content, attribution, timestamp: timestamp ?? Date.now() };
 			this.#queuedMessageRawText.set(userMessage, rawText);
+			markRefusalChecked(userMessage);
 			records.push(userMessage);
 			this.#irc.queueAside(records);
 			options?.onPromptAdmitted?.();
@@ -8432,6 +8631,7 @@ export class AgentSession implements SettingsScope {
 				timestamp: timestamp ?? Date.now(),
 			};
 			this.#queuedMessageRawText.set(userMessage, rawText);
+			markRefusalChecked(userMessage);
 			this.agent.followUp(userMessage);
 		} else {
 			for (const notice of prependMessages) this.agent.steer(notice);
@@ -8445,6 +8645,7 @@ export class AgentSession implements SettingsScope {
 				timestamp: timestamp ?? Date.now(),
 			};
 			this.#queuedMessageRawText.set(userMessage, rawText);
+			markRefusalChecked(userMessage);
 			this.agent.steer(userMessage);
 		}
 		options?.onPromptAdmitted?.();
@@ -8953,17 +9154,26 @@ export class AgentSession implements SettingsScope {
 		let deliveredAsAside = false;
 		if (options?.deliverAs === "aside") {
 			if (this.isStreaming) {
-				await this.#queueUserMessage(text, images, "aside", { attribution: options.attribution });
+				await this.#queueUserMessage(text, images, "aside", {
+					attribution: options.attribution,
+					source: options.source,
+				});
 				return;
 			}
 			// Idle: fall through to the prompt flow below (starts a turn, like an omitted
 			// deliverAs) — there is no live run to inject an aside into.
 			deliveredAsAside = true;
 		} else if (options?.deliverAs === "followUp") {
-			await this.#queueUserMessage(text, images, "followUp", { attribution: options.attribution });
+			await this.#queueUserMessage(text, images, "followUp", {
+				attribution: options.attribution,
+				source: options.source,
+			});
 			return;
 		} else if (options?.deliverAs === "steer") {
-			await this.#queueUserMessage(text, images, "steer", { attribution: options.attribution });
+			await this.#queueUserMessage(text, images, "steer", {
+				attribution: options.attribution,
+				source: options.source,
+			});
 			return;
 		}
 
@@ -8978,6 +9188,7 @@ export class AgentSession implements SettingsScope {
 			attribution: options?.attribution,
 			expandPromptTemplates: false,
 			images,
+			source: options?.source,
 			streamingBehavior: deliveredAsAside ? "aside" : "steer",
 		});
 	}

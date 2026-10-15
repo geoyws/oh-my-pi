@@ -3356,11 +3356,14 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	/**
-	 * Hands back a prompt the session dropped before dispatch (an Esc abort or
-	 * usage preflight denial raced turn setup). The message was never persisted,
-	 * so the tree/branch selectors cannot offer it — remove the optimistic
-	 * transcript row and put the typed text back in the editor for editing.
+	 * Hands back a submission refused by a `before_user_message` handler. The
+	 * refused text was never sent or persisted; restore it for editing like
+	 * any other dropped prompt.
 	 */
+	restoreRefusedPrompt(prompt: DroppedPrompt): void {
+		this.#restoreDroppedPrompt(prompt);
+	}
+
 	#restoreDroppedPrompt(prompt: DroppedPrompt): void {
 		this.clearOptimisticUserMessage();
 		this.#pendingWorkingMessage = undefined;
@@ -3369,11 +3372,15 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		this.rebuildChatFromMessages();
 		// The drop arrives asynchronously (after the abort settles); never clobber
-		// a draft the user has already started typing in the meantime.
+		// a draft the user has already started typing in the meantime. Images
+		// likewise only restore onto an empty pending tray, so attachments added
+		// since the submission are kept.
 		if (!this.editor.getText().trim()) {
-			this.editor.pendingImages = prompt.images ? [...prompt.images] : [];
-			this.editor.pendingImageLinks = prompt.images ? prompt.images.map(() => undefined) : [];
-			this.editor.imageLinks = this.editor.pendingImageLinks;
+			if (this.editor.pendingImages.length === 0) {
+				this.editor.pendingImages = prompt.images ? [...prompt.images] : [];
+				this.editor.pendingImageLinks = prompt.images ? prompt.images.map(() => undefined) : [];
+				this.editor.imageLinks = this.editor.pendingImageLinks;
+			}
 			this.editor.setText(prompt.text);
 		}
 		this.ui.requestRender();

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a `before_user_message` extension event that gates a user message after command/template expansion but before it reaches the provider, the session JSONL, or any persisting queue. Returning `{ refuse: true, notice }` drops the message (never sent, never persisted) and surfaces only the handler's safe notice; the interactive draft is handed back for editing. A handler that throws or times out refuses the message (fail-closed).
+
 ## [18.10.1] - 2026-10-12
 
 ### Added

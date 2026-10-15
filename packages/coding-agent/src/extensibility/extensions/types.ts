@@ -1173,12 +1173,42 @@ export interface UserPythonEvent {
 // Input Events
 // ============================================================================
 
+/** Where a user message entered the session. `queued`/`aside` name the
+ * delivery-time recheck of a message that was already queued; every other
+ * value names the submission path. `unknown` means the caller did not say
+ * (programmatic sends that bypass the known ingress points). */
+export type UserMessageSource = "interactive" | "rpc" | "acp" | "print" | "extension" | "queued" | "aside" | "unknown";
+
 /** Fired when the user submits input (interactive mode only). */
 export interface InputEvent {
 	type: "input";
 	text: string;
 	images?: ImageContent[];
 	source: "interactive" | "rpc" | "extension";
+}
+
+/**
+ * Pre-persistence gate for a user message. Fires at submission (before the
+ * message reaches the provider, the session JSONL, or any queue that later
+ * persists it) and again at queued/aside delivery, so a message enqueued
+ * before extensions finished registering still faces the check.
+ *
+ * Unlike `input` (interactive/RPC ingress only, `handled: true` clears the
+ * draft), this covers every user-message ingress and a refusal keeps the
+ * interactive editor draft. Return `{ refuse: true, notice }` to drop the
+ * message: it is never sent, never persisted, and the UI shows only `notice`.
+ * The notice is the extension's responsibility — it must be safe to display
+ * verbatim and must never quote the message text. A refusal without a notice
+ * receives a generic fallback. Any other return (including `undefined`)
+ * admits the message. A handler that throws or exceeds its timeout refuses
+ * the message (fail-closed) with the generic fallback notice.
+ */
+export interface BeforeUserMessageEvent {
+	type: "before_user_message";
+	/** The user message text as submitted (post command/template expansion at submission time). */
+	text: string;
+	images?: ImageContent[];
+	source: UserMessageSource;
 }
 
 // ============================================================================
@@ -1376,6 +1406,7 @@ export type ExtensionEvent =
 	| UserBashEvent
 	| UserPythonEvent
 	| InputEvent
+	| BeforeUserMessageEvent
 	| ToolCallEvent
 	| ToolResultEvent
 	| ToolApprovalRequestedEvent
@@ -1416,6 +1447,14 @@ export interface InputEventResult {
 	text?: string;
 	/** Replace any pending images */
 	images?: ImageContent[];
+}
+
+/** Result from a `before_user_message` handler. Return `undefined` to admit the message. */
+export interface BeforeUserMessageEventResult {
+	/** Refuse the message: it is never sent, never persisted, never queued. */
+	refuse?: boolean;
+	/** Safe-to-display notice shown in place of the message. Must never quote the message text. */
+	notice?: string;
 }
 
 /** Result from user_bash event handler */
@@ -1580,6 +1619,10 @@ export interface ExtensionAPI {
 	on(event: "goal_updated", handler: ExtensionHandler<GoalUpdatedEvent>): void;
 	on(event: "credential_disabled", handler: ExtensionHandler<CredentialDisabledEvent>): void;
 	on(event: "input", handler: ExtensionHandler<InputEvent, InputEventResult>): void;
+	on(
+		event: "before_user_message",
+		handler: ExtensionHandler<BeforeUserMessageEvent, BeforeUserMessageEventResult>,
+	): void;
 	on(event: "tool_approval_requested", handler: ExtensionHandler<ToolApprovalRequestedEvent>): void;
 	on(event: "tool_approval_resolved", handler: ExtensionHandler<ToolApprovalResolvedEvent>): void;
 	on(event: "tool_call", handler: ExtensionHandler<ToolCallEvent, ToolCallEventResult>): void;

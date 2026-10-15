@@ -41,6 +41,7 @@ import type { InteractiveModeContext, SubmittedUserInput } from "../../modes/typ
 import manualContinuePrompt from "../../prompts/system/manual-continue.md" with { type: "text" };
 import { AgentRegistry } from "../../registry/agent-registry";
 import type { RestoredQueuedMessage } from "../../session/agent-session-types";
+import { UserMessageRefusedError } from "../../session/agent-session";
 import { USER_INTERRUPT_LABEL } from "../../session/messages";
 import { PINNED_HUD_TOGGLE_ID } from "@oh-my-pi/pi-tui/prompt/composer";
 import { pickRecentFocusableAgentId } from "./session-focus-controller";
@@ -937,6 +938,25 @@ export class InputController {
 		return { text, images, imageLinks };
 	}
 
+	/**
+	 * Restore a submission refused by a `before_user_message` handler. The
+	 * refused text was never sent or persisted; merge it back alongside any
+	 * newer draft typed while dispatch was pending (never clobber it) and
+	 * show only the handler's safe notice. Returns true when `error` is a
+	 * refusal; other errors fall through to the caller's own handling.
+	 */
+	#restoreRefusedSubmission(
+		error: unknown,
+		text: string,
+		images?: ImageContent[],
+		imageLinks?: (string | undefined)[],
+	): boolean {
+		if (!(error instanceof UserMessageRefusedError)) return false;
+		restoreDetachedDraft(this.ctx.editor, text, images, imageLinks);
+		this.ctx.showError(error.notice);
+		return true;
+	}
+
 	setupEditorSubmitHandler(): void {
 		this.ctx.editor.onSubmit = async (text: string) => {
 			const submittedText = text;
@@ -1196,8 +1216,9 @@ export class InputController {
 			if (this.#isLocalExtensionCommand(text)) {
 				this.ctx.editor.clearDraft(text);
 				try {
-					await this.ctx.session.prompt(text, { images: inputImages });
+					await this.ctx.session.prompt(text, { images: inputImages, source: "interactive" });
 				} catch (error) {
+					if (this.#restoreRefusedSubmission(error, text, inputImages, inputImageLinks)) return;
 					// Restore the snapshot only when nothing newer was attached
 					// while the command ran; otherwise the newer draft wins.
 					if (inputImages && inputImages.length > 0 && this.ctx.editor.pendingImages.length === 0) {
@@ -1230,7 +1251,7 @@ export class InputController {
 				try {
 					const forwarded = await this.ctx.withLocalSubmission(
 						text,
-						() => this.ctx.session.prompt(text, { streamingBehavior: "steer", images }),
+						() => this.ctx.session.prompt(text, { streamingBehavior: "steer", images, source: "interactive" }),
 						{ imageCount: images?.length ?? 0 },
 					);
 					// An inline `/loop` body arms the loop only after dispatch
@@ -1240,6 +1261,13 @@ export class InputController {
 					// state untouched, so the previous body (if any) survives.
 					if (submittedMode === "loop" && forwarded) this.ctx.setLoopPrompt(text);
 				} catch (error) {
+					// A refusal merges back alongside any newer draft instead of
+					// overwriting it (see #restoreRefusedSubmission).
+					if (this.#restoreRefusedSubmission(error, text, images, inputImageLinks)) {
+						this.ctx.updatePendingMessagesDisplay();
+						this.ctx.ui.requestRender();
+						return;
+					}
 					// Don't lose the queued steer draft: restore images then the collapsed
 					// text so chip tokens (and band cards) survive the retry.
 					if (images && images.length > 0) {
@@ -1307,7 +1335,7 @@ export class InputController {
 				try {
 					const forwarded = await this.ctx.withLocalSubmission(
 						text,
-						() => this.ctx.session.prompt(text, { streamingBehavior: "steer", images }),
+						() => this.ctx.session.prompt(text, { streamingBehavior: "steer", images, source: "interactive" }),
 						{
 							imageCount: images?.length ?? 0,
 						},
@@ -1317,6 +1345,14 @@ export class InputController {
 					// loop instead of resubmitting a local action on next idle.
 					if (!forwarded && this.ctx.loopPrompt === text) this.ctx.pauseLoop();
 				} catch (error) {
+					// A refusal merges back alongside any newer draft instead of
+					// overwriting it (see #restoreRefusedSubmission).
+					if (this.#restoreRefusedSubmission(error, text, images, inputImageLinks)) {
+						if (this.ctx.loopPrompt === text) this.ctx.pauseLoop();
+						this.ctx.updatePendingMessagesDisplay();
+						this.ctx.ui.requestRender();
+						return;
+					}
 					// Don't lose the message: hand images then collapsed text back to the
 					// editor so the user can retry (e.g. prompt dispatch rejecting an
 					// extension command).
@@ -1451,11 +1487,22 @@ export class InputController {
 			if (isContinueShortcut) {
 				await target.prompt(manualContinuePrompt, { synthetic: true, userInitiated: true });
 			} else {
-				await this.ctx.withLocalSubmission(text, () => target.prompt(text, { streamingBehavior, images }), {
-					imageCount: images?.length ?? 0,
-				});
+				await this.ctx.withLocalSubmission(
+					text,
+					() => target.prompt(text, { streamingBehavior, images, source: "interactive" }),
+					{
+						imageCount: images?.length ?? 0,
+					},
+				);
 			}
 		} catch (error) {
+			// A refusal merges back alongside any newer draft instead of
+			// overwriting it (see #restoreRefusedSubmission).
+			if (this.#restoreRefusedSubmission(error, text, images, imageLinks)) {
+				this.ctx.updatePendingMessagesDisplay();
+				this.ctx.ui.requestRender();
+				return;
+			}
 			// Hand the message back, mirroring the main submit error path: restore
 			// pasted images so the user can retry an image-only or text+image draft.
 			if (images && images.length > 0) {
@@ -1798,9 +1845,10 @@ export class InputController {
 							await this.ctx.session.prompt(message, {
 								images: queuedImages,
 								streamingBehavior: "followUp",
+								source: "interactive",
 							});
 						} else {
-							await this.ctx.session.followUp(message, queuedImages);
+							await this.ctx.session.followUp(message, queuedImages, { source: "interactive" });
 						}
 					},
 					{ imageCount: queuedImages?.length ?? 0 },
@@ -1930,7 +1978,7 @@ export class InputController {
 			try {
 				await this.ctx.withLocalSubmission(
 					text,
-					() => this.ctx.session.prompt(text, { streamingBehavior: "followUp", images }),
+					() => this.ctx.session.prompt(text, { streamingBehavior: "followUp", images, source: "interactive" }),
 					{ imageCount: images?.length ?? 0 },
 				);
 			} catch (error) {
@@ -1944,9 +1992,13 @@ export class InputController {
 		// Not streaming — just submit normally
 		this.ctx.editor.addToHistory(text);
 		try {
-			await this.ctx.withLocalSubmission(text, () => this.ctx.session.prompt(text, { images }), {
-				imageCount: images?.length ?? 0,
-			});
+			await this.ctx.withLocalSubmission(
+				text,
+				() => this.ctx.session.prompt(text, { images, source: "interactive" }),
+				{
+					imageCount: images?.length ?? 0,
+				},
+			);
 		} catch (error) {
 			restoreOnError(error);
 		}

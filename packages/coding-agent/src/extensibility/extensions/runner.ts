@@ -54,6 +54,8 @@ import type {
 	BeforeProviderRequestEventResult,
 	BeforeSubagentSpawnEvent,
 	BeforeSubagentSpawnEventResult,
+	BeforeUserMessageEvent,
+	BeforeUserMessageEventResult,
 	CompactOptions,
 	ContextEvent,
 	ContextEventResult,
@@ -102,6 +104,7 @@ import type {
 	UserBashEventResult,
 	UserPythonEvent,
 	UserPythonEventResult,
+	UserMessageSource,
 } from "./types";
 
 import { cfgExtensionHandlersToolCallTimeoutMs } from "../settings";
@@ -393,6 +396,7 @@ type RunnerEmitEvent = Exclude<
 	| BeforeProviderRequestEvent
 	| AfterProviderResponseEvent
 	| BeforeAgentStartEvent
+	| BeforeUserMessageEvent
 	| ResourcesDiscoverEvent
 	| InputEvent
 >;
@@ -1984,6 +1988,44 @@ export class ExtensionRunner {
 		if (currentText !== text) transformed.text = currentText;
 		if (currentImages !== images) transformed.images = currentImages;
 		return transformed;
+	}
+
+	/**
+	 * Pre-persistence user-message gate. First refusal wins; later handlers are
+	 * skipped. A refusal without a notice receives a generic fallback — the
+	 * notice is the extension's responsibility and must never quote the message.
+	 * Fail-closed: a handler that throws or exceeds its timeout refuses the
+	 * message (a leaked secret is irreversible; a blocked draft is recoverable
+	 * — the caller hands it back for editing). Failures still report through
+	 * the error channel. The runtime never logs the message text here.
+	 */
+	async emitBeforeUserMessage(
+		text: string,
+		images: ImageContent[] | undefined,
+		source: UserMessageSource,
+	): Promise<{ refused: boolean; notice?: string }> {
+		if (!this.hasHandlers("before_user_message")) return { refused: false };
+		const ctx = this.createContext();
+		for (const ext of this.extensions) {
+			for (const handler of ext.handlers.get("before_user_message") ?? []) {
+				const event: BeforeUserMessageEvent = { type: "before_user_message", text, images, source };
+				const result = (await this.#runHandlerWithTimeout(
+					handler,
+					event,
+					ctx,
+					ext,
+					extensionHandlerTimeoutMs,
+					// Fail-closed: a throwing or timed-out handler refuses with the
+					// generic fallback notice (no notice here → fallback below).
+					() => ({ refuse: true }) as BeforeUserMessageEventResult,
+				)) as BeforeUserMessageEventResult | undefined;
+				if (result?.refuse) {
+					const notice = result.notice?.trim() ? result.notice : "An extension refused to send this message.";
+					return { refused: true, notice };
+				}
+			}
+		}
+		return { refused: false };
 	}
 
 	async emitContext(messages: AgentMessage[], signal?: AbortSignal): Promise<AgentMessage[]> {

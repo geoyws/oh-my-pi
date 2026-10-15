@@ -1774,11 +1774,11 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			if (!isCurrent()) return "cancelled";
 			if (!text.trim() && !images?.length) return "local";
 			if (command.type === "steer") {
-				await session.steer(text, images);
+				await session.steer(text, images, { source: "rpc" });
 				return "admitted";
 			}
 			if (command.type === "follow_up") {
-				await session.followUp(text, images);
+				await session.followUp(text, images, { source: "rpc" });
 				return "admitted";
 			}
 			if (command.type === "prompt") {
@@ -1839,6 +1839,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 						images,
 						...(command.type === "prompt" ? { streamingBehavior: command.streamingBehavior } : {}),
 						onPromptAdmitted,
+						source: "rpc",
 					}),
 				results: promptResults,
 				onError: onPromptError(command.id, command.type),
