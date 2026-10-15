@@ -978,3 +978,315 @@ mod zombie_repro_tests {
 		);
 	}
 }
+
+#[cfg(all(test, unix))]
+mod spin_bound_tests {
+	//! Regression bounds for the macOS PTY/fd hot loop (#10549: a dead or
+	//! wedged descriptor re-polled without backoff, convoying every Tokio
+	//! worker at ~4 cores). Each scenario drives `run_pty_sync` to its end in a
+	//! fresh child process running only that scenario, so `getrusage(SELF)`
+	//! measures this session's threads alone: the PTY children are separate
+	//! processes and do not count, and no sibling test shares the process.
+	//! A session that is only waiting (on its child, on EOF, on an open slave)
+	//! must cost almost no CPU; one spinning thread costs a whole core.
+	//!
+	//! The child entry is `#[ignore]`d and is a no-op unless the scenario
+	//! variable is set, so `--run-ignored` sweeps stay green.
+
+	use std::{
+		path::{Path, PathBuf},
+		process::Command,
+		thread,
+	};
+
+	use super::*;
+
+	const SCENARIO_ENV: &str = "PI_PTY_SPIN_SCENARIO";
+	const DIR_ENV: &str = "PI_PTY_SPIN_DIR";
+	const RESULT_TAG: &str = "PTY_SPIN_RESULT";
+	const CHILD_TEST: &str = "pty::spin_bound_tests::scenario_child";
+	/// Ceiling on CPU per wall second for a waiting session. A spin is ≥ 1.0;
+	/// the #10549 fingerprint was ~4.4.
+	const MAX_CPU_PER_WALL: f64 = 0.25;
+	/// Absolute floor for the ratio, so a run that is over in a few
+	/// milliseconds is not judged on scheduler noise.
+	const CPU_GRACE: Duration = Duration::from_millis(50);
+
+	#[derive(Debug)]
+	struct Outcome {
+		exit_code:  Option<i32>,
+		cancelled:  bool,
+		timed_out:  bool,
+		wall:       Duration,
+		cpu:        Duration,
+		fds_before: usize,
+		fds_after:  usize,
+		children:   bool,
+	}
+
+	fn self_cpu() -> Duration {
+		// SAFETY: `getrusage` only writes the zeroed struct we own.
+		let usage = unsafe {
+			let mut usage = std::mem::zeroed::<libc::rusage>();
+			assert_eq!(libc::getrusage(libc::RUSAGE_SELF, &raw mut usage), 0);
+			usage
+		};
+		let tv = |t: libc::timeval| {
+			Duration::from_secs(t.tv_sec as u64) + Duration::from_micros(t.tv_usec as u64)
+		};
+		tv(usage.ru_utime) + tv(usage.ru_stime)
+	}
+
+	fn open_fds() -> usize {
+		let dir = if cfg!(target_os = "linux") {
+			"/proc/self/fd"
+		} else {
+			"/dev/fd"
+		};
+		std::fs::read_dir(dir).expect("fd directory").count()
+	}
+
+	/// Whether this process still has an unreaped or live child.
+	fn has_children() -> bool {
+		let mut status = 0;
+		// SAFETY: `WNOHANG` never blocks; `status` is ours.
+		let pid = unsafe { libc::waitpid(-1, &raw mut status, libc::WNOHANG) };
+		// ECHILD: none at all. 0: a live child. > 0: we just reaped a zombie the
+		// session abandoned.
+		pid != -1
+	}
+
+	fn read_pid(path: &Path, deadline: Instant) -> libc::pid_t {
+		loop {
+			if let Some(pid) = std::fs::read_to_string(path)
+				.ok()
+				.and_then(|text| text.trim().parse().ok())
+			{
+				return pid;
+			}
+			assert!(Instant::now() < deadline, "PTY child never wrote {}", path.display());
+			thread::sleep(Duration::from_millis(5));
+		}
+	}
+
+	fn shell(command: String) -> PtyRunConfig {
+		PtyRunConfig {
+			command: PtyCommand::Shell { command, shell: Some("/bin/sh".to_string()) },
+			cwd:     None,
+			env:     None,
+			cols:    80,
+			rows:    24,
+		}
+	}
+
+	/// Run one scenario inside this (child) process and print its outcome.
+	fn run_scenario(name: &str, dir: &Path) {
+		let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+		let _runtime = runtime.enter();
+		let pid_file = dir.join("pid");
+		let pid_arg = pid_file.display().to_string();
+
+		let (config, ct, killer) = match name {
+			"exit" => {
+				(shell("echo done; exit 7".to_string()), task::CancelToken::new(None, None), None)
+			},
+			// The session leader is SIGKILLed while it is writing; a reader that
+			// re-polled the dead descriptor instead of taking EOF/EIO would spin.
+			"dead_child_mid_read" => (
+				shell(format!("echo $$ > '{pid_arg}'; while :; do echo tick; sleep 0.01; done")),
+				task::CancelToken::new(None, None),
+				Some(pid_file.clone()),
+			),
+			// The child exits but a background descendant keeps the slave open,
+			// so EOF never comes: the reader must park in `read`, and the run
+			// must give up after `STUCK_SLAVE_IDLE` without spinning meanwhile.
+			"open_slave_after_exit" => (
+				// The holder ignores SIGHUP: the session leader's exit hangs up its
+				// foreground group, which would otherwise close the slave for us.
+				shell(format!("trap '' HUP; sleep 30 & echo $! > '{pid_arg}'; echo started; exit 0")),
+				task::CancelToken::new(None, None),
+				None,
+			),
+			"timeout" => (
+				shell("echo waiting; exec sleep 30".to_string()),
+				task::CancelToken::new(Some(300), None),
+				None,
+			),
+			other => panic!("unknown scenario {other}"),
+		};
+
+		let killer = killer.map(|path| {
+			thread::spawn(move || {
+				let pid = read_pid(&path, Instant::now() + Duration::from_secs(10));
+				thread::sleep(Duration::from_millis(300));
+				// SAFETY: plain signal to the PTY child we spawned.
+				unsafe { libc::kill(pid, libc::SIGKILL) };
+			})
+		});
+
+		let fds_before = open_fds();
+		let cpu_before = self_cpu();
+		let started = Instant::now();
+		let (tx, rx) = flume::unbounded();
+		let result = run_pty_sync(config, None, None, tx, rx, ct).expect("PTY run");
+		let wall = started.elapsed();
+		let cpu = self_cpu().saturating_sub(cpu_before);
+		if let Some(killer) = killer {
+			killer.join().expect("killer thread");
+		}
+		// The run gave up on an open slave, leaving its reader parked in `read`
+		// on a master clone: that is the documented no-join case, so the census
+		// is taken once the holder dies and the reader has had its EOF.
+		let mut fds_after = open_fds();
+		if name == "open_slave_after_exit" {
+			let holder = read_pid(&pid_file, Instant::now() + Duration::from_secs(1));
+			// SAFETY: plain signal to the descendant the scenario started.
+			unsafe { libc::kill(holder, libc::SIGKILL) };
+			let deadline = Instant::now() + Duration::from_secs(2);
+			while fds_after > fds_before && Instant::now() < deadline {
+				thread::sleep(Duration::from_millis(10));
+				fds_after = open_fds();
+			}
+		}
+		let children = has_children();
+		println!(
+			"{RESULT_TAG} exit={} cancelled={} timed_out={} wall_us={} cpu_us={} fds_before={} \
+			 fds_after={} children={}",
+			result
+				.exit_code
+				.map_or_else(|| "none".to_string(), |code| code.to_string()),
+			result.cancelled,
+			result.timed_out,
+			wall.as_micros(),
+			cpu.as_micros(),
+			fds_before,
+			fds_after,
+			children,
+		);
+	}
+
+	#[test]
+	#[ignore = "child entry for spin_bound_tests; no-op unless PI_PTY_SPIN_SCENARIO is set"]
+	fn scenario_child() {
+		let (Ok(name), Ok(dir)) = (std::env::var(SCENARIO_ENV), std::env::var(DIR_ENV)) else {
+			return;
+		};
+		run_scenario(&name, Path::new(&dir));
+	}
+
+	fn scratch_dir(name: &str) -> PathBuf {
+		let nanos = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map_or(0, |d| d.as_nanos());
+		let dir =
+			std::env::temp_dir().join(format!("pi-pty-spin-{name}-{}-{nanos}", std::process::id()));
+		std::fs::create_dir_all(&dir).expect("scratch dir");
+		dir
+	}
+
+	fn run_isolated(name: &str) -> Outcome {
+		let dir = scratch_dir(name);
+		let output = Command::new(std::env::current_exe().expect("test binary"))
+			.args([CHILD_TEST, "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+			.env(SCENARIO_ENV, name)
+			.env(DIR_ENV, &dir)
+			.output()
+			.expect("spawn scenario child");
+		let _ = std::fs::remove_dir_all(&dir);
+		let stdout = String::from_utf8_lossy(&output.stdout);
+		let stderr = String::from_utf8_lossy(&output.stderr);
+		assert!(output.status.success(), "scenario {name} failed\n{stdout}\n{stderr}");
+		let line = stdout
+			.lines()
+			// libtest prints the test name on the same line under `--nocapture`.
+			.find_map(|line| line.split_once(RESULT_TAG).map(|(_, rest)| rest))
+			.unwrap_or_else(|| panic!("scenario {name} printed no result\n{stdout}\n{stderr}"));
+		let field = |key: &str| {
+			line
+				.split_whitespace()
+				.find_map(|pair| pair.strip_prefix(key)?.strip_prefix('='))
+				.unwrap_or_else(|| panic!("scenario {name}: no {key} in {line}"))
+		};
+		let micros = |key: &str| Duration::from_micros(field(key).parse().expect("micros"));
+		let count = |key: &str| field(key).parse::<usize>().expect("count");
+		Outcome {
+			exit_code:  field("exit").parse().ok(),
+			cancelled:  field("cancelled") == "true",
+			timed_out:  field("timed_out") == "true",
+			wall:       micros("wall_us"),
+			cpu:        micros("cpu_us"),
+			fds_before: count("fds_before"),
+			fds_after:  count("fds_after"),
+			children:   field("children") == "true",
+		}
+	}
+
+	/// The bounds every scenario shares: no spin, no leaked descriptor, no
+	/// unreaped child, and an upper bound on how long the run may take.
+	fn assert_bounded(name: &str, outcome: &Outcome, max_wall: Duration) {
+		let budget = outcome.wall.mul_f64(MAX_CPU_PER_WALL).max(CPU_GRACE);
+		assert!(
+			outcome.cpu <= budget,
+			"{name}: session burned {:?} CPU over {:?} wall (budget {budget:?}): a waiting PTY \
+			 session is spinning\n{outcome:?}",
+			outcome.cpu,
+			outcome.wall,
+		);
+		assert!(
+			outcome.wall <= max_wall,
+			"{name}: run took {:?}, bound {max_wall:?}\n{outcome:?}",
+			outcome.wall
+		);
+		assert!(
+			outcome.fds_after <= outcome.fds_before,
+			"{name}: leaked {} descriptor(s)\n{outcome:?}",
+			outcome.fds_after - outcome.fds_before
+		);
+		assert!(!outcome.children, "{name}: left a child unreaped\n{outcome:?}");
+	}
+
+	#[test]
+	fn normal_exit_reports_code_without_spinning() {
+		let outcome = run_isolated("exit");
+		assert_eq!(outcome.exit_code, Some(7), "{outcome:?}");
+		assert!(!outcome.cancelled && !outcome.timed_out, "{outcome:?}");
+		assert_bounded("exit", &outcome, Duration::from_secs(5));
+	}
+
+	#[test]
+	fn dead_child_mid_read_finishes_without_spinning() {
+		let outcome = run_isolated("dead_child_mid_read");
+		assert_ne!(outcome.exit_code, Some(0), "a SIGKILLed child cannot exit 0: {outcome:?}");
+		assert!(!outcome.cancelled && !outcome.timed_out, "{outcome:?}");
+		// ~300 ms of output, then EOF/EIO must end the read at once: well under
+		// the open-slave idle cutoff, which would mean the reader never saw it.
+		assert_bounded("dead_child_mid_read", &outcome, STUCK_SLAVE_IDLE);
+	}
+
+	#[test]
+	fn open_slave_after_exit_gives_up_without_spinning() {
+		let outcome = run_isolated("open_slave_after_exit");
+		assert_eq!(outcome.exit_code, Some(0), "{outcome:?}");
+		assert!(
+			outcome.wall >= STUCK_SLAVE_IDLE,
+			"returned before the open-slave idle cutoff, so EOF was not what it waited for: \
+			 {outcome:?}"
+		);
+		assert_bounded(
+			"open_slave_after_exit",
+			&outcome,
+			STUCK_SLAVE_IDLE + POST_CANCEL_DRAIN_TIMEOUT + Duration::from_secs(2),
+		);
+	}
+
+	#[test]
+	fn timeout_kills_and_reaps_without_spinning() {
+		let outcome = run_isolated("timeout");
+		assert!(outcome.timed_out && !outcome.cancelled, "{outcome:?}");
+		assert_bounded(
+			"timeout",
+			&outcome,
+			Duration::from_millis(300) + KILL_GRACE + CANCEL_EXIT_WAIT + Duration::from_secs(2),
+		);
+	}
+}
