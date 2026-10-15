@@ -1,4 +1,5 @@
-import { clearSubmittedText } from "./helpers/draft";
+import { clearSubmittedText, restoreDetachedDraft } from "./helpers/draft";
+import { UserMessageRefusedError } from "../session/agent-session";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { CompactionCancelledError } from "@oh-my-pi/pi-agent-core/compaction";
@@ -269,7 +270,21 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				runtime.ctx.showWarning(parsed.error);
 				return;
 			}
-			await runtime.ctx.handleCompactCommand(parsed.instructions, parsed.mode);
+			try {
+				await runtime.ctx.handleCompactCommand(parsed.instructions, parsed.mode);
+			} catch (error) {
+				// A `before_user_message` refusal carries only the safe notice.
+				// The composer is already empty on production Enter, so merge
+				// the exact original slash line back ahead of any newer draft
+				// instead of dropping it.
+				if (error instanceof UserMessageRefusedError) {
+					restoreDetachedDraft(runtime.ctx.editor, command.text);
+					runtime.ctx.showError(error.notice);
+					runtime.ctx.ui.requestRender();
+					return;
+				}
+				throw error;
+			}
 		},
 	},
 	{
@@ -365,7 +380,19 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		handleTui: async (command, runtime) => {
 			const customInstructions = command.args || undefined;
 			clearSubmittedText(runtime);
-			await runtime.ctx.handleHandoffCommand(customInstructions);
+			try {
+				await runtime.ctx.handleHandoffCommand(customInstructions);
+			} catch (error) {
+				// Same refusal-restore contract as /compact above: merge the
+				// exact original slash line back into the emptied composer.
+				if (error instanceof UserMessageRefusedError) {
+					restoreDetachedDraft(runtime.ctx.editor, command.text);
+					runtime.ctx.showError(error.notice);
+					runtime.ctx.ui.requestRender();
+					return;
+				}
+				throw error;
+			}
 		},
 	},
 	{

@@ -56,7 +56,6 @@ import { computeSessionContextBreakdown } from "../../session/context-usage-runt
 import { buildHotkeysMarkdown, HotkeysSheetComponent } from "@oh-my-pi/pi-tui/hotkeys-markdown";
 import { isNativeRendering } from "@oh-my-pi/pi-tui/native/state";
 import { buildToolsMarkdown } from "@oh-my-pi/pi-tui/prompt/tools-markdown";
-import { UserMessageRefusedError } from "../../session/agent-session";
 import type { AsyncJobSnapshotItem } from "../../session/agent-session";
 import type { AuthStorage, OAuthAccountIdentity } from "../../session/auth-storage";
 import type { CompactMode } from "../../session/compact-modes";
@@ -1964,17 +1963,11 @@ export class CommandController {
 		}
 		// User-authored summarizer focus is sent to the summarizer provider and
 		// persisted with the compaction entry: gate it first. Agent-authored
-		// `internalGuidance` above never faces the gate.
+		// `internalGuidance` above never faces the gate. A refusal propagates
+		// to the slash builtin, which owns the exact original line and merges
+		// it back into the composer.
 		if (customInstructions?.trim()) {
-			try {
-				await this.ctx.session.gateUserMessage(customInstructions, undefined, "interactive");
-			} catch (error) {
-				if (error instanceof UserMessageRefusedError) {
-					this.ctx.showError(error.notice);
-					return "cancelled";
-				}
-				throw error;
-			}
+			await this.ctx.session.gateUserMessage(customInstructions, undefined, "interactive");
 		}
 		return this.executeCompaction(customInstructions, false, beforeFlush, mode);
 	}
@@ -2110,18 +2103,11 @@ export class CommandController {
 		}
 
 		// User-authored handoff focus reaches the summarizer provider: gate it
-		// before any UI teardown or history mutation. A refusal reports only
-		// the handler's notice and leaves the session untouched.
+		// before any UI teardown or history mutation. A refusal propagates to
+		// the slash builtin, which owns the exact original line and merges it
+		// back into the composer.
 		if (customInstructions?.trim()) {
-			try {
-				await this.ctx.session.gateUserMessage(customInstructions, undefined, "interactive");
-			} catch (error) {
-				if (error instanceof UserMessageRefusedError) {
-					this.ctx.showError(error.notice);
-					return;
-				}
-				throw error;
-			}
+			await this.ctx.session.gateUserMessage(customInstructions, undefined, "interactive");
 		}
 		if (this.ctx.loadingAnimation) {
 			this.ctx.loadingAnimation.stop();

@@ -1531,19 +1531,30 @@ export class SelectorController {
 						break;
 					}
 					// User-authored summarization focus reaches the summarizer
-					// provider: gate it before navigation mutates anything. A
-					// refusal reports only the handler's notice and re-shows the
-					// tree selector, like a cancelled summarization.
-					if (customInstructions?.trim()) {
+					// provider: gate it before navigation mutates anything.
+					// Recovery choice (boring on purpose): a refusal reopens
+					// the same hook editor prefilled with the refused text, so
+					// the operator edits the flagged content out and resubmits
+					// in place instead of retyping it. The modal flow needs no
+					// composer interplay and no extra render juggling; each
+					// refusal still reports only the handler's notice, and
+					// cancelling the editor returns to the tree selector.
+					while (customInstructions?.trim()) {
 						try {
 							await this.ctx.session.gateUserMessage(customInstructions, undefined, "interactive");
+							break;
 						} catch (error) {
-							if (error instanceof UserMessageRefusedError) {
-								this.ctx.showError(error.notice);
+							if (!(error instanceof UserMessageRefusedError)) throw error;
+							this.ctx.showError(error.notice);
+							const retry = await this.ctx.showHookEditor(
+								"Custom summarization instructions",
+								customInstructions,
+							);
+							if (retry === undefined) {
 								this.showTreeSelector();
 								return;
 							}
-							throw error;
+							customInstructions = retry;
 						}
 					}
 

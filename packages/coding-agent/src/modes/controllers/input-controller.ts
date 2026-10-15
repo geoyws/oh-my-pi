@@ -1163,14 +1163,18 @@ export class InputController {
 				if (command) {
 					// User-authored shell text is persisted with the execution and
 					// replayed into later context: gate it before anything runs.
-					// The draft never left the editor, so a refusal only reports
-					// the handler's notice and keeps the typed text in place.
+					// Production Enter already emptied the composer, so a refusal
+					// merges the full original line (with its `!` prefix) back
+					// ahead of any newer draft instead of only reporting.
 					try {
 						await this.ctx.session.gateUserMessage(text, inputImages, "interactive");
 					} catch (error) {
 						if (error instanceof UserMessageRefusedError) {
-							this.ctx.showError(error.notice);
-							return;
+							if (this.#restoreRefusedSubmission(error, text, inputImages, inputImageLinks)) {
+								this.ctx.updatePendingMessagesDisplay();
+								this.ctx.ui.requestRender();
+								return;
+							}
 						}
 						throw error;
 					}
@@ -1196,14 +1200,18 @@ export class InputController {
 				const { code, isExcluded } = pythonCommand;
 				if (code) {
 					// Same pre-persistence gate as `!`: user-authored code is
-					// persisted with the execution result. The draft stays put on
-					// refusal.
+					// persisted with the execution result. A refusal merges the
+					// full original line (with its `$` prefix) back — the
+					// composer is already empty on production Enter.
 					try {
 						await this.ctx.session.gateUserMessage(text, inputImages, "interactive");
 					} catch (error) {
 						if (error instanceof UserMessageRefusedError) {
-							this.ctx.showError(error.notice);
-							return;
+							if (this.#restoreRefusedSubmission(error, text, inputImages, inputImageLinks)) {
+								this.ctx.updatePendingMessagesDisplay();
+								this.ctx.ui.requestRender();
+								return;
+							}
 						}
 						throw error;
 					}
@@ -1919,10 +1927,20 @@ export class InputController {
 						: `=>\n${remaining
 								.map((message, index) => `${index + 1}. ${message.replaceAll("\n", "\n   ")}`)
 								.join("\n")}`;
-				if (options.detachedText !== undefined) restoreDetachedDraft(this.ctx.editor, restored);
-				else this.ctx.editor.setText(restored);
+				// A refusal merges the remainder back alongside any newer
+				// draft typed while dispatch was pending instead of
+				// overwriting it; other errors keep the legacy snapshot.
+				if (error instanceof UserMessageRefusedError || options.detachedText !== undefined) {
+					restoreDetachedDraft(this.ctx.editor, restored);
+				} else {
+					this.ctx.editor.setText(restored);
+				}
 			}
-			this.ctx.showError(error instanceof Error ? error.message : String(error));
+			if (error instanceof UserMessageRefusedError) {
+				this.ctx.showError(error.notice);
+			} else {
+				this.ctx.showError(error instanceof Error ? error.message : String(error));
+			}
 		}
 
 		this.ctx.updatePendingMessagesDisplay();
