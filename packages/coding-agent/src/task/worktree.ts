@@ -553,6 +553,57 @@ export function formatIsolationBackend(backend: IsoBackendKind): Exclude<Isolati
 	}
 }
 
+/**
+ * Initialized submodules in the source checkout, listed recursively as paths
+ * relative to `sourceRoot` (`[]` when there are none or the lookup fails).
+ *
+ * Clone-first worktree creation copies the source checkout verbatim, including
+ * every initialized submodule's `.git` gitfile. From a main checkout the copy
+ * reads `gitdir: ../.git/modules/<name>`, which dangles because the new
+ * tree's `.git` is a file; from a linked worktree it points into the source
+ * tree's module dir, so the new tree shares submodule state with the source.
+ * When this list is non-empty the caller must pass `clone: false` to
+ * `worktreeAdd` and populate the new tree with {@link initWorktreeSubmodules}
+ * instead.
+ */
+export async function initializedWorktreeSubmodules(sourceRoot: string): Promise<string[]> {
+	try {
+		return await vcs.requireGit(sourceRoot).submodulePaths();
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * Populate the submodules a plain (non-cloned) worktree left empty, giving
+ * each its own module dir under the new tree's admin. Call with the exact
+ * list from {@link initializedWorktreeSubmodules} (parents precede children)
+ * so only submodules the source had initialized are fetched. Failures throw
+ * with git's stderr; callers downgrade to a warning because the tree itself
+ * is a valid plain checkout either way.
+ */
+export async function initWorktreeSubmodules(worktreePath: string, submodules: string[]): Promise<void> {
+	// Submodule URLs are often local paths (absolute or `../relative`); git
+	// refuses the `file` transport for submodule clones unless it is
+	// explicitly allowed, and repo config is not honored here, so allow it on
+	// the command line. The user already trusts these URLs: the same pins
+	// are initialized in the source checkout.
+	const proc = Bun.spawn(
+		["git", "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--", ...submodules],
+		{
+			cwd: worktreePath,
+			stdout: "pipe",
+			stderr: "pipe",
+			windowsHide: true,
+		},
+	);
+	const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+	await new Response(proc.stdout).text();
+	if ((exitCode ?? 0) !== 0) {
+		throw new Error(`git submodule update --init failed: ${stderr.trim() || `exit code ${exitCode ?? 0}`}`);
+	}
+}
+
 export interface IsolationHandle {
 	/** Merged view materialised by the backend; pass this to the task. */
 	mergedDir: string;

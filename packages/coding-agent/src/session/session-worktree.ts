@@ -15,7 +15,12 @@ import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { getWorktreeDir, hashPath, logger } from "@oh-my-pi/pi-utils";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import type { Settings } from "../config/settings";
-import { formatIsolationBackend, parseIsolationBackend } from "../task/worktree";
+import {
+	formatIsolationBackend,
+	initializedWorktreeSubmodules,
+	initWorktreeSubmodules,
+	parseIsolationBackend,
+} from "../task/worktree";
 import { resolveAvailableWorktreePath } from "../tools/gh-pr-checkout";
 
 import { cfgIsolationBackend, cfgWorktreeCleanSource, cfgWorktreeClone } from "../task/settings";
@@ -147,12 +152,27 @@ export async function createSessionWorktree(
 	await fs.mkdir(path.dirname(worktreePath), { recursive: true });
 
 	await repository.createBranch(branch, baseCommit, false);
+	const cloneSetting = cfgWorktreeClone.get(settings);
+	// A clone copies initialized submodule gitfiles verbatim, which dangle
+	// from a main checkout or point into a linked worktree's source. Start
+	// from a plain checkout and initialize private submodule clones instead.
+	const submodulePaths = cloneSetting ? await initializedWorktreeSubmodules(repository.info().repoRoot) : [];
 	const result = await repository.worktreeAdd(worktreePath, branch, {
 		detach: false,
-		clone: cfgWorktreeClone.get(settings),
+		clone: submodulePaths.length === 0 && cloneSetting,
 		backend: parseIsolationBackend(cfgIsolationBackend.get(settings)),
 		keepChanges,
 	});
+	if (submodulePaths.length > 0) {
+		try {
+			await initWorktreeSubmodules(worktreePath, submodulePaths);
+		} catch (error) {
+			logger.warn("worktree submodules were left uninitialized", {
+				path: worktreePath,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
 	return {
 		path: await fs.realpath(worktreePath),
 		branch,
