@@ -11,7 +11,7 @@
  *     post-prompt recovery, but the loop is already done) must be drained when
  *     the session settles.
  */
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -29,6 +29,10 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm, type CustomMessage, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { tagImageAttachmentSource } from "@oh-my-pi/pi-tui/prompt/image-source";
+import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
+import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
+import { getEditorTheme } from "@oh-my-pi/pi-tui/theme/tui-adapters";
 import { removeSyncWithRetries, Snowflake, withTimeout } from "@oh-my-pi/pi-utils";
 import manualContinuePrompt from "../src/prompts/system/manual-continue.md" with { type: "text" };
 
@@ -432,6 +436,70 @@ describe("AgentSession queued steer delivery", () => {
 
 		expect(queuedUserContent).toEqual(["text", "image"]);
 	});
+
+	for (const alreadyQueued of [false, true]) {
+		it(`delivers an image-only Enter steer exactly once with ${alreadyQueued ? "an existing steer" : "an empty queue"}`, async () => {
+			const { session, sessionManager, mock } = await createSession([
+				{ content: ["initial"] },
+				{ content: ["steered answer"] },
+				{ content: ["remaining steer answer"] },
+			]);
+			const image = { type: "image" as const, mimeType: "image/png", data: PATH_PASTED_IMAGE.data };
+			const editor = new CustomEditor(getEditorTheme());
+			const showError = vi.fn();
+			const ctx = {
+				editor, session, viewSession: session, sessionManager,
+				skillCommands: new Map(), fileSlashCommands: new Set(),
+				compactionQueuedMessages: [], locallySubmittedUserSignatures: new Set(),
+				isBashMode: false, isPythonMode: false, loopModeEnabled: false,
+				ui: { requestRender: vi.fn(), getFocused: () => editor },
+				showError, updatePendingMessagesDisplay: vi.fn(),
+				withLocalSubmission: async <T>(_text: string, submit: () => Promise<T>) => submit(),
+			} as unknown as InteractiveModeContext;
+			new InputController(ctx).setupEditorSubmitHandler();
+			const onSubmit = editor.onSubmit;
+			let submission: Promise<void> | undefined;
+			editor.onSubmit = text => {
+				submission = Promise.resolve(onSubmit?.(text));
+				return submission;
+			};
+			let injected = false;
+			session.agent.setOnBeforeYield(async () => {
+				if (injected) return;
+				injected = true;
+				if (alreadyQueued) await session.steer("earlier steer");
+				expect(session.queuedMessageCount).toBe(alreadyQueued ? 1 : 0);
+				// The real composer submits only an image chip; Enter clears its
+				// text before the controller queues it in the real streaming session.
+				editor.setDraft("[Image #1]", [image]);
+				editor.handleInput("\r");
+				expect(submission).toBeDefined();
+				await submission;
+				expect(editor.getExpandedText()).toBe("");
+				expect(editor.pendingImages).toEqual([]);
+				expect(editor.pendingImageLinks).toEqual([]);
+			});
+
+			await session.prompt("start");
+			await session.waitForIdle();
+
+			expect(showError).not.toHaveBeenCalled();
+			expect(session.agent.hasQueuedMessages()).toBe(false);
+			const delivered = mock.calls.at(-1)!.context.messages.filter(message => message.role === "user");
+			expect(delivered.flatMap(message => message.content).filter(part => part.type === "image")).toEqual([image]);
+			const retainedImages = session.messages
+				.filter(message => message.role === "user")
+				.flatMap(message => (Array.isArray(message.content) ? message.content : []))
+				.filter(part => part.type === "image");
+			expect(retainedImages).toEqual([image]);
+			if (alreadyQueued) {
+				const earlierSteers = delivered
+					.flatMap(message => message.content)
+					.filter(part => part.type === "text" && part.text === "earlier steer");
+				expect(earlierSteers).toHaveLength(1);
+			}
+		});
+	}
 
 	it("delivers a queued path-pasted image prompt in the same one-at-a-time turn as its source path", async () => {
 		const { session, mock } = await createSession([{ content: ["initial"] }, { content: ["image answer"] }]);
