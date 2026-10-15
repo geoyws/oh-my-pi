@@ -7,8 +7,10 @@ import { setWorktreesDir } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../src/config/settings";
 import {
 	canAutoCreateWorktree,
+	cleanSourceCheckoutIfConfigured,
 	createSessionWorktree,
 	decideWorktreeExit,
+	formatSessionWorktreeSummary,
 	inspectSessionWorktree,
 	planWorktreeExit,
 	removeExitWorktrees,
@@ -69,6 +71,15 @@ const exists = (p: string) =>
 		() => true,
 		() => false,
 	);
+
+/** Resolve a `.git` gitfile to its absolute target dir. */
+async function readGitfile(gitfile: string): Promise<string> {
+	const content = await fs.readFile(gitfile, "utf8");
+	const pointer = (content.split("\n", 1)[0] ?? "").trim();
+	const match = /^gitdir:[ \t]*(.+?)\s*$/.exec(pointer);
+	if (!match) throw new Error(`${gitfile} is not a gitfile: ${pointer}`);
+	return path.resolve(path.dirname(gitfile), match[1]);
+}
 
 const commitFile = async (cwd: string, name: string) => {
 	await Bun.write(path.join(cwd, name), "x\n");
@@ -287,5 +298,80 @@ describe("session worktree helpers (real git)", () => {
 		const messages = await removeExitWorktrees(plan);
 		expect(messages).toEqual([`Failed to remove worktree ${wt.path}; branch '${branch}' kept.`]);
 		expect(branchSha(repo, branch)).toBe(wt.baseCommit);
+	});
+
+	it("initializes nested parent→mid→leaf submodules privately at every depth", async () => {
+		const leafSrc = path.join(root, "leaf-src");
+		await fs.mkdir(leafSrc);
+		git(leafSrc, "init", "-q", "-b", "main");
+		await commitFile(leafSrc, "leaf.txt");
+		const midSrc = path.join(root, "mid-src");
+		await fs.mkdir(midSrc);
+		git(midSrc, "init", "-q", "-b", "main");
+		await commitFile(midSrc, "mid.txt");
+		git(midSrc, "-c", "protocol.file.allow=always", "submodule", "add", "-q", leafSrc, "leaf");
+		git(midSrc, "commit", "-q", "-m", "add leaf");
+		const nested = path.join(root, "nested");
+		await fs.mkdir(nested);
+		git(nested, "init", "-q", "-b", "main");
+		git(nested, "config", "core.autocrlf", "false");
+		await commitFile(nested, "main.txt");
+		git(nested, "-c", "protocol.file.allow=always", "submodule", "add", "-q", midSrc, "mid");
+		git(nested, "commit", "-q", "-m", "add mid");
+		git(nested, "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init", "--recursive");
+		const midHead = git(path.join(nested, "mid"), "rev-parse", "HEAD");
+		const leafHead = git(path.join(nested, "mid", "leaf"), "rev-parse", "HEAD");
+
+		const wt = await createSessionWorktree(nested, Settings.isolated(), "wt/nested-sub", { keepChanges: true });
+		expect(wt.submodulesNotCarried).toEqual([]);
+		for (const rel of ["", "mid", "mid/leaf"]) {
+			expect(git(path.join(wt.path, rel), "status", "--porcelain")).toBe("");
+		}
+		expect(git(path.join(wt.path, "mid"), "rev-parse", "HEAD")).toBe(midHead);
+		expect(git(path.join(wt.path, "mid", "leaf"), "rev-parse", "HEAD")).toBe(leafHead);
+		const admin = await readGitfile(path.join(wt.path, ".git"));
+		for (const rel of ["mid", "mid/leaf"]) {
+			const moduleDir = await readGitfile(path.join(wt.path, rel, ".git"));
+			expect((await fs.stat(moduleDir)).isDirectory()).toBe(true);
+			expect(moduleDir === admin || moduleDir.startsWith(`${admin}${path.sep}`)).toBe(true);
+		}
+		expect(await readGitfile(path.join(wt.path, "mid", ".git"))).not.toBe(
+			await readGitfile(path.join(nested, "mid", ".git")),
+		);
+	});
+
+	it("reports dirty submodules as not carried and never cleans the source", async () => {
+		const subSrc = path.join(root, "sub-src");
+		await fs.mkdir(subSrc);
+		git(subSrc, "init", "-q", "-b", "main");
+		await commitFile(subSrc, "lib.txt");
+		const dirtyParent = path.join(root, "dirty-parent");
+		await fs.mkdir(dirtyParent);
+		git(dirtyParent, "init", "-q", "-b", "main");
+		git(dirtyParent, "config", "core.autocrlf", "false");
+		await commitFile(dirtyParent, "main.txt");
+		git(dirtyParent, "-c", "protocol.file.allow=always", "submodule", "add", "-q", subSrc, "sub");
+		git(dirtyParent, "commit", "-q", "-m", "add sub");
+		git(dirtyParent, "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init");
+		const pin = git(path.join(dirtyParent, "sub"), "rev-parse", "HEAD");
+		await Bun.write(path.join(dirtyParent, "sub", "lib.txt"), "x\ndirty edit\n");
+		await Bun.write(path.join(dirtyParent, "sub", "scratch-new.txt"), "untracked\n");
+		const before = git(path.join(dirtyParent, "sub"), "status", "--porcelain");
+		expect(before).not.toBe("");
+
+		const wt = await createSessionWorktree(dirtyParent, Settings.isolated(), "wt/dirty-sub", { keepChanges: true });
+		expect(wt.submodulesNotCarried).toEqual(["sub"]);
+		expect(git(path.join(wt.path, "sub"), "rev-parse", "HEAD")).toBe(pin);
+		expect(formatSessionWorktreeSummary(wt, false)).toContain("sub");
+
+		const cleaning = Settings.isolated({ "worktree.cleanSource": true });
+		const cleanup = await cleanSourceCheckoutIfConfigured(dirtyParent, cleaning, {
+			preserveSubmodules: wt.submodulesNotCarried,
+		});
+		expect(cleanup.cleaned).toBe(false);
+		expect(cleanup.skipped ?? "").toContain("sub");
+		expect(await Bun.file(path.join(dirtyParent, "sub", "lib.txt")).text()).toBe("x\ndirty edit\n");
+		expect(await exists(path.join(dirtyParent, "sub", "scratch-new.txt"))).toBe(true);
+		expect(git(path.join(dirtyParent, "sub"), "status", "--porcelain")).toBe(before);
 	});
 });

@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { addWorktree } from "@oh-my-pi/pi-coding-agent/cli/worktree-cli";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { cfgWorktreeClone } from "@oh-my-pi/pi-coding-agent/task/settings";
+import { initWorktreeSubmodules } from "@oh-my-pi/pi-coding-agent/task/worktree";
 const tempRoots: string[] = [];
 const ALLOW_FILE = ["-c", "protocol.file.allow=always"];
 
@@ -54,6 +55,29 @@ async function makeParentWithSubmodule(root: string): Promise<{ parent: string; 
 	await runGit(parent, [...ALLOW_FILE, "submodule", "add", "-q", subSrc, "sub"]);
 	await runGit(parent, ["commit", "-q", "-m", "add sub"]);
 	return { parent, subSrc };
+}
+
+/** Parent → mid → leaf, every level initialized; returns pins recorded in the parent. */
+async function makeNestedSubmodules(root: string): Promise<{ parent: string; midHead: string; leafHead: string }> {
+	const leafSrc = path.join(root, "leaf-src");
+	await initRepo(leafSrc);
+	await commitFile(leafSrc, "leaf.txt", "leaf v1\n", "leaf v1");
+
+	const midSrc = path.join(root, "mid-src");
+	await initRepo(midSrc);
+	await commitFile(midSrc, "mid.txt", "mid v1\n", "mid v1");
+	await runGit(midSrc, [...ALLOW_FILE, "submodule", "add", "-q", leafSrc, "leaf"]);
+	await runGit(midSrc, ["commit", "-q", "-m", "add leaf"]);
+
+	const parent = path.join(root, "parent");
+	await initRepo(parent);
+	await commitFile(parent, "main.txt", "main\n", "main v1");
+	await runGit(parent, [...ALLOW_FILE, "submodule", "add", "-q", midSrc, "mid"]);
+	await runGit(parent, ["commit", "-q", "-m", "add mid"]);
+	await runGit(parent, [...ALLOW_FILE, "submodule", "update", "-q", "--init", "--recursive"]);
+	const midHead = await runGit(path.join(parent, "mid"), ["rev-parse", "HEAD"]);
+	const leafHead = await runGit(path.join(parent, "mid", "leaf"), ["rev-parse", "HEAD"]);
+	return { parent, midHead, leafHead };
 }
 
 /** Resolve a `<checkout>/sub/.git` gitfile to its absolute module dir. */
@@ -163,5 +187,58 @@ describe("omp worktree add with submodules", () => {
 		await commitFile(path.join(copy, "sub"), "lib.txt", "v1\ncopy edit\n", "copy sub edit");
 		expect(await runGit(path.join(sourceWt, "sub"), ["rev-parse", "HEAD"])).toBe(sourceSubHead);
 		expect(await runGit(sourceWt, ["status", "--porcelain"])).toBe(sourceStatus);
+	});
+
+	it("nested: parent→mid→leaf submodules initialize privately at every depth", async () => {
+		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "omp-wt-sub-n-")));
+		tempRoots.push(root);
+		const { parent, midHead, leafHead } = await makeNestedSubmodules(root);
+		const sourceMidGitdir = await submoduleGitdir(path.join(parent, "mid"));
+		const sourceLeafGitdir = await submoduleGitdir(path.join(parent, "mid", "leaf"));
+
+		const copy = path.join(root, "nested-copy");
+		await addWorktree({ path: copy, cwd: parent, detach: false, quiet: true });
+
+		// Every depth is a usable checkout at the source pins.
+		for (const rel of ["", "mid", "mid/leaf"]) {
+			expect(await runGit(path.join(copy, rel), ["status", "--porcelain"])).toBe("");
+		}
+		expect(await runGit(path.join(copy, "mid"), ["rev-parse", "HEAD"])).toBe(midHead);
+		expect(await runGit(path.join(copy, "mid", "leaf"), ["rev-parse", "HEAD"])).toBe(leafHead);
+
+		// Every depth is owned by the new tree's own worktree admin and
+		// differs from the source's module dirs.
+		const copyAdmin = await worktreeGitdir(copy);
+		for (const [rel, sourceGitdir] of [
+			["mid", sourceMidGitdir],
+			["mid/leaf", sourceLeafGitdir],
+		] as const) {
+			const copyGitdir = await submoduleGitdir(path.join(copy, rel));
+			expect((await fs.stat(copyGitdir)).isDirectory()).toBe(true);
+			expect(copyGitdir === copyAdmin || copyGitdir.startsWith(`${copyAdmin}${path.sep}`)).toBe(true);
+			expect(copyGitdir).not.toBe(sourceGitdir);
+		}
+
+		// Committing in the copy's leaf leaves the source leaf alone.
+		await commitFile(path.join(copy, "mid", "leaf"), "leaf.txt", "leaf v1\ncopy edit\n", "copy leaf edit");
+		expect(await runGit(path.join(parent, "mid", "leaf"), ["rev-parse", "HEAD"])).toBe(leafHead);
+	});
+
+	it("skips source submodules missing at the target ref instead of aborting", async () => {
+		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "omp-wt-sub-m-")));
+		tempRoots.push(root);
+		const { parent } = await makeNestedSubmodules(root);
+		// A ref whose tree has no `mid` at all (e.g. a PR branch that
+		// removed it): the plain tree there knows neither `mid` nor `mid/leaf`.
+		await runGit(parent, ["checkout", "-q", "-b", "nosub"]);
+		await runGit(parent, ["rm", "-q", "mid"]);
+		await runGit(parent, ["commit", "-q", "-m", "drop mid"]);
+		const plain = path.join(root, "plain-nosub");
+		await runGit(parent, ["worktree", "add", "-q", "--detach", plain, "nosub"]);
+
+		const result = await initWorktreeSubmodules(plain, ["mid", "mid/leaf"]);
+		expect(result.initialized).toEqual([]);
+		expect(result.skipped).toEqual(["mid", "mid/leaf"]);
+		expect(await runGit(plain, ["status", "--porcelain"])).toBe("");
 	});
 });

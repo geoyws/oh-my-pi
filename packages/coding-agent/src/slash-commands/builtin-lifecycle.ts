@@ -744,11 +744,15 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 			}
 			const failure = await relocateHeadlessSession(runtime, worktree.path);
 			if (failure) return failure;
-			const cleanup = await cleanSourceCheckoutIfConfigured(sourceCwd, runtime.settings);
+			const cleanup = await cleanSourceCheckoutIfConfigured(sourceCwd, runtime.settings, {
+				preserveSubmodules: worktree.submodulesNotCarried,
+			});
 			if (cleanup.errorMessage !== undefined) {
 				await runtime.output(
 					`Warning: Worktree created, but cleaning source checkout failed: ${cleanup.errorMessage}`,
 				);
+			} else if (cleanup.skipped !== undefined) {
+				await runtime.output(`Warning: Worktree created, but the source checkout was kept: ${cleanup.skipped}.`);
 			}
 			await runtime.output(formatSessionWorktreeSummary(worktree, cleanup.cleaned));
 			return commandConsumed();

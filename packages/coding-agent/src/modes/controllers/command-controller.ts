@@ -1700,11 +1700,15 @@ export class CommandController {
 			}
 			if (!(await this.#relocateSession(worktree.path))) return false;
 			created = worktree;
-			const cleanup = worktree.keptChanges
-				? await cleanSourceCheckoutIfConfigured(cwd, this.ctx.settings)
+			const cleanup: { cleaned: boolean; errorMessage?: string; skipped?: string } = worktree.keptChanges
+				? await cleanSourceCheckoutIfConfigured(cwd, this.ctx.settings, {
+						preserveSubmodules: worktree.submodulesNotCarried,
+					})
 				: { cleaned: false, errorMessage: undefined };
 			if (cleanup.errorMessage !== undefined) {
 				this.ctx.showWarning(`Worktree created, but cleaning source checkout failed: ${cleanup.errorMessage}`);
+			} else if (cleanup.skipped !== undefined) {
+				this.ctx.showWarning(`Worktree created, but the source checkout was kept: ${cleanup.skipped}.`);
 			}
 			this.ctx.present([
 				new Spacer(1),

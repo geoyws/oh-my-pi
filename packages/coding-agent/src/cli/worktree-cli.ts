@@ -165,7 +165,14 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 	let submoduleError: string | undefined;
 	if (submodulePaths.length > 0) {
 		try {
-			await initWorktreeSubmodules(worktreePath, submodulePaths);
+			const inited = await initWorktreeSubmodules(worktreePath, submodulePaths);
+			if (inited.skipped.length > 0) {
+				console.error(
+					chalk.dim(
+						`warning: worktree submodules not present at ${ref}, left uninitialized: ${inited.skipped.join(", ")}`,
+					),
+				);
+			}
 		} catch (error) {
 			submoduleError = error instanceof Error ? error.message : String(error);
 		}

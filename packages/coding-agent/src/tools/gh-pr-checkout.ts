@@ -520,7 +520,13 @@ export async function checkoutPullRequest(
 				);
 				if (submodulePaths.length > 0) {
 					try {
-						await initWorktreeSubmodules(finalWorktreePath, submodulePaths);
+						const inited = await initWorktreeSubmodules(finalWorktreePath, submodulePaths);
+						if (inited.skipped.length > 0) {
+							logger.warn("worktree submodules not present at the target commit, left uninitialized", {
+								path: finalWorktreePath,
+								submodules: inited.skipped,
+							});
+						}
 					} catch (error) {
 						logger.warn("worktree submodules were left uninitialized", {
 							path: finalWorktreePath,
