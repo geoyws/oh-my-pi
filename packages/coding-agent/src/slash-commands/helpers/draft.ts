@@ -1,7 +1,8 @@
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { shiftImageMarkers } from "@oh-my-pi/pi-tui/prompt/composer-attachments";
 import type { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
-import type { TuiSlashCommandRuntime } from "../types";
+import { UserMessageRefusedError } from "../../session/agent-session";
+import type { ParsedSlashCommand, TuiSlashCommandRuntime } from "../types";
 
 /** Clear only text still owned by this submission, never a newer detached draft. */
 export function clearSubmittedText(runtime: TuiSlashCommandRuntime): void {
@@ -27,6 +28,34 @@ export function restoreDetachedDraft(
 		editor.imageLinks = editor.pendingImageLinks;
 	}
 	editor.setCollapsedText([restoredText, currentText].filter(part => part.trim()).join("\n\n"));
+}
+
+/**
+ * Gate user-authored slash text that a command persists or sends to a model
+ * outside `prompt()` (`/tan` work, `/omfg` complaint, `/cleanse` request,
+ * `/ratchet` flow). A refusal merges the original slash line (and its
+ * attachments) back ahead of any newer draft, shows only the handler's
+ * notice, and returns false so nothing starts.
+ */
+export async function admitTuiSlashText(
+	command: ParsedSlashCommand,
+	runtime: TuiSlashCommandRuntime,
+	text: string,
+): Promise<boolean> {
+	const images = runtime.input?.images?.length ? runtime.input.images : undefined;
+	if (!text && !images) return true;
+	try {
+		await runtime.ctx.session.gateUserMessage(text, images, "interactive");
+		return true;
+	} catch (error) {
+		if (error instanceof UserMessageRefusedError) {
+			restoreDetachedDraft(runtime.ctx.editor, command.text, images, runtime.input?.imageLinks);
+			runtime.ctx.showError(error.notice);
+			runtime.ctx.ui.requestRender();
+			return false;
+		}
+		throw error;
+	}
 }
 
 /**

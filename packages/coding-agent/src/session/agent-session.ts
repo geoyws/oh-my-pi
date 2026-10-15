@@ -5609,7 +5609,11 @@ export class AgentSession implements SettingsScope {
 		this.#memory.cancelLocalMemoryStartup();
 		this.#titleGenerationAbortController.abort();
 		this.#abortAutolearnCapture();
-		this.#irc.flushPending();
+		// Dispose cannot await the `before_user_message` recheck: drop pending
+		// user asides that never faced it (fail-closed) instead of persisting them.
+		const pendingIrc = this.#irc.drainPending();
+		if (this.#hasUncheckedUserRecords(pendingIrc)) this.#dropUncheckedUserRecords(pendingIrc);
+		this.#irc.flushPending(pendingIrc);
 		this.yieldQueue.clear();
 		this.agent.setAsideMessageProvider(undefined);
 		this.agent.hasIrcInterrupts = undefined;
@@ -7927,6 +7931,25 @@ export class AgentSession implements SettingsScope {
 		return { text: parts.join(""), images };
 	}
 
+	/** Whether `records` hold a user-authored message that never faced `before_user_message` while handlers exist. */
+	#hasUncheckedUserRecords(records: readonly AgentMessage[]): boolean {
+		return (
+			this.#extensionRunner?.hasHandlers("before_user_message") === true &&
+			records.some(record => isUserAuthoredQueuedMessage(record) && !this.#userMessageRefusalChecked.has(record))
+		);
+	}
+
+	/** Synchronous fail-closed drop of unchecked user records and their companion groups, in place. */
+	#dropUncheckedUserRecords(records: AgentMessage[]): void {
+		for (let index = records.length - 1; index >= 0; index--) {
+			const record = records[index];
+			if (!isUserAuthoredQueuedMessage(record) || this.#userMessageRefusalChecked.has(record)) continue;
+			const start = this.#queuedUserGroupStart(records, index);
+			records.splice(start, index - start + 1);
+			index = start;
+		}
+	}
+
 	/**
 	 * Fail-closed delivery recheck for already-queued user messages: anything
 	 * enqueued before `before_user_message` handlers were registered (never
@@ -7958,8 +7981,12 @@ export class AgentSession implements SettingsScope {
 				images.length > 0 ? images : undefined,
 				source,
 			);
-			this.#userMessageRefusalChecked.add(message);
 			if (!refused) {
+				// Only an admitted message is pre-cleared. A refused one stays
+				// unchecked: if a queue rewrite during the handler await kept a
+				// copy of it, the next delivery refuses it again instead of
+				// treating it as cleared.
+				this.#userMessageRefusalChecked.add(message);
 				survivors.push(message);
 				continue;
 			}
@@ -8179,7 +8206,14 @@ export class AgentSession implements SettingsScope {
 			// Flush any pending bash messages before the new prompt
 			await this.#bash.flushPending();
 			this.#eval.flushPending();
-			this.#irc.flushPending();
+			// Pending asides missed their step-boundary injection and persist
+			// here; ones enqueued before `before_user_message` handlers
+			// registered face the same delivery recheck as the other drains.
+			const pendingIrc = this.#irc.drainPending();
+			if (this.#hasUncheckedUserRecords(pendingIrc)) {
+				await this.#dropRefusedDelivery(pendingIrc, pendingIrc.filter(isUserAuthoredQueuedMessage), "aside");
+			}
+			this.#irc.flushPending(pendingIrc);
 
 			this.#todo.resetCycle();
 			this.#resetPromptMaintenanceState();

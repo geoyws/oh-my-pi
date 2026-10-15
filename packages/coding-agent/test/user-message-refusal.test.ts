@@ -434,6 +434,72 @@ describe("before_user_message refusal", () => {
 		expect(leakedEverywhere(harness, "FAKE-SECRET")).toEqual([]);
 	});
 
+	it("a refused queued message stays refused when the queue is rewritten during the check", async () => {
+		lateApi.current = undefined;
+		harness = await createHarness({
+			factory: pi => {
+				lateApi.current = pi;
+			},
+			withSlowTool: true,
+		});
+		const run = harness.session.prompt("first");
+		await harness.toolEntered;
+		await harness.session.steer(`steered ${SECRET} steer`);
+		await harness.session.steer("keep me queued");
+		const checking = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let held = false;
+		lateApiCurrent()?.on("before_user_message", async (event: BeforeUserMessageEvent) => {
+			if (!event.text.includes("FAKE-SECRET")) return undefined;
+			if (!held) {
+				held = true;
+				checking.resolve();
+				await release.promise;
+			}
+			return { refuse: true, notice: NOTICE };
+		});
+		harness.releaseTool?.();
+		await checking.promise;
+		// Taking the other steer back rewrites the live queue from the claimed
+		// view, so the refused message survives in the fresh copy.
+		expect(harness.session.takeQueuedMessage("keep me queued", "steering")).toBeDefined();
+		release.resolve();
+		await run;
+		await harness.session.waitForIdle();
+		expect(leakedEverywhere(harness, "FAKE-SECRET")).toEqual([]);
+	});
+
+	it("a direct prompt rechecks pending asides before flushing them into the transcript", async () => {
+		lateApi.current = undefined;
+		harness = await createHarness({
+			factory: pi => {
+				lateApi.current = pi;
+			},
+			withSlowTool: true,
+		});
+		const session = harness.session;
+		const run = session.prompt("first");
+		await harness.toolEntered;
+		await session.runModeExitTeardown(async () => {
+			// Queued mid-run with no handler registered, so never gated. The
+			// abort skips the final aside poll and the suppressed drain leaves
+			// the record pending for the next direct prompt's flush.
+			await session.sendUserMessage(`aside ${SECRET} aside`, { deliverAs: "aside" });
+			harness?.releaseTool?.();
+			await session.abort();
+			await run.catch(() => undefined);
+			lateApiCurrent()?.on("before_user_message", (event: BeforeUserMessageEvent) => {
+				if (event.text.includes("FAKE-SECRET")) return { refuse: true, notice: NOTICE };
+				return undefined;
+			});
+			await session.prompt("clean direct prompt");
+		});
+		await session.waitForIdle();
+		expect(JSON.stringify(harness.contexts).includes("clean direct prompt")).toBe(true);
+		expect(harness.notices.filter(notice => notice === NOTICE)).toHaveLength(1);
+		expect(leakedEverywhere(harness, "FAKE-SECRET")).toEqual([]);
+	});
+
 	it("acp source: refused at the session layer, clean sends", async () => {
 		harness = await createHarness();
 		await expect(harness.session.prompt(`acp ${SECRET}`, { source: "acp" })).rejects.toBeInstanceOf(
@@ -630,7 +696,7 @@ describe("before_user_message refusal", () => {
 		expect(leakedEverywhere(harness, "FAKE-SECRET")).toEqual([]);
 	});
 
-	it("interactive /tan, /omfg and /cleanse: refusal restores the line and starts nothing", async () => {
+	it("interactive /tan, /omfg, /cleanse and /ratchet: refusal restores the line and starts nothing", async () => {
 		harness = await createHarness();
 		const entriesBefore = structuredClone(harness.sessionManager.getEntries());
 		for (const name of ["tan", "omfg", "cleanse"] as const) {
@@ -656,6 +722,24 @@ describe("before_user_message refusal", () => {
 			await executeBuiltinSlashCommand(`/${name} tidy the docs`, { ctx });
 			expect(started).toHaveBeenCalledWith("tidy the docs");
 		}
+		// /ratchet renders its flow text into a synthetic kickoff the prompt gate
+		// skips: the refusal must land before anything is armed or sent.
+		const editor = new CustomEditor(getEditorTheme());
+		const showError = vi.fn();
+		const prompt = vi.spyOn(harness.session, "prompt");
+		const followUp = vi.spyOn(harness.session, "followUp");
+		const ratchetLine = `/ratchet tune the summarizer with ${SECRET}`;
+		const ctx = {
+			session: harness.session,
+			editor,
+			showError,
+			ui: { requestRender: () => {} },
+		} as unknown as InteractiveModeContext;
+		expect(await executeBuiltinSlashCommand(ratchetLine, { ctx })).toBe(true);
+		expect(prompt).not.toHaveBeenCalled();
+		expect(followUp).not.toHaveBeenCalled();
+		expect(editor.getExpandedText()).toBe(ratchetLine);
+		expect(showError).toHaveBeenCalledWith(NOTICE);
 		expect(harness.streamCalls).toBe(0);
 		expect(harness.sessionManager.getEntries()).toEqual(entriesBefore);
 		expect(leakedEverywhere(harness, "FAKE-SECRET")).toEqual([]);

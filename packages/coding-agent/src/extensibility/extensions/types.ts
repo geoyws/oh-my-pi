@@ -1197,7 +1197,8 @@ export interface InputEvent {
  * draft), this covers every user-message ingress: typed prompts, queued and
  * aside deliveries, user-invoked skill expansions, writable-collab peer
  * prompts, `/btw` questions, `/goal` and RPC goal objectives, `/tan` work,
- * `/omfg` complaints, `/cleanse` requests, summarizer instructions
+ * `/omfg` complaints, `/cleanse` requests, `/guided-goal` and `/ratchet`
+ * text, summarizer instructions
  * (`/compact`, `/handoff`, `/tree`), and local shell (`!`) and Python (`$`)
  * commands. A refusal keeps
  * the interactive editor draft. Return `{ refuse: true, notice }` to drop the

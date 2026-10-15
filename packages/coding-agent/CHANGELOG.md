@@ -12,8 +12,8 @@
 - Fixed a collab guest losing its refused prompt: the host returns a refused prompt to its sender only (`error` frame with the safe notice and a `refused` payload), and the TUI guest restores the text and images ahead of any newer draft.
 - Fixed a message queued with `/queue` during compaction disappearing when the `before_user_message` gate refused it at the post-compaction flush: the refused text and images come back into the editor, ahead of anything typed since
 - Gated `/goal <objective>`, `/goal set <objective>` and `--goal` objectives with `before_user_message` before the goal is created or replaced: a refused objective is never written to the session or steered into a running turn, and the `/goal` line comes back into the editor
-- Gated RPC `goal` `create` objectives and the interactive `/tan` work, `/omfg` complaint and `/cleanse` request with `before_user_message`: a refused text starts nothing, is never written to a session or sent to a model, and the slash line comes back into the editor
-- Fixed a refused queued message's hidden companions (image description, attachment path, keyword notice) still being delivered when another message in the same batch was admitted
+- Gated RPC `goal` `create` objectives and the interactive `/tan` work, `/omfg` complaint, `/cleanse` request, `/guided-goal` rough objective and `/ratchet` flow with `before_user_message`: a refused text starts nothing, is never written to a session or sent to a model, and the slash line comes back into the editor
+- Fixed refused queued messages leaking past the delivery recheck: their hidden companions (image description, attachment path, keyword notice) are dropped even when another message in the batch is admitted, a refusal is never remembered as cleared (so a queue rewrite during the check cannot redeliver it), and pending asides flushed by a direct prompt or session dispose face the recheck too
 - Fixed a refused `!` or `$` line coming back with its attached images doubled
 
 ## [18.10.1] - 2026-10-12

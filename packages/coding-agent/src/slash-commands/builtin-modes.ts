@@ -1,4 +1,4 @@
-import { clearSubmittedText, restoreDetachedDraft } from "./helpers/draft";
+import { admitTuiSlashText, clearSubmittedText, restoreDetachedDraft } from "./helpers/draft";
 import * as path from "node:path";
 import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
 import { formatKeyHint } from "@oh-my-pi/pi-tui/app-keybindings";
@@ -742,8 +742,11 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		},
 		handleTui: async (command, runtime) => {
 			const { session } = runtime.ctx;
-			const armed = prepareRatchet(session, command.args);
 			clearSubmittedText(runtime);
+			// The flow text rides into a synthetic kickoff, which the prompt
+			// gate skips: gate it here, before anything is armed or sent.
+			if (!(await admitTuiSlashText(command, runtime, command.args.trim()))) return;
+			const armed = prepareRatchet(session, command.args);
 			if ("error" in armed) {
 				runtime.ctx.showWarning(armed.error);
 				return;

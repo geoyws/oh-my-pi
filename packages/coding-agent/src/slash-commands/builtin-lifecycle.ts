@@ -1,4 +1,4 @@
-import { clearSubmittedText, restoreDetachedDraft } from "./helpers/draft";
+import { admitTuiSlashText, clearSubmittedText, restoreDetachedDraft } from "./helpers/draft";
 import { UserMessageRefusedError } from "../session/agent-session";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -45,32 +45,6 @@ export const shutdownHandlerTui = (
 	void runtime.ctx.shutdown();
 	return commandConsumed();
 };
-
-/**
- * Gate user-authored slash text that a command persists or sends to a model
- * outside `prompt()` (`/tan` work, `/omfg` complaint, `/cleanse` request).
- * A refusal merges the original slash line back ahead of any newer draft,
- * shows only the handler's notice, and returns false so nothing starts.
- */
-async function admitTuiSlashText(
-	command: ParsedSlashCommand,
-	runtime: TuiSlashCommandRuntime,
-	text: string,
-): Promise<boolean> {
-	if (!text) return true;
-	try {
-		await runtime.ctx.session.gateUserMessage(text, undefined, "interactive");
-		return true;
-	} catch (error) {
-		if (error instanceof UserMessageRefusedError) {
-			restoreDetachedDraft(runtime.ctx.editor, command.text);
-			runtime.ctx.showError(error.notice);
-			runtime.ctx.ui.requestRender();
-			return false;
-		}
-		throw error;
-	}
-}
 
 /** Parse the `/shake` subcommand into a {@link ShakeMode}; empty defaults to elide. */
 function parseShakeMode(args: string): ShakeMode | { error: string } {

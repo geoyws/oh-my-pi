@@ -127,6 +127,7 @@ import {
 	type DroppedPrompt,
 	type ResolvedRoleModel,
 	SHUTDOWN_CONSOLIDATE_BUDGET_MS,
+	UserMessageRefusedError,
 } from "../session/agent-session";
 import type { CompactMode } from "../session/compact-modes";
 import type { ForeignSessionSource } from "../session/foreign-session-store";
@@ -6211,6 +6212,14 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.showWarning("Resume the current goal first, or drop it before setting a new objective.");
 				return false;
 			}
+			// The rough objective (and its images) ride into a synthetic kickoff,
+			// which the prompt gate skips: gate them before the goal tool is
+			// exposed or anything is sent. A refusal propagates so the Enter path
+			// restores the `/guided-goal` line.
+			const initial = rest?.trim() ?? "";
+			if (initial || input?.images?.length) {
+				await this.session.gateUserMessage(initial, input?.images, "interactive");
+			}
 
 			// Expose the goal tool for the interview so the agent can finish by
 			// calling `goal create`. Record the pre-interview toolset first: the
@@ -6243,6 +6252,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			}
 			return true;
 		} catch (error) {
+			if (error instanceof UserMessageRefusedError) throw error;
 			this.#guidedGoalInterviewActive = false;
 			this.showError(error instanceof Error ? error.message : String(error));
 			return false;
