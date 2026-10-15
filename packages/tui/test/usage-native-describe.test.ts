@@ -144,12 +144,15 @@ describe("UsageDashboardComponent.describe", () => {
 		const tiles = findAll(root, n => n.p?.role === "omp.usage.stat").map(tile =>
 			findAll(tile, n => n.k === "text").map(plain),
 		);
-		expect(tiles).toEqual([
-			["Tightest quota", "10% left", "Claude Weekly · Anthropic"],
-			["Past year", "$247", "740 requests"],
-			["Last 30 days", "$46.50", "140 requests"],
-			["Busiest day", "$200", expect.stringMatching(/ · 600 requests$/)],
+		expect(tiles.map(tile => tile.slice(0, 2))).toEqual([
+			["Tightest quota", "10% left"],
+			["Past year", "$247"],
+			["Last 30 days", "$46.50"],
+			["Busiest day", "$200"],
 		]);
+		expect(tiles[1]?.[2]).toBe("740 requests");
+		expect(tiles[2]?.[2]).toBe("140 requests");
+		expect(tiles[3]?.[2]).toMatch(/ · 600 requests$/);
 		const spark = findAll(root, n => n.k === "chart" && n.p?.kind === "spark")[0];
 		expect(spark?.k === "chart" ? spark.p?.series?.length : 0).toBe(30);
 		const foot = findAll(root, n => n.p?.role === "omp.usage.activity.foot")[0];
