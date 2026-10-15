@@ -2496,9 +2496,7 @@ async function streamAssistantResponse(
 		abortForSteer();
 		throw new SteerInterruption(resolvedCredential);
 	}
-	const apiKey = isApiKeyResolver(requestApiKey)
-		? seedApiKeyResolver(resolvedSeed, requestApiKey)
-		: requestApiKey;
+	const apiKey = isApiKeyResolver(requestApiKey) ? seedApiKeyResolver(resolvedSeed, requestApiKey) : requestApiKey;
 
 	// Re-resolve metadata after credential selection so the per-request value
 	// reflects the credential actually used, not the snapshot from AgentLoopConfig construction.
@@ -2643,61 +2641,126 @@ async function streamAssistantResponse(
 			};
 			const speculationConfig =
 				config.speculativeToolExecution?.enabled === true ? config.speculativeToolExecution : undefined;
-			const speculationCoordinator = speculationConfig
-				? new SpeculativeOperationCoordinator(speculationConfig, {
-						context,
-						loopConfig: config,
-						signal: requestSignal,
-					})
-				: undefined;
 			const speculationPlansFromStream =
 				!config.transformAssistantMessage || config.transformAssistantMessagePreservesToolCalls === true;
 
 			let providerStreamSettled = false;
 			let speculationSettled = false;
-			const responseIterator = response[Symbol.asyncIterator]();
-			const finishAbortedStream = async (): Promise<AssistantMessage> => {
+			// Everything between the resolved response and the read loop runs with
+			// the steering watch armed. If any of it throws (`wrapInbandToolStream`,
+			// the speculation coordinator, the async iterator, the abort-listener
+			// setup), the watch must stop here: for a poll-only host its
+			// `setInterval` would otherwise tick for the life of the process even
+			// though `check()` no-ops after teardown. The read loop's `finally`
+			// below cannot cover this window, so this `catch` stops the watch and
+			// rethrows.
+			let speculationCoordinator: SpeculativeOperationCoordinator | undefined;
+			let responseIterator: AsyncIterator<AssistantMessageEvent>;
+			let finishAbortedStream: () => Promise<AssistantMessage>;
+			let abortRacePromise: Promise<typeof ABORTED> | undefined = undefined;
+			let detachAbortListener: (() => void) | undefined = undefined;
+			try {
+				if (promptToolWireTools && ownedDialect) {
+					// Re-materialize in-band tool-call text as native toolCall content blocks
+					// so the rest of the loop executes them unchanged. When the model starts
+					// fabricating tool results, the abort callback cancels the provider — unless
+					// `abortOnFabricatedToolResult` is false, in which case the stream drains and
+					// the fabricated continuation is discarded without aborting.
+					response = wrapInbandToolStream(
+						response,
+						promptToolWireTools,
+						ownedDialect,
+						() => promptToolAbortController?.abort(),
+						config.abortOnFabricatedToolResult ?? true,
+					);
+				}
+				speculationCoordinator = speculationConfig
+					? new SpeculativeOperationCoordinator(speculationConfig, {
+							context,
+							loopConfig: config,
+							signal: requestSignal,
+						})
+					: undefined;
+				responseIterator = response[Symbol.asyncIterator]();
+				finishAbortedStream = async (): Promise<AssistantMessage> => {
+					try {
+						const cleanup = responseIterator.return?.();
+						if (cleanup) void cleanup.catch(() => {});
+					} catch {
+						// Provider cancellation failures cannot change the committed aborted message.
+					}
+					await speculationCoordinator?.discardAll("run aborted", "aborted");
+					speculationSettled = true;
+					const aborted = emitAbortedAssistantMessage(
+						partialMessage,
+						addedPartial,
+						completedToolCallIds,
+						context,
+						config,
+						stream,
+						requestSignal,
+					);
+					await finishChat(aborted);
+					return aborted;
+				};
+
+				// Set up a single abort race: register the abort listener once for the whole
+				// stream and reuse the same race promise for every iterator.next() instead of
+				// allocating Promise.withResolvers and add/removeEventListener per event.
+				if (requestSignal) {
+					if (requestSignal.aborted) {
+						steerWatch?.stop();
+						return await finishAbortedStream();
+					}
+					const { promise, resolve } = Promise.withResolvers<typeof ABORTED>();
+					const onAbort = () => resolve(ABORTED);
+					requestSignal.addEventListener("abort", onAbort, { once: true });
+					abortRacePromise = promise;
+					detachAbortListener = () => requestSignal.removeEventListener("abort", onAbort);
+				}
+			} catch (error) {
+				steerWatch?.stop();
+				throw error;
+			}
+			/** Discard a request that streamed nothing: no boundary, no partial, no
+			 *  replay. Returns the interruption for the caller to throw. */
+			const steerInterruptedStream = (): SteerInterruption => {
+				abortForSteer();
 				try {
 					const cleanup = responseIterator.return?.();
 					if (cleanup) void cleanup.catch(() => {});
 				} catch {
-					// Provider cancellation failures cannot change the committed aborted message.
+					// Provider cancellation failures cannot change the discarded request.
 				}
-				await speculationCoordinator?.discardAll("run aborted", "aborted");
-				speculationSettled = true;
-				const aborted = emitAbortedAssistantMessage(
-					partialMessage,
-					addedPartial,
-					completedToolCallIds,
-					context,
-					config,
-					stream,
-					requestSignal,
-				);
-				await finishChat(aborted);
-				return aborted;
+				return new SteerInterruption();
 			};
-
-			// Set up a single abort race: register the abort listener once for the whole
-			// stream and reuse the same race promise for every iterator.next() instead of
-			// allocating Promise.withResolvers and add/removeEventListener per event.
-			let abortRacePromise: Promise<typeof ABORTED> | undefined;
-			let detachAbortListener: (() => void) | undefined;
-			if (requestSignal) {
-				if (requestSignal.aborted) {
-					return await finishAbortedStream();
-				}
-				const { promise, resolve } = Promise.withResolvers<typeof ABORTED>();
-				const onAbort = () => resolve(ABORTED);
-				requestSignal.addEventListener("abort", onAbort, { once: true });
-				abortRacePromise = promise;
-				detachAbortListener = () => requestSignal.removeEventListener("abort", onAbort);
-			}
 
 			try {
 				while (true) {
 					let next: IteratorResult<AssistantMessageEvent>;
-					if (abortRacePromise) {
+					// Three-way race only while the steer window is open — i.e. for the
+					// first event alone, so steady-state streaming keeps the original
+					// two-promise (or bare) path and its per-event allocation profile.
+					if (steerRace && steerWindowOpen) {
+						// The waiter this race abandons is rejected moments later by the
+						// cancel below (pi-ai `fail()`s the stream with the abort reason).
+						// `Promise.race` keeps its own handler attached to every input for
+						// good, and `steerInterruptedStream` drains this very iterator via
+						// `return()`, so that rejection can never go unhandled.
+						const result = await Promise.race(
+							abortRacePromise
+								? [responseIterator.next(), abortRacePromise, steerRace]
+								: [responseIterator.next(), steerRace],
+						);
+						if (result === ABORTED || (result === STEER_INTERRUPTED && requestSignal?.aborted)) {
+							// An external abort in the same window always wins: the user's
+							// interrupt must never be reclassified as steering.
+							steerWatch?.stop();
+							return await finishAbortedStream();
+						}
+						if (result === STEER_INTERRUPTED) throw steerInterruptedStream();
+						next = result;
+					} else if (abortRacePromise) {
 						const result = await Promise.race([responseIterator.next(), abortRacePromise]);
 						if (result === ABORTED) {
 							return await finishAbortedStream();
@@ -2705,6 +2768,12 @@ async function streamAssistantResponse(
 						next = result;
 					} else {
 						next = await responseIterator.next();
+					}
+					// The provider answered: from here on a queued steer waits for the
+					// turn boundary rather than throwing away output the user is reading.
+					if (steerWindowOpen) {
+						steerWindowOpen = false;
+						steerWatch?.stop();
 					}
 					if (next.done) {
 						providerStreamSettled = true;
@@ -3003,6 +3072,7 @@ async function streamAssistantResponse(
 				}
 			} finally {
 				detachAbortListener?.();
+				steerWatch?.stop();
 				cancelArgStreams();
 				if (!providerStreamSettled) {
 					await speculationCoordinator?.discardAll("provider stream failed", "aborted");
@@ -3086,11 +3156,20 @@ async function streamAssistantResponse(
 			}
 		});
 	} catch (err) {
-		failChatSpan(telemetry, chatSpan, {
-			errorObject: err,
-			responseHeaders: capturedHeaders,
-			baseUrl: model.baseUrl,
-		});
+		if (err instanceof SteerInterruption) {
+			// Queued steering discarded a request that produced nothing; the
+			// re-issued call owns the step's telemetry. End the span as
+			// cancelled so it never reaches failChatSpan or the run summary —
+			// a routine steer is not an error, unlike an external abort in the
+			// same window, which takes the recorded aborted-turn path instead.
+			cancelChatSpan(chatSpan);
+		} else {
+			failChatSpan(telemetry, chatSpan, {
+				errorObject: err,
+				responseHeaders: capturedHeaders,
+				baseUrl: model.baseUrl,
+			});
+		}
 		throw err;
 	}
 }
@@ -3852,15 +3931,7 @@ async function executeToolCalls(
 			steeringQueued = true;
 			steeringSource = steeringQueueState(liveSteering).source;
 		} else if (hasSteeringMessages) {
-			const queuedState = await hasSteeringMessages();
-			if (typeof queuedState === "boolean") {
-				steeringQueued = queuedState;
-				steeringSource = queuedState ? "user" : undefined;
-			} else {
-				const state: SteeringQueueState = queuedState;
-				steeringQueued = state.queued;
-				steeringSource = state.source ?? (state.queued ? "unknown" : undefined);
-			}
+			({ queued: steeringQueued, source: steeringSource } = await peekSteeringQueue(hasSteeringMessages));
 		}
 		if (steeringQueued) {
 			// Queued steering hard-aborts only interruptible waits and (unless

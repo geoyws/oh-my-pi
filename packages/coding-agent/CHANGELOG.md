@@ -5,6 +5,7 @@
 ### Fixed
 
 - Fixed a subagent whose `task.agentModelOverrides` entry is an explicit multi-entry list (e.g. scout) escaping its list on retry: the installed `subagent:<id>` chain used to lose to the current model's model-keyed chain, spending expensive models on readers. The list is now the session's complete retry chain — recovery walks it alone and stops with the normal exhausted-retry error when it runs out.
+- A message typed while the agent is streaming now gets an explicit queued status instead of only a pending-bar repaint, so typed input is never silently swallowed: "Queued — interrupting the current step" when the model call it lands on has produced no output yet (the loop cancels that call and applies the steer immediately), "Queued — will apply after the current response" otherwise. The same notice now fires for collab guest prompts and skill commands queued mid-run; `interruptMode` (Settings → Interaction → Interrupt Mode) governs that cancellation as well as tool execution ([#12787](https://github.com/can1357/oh-my-pi/pull/12787) by [@geoyws](https://github.com/geoyws)).
 
 ## [18.10.1] - 2026-10-12
 

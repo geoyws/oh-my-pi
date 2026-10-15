@@ -8332,6 +8332,27 @@ export class AgentSession implements SettingsScope {
 		}
 	}
 
+	/**
+	 * Acknowledge a user-attributed steer queued mid-run, from every queue path
+	 * (`#queueUserMessage` for typed/steered text, `#queueCustomMessage` for
+	 * collab guest prompts and skill commands). Hidden companions queued ahead
+	 * of the user's text (magic-keyword notices) stay silent — the submission's
+	 * own notice covers them. The copy discriminates: while the model call has
+	 * streamed nothing and `interruptMode` is not `"wait"`, the loop cancels it
+	 * and the steer interrupts instead of waiting for the boundary.
+	 */
+	#emitQueuedSteerNotice(
+		deliverAs: "steer" | "followUp" | "aside",
+		attribution: MessageAttribution | undefined,
+	): void {
+		if (deliverAs !== "steer" || attribution !== "user" || !this.isStreaming) return;
+		const willInterrupt = this.interruptMode !== "wait" && this.agent.state.streamMessage === null;
+		this.emitNotice(
+			"info",
+			willInterrupt ? "Queued — interrupting the current step" : "Queued — will apply after the current response",
+		);
+	}
+
 	async #queueUserMessage(
 		text: string,
 		images: ImageContent[] | undefined,
@@ -8448,6 +8469,14 @@ export class AgentSession implements SettingsScope {
 			this.agent.steer(userMessage);
 		}
 		options?.onPromptAdmitted?.();
+		// Typed input that lands mid-run is otherwise acknowledged only by the
+		// pending bar repainting, which reads as "swallowed" on a long turn.
+		// Same feedback the compaction queue gives (`queueCompactionMessage`),
+		// emitted from the session so every front-end (TUI, RPC, collab) shows
+		// it. The copy discriminates: when the loop can still cancel a model
+		// call that has streamed nothing, the steer interrupts instead of
+		// waiting for the boundary.
+		this.#emitQueuedSteerNotice(mode, attribution);
 		this.#scheduleIdleQueueDrain();
 		return true;
 	}
@@ -8651,6 +8680,8 @@ export class AgentSession implements SettingsScope {
 			prependMessages?: readonly CustomMessage[];
 			/** Called synchronously once the message is pushed onto its queue. See {@link PromptOptions.onPromptAdmitted}. */
 			onPromptAdmitted?: () => void;
+			/** Suppress the queued-steer notice; set when the submission's own notice covers this call. */
+			silent?: boolean;
 		},
 	): Promise<void> {
 		// Captured before the normalization await below — see #sessionGeneration's doc comment.
@@ -8713,6 +8744,7 @@ export class AgentSession implements SettingsScope {
 			this.agent.steer(normalizedAppMessage);
 		}
 		onPromptAdmitted?.();
+		if (!options?.silent) this.#emitQueuedSteerNotice(deliverAs, appMessage.attribution);
 		this.#scheduleIdleQueueDrain();
 	}
 
