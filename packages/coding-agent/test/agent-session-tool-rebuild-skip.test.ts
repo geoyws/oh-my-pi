@@ -197,6 +197,7 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 			},
 			extensionRunner: options.beforeAgentStartSystemPrompt
 				? ({
+						hasHandlers: (eventType: string) => eventType === "before_agent_start",
 						emitBeforeAgentStart: async () => ({ systemPrompt: options.beforeAgentStartSystemPrompt }),
 						emit: async () => undefined,
 					} as unknown as ExtensionRunner)
