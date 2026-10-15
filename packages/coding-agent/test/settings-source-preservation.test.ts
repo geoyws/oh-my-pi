@@ -756,6 +756,75 @@ describe("settings YAML source preservation", () => {
 		}
 	}
 
+	describe("empty document roots", () => {
+		for (const project of [false, true]) {
+			for (const authored of [["---"], ["--- # marker"], ["# header", "---"], ["--- &root # anchored"]]) {
+				for (const newline of ["\n", "\r\n"]) {
+					for (const eof of [false, true]) {
+						for (const bom of [false, true]) {
+							for (const docEnd of [false, true]) {
+								const name = JSON.stringify({ project, authored, newline, eof, bom, docEnd });
+								it("adds a block root after the authored marker lines " + name, async () => {
+									const head = (bom ? "\uFEFF" : "") + authored.join(newline);
+									const source = head + (docEnd ? newline + "..." : "") + (eof ? newline : "");
+									const target = project ? projectConfig : config;
+									await Bun.write(target, source);
+									const settings = await Settings.init({ cwd, agentDir });
+									if (project) settings.setProjectModelRole("default", "new/model");
+									else {
+										settings.set("display.showTokenUsage", true);
+										settings.setModelRole("default", "new/model");
+									}
+									await settings.flush();
+									const output = await Bun.file(target).text();
+									expect(output.startsWith(head + newline)).toBe(true);
+									expect(output.indexOf("\uFEFF", 1)).toBe(-1);
+									if (docEnd) expect(output.endsWith(newline + "..." + (eof ? newline : ""))).toBe(true);
+									expect(output.endsWith(newline)).toBe(eof);
+									expect(output.split(newline).join("")).not.toMatch(/[\r\n]/);
+									expect(YAML.parse(output)).toEqual(
+										project
+											? { modelRoles: { default: "new/model" } }
+											: { display: { showTokenUsage: true }, modelRoles: { default: "new/model" } },
+									);
+									const reopened = await Settings.loadIsolated({ cwd, agentDir });
+									expect(reopened.getModelRole("default")).toBe("new/model");
+									if (!project) expect(reopened.get("display.showTokenUsage")).toBe(true);
+								});
+							}
+						}
+					}
+				}
+			}
+
+			for (const [literal, comment] of [
+				["null", ""],
+				["~ # keep", " # keep"],
+			]) {
+				it(
+					"keeps replacing a meaningful null root in " + (project ? "project" : "global") + " YAML: " + literal,
+					async () => {
+						const source = "# header\n---\n" + literal + "\n";
+						const target = project ? projectConfig : config;
+						await Bun.write(target, source);
+						const settings = await Settings.init({ cwd, agentDir });
+						if (project) settings.setProjectModelRole("default", "new/model");
+						else settings.setModelRole("default", "new/model");
+						await settings.flush();
+						const output = await Bun.file(target).text();
+						expect(output.startsWith("# header\n---\n")).toBe(true);
+						expect(output).not.toContain("null");
+						expect(output.endsWith(comment + "\n")).toBe(true);
+						expect(output.split("\n")).toHaveLength(4);
+						expect(YAML.parse(output)).toEqual({ modelRoles: { default: "new/model" } });
+						const reopened = await Settings.loadIsolated({ cwd, agentDir });
+						expect(reopened.getModelRole("default")).toBe("new/model");
+					},
+				);
+			}
+		}
+	});
+
 	it("keeps legacy JSON migration on the fresh-file path", async () => {
 		const legacy = path.join(agentDir, "settings.json");
 		const source = '{"theme":{"dark":"titanium"}}';

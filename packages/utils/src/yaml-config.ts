@@ -258,11 +258,33 @@ export function reconcileYamlConfig(source: string, value: unknown): string {
 			edits.push({ start: offset, end: offset, text: before + text + after });
 		}
 	};
-	if (document.contents) reconcile(document.contents, value);
-	else {
+	const root = document.contents;
+	if (!root) {
 		const prefix = source.length > 0 && !source.endsWith("\n") ? newline : "";
 		const text = stringifyYamlConfig(value).replace(/\n/g, newline);
 		return source + prefix + (source.length > 0 && !source.endsWith("\n") ? text.replace(/\r?\n$/, "") : text);
+	}
+	// A document of only markers, comments or an anchor has an empty untagged
+	// root whose zero-width range follows that marker or anchor. Splicing there
+	// would join the new root to the marker line, so a fresh block root goes on
+	// the next line, after the root line's comment, keeping every authored byte.
+	// A root that starts its line (before a bare `...` end marker) precedes it.
+	const emptyRootOffset = (): number | undefined => {
+		const at = root.range?.[0];
+		if (!isScalar(root) || root.tag || at === undefined || at !== root.range?.[1]) return undefined;
+		const lineEnd = source.indexOf("\n", at);
+		if (/^[ \t]*(?:#[^\r\n]*)?\r?$/.test(source.slice(at, lineEnd < 0 ? source.length : lineEnd))) {
+			return lineEnd < 0 ? source.length : lineEnd + 1;
+		}
+		return /^\uFEFF?$/.test(source.slice(lineStart(at), at)) ? at : undefined;
+	};
+	const rootOffset = emptyRootOffset();
+	if (rootOffset === undefined || Bun.deepEquals(root.toJS(document), value)) reconcile(root, value);
+	else {
+		const text = stringifyYamlConfig(value).replace(/\n$/, "").replace(/\n/g, newline);
+		const before = rootOffset === source.length && !source.endsWith("\n") ? newline : "";
+		const after = rootOffset < source.length || source.endsWith("\n") ? newline : "";
+		edits.push({ start: rootOffset, end: rootOffset, text: before + text + after });
 	}
 	// Anchor edits must not change untouched aliases when the file is reopened.
 	const children = (node: Node): Node[] => {
