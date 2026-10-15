@@ -4324,6 +4324,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						model || modelOverride === undefined ? undefined : options.parentActiveModelPattern,
 					modelPatternFallbackRole:
 						model || modelOverride === undefined ? undefined : subagentRetryFallbackRole(id),
+					// An explicit multi-entry list is its own complete retry chain:
+					// tell the SDK installer to mark it exhaustive, matching the
+					// immediate install above. Singleton and @role patterns leave
+					// this unset and keep inheriting their (default) chain.
+					modelPatternFallbackExhaustive:
+						model || modelOverride === undefined || modelPatterns.length <= 1 ? undefined : true,
 					modelPatternDefaultFallbackChain:
 						model || modelOverride === undefined ? undefined : inheritedRetryFallbackChain,
 					thinkingLevel: effectiveThinkingLevel,

@@ -596,6 +596,13 @@ export interface CreateAgentSessionOptions {
 	modelPatternAuthFallback?: string;
 	/** Role name used to install retry fallbacks after deferred subagent patterns resolve. */
 	modelPatternFallbackRole?: string;
+	/**
+	 * True when the deferred subagent patterns are an explicit multi-entry
+	 * list: the SDK installer marks its chain exhaustive, matching the
+	 * executor's immediate install. Singleton patterns inheriting the default
+	 * chain leave this unset and stay non-exhaustive.
+	 */
+	modelPatternFallbackExhaustive?: boolean;
 	/** Validated default retry chain to install when a deferred singleton pattern resolves. */
 	modelPatternDefaultFallbackChain?: string[];
 	/** Thinking selector. Default: from settings, else unset */
@@ -3087,6 +3094,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						seenSelectors.add(fallbackSelector);
 						fallbackSelectors.push(fallbackSelector);
 					}
+					const explicitFallbackCount = fallbackSelectors.length;
 					if (fallbackSelectors.length === 0) {
 						for (const selector of options.modelPatternDefaultFallbackChain ?? []) {
 							if (typeof selector !== "string" || seenSelectors.has(selector)) continue;
@@ -3098,6 +3106,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						installRetryFallbackRole(settings, options.modelPatternFallbackRole, {
 							primary: primarySelector,
 							chain: fallbackSelectors,
+							// An explicit multi-entry list owns its session end to end,
+							// matching the executor's immediate install. A singleton
+							// inheriting the default chain stays non-exhaustive.
+							...(explicitFallbackCount > 0 && options.modelPatternFallbackExhaustive === true
+								? { exhaustive: true as const }
+								: {}),
 						});
 					}
 				}

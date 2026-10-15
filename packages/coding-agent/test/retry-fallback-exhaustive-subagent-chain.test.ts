@@ -5,6 +5,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import {
 	findRetryFallbackCandidates,
+	getExhaustiveRetryFallbackRoles,
 	getRetryFallbackChains,
 	getRetryFallbackRole,
 	installRetryFallbackRole,
@@ -250,5 +251,89 @@ describe("exhaustive subagent fallback chains", () => {
 		const role = getRetryFallbackRole(childSettings, "subagent:single-spawn");
 		expect(role?.chain).toEqual([SECOND]);
 		expect(role?.exhaustive).toBeUndefined();
+	});
+
+	it("survives a warm-revival overlay round trip", () => {
+		const parent = scoutSettings();
+		const child = parent.overlay();
+		installScoutChain(child, true);
+		// Warm revival parks the live session, captures its overlay layers, and
+		// rebuilds settings from them on the same parent — the rebuilt object
+		// must keep the exhaustive flag, not just the selectors.
+		const restored = parent.restoreOverlay(child.overlayLayers());
+		expect(getRetryFallbackRole(restored, SCOUT_ROLE)?.exhaustive).toBe(true);
+		const models = [model("scout-a", "first"), model("scout-b", "second"), model("scout-c", "third")];
+		const context: RetryFallbackResolutionContext = {
+			chains: getRetryFallbackChains(restored),
+			getModelRole: (role: string) => restored.getModelRole(role),
+			modelLookup: lookupFor(models),
+			exhaustiveRoles: getExhaustiveRetryFallbackRoles(restored),
+		};
+		expect(resolveRetryFallbackChainKey(context, FIRST)).toBe(SCOUT_ROLE);
+		expect(resolveRetryFallbackChainKey(context, SECOND)).toBe(SCOUT_ROLE);
+		const recovery = recoveryFor(restored, models);
+		const attempted: string[] = [];
+		let pinned: string | undefined;
+		let current: string | undefined = FIRST;
+		for (let step = 0; step < 10; step += 1) {
+			if (current === undefined) break;
+			const selector: string = current;
+			attempted.push(selector);
+			const keys = recovery.retryFallbackChainKeys(selector, undefined, pinned ? { pinnedRole: pinned } : undefined);
+			const next = keys
+				.flatMap(key =>
+					recovery.findRetryFallbackCandidates(key, selector, undefined).map(candidate => candidate.raw),
+				)
+				.at(0);
+			if (next === undefined) {
+				current = undefined;
+				break;
+			}
+			pinned = keys[0];
+			current = next;
+		}
+		expect(attempted).toEqual([FIRST, SECOND, THIRD]);
+		expect(recovery.findRetryFallbackCandidates(SCOUT_ROLE, THIRD, undefined)).toEqual([]);
+	});
+
+	it("passes exhaustive intent when a multi-entry list defers to the SDK installer", async () => {
+		// None of the requested models is visible yet (discovery pending), so the
+		// executor defers resolution to the SDK installer inside createAgentSession.
+		const unrelated = model("elsewhere", "other");
+		let fallbackRole: unknown;
+		let fallbackExhaustive: unknown;
+		let fallbackDefaultChain: unknown;
+		let fallbackPattern: unknown;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			fallbackRole = options?.modelPatternFallbackRole;
+			if (options && typeof options === "object" && "modelPatternFallbackExhaustive" in options) {
+				fallbackExhaustive = options.modelPatternFallbackExhaustive;
+			}
+			fallbackDefaultChain = options?.modelPatternDefaultFallbackChain;
+			fallbackPattern = options?.modelPattern;
+			return { session: createYieldingSession(), extensionsResult: {}, setToolUIContext: () => {} } as never;
+		});
+		const agent: AgentDefinition = { name: "scout", description: "test", systemPrompt: "test", source: "bundled" };
+		await runSubprocess({
+			cwd: "/tmp",
+			agent,
+			task: "work",
+			index: 0,
+			id: "deferred-exhaustive",
+			modelOverride: [FIRST, "scout-b/second", "scout-c/third"],
+			settings: Settings.isolated({
+				"retry.fallbackChains": { default: [OUTSIDE] },
+			}),
+			modelRegistry: {
+				refresh: async () => {},
+				getAvailable: () => [unrelated],
+				getApiKey: async () => "test-key",
+			} as never,
+			enableLsp: false,
+		});
+		expect(fallbackPattern).toEqual([FIRST, "scout-b/second", "scout-c/third"]);
+		expect(fallbackRole).toBe("subagent:deferred-exhaustive");
+		expect(fallbackDefaultChain).toBeUndefined();
+		expect(fallbackExhaustive).toBe(true);
 	});
 });

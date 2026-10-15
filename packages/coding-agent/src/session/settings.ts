@@ -843,6 +843,20 @@ export const cfgRetryFallbackChains = register({
 	},
 });
 
+/**
+ * Roles whose installed retry fallback chain is an explicit multi-entry
+ * override list that owns its session end to end. Session-scoped runtime
+ * state, never user configuration: written only through
+ * `installRetryFallbackRole`, so it rides the same overlay layers as the
+ * installed chains and survives settings rebuilds (warm-revival overlay
+ * restore). Deliberately has no `ui`: it must never be user-configured.
+ */
+export const cfgExhaustiveRetryFallbackRoles = register({
+	id: "retry.exhaustiveFallbackRoles",
+	type: "array",
+	default: EMPTY_STRING_ARRAY,
+});
+
 export const cfgRetryFallbackRevertPolicy = register({
 	id: "retry.fallbackRevertPolicy",
 	type: "enum",

@@ -13,7 +13,12 @@ import {
 import { resolveConfiguredModelPatterns, resolveModelRoleValue } from "../config/model-resolver";
 import { getRoleInfo, isKindRole } from "../config/model-roles";
 
-import { cfgRetryFallbackChains, cfgRetryFallbackRevertPolicy, type RetrySettings } from "./settings";
+import {
+	cfgExhaustiveRetryFallbackRoles,
+	cfgRetryFallbackChains,
+	cfgRetryFallbackRevertPolicy,
+	type RetrySettings,
+} from "./settings";
 
 /** Configured fallback chains keyed by role or model selector. */
 export type RetryFallbackChains = Record<string, string[]>;
@@ -194,16 +199,16 @@ export interface RetryFallbackRole {
 }
 
 /**
- * Installed exhaustive chains per session settings. The flag travels inside
- * {@link RetryFallbackRole} (so `session_init` persists it for cold revival),
- * but the live chains map holds only selectors — this side table is what the
- * runtime consults. Session-scoped like the overrides themselves.
+ * Installed exhaustive chains per session settings. The flag rides the same
+ * overlay layers as the installed chains (see `cfgExhaustiveRetryFallbackRoles`),
+ * so a rebuilt Settings keeps it: `session_init` persists it for cold revival
+ * and overlay capture/restore carries it for warm revival. Session-scoped like
+ * the overrides themselves.
  */
-const exhaustiveRetryFallbackRoles = new WeakMap<Settings, Set<string>>();
 
 /** Names of installed exhaustive chains for `settings` (empty when none). */
 export function getExhaustiveRetryFallbackRoles(settings: Settings): ReadonlySet<string> {
-	return exhaustiveRetryFallbackRoles.get(settings) ?? new Set();
+	return new Set(cfgExhaustiveRetryFallbackRoles.get(settings) ?? []);
 }
 
 /** Reads the primary and non-empty chain installed for `role`, if any. */
@@ -212,7 +217,7 @@ export function getRetryFallbackRole(settings: Settings, role: string): RetryFal
 	const chain = cfgRetryFallbackChains.get(settings)[role];
 	if (!primary || !Array.isArray(chain) || chain.length === 0) return undefined;
 	const roleState: RetryFallbackRole = { primary, chain };
-	if (exhaustiveRetryFallbackRoles.get(settings)?.has(role)) roleState.exhaustive = true;
+	if (cfgExhaustiveRetryFallbackRoles.get(settings)?.includes(role)) roleState.exhaustive = true;
 	return roleState;
 }
 
@@ -226,16 +231,11 @@ export function installRetryFallbackRole(
 	role: string,
 	{ primary, chain, exhaustive }: RetryFallbackRole,
 ): void {
-	if (exhaustive) {
-		let roles = exhaustiveRetryFallbackRoles.get(settings);
-		if (!roles) {
-			roles = new Set();
-			exhaustiveRetryFallbackRoles.set(settings, roles);
-		}
-		roles.add(role);
-	} else {
-		exhaustiveRetryFallbackRoles.get(settings)?.delete(role);
-	}
+	const current = cfgExhaustiveRetryFallbackRoles.get(settings) ?? [];
+	cfgExhaustiveRetryFallbackRoles.override(
+		settings,
+		exhaustive ? (current.includes(role) ? current : [...current, role]) : current.filter(entry => entry !== role),
+	);
 	const modelRoles: Record<string, string> = {};
 	const existingRoles = settings.getModelRoles();
 	for (const key in existingRoles) {
