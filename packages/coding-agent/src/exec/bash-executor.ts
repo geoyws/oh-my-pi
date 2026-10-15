@@ -201,12 +201,12 @@ const shellSessionsInUse = new Set<string>();
  * Shells retained past their turn because a background (`nohup`/`&`) job is
  * still running. A per-call `:async:` Shell is normally dropped at teardown,
  * which SIGKILLs its children via kill-on-drop. Keeping the reference alive lets
- * the process survive across turns; the Shell is dropped once its last
- * background job exits (reaped by the poll loop below). Children stay
- * kill-on-drop, so they still die when the harness tears the Shell down on exit.
+ * the process survive across turns; it is reaped once its last job exits and
+ * still dies with the harness. The map value is the owning session key (the
+ * `:async:` sessionKey the run used, if any) so session dispose can shut down
+ * exactly its own retained shells.
  */
-const retainedShells = new Set<Shell>();
-const RETAIN_REAP_INTERVAL_MS = 5_000;
+const retainedShells = new Map<Shell, string | undefined>();
 // Native cancellation may spend two seconds unwinding the shell before its
 // N-API chunk bridge drains. The JS watchdog must not race that teardown.
 const NATIVE_TIMEOUT_FALLBACK_GRACE_MS = 5_000;
@@ -217,8 +217,9 @@ const NATIVE_TIMEOUT_FALLBACK_GRACE_MS = 5_000;
 // leaking the session key in `brokenShellSessions`/`shellSessionQuarantines`
 // (#10308). The backing timer is unref'd so it never keeps the process alive.
 const QUARANTINE_CLEANUP_TIMEOUT_MS = 30_000;
+const RETAIN_REAP_INTERVAL_MS = 5_000;
 
-async function retainShellWithLiveBackgroundJobs(shell: Shell): Promise<void> {
+async function retainShellWithLiveBackgroundJobs(shell: Shell, owner: string | undefined): Promise<void> {
 	let live: number;
 	try {
 		live = await shell.liveBackgroundJobCount();
@@ -226,7 +227,7 @@ async function retainShellWithLiveBackgroundJobs(shell: Shell): Promise<void> {
 		return;
 	}
 	if (live <= 0) return;
-	retainedShells.add(shell);
+	retainedShells.set(shell, owner);
 	const interval = setInterval(() => {
 		void shell
 			.liveBackgroundJobCount()
@@ -279,21 +280,32 @@ function quarantineShellSession(
 }
 
 /**
- * Drops every persistent Shell owned by an agent session (keys built with
- * `agentSessionKey` as the {@link BashExecutorOptions.sessionKey}). The map is
- * process-global, so without this each disposed session keeps its native shell
- * for the life of the process. A Shell with live background jobs is retained
- * until they exit, matching the `:async:` teardown; an in-flight run keeps its
- * own reference and drops the Shell when it settles.
+ * Shuts down every Shell owned by an agent session (keys built with
+ * `agentSessionKey` as the {@link BashExecutorOptions.sessionKey}), plus that
+ * session's retained `:async:` shells. Each shell is aborted (an in-flight run
+ * cancels through the native TERM→KILL bridge) and its leftover background
+ * jobs are terminated with awaited TERM→KILL escalation, so no bash-tool
+ * process group outlives session dispose — and, through the postmortem
+ * SIGTERM/SIGHUP teardown, process exit. The maps are process-global, so
+ * without this each disposed session keeps its native shell (and its
+ * background jobs) for the life of the process.
  */
-export function releaseShellSessions(agentSessionKey: string | undefined): void {
+export async function releaseShellSessions(agentSessionKey: string | undefined): Promise<void> {
 	if (!agentSessionKey) return;
 	const prefix = `${agentSessionKey}\n`;
+	const owned: Shell[] = [];
 	for (const [key, shell] of shellSessions) {
 		if (!key.startsWith(prefix)) continue;
 		shellSessions.delete(key);
-		if (!shellSessionsInUse.has(key)) void retainShellWithLiveBackgroundJobs(shell);
+		owned.push(shell);
 	}
+	for (const [shell, owner] of retainedShells) {
+		if (owner === agentSessionKey || owner?.startsWith(`${agentSessionKey}:`) === true) {
+			retainedShells.delete(shell);
+			owned.push(shell);
+		}
+	}
+	await Promise.all(owned.map(shell => shell.shutdown().catch(() => undefined)));
 }
 
 function resolveShellCwd(cwd: string | undefined): string | undefined {
@@ -838,7 +850,13 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			}
 		}
 
-		// Normal completion
+		// Normal completion of a non-retained run: reap backgrounded (`&`/`nohup`)
+		// jobs so they never outlive the call. `:async:` runs opt out — the job
+		// manager owns their lifetime — but they still die at session dispose.
+		// Awaited: return means the recorded groups are dead.
+		if (!options?.sessionKey?.includes(":async:")) {
+			await executionShell.terminateBackgroundJobs().catch(() => undefined);
+		}
 		return {
 			exitCode: winner.result.exitCode,
 			cancelled: false,
@@ -847,6 +865,11 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		};
 	} catch (err) {
 		resetSession = true;
+		// An errored run can still leave backgrounded jobs behind; reap them
+		// like a normal end unless the `:async:` job manager owns them.
+		if (!options?.sessionKey?.includes(":async:")) {
+			await executionShell.terminateBackgroundJobs().catch(() => undefined);
+		}
 		throw err;
 	} finally {
 		await sink.dispose();
@@ -865,10 +888,11 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 				// Dropping the only reference to a per-call `:async:` Shell SIGKILLs
 				// any `nohup`/`&` children (kill-on-drop). If the command left a live
 				// background job, retain the Shell so the process survives across
-				// turns; it is reaped once its last job exits and still dies with the
-				// harness. Skip on resetSession (cancel/error) — those tear down.
+				// turns; it is reaped once its last job exits, and session dispose
+				// shuts it down (see `releaseShellSessions`). Skip on resetSession
+				// (cancel/error) — those tear down.
 				if (!resetSession && shellSession) {
-					await retainShellWithLiveBackgroundJobs(shellSession);
+					await retainShellWithLiveBackgroundJobs(shellSession, options?.sessionKey);
 				}
 			}
 		}

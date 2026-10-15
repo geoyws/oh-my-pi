@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed bash-tool child processes outliving their call or session (orphaned `bun test` runs, `while :; do :; done` loops): a call's whole process group is now signalled TERM, then KILL after a short grace, on normal end, abort, and timeout — not just the direct child. Background jobs started with plain `&` no longer survive a foreground call (use an async/background job to keep one across turns); every live bash-tool group is shut down at session dispose, including retained async shells, so nothing survives SIGTERM/SIGHUP process exit as a PPID-1 orphan.
+
 ## [18.10.1] - 2026-10-12
 
 ### Added

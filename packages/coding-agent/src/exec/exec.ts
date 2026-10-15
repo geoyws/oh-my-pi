@@ -44,6 +44,11 @@ export async function execCommand(
 		allowNonZero: true,
 		allowAbort: true,
 		stderr: "full",
+		// Own process group (setsid) on POSIX so abort/timeout signals the
+		// whole group (TERM→KILL escalation in `ChildProcess.kill`), not just
+		// the direct child — grandchildren must not outlive the call.
+		// Windows has no process groups; the retained-handle tree kill applies.
+		...(process.platform === "win32" ? {} : { detached: true }),
 	});
 
 	const killed = Boolean(result.exitError?.aborted);

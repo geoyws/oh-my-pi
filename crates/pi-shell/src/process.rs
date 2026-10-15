@@ -1131,6 +1131,24 @@ impl TerminationTargets {
 			let _ = process.signal_tree(signal);
 		}
 	}
+	/// True when every recorded target has exited: no pinned process is still
+	/// running and no recorded group still has members. Bounds the post-KILL
+	/// wait so a caller that just signalled can treat return as "the group is
+	/// dead" instead of racing still-dying processes.
+	#[must_use]
+	pub fn all_exited(&self) -> bool {
+		if self
+			.processes
+			.iter()
+			.any(|process| process.status() == ProcessStatus::Running)
+		{
+			return false;
+		}
+		if self.pgids.iter().any(|pgid| process_group_alive(*pgid)) {
+			return false;
+		}
+		true
+	}
 }
 
 /// A single external child reported by the shell's spawn-observer hook.
