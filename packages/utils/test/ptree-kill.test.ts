@@ -89,6 +89,14 @@ describe("ptree kill without a usable native process handle", () => {
 			const waiting = child.wait({ allowAbort: true });
 			waiting.catch(() => {});
 			const reason = new AbortError(new Error("cancelled"), "");
+			// kill(reason) makes `exited` reject with `reason` as soon as the leader
+			// dies, while wait() only awaits it after pipe EOF. Without a signal or
+			// timeout attached nothing else observes it, so capture the rejection
+			// here (it is asserted below) instead of leaving it unhandled.
+			const leaderExit = child.exited.then(
+				code => ({ code }),
+				(error: unknown) => ({ error }),
+			);
 			child.kill(reason, GRACE_MS);
 
 			const outcome = await Promise.race([
@@ -97,6 +105,9 @@ describe("ptree kill without a usable native process handle", () => {
 			]);
 			expect(outcome, `wait() did not settle within ${SETTLE_MS}ms of a ${GRACE_MS}ms grace kill`).toBeDefined();
 			expect(outcome?.result.exitError).toBe(reason);
+			// wait() awaited `exited`, so it has settled with the kill reason.
+			const settledExit = await leaderExit;
+			expect("error" in settledExit && settledExit.error).toBe(reason);
 
 			const reapDeadline = Date.now() + REAP_MS;
 			while (holder.status() === ProcessStatus.Running && Date.now() < reapDeadline) await Bun.sleep(10);
