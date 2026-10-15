@@ -34,18 +34,22 @@ const execOwnerStorage = new AsyncLocalStorage<string>();
 
 /**
  * Owners whose session has run its dispose-time `shutdownExecCommands(owner)`.
- * A `session_shutdown` handler that outlives its 2s cap keeps running inside
- * the owner scope; a `pi.exec` it starts after that single kill snapshot would
- * otherwise run unkilled until process exit. Such calls are refused instead.
- * A fresh `runWithExecOwner` entry reopens the owner, so a session id that is
- * resumed in-process after dispose spawns normally again.
+ * Work the disposing session still triggers after that single kill snapshot —
+ * a `session_shutdown` handler past its 2s cap, a `tool_result` or `agent_end`
+ * handler fired as the aborted turn settles — runs inside the owner scope, and
+ * a `pi.exec` it starts would otherwise run unkilled until process exit. Such
+ * calls are refused instead. Entering the scope never reopens an owner: only
+ * {@link reopenExecOwner}, when a live session takes that id again.
  */
 const closedExecOwners = new Set<string>();
 
 export function runWithExecOwner<T>(owner: string | undefined, fn: () => T): T {
-	if (owner === undefined) return fn();
+	return owner === undefined ? fn() : execOwnerStorage.run(owner, fn);
+}
+
+/** A live session (constructed for, or switched to, `owner`) may spawn under that id again. */
+export function reopenExecOwner(owner: string): void {
 	closedExecOwners.delete(owner);
-	return execOwnerStorage.run(owner, fn);
 }
 
 /**

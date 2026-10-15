@@ -138,7 +138,7 @@ import type { PythonResult } from "../eval/py/executor";
 import { formatEvalStateContext } from "../eval/state";
 import { WorkPoolRegistry } from "../task/workpool";
 import { type BashPtyOptions, type BashResult, releaseShellSessions } from "../exec/bash-executor";
-import { runWithExecOwner, shutdownExecCommands } from "../exec/exec";
+import { reopenExecOwner, runWithExecOwner, shutdownExecCommands } from "../exec/exec";
 import type { TtsrManager } from "../export/ttsr";
 import type { LoadedCustomCommand } from "../extensibility/custom-commands";
 import type { CustomTool } from "../extensibility/custom-tools/types";
@@ -1648,6 +1648,8 @@ export class AgentSession implements SettingsScope {
 		);
 		this.#codeModeState = config.codeModeState ?? {};
 		this.sessionManager = config.sessionManager;
+		// A session revived in-process under a previously disposed id spawns again.
+		reopenExecOwner(this.sessionManager.getSessionId());
 		this.settings = config.settings;
 		this.#skillDescriptions = config.skillDescriptions ?? new SkillDescriptionCatalog();
 		this.memoryEnabled = config.memoryEnabled ?? true;
@@ -11498,6 +11500,7 @@ export class AgentSession implements SettingsScope {
 			// switch rolled back via restoreState); re-read it on the next model call either way.
 			this.#sessionInit = undefined;
 			await this.sessionManager.setSessionFile(sessionPath);
+			reopenExecOwner(this.sessionManager.getSessionId());
 			this.#bash.markSessionTransition(bashTransition);
 			const newCwd = this.sessionManager.getCwd();
 			const recordedCwd = this.sessionManager.getRecordedCwd() ?? previousSessionState.cwd;

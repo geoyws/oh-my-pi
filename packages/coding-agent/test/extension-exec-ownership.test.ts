@@ -7,7 +7,7 @@ import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { shutdownExecCommands, type ExecResult } from "@oh-my-pi/pi-coding-agent/exec/exec";
+import { reopenExecOwner, shutdownExecCommands, type ExecResult } from "@oh-my-pi/pi-coding-agent/exec/exec";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { emitSessionShutdownEvent, ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import type {
@@ -183,33 +183,29 @@ describe("extension exec ownership", () => {
 			expect(live(markerA).length).toBeGreaterThan(0);
 			expect(live(markerB).length).toBeGreaterThan(0);
 
-			// Disposing session A kills only A's event-handler child. The
-			// sleep is a settle check, not a wait: a kill settles the call
-			// near-instantly (real-clock escalation, no event handle to await).
+			// session_shutdown runs through the same funnel, so the child its
+			// handler starts is owned too. Dispose order: the emit, then the
+			// owner's kill.
+			expect(await emitSessionShutdownEvent(runnerA)).toBe(true);
+			expect(pendingSd).toBeDefined();
+			await waitLive(markerSd);
+
+			// Disposing session A kills only A's handler children. The sleep is
+			// a settle check, not a wait: a kill settles the call near-instantly
+			// (real-clock escalation, no event handle to await), and fail-before
+			// (unowned child) fails here instead of hanging on the awaits below.
 			await shutdownExecCommands(sidA);
 			await Bun.sleep(500);
 			expect(settled.a).toBe(true);
+			expect(settled.sd).toBe(true);
 			expect((await pendingA!).killed).toBe(true);
+			expect((await pendingSd!).killed).toBe(true);
 			expect(live(markerA)).toEqual([]);
+			expect(live(markerSd)).toEqual([]);
 			// B is untouched: still alive and its call unsettled. A short
 			// settle check, not a leak window: a wrongful kill would settle
 			// it near-instantly, while the loop spins without the shutdown.
 			expect(live(markerB).length).toBeGreaterThan(0);
-			expect(settled.b).toBe(false);
-
-			// session_shutdown runs through the same funnel, so the child
-			// its handler starts is owned too — and dies on the
-			// dispose-order shutdown that follows the emit.
-			expect(await emitSessionShutdownEvent(runnerA)).toBe(true);
-			expect(pendingSd).toBeDefined();
-			await waitLive(markerSd);
-			await shutdownExecCommands(sidA);
-			// Settle check as above: fail-before (unowned child) fails here
-			// instead of hanging on the `await` below.
-			await Bun.sleep(500);
-			expect(settled.sd).toBe(true);
-			expect((await pendingSd!).killed).toBe(true);
-			expect(live(markerSd)).toEqual([]);
 			expect(settled.b).toBe(false);
 
 			// The owner-less (postmortem) shutdown kills everything left.
@@ -222,12 +218,14 @@ describe("extension exec ownership", () => {
 		}
 	}, 120_000);
 
-	it("a session_shutdown handler outliving its cap cannot spawn past the dispose kill", async () => {
+	it("a disposed session's late handlers cannot spawn past its kill until the id is live again", async () => {
 		if (process.platform === "win32") return;
 		const tag = `${process.pid}_${Math.random().toString(36).slice(2, 8)}`;
 		const markerLate = `EXTEXEC_LATE_${tag}`;
+		const markerEnd = `EXTEXEC_END_${tag}`;
 		const gate = Promise.withResolvers<void>();
 		let pendingLate: Promise<ExecResult> | undefined;
+		const pendingEnd: Promise<ExecResult>[] = [];
 
 		const runner = await makeRunner("ext-exec-late", pi => {
 			pi.on("session_shutdown", async () => {
@@ -238,8 +236,22 @@ describe("extension exec ownership", () => {
 				pendingLate = pi.exec(command, args);
 				pendingLate.catch(() => {});
 			});
+			pi.on("agent_end", () => {
+				const [command, args] = trapLoop(markerEnd);
+				const pending = pi.exec(command, args);
+				pending.catch(() => {});
+				pendingEnd.push(pending);
+			});
 		});
 		const sid = runner.sessionId;
+		// One macrotask turn, not a clock wait: a refused call has settled by
+		// then, while fail-before's spawned TERM-ignoring loop has not, so the
+		// checks fail instead of hanging on the awaits after them.
+		const nextTurn = async (): Promise<void> => {
+			const turn = Promise.withResolvers<void>();
+			setImmediate(turn.resolve);
+			await turn.promise;
+		};
 
 		try {
 			// Same ordering as a handler past its cap, without waiting the cap
@@ -250,19 +262,30 @@ describe("extension exec ownership", () => {
 			gate.resolve();
 			await emitted;
 			expect(pendingLate).toBeDefined();
-			// One macrotask turn, not a clock wait: a refused call has settled
-			// by now, while fail-before's spawned TERM-ignoring loop has not, so
-			// it fails here instead of hanging on the await below.
-			const turn = Promise.withResolvers<void>();
-			setImmediate(turn.resolve);
-			await turn.promise;
+			await nextTurn();
 			expect(Bun.peek.status(pendingLate!)).toBe("fulfilled");
 			expect((await pendingLate!).killed).toBe(true);
 			expect(live(markerLate)).toEqual([]);
+
+			// A fresh handler entry the disposing session still fires (the
+			// aborted turn's `agent_end`) does not reopen the owner either.
+			await runner.emit({ type: "agent_end", messages: [] });
+			expect(pendingEnd).toHaveLength(1);
+			await nextTurn();
+			expect(Bun.peek.status(pendingEnd[0])).toBe("fulfilled");
+			expect((await pendingEnd[0]).killed).toBe(true);
+			expect(live(markerEnd)).toEqual([]);
+
+			// A live session taking the id again (revival, switch) spawns.
+			reopenExecOwner(sid);
+			await runner.emit({ type: "agent_end", messages: [] });
+			expect(pendingEnd).toHaveLength(2);
+			await waitLive(markerEnd);
+			expect(live(markerEnd).length).toBeGreaterThan(0);
 		} finally {
 			gate.resolve();
 			await shutdownExecCommands();
-			killSweep(markerLate);
+			killSweep(markerLate, markerEnd);
 		}
 	}, 120_000);
 
