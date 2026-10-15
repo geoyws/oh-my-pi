@@ -1,5 +1,5 @@
 import { YAML } from "bun";
-import { Document, isMap, isNode, isScalar, isSeq, type Node, parseDocument } from "yaml";
+import { Document, isAlias, isMap, isNode, isScalar, isSeq, type Node, parseDocument } from "yaml";
 
 const YAML_MAPPING_HEADER_TRAILING_SPACE = /: +$/gm;
 
@@ -26,6 +26,11 @@ export function reconcileYamlConfig(source: string, value: unknown): string {
 	const newline = source.includes("\r\n") ? "\r\n" : "\n";
 	const lineStart = (offset: number) => source.lastIndexOf("\n", offset - 1) + 1;
 	const column = (offset: number) => offset - lineStart(offset);
+	const commaBetween = (start: number, end: number): number => {
+		const tail = source.slice(start, end).replace(/#[^\r\n]*/g, comment => " ".repeat(comment.length));
+		const comma = tail.indexOf(",");
+		return comma < 0 ? -1 : start + comma;
+	};
 	// Infer indentation from collection keys, not multiline scalar content.
 	let indent = 2;
 	const findIndent = (node: Node | null): void => {
@@ -104,6 +109,10 @@ export function reconcileYamlConfig(source: string, value: unknown): string {
 					const comma = source.lastIndexOf(",", start);
 					if (comma >= (node.range?.[0] ?? 0)) start = comma;
 				}
+				if (index === node.items.length - 1 && node.range) {
+					const comma = commaBetween(end, node.range[1] - 1);
+					if (comma >= 0) finish = comma + 1;
+				}
 			} else {
 				const beginning = lineStart(start);
 				if (/^ *$/.test(source.slice(beginning, start))) start = beginning;
@@ -114,16 +123,28 @@ export function reconcileYamlConfig(source: string, value: unknown): string {
 		if (added.length === 0) return;
 		if (!node.range) throw new Error("YAML mapping has no source range");
 		if (node.flow) {
-			const offset = node.range[1] - 1;
+			let offset = node.range[1] - 1;
 			const retained = node.items.some(
 				pair =>
 					isScalar(pair.key) &&
 					Object.hasOwn(next, String(pair.key.value)) &&
 					next[String(pair.key.value)] !== undefined,
 			);
+			const last = node.items.at(-1);
+			const lastValue = isNode(last?.value) ? last.value : null;
+			const lastRetained =
+				isScalar(last?.key) &&
+				Object.hasOwn(next, String(last.key.value)) &&
+				next[String(last.key.value)] !== undefined;
+			const lastRange = lastValue?.range;
+			const trailingComma = !!lastRange && commaBetween(lastRange[1], offset) >= 0;
+			// Insert before an authored trailing comma, retaining its whitespace and comments.
+			if (lastRetained && trailingComma && lastRange) offset = lastRange[1];
 			const prefix = retained ? ", " : "";
 			const text =
-				prefix + added.map(([key, item]) => render(key) + ": " + render(item, undefined, true)).join(", ");
+				prefix +
+				added.map(([key, item]) => render(key) + ": " + render(item, undefined, true)).join(", ") +
+				(trailingComma && !lastRetained ? "," : "");
 			edits.push({ start: offset, end: offset, text });
 		} else {
 			const last = node.items.at(-1);
@@ -150,12 +171,54 @@ export function reconcileYamlConfig(source: string, value: unknown): string {
 		const text = stringifyYamlConfig(value).replace(/\n/g, newline);
 		return source + prefix + (source.length > 0 && !source.endsWith("\n") ? text.replace(/\r?\n$/, "") : text);
 	}
+	// Anchor edits must not change untouched aliases when the file is reopened.
+	const children = (node: Node): Node[] => {
+		if (isMap(node)) return node.items.flatMap(pair => [pair.key, pair.value].filter(isNode));
+		if (isSeq(node)) return node.items.filter(isNode);
+		return [];
+	};
+	const anchorEdits = edits.slice();
+	const affected = (node: Node, seen = new Set<Node>()): boolean => {
+		if (seen.has(node)) return false;
+		seen.add(node);
+		const range = node.range;
+		if (
+			range &&
+			anchorEdits.some(
+				edit =>
+					(edit.start < range[1] && edit.end > range[0]) ||
+					(isMap(node) && edit.start === edit.end && edit.start >= range[0] && edit.start <= range[2]),
+			)
+		)
+			return true;
+		if (isAlias(node)) {
+			const target = node.resolve(document);
+			return !!target && affected(target, seen);
+		}
+		return children(node).some(child => affected(child, seen));
+	};
+	const preserveAliases = (node: Node): void => {
+		if (isAlias(node) && node.range) {
+			const range = node.range;
+			const alreadyEdited = edits.some(edit => edit.start <= range[0] && edit.end >= range[1]);
+			const target = node.resolve(document);
+			if (!alreadyEdited && target && affected(target)) replace(node, node.toJS(document));
+		} else {
+			for (const child of children(node)) preserveAliases(child);
+		}
+	};
+	if (document.contents) preserveAliases(document.contents);
+	// Nested and parent additions can share EOF. Preserve traversal order so
+	// child keys precede newly added parent siblings.
 	// Adjacent removed flow entries can share their separating comma.
 	edits.sort((left, right) => left.start - right.start || left.end - right.end);
 	for (let index = 1; index < edits.length;) {
 		const previous = edits[index - 1];
 		const current = edits[index];
-		if (previous.text === "" && current.text === "" && current.start <= previous.end) {
+		if (previous.start === previous.end && current.start === current.end && previous.start === current.start) {
+			previous.text += current.text;
+			edits.splice(index, 1);
+		} else if (previous.text === "" && current.text === "" && current.start <= previous.end) {
 			previous.end = Math.max(previous.end, current.end);
 			edits.splice(index, 1);
 		} else index++;

@@ -41,6 +41,137 @@ describe("settings YAML source preservation", () => {
 		await settings.flush();
 		expect(await Bun.file(config).text()).toBe(source.replace("default: *model", "default: new/model"));
 	});
+	for (const project of [false, true]) {
+		for (const remove of [false, true]) {
+			it(
+				"preserves scalar aliases after " +
+					(remove ? "deleting" : "editing") +
+					" their anchor in " +
+					(project ? "project" : "global") +
+					" YAML",
+				async () => {
+					const source =
+						'# header\nmodelRoles:\n    default: &model "old/model"\n    smol: *model # retain meaning\n\ncustom: [*model]\n';
+					const target = project ? projectConfig : config;
+					await Bun.write(target, source);
+					const settings = await Settings.init({ cwd, agentDir });
+					if (project) {
+						if (remove) settings.clearProjectModelRole("default");
+						else settings.setProjectModelRole("default", "new/model");
+					} else settings.setModelRole("default", remove ? undefined : "new/model");
+					await settings.flush();
+					const output = await Bun.file(target).text();
+					expect(YAML.parse(output)).toEqual({
+						modelRoles: remove ? { smol: "old/model" } : { default: "new/model", smol: "old/model" },
+						custom: ["old/model"],
+					});
+					expect(output).toContain("# header\n");
+					expect(output).toContain("# retain meaning\n\ncustom:");
+					const reopened = await Settings.loadIsolated({ cwd, agentDir });
+					expect(reopened.getModelRole("smol")).toBe("old/model");
+					if (!remove) expect(reopened.getModelRole("default")).toBe("new/model");
+				},
+			);
+		}
+		for (const action of ["edit", "add", "delete"] as const) {
+			for (const mapping of ['&roles { default: "old/model" }', '&roles\n    default: "old/model"']) {
+				it(
+					"preserves map aliases after anchor " +
+						action +
+						" in " +
+						(project ? "project" : "global") +
+						" YAML: " +
+						mapping,
+					async () => {
+						const source = "# header\nmodelRoles: " + mapping + "\ncustom: *roles # retain meaning\n";
+						const target = project ? projectConfig : config;
+						await Bun.write(target, source);
+						const settings = await Settings.init({ cwd, agentDir });
+						const role = action === "add" ? "smol" : "default";
+						if (project) {
+							if (action === "delete") settings.clearProjectModelRole(role);
+							else settings.setProjectModelRole(role, "new/model");
+						} else settings.setModelRole(role, action === "delete" ? undefined : "new/model");
+						await settings.flush();
+						const output = await Bun.file(target).text();
+						const parsed = YAML.parse(output) as Record<string, unknown>;
+						expect(parsed.custom).toEqual({ default: "old/model" });
+						expect(parsed.modelRoles ?? {}).toEqual(
+							action === "delete"
+								? {}
+								: action === "add"
+									? { default: "old/model", smol: "new/model" }
+									: { default: "new/model" },
+						);
+						expect(output).toContain("# header\n");
+						expect(output).toContain("# retain meaning\n");
+						const reopened = await Settings.loadIsolated({ cwd, agentDir });
+						if (action !== "delete") expect(reopened.getModelRole(role)).toBe("new/model");
+					},
+				);
+			}
+		}
+		for (const tail of [", }", ",\n    # trailing comma, not a second separator\n}"]) {
+			it(
+				"adds a role to a trailing-comma flow map in " +
+					(project ? "project" : "global") +
+					" YAML: " +
+					JSON.stringify(tail),
+				async () => {
+					const source = '# header\nmodelRoles: {default: "old/model"' + tail + " # roles\n";
+					const target = project ? projectConfig : config;
+					await Bun.write(target, source);
+					const settings = await Settings.init({ cwd, agentDir });
+					if (project) settings.setProjectModelRole("smol", "new/model");
+					else settings.setModelRole("smol", "new/model");
+					await settings.flush();
+					const output = await Bun.file(target).text();
+					expect(YAML.parse(output)).toEqual({ modelRoles: { default: "old/model", smol: "new/model" } });
+					expect(output).toContain('default: "old/model"');
+					expect(output).toContain(tail + " # roles\n");
+					const reopened = await Settings.loadIsolated({ cwd, agentDir });
+					expect(reopened.getModelRole("smol")).toBe("new/model");
+					// A subsequent write must also parse and reconcile the persisted source.
+					if (project) settings.setProjectModelRole("smol", "next/model");
+					else settings.setModelRole("smol", "next/model");
+					await settings.flush();
+					expect(YAML.parse(await Bun.file(target).text())).toEqual({
+						modelRoles: { default: "old/model", smol: "next/model" },
+					});
+				},
+			);
+		}
+		for (const keepSibling of [false, true]) {
+			it(
+				"replaces the last entry of a trailing-comma flow map in " +
+					(project ? "project" : "global") +
+					" YAML, retained sibling: " +
+					keepSibling,
+				async () => {
+					const source =
+						"# header\nmodelRoles: {" +
+						(keepSibling ? 'advisor: "keep/model", ' : "") +
+						'default: "old/model", } # roles\n';
+					const target = project ? projectConfig : config;
+					await Bun.write(target, source);
+					const settings = await Settings.init({ cwd, agentDir });
+					if (project) {
+						settings.clearProjectModelRole("default");
+						settings.setProjectModelRole("smol", "new/model");
+					} else {
+						settings.setModelRole("default", undefined);
+						settings.setModelRole("smol", "new/model");
+					}
+					await settings.flush();
+					const expected = keepSibling ? { advisor: "keep/model", smol: "new/model" } : { smol: "new/model" };
+					expect(YAML.parse(await Bun.file(target).text())).toEqual({ modelRoles: expected });
+					const reopened = await Settings.loadIsolated({ cwd, agentDir });
+					expect(reopened.getModelRole("smol")).toBe("new/model");
+					if (keepSibling) expect(reopened.getModelRole("advisor")).toBe("keep/model");
+				},
+			);
+		}
+	}
 
 	it("preserves flow-map sibling bytes while changing a role", async () => {
 		const source = "modelRoles: {default: \"old/model\",  smol: 'keep/smol'} # roles\n";
@@ -186,13 +317,6 @@ describe("settings YAML source preservation", () => {
 		expect(await Bun.file(config).text()).toBe(external + "modelRoles:\n    default: new/model\n");
 	});
 
-	it("creates fresh YAML with the existing serializer", async () => {
-		const settings = await Settings.init({ cwd, agentDir });
-		settings.setModelRole("default", "new/model");
-		await settings.flush();
-		expect(await Bun.file(config).text()).toBe("modelRoles:\n  default: new/model\n");
-	});
-
 	it("recreates a dangling symlink target without replacing its link", async () => {
 		const target = directory.join("managed.yml");
 		fs.symlinkSync(target, config, "file");
@@ -200,7 +324,7 @@ describe("settings YAML source preservation", () => {
 		settings.setModelRole("default", "new/model");
 		await settings.flush();
 		expect(fs.lstatSync(config).isSymbolicLink()).toBe(true);
-		expect(await Bun.file(target).text()).toBe("modelRoles:\n  default: new/model\n");
+		expect(YAML.parse(await Bun.file(target).text())).toEqual({ modelRoles: { default: "new/model" } });
 	});
 
 	it("quarantines malformed source and uses fresh serialization on recovery", async () => {
@@ -214,7 +338,10 @@ describe("settings YAML source preservation", () => {
 		expect(backups).toHaveLength(1);
 		expect(await Bun.file(path.join(agentDir, backups[0])).text()).toBe(malformed);
 		await settings.flush();
-		expect(await Bun.file(config).text()).toBe("modelRoles:\n  default: keep/default\ntheme:\n  dark: anthracite\n");
+		expect(YAML.parse(await Bun.file(config).text())).toEqual({
+			modelRoles: { default: "keep/default" },
+			theme: { dark: "anthracite" },
+		});
 		expect(await Bun.file(path.join(agentDir, backups[0])).text()).toBe(malformed);
 	});
 
@@ -230,15 +357,70 @@ describe("settings YAML source preservation", () => {
 		);
 	});
 
+	for (const newline of ["\n", "\r\n"]) {
+		for (const eof of [false, true]) {
+			it("keeps nested migration additions before parent siblings " + JSON.stringify({ newline, eof }), async () => {
+				const source =
+					["# header", "task:", "    isolation:", "        mode: none"].join(newline) + (eof ? newline : "");
+				await Bun.write(config, source);
+				const settings = await Settings.init({ cwd, agentDir });
+				settings.set("display.showTokenUsage", true);
+				await settings.flush();
+				const output = await Bun.file(config).text();
+				expect(YAML.parse(output)).toEqual({
+					task: { isolation: { enabled: false } },
+					display: { showTokenUsage: true },
+				});
+				expect(output).toContain("# header" + newline);
+				expect(output.endsWith(newline)).toBe(eof);
+				const reopened = await Settings.loadIsolated({ cwd, agentDir });
+				expect(reopened.get("task.isolation.enabled")).toBe(false);
+				expect(reopened.get("display.showTokenUsage")).toBe(true);
+			});
+			it(
+				"persists consent/reminder migrations alongside a parent sibling " + JSON.stringify({ newline, eof }),
+				async () => {
+					const source =
+						[
+							"# header",
+							"dev:",
+							"    autoqa:",
+							"        consent: denied",
+							"todo:",
+							"    reminders:",
+							"        max: 1",
+						].join(newline) + (eof ? newline : "");
+					await Bun.write(config, source);
+					const settings = await Settings.init({ cwd, agentDir });
+					settings.set("display.showTokenUsage", true);
+					await settings.flush();
+					const output = await Bun.file(config).text();
+					expect(YAML.parse(output)).toEqual({
+						dev: { autoqaConsent: "denied" },
+						todo: { remindersMax: 1 },
+						display: { showTokenUsage: true },
+					});
+					expect(output).toContain("# header" + newline);
+					expect(output.endsWith(newline)).toBe(eof);
+					const reopened = await Settings.loadIsolated({ cwd, agentDir });
+					expect(reopened.get("dev.autoqaConsent")).toBe("denied");
+					expect(reopened.isConfigured("dev.autoqa")).toBe(false);
+					expect(reopened.get("todo.remindersMax")).toBe(1);
+					expect(reopened.get("todo.reminders")).toBe(true);
+				},
+			);
+		}
+	}
+
 	it("keeps legacy JSON migration on the fresh-file path", async () => {
 		const legacy = path.join(agentDir, "settings.json");
 		const source = '{"theme":{"dark":"titanium"}}';
 		await Bun.write(legacy, source);
 		const settings = await Settings.init({ cwd, agentDir });
-		expect(await Bun.file(config).text()).toBe("theme:\n  dark: titanium\n");
+		expect(YAML.parse(await Bun.file(config).text())).toEqual({ theme: { dark: "titanium" } });
 		expect(await Bun.file(legacy + ".bak").text()).toBe(source);
 		settings.set("theme.dark", "anthracite");
 		await settings.flush();
-		expect(await Bun.file(config).text()).toBe("theme:\n  dark: anthracite\n");
+		expect(YAML.parse(await Bun.file(config).text())).toEqual({ theme: { dark: "anthracite" } });
 	});
 });
