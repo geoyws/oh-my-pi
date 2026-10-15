@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `Process.terminate({ group: true })` resolving `true` without escalating to `SIGKILL` when the group leader exited on `SIGTERM` while a TERM-ignoring group member reparented outside its tree kept running and holding inherited pipes. Descendants are now captured before the polite signal, and group termination always completes the hard group wave before reporting success.
+
 ## [18.10.0] - 2026-10-12
 
 ### Added

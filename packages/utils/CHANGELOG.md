@@ -5,6 +5,7 @@
 ### Fixed
 
 - Fixed `ptree.spawn`/`ptree.exec` resolving the command against the `PATH` the process started with, ignoring later `process.env.PATH` changes; commands now resolve against the current environment unless the caller passes its own `env`
+- Fixed process-group cancellation leaving a TERM-ignoring descendant alive with open pipes after its leader exited, including when native handle lookup fails or the leader was killed by a signal.
 
 ## [18.10.0] - 2026-10-12
 
