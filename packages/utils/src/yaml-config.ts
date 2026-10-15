@@ -1,5 +1,6 @@
 import { YAML } from "bun";
-import { Document, isAlias, isMap, isNode, isScalar, isSeq, type Node, parseDocument } from "yaml";
+import type { Node, Pair } from "yaml";
+import { Document, isAlias, isMap, isNode, isScalar, isSeq, parseDocument } from "yaml";
 
 const YAML_MAPPING_HEADER_TRAILING_SPACE = /: +$/gm;
 
@@ -82,7 +83,7 @@ export function reconcileYamlConfig(source: string, value: unknown): string {
 			return;
 		}
 		for (let index = 0; index < node.items.length; index++) {
-			const pair = node.items[index];
+			const pair: Pair = node.items[index];
 			if (!isScalar(pair.key) || !pair.key.range) throw new Error("Settings YAML keys must be scalars");
 			const key = String(pair.key.value);
 			keys.add(key);

@@ -45,7 +45,7 @@ describe("settings YAML source preservation", () => {
 		for (const remove of [false, true]) {
 			it(
 				"preserves scalar aliases after " +
-					(remove ? "deleting" : "editing") +
+					(remove ? (project ? "clearing" : "deleting") : "editing") +
 					" their anchor in " +
 					(project ? "project" : "global") +
 					" YAML",
@@ -61,15 +61,20 @@ describe("settings YAML source preservation", () => {
 					} else settings.setModelRole("default", remove ? undefined : "new/model");
 					await settings.flush();
 					const output = await Bun.file(target).text();
-					expect(YAML.parse(output)).toEqual({
-						modelRoles: remove ? { smol: "old/model" } : { default: "new/model", smol: "old/model" },
-						custom: ["old/model"],
-					});
+					const parsed = YAML.parse(output) as { modelRoles: Record<string, unknown>; custom: unknown };
+					expect(parsed.custom).toEqual(["old/model"]);
+					expect(parsed.modelRoles.smol).toBe("old/model");
+					// Global deletion removes the key; project clearing persists a tombstone.
+					if (!project || !remove) {
+						expect(parsed.modelRoles).toEqual(
+							remove ? { smol: "old/model" } : { default: "new/model", smol: "old/model" },
+						);
+					}
 					expect(output).toContain("# header\n");
 					expect(output).toContain("# retain meaning\n\ncustom:");
 					const reopened = await Settings.loadIsolated({ cwd, agentDir });
 					expect(reopened.getModelRole("smol")).toBe("old/model");
-					if (!remove) expect(reopened.getModelRole("default")).toBe("new/model");
+					expect(reopened.getModelRole("default")).toBe(remove ? undefined : "new/model");
 				},
 			);
 		}
@@ -77,7 +82,7 @@ describe("settings YAML source preservation", () => {
 			for (const mapping of ['&roles { default: "old/model" }', '&roles\n    default: "old/model"']) {
 				it(
 					"preserves map aliases after anchor " +
-						action +
+						(action === "delete" && project ? "clear" : action) +
 						" in " +
 						(project ? "project" : "global") +
 						" YAML: " +
@@ -96,22 +101,27 @@ describe("settings YAML source preservation", () => {
 						const output = await Bun.file(target).text();
 						const parsed = YAML.parse(output) as Record<string, unknown>;
 						expect(parsed.custom).toEqual({ default: "old/model" });
-						expect(parsed.modelRoles ?? {}).toEqual(
-							action === "delete"
-								? {}
-								: action === "add"
-									? { default: "old/model", smol: "new/model" }
-									: { default: "new/model" },
-						);
+						// Global deletion removes the key; project clearing persists a tombstone.
+						if (!project || action !== "delete") {
+							expect(parsed.modelRoles ?? {}).toEqual(
+								action === "delete"
+									? {}
+									: action === "add"
+										? { default: "old/model", smol: "new/model" }
+										: { default: "new/model" },
+							);
+						}
 						expect(output).toContain("# header\n");
 						expect(output).toContain("# retain meaning\n");
 						const reopened = await Settings.loadIsolated({ cwd, agentDir });
-						if (action !== "delete") expect(reopened.getModelRole(role)).toBe("new/model");
+						expect(reopened.getModelRole(role)).toBe(action === "delete" ? undefined : "new/model");
+						if (action === "add") expect(reopened.getModelRole("default")).toBe("old/model");
 					},
 				);
 			}
 		}
-		for (const tail of [", }", ",\n    # trailing comma, not a second separator\n}"]) {
+		// A multiline flow end indicator must be indented past its parent key.
+		for (const tail of [", }", ",\n    # trailing comma, not a second separator\n  }"]) {
 			it(
 				"adds a role to a trailing-comma flow map in " +
 					(project ? "project" : "global") +
@@ -143,7 +153,8 @@ describe("settings YAML source preservation", () => {
 		}
 		for (const keepSibling of [false, true]) {
 			it(
-				"replaces the last entry of a trailing-comma flow map in " +
+				(project ? "clears" : "removes") +
+					" the last entry of a trailing-comma flow map and adds a role in " +
 					(project ? "project" : "global") +
 					" YAML, retained sibling: " +
 					keepSibling,
@@ -164,9 +175,13 @@ describe("settings YAML source preservation", () => {
 					}
 					await settings.flush();
 					const expected = keepSibling ? { advisor: "keep/model", smol: "new/model" } : { smol: "new/model" };
-					expect(YAML.parse(await Bun.file(target).text())).toEqual({ modelRoles: expected });
+					const parsed = YAML.parse(await Bun.file(target).text()) as { modelRoles: Record<string, unknown> };
+					// Global deletion removes the key; project clearing persists a tombstone.
+					if (project) expect(parsed.modelRoles).toMatchObject(expected);
+					else expect(parsed).toEqual({ modelRoles: expected });
 					const reopened = await Settings.loadIsolated({ cwd, agentDir });
 					expect(reopened.getModelRole("smol")).toBe("new/model");
+					expect(reopened.getModelRole("default")).toBeUndefined();
 					if (keepSibling) expect(reopened.getModelRole("advisor")).toBe("keep/model");
 				},
 			);
