@@ -122,6 +122,8 @@ export interface GenericKernel<TEnv> {
 		kernelKilled?: boolean;
 		stdinRequested?: boolean;
 	}>;
+	/** Runner process id, when the kernel runs as a host child process. */
+	readonly pid?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -550,6 +552,7 @@ export async function executeWithKernelBase<
 					shieldedSignal: abortShield.signal,
 					emitStatus,
 					onTimeoutControl: handleTimeoutControl,
+					kernelPid: kernel.pid,
 					shadowCell: getActiveEvalShadowCell(),
 					abortRequested: () => {
 						return abortShield.abortRequested;

@@ -191,6 +191,11 @@ export abstract class BaseKernel<TExecuteOptions extends KernelExecuteOptions = 
 		this.#options = options;
 	}
 
+	/** Runner process id; a detached (setsid) runner also leads the process group of that id. */
+	get pid(): number | undefined {
+		return this.#proc?.pid;
+	}
+
 	setProcess(proc: Subprocess<"pipe", "pipe", "pipe">) {
 		this.#proc = proc;
 		this.#stdin = proc.stdin;

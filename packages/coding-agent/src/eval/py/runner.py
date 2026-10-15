@@ -1301,17 +1301,47 @@ class _BoundedLineScanner:
             self._partial = ""
 
 
+_PIP_WAIT_BRIDGE_NAME = "__omp_pip_wait__"
+
+
+def _request_pip_pause(pid: int) -> None:
+    """Ask the host to pause the eval watchdog while pip child `pid` runs.
+
+    Blocks until the host sees the process exit. The host verifies the pid in
+    the OS process table (live child of this kernel, `<python> -m pip`), so
+    the pause cannot be minted by cell code; see eval/py/pip-wait.ts. Any
+    failure leaves the install counted against the cell timeout.
+    """
+    base = os.environ.get("PI_TOOL_BRIDGE_URL")
+    token = os.environ.get("PI_TOOL_BRIDGE_TOKEN")
+    session = os.environ.get("PI_TOOL_BRIDGE_SESSION")
+    rid = _CURRENT_RID.get()
+    if not base or not token or not session or rid is None:
+        return
+    import urllib.request
+
+    payload = json.dumps(
+        {"session": session, "run": rid, "name": _PIP_WAIT_BRIDGE_NAME, "args": {"pid": pid}}
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base.rstrip('/')}/v1/tool",
+        data=payload,
+        method="POST",
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req) as resp:
+            resp.read()
+    except Exception:
+        pass
+
+
 @line_magic("pip")
 def _magic_pip(args: str) -> None:
     argv = shlex.split(args) if args else ["--help"]
     cmd = [sys.executable, "-m", "pip", *argv]
-    # Installs are host work, not cell compute: suspend the eval watchdog (same
-    # protocol as bridge waits in bridge-timeout.ts). Caller aborts still apply.
-    _emit_status("timeout-pause")
-    try:
-        _run_pip(cmd, args)
-    finally:
-        _emit_status("timeout-resume")
+    _run_pip(cmd, args)
 
 
 def _run_pip(cmd: list[str], args: str) -> None:
@@ -1322,6 +1352,15 @@ def _run_pip(cmd: list[str], args: str) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
+    # Installs are host work, not cell compute: the host suspends the eval
+    # watchdog for this verified pip child's lifetime. Caller aborts still apply.
+    pause = threading.Thread(
+        target=contextvars.copy_context().run,
+        args=(_request_pip_pause, proc.pid),
+        name="omp-pip-pause",
+        daemon=True,
+    )
+    pause.start()
     installed_packages: list[str] = []
 
     def scan_pip_line(raw_line: str) -> None:
@@ -1336,6 +1375,9 @@ def _run_pip(cmd: list[str], args: str) -> None:
     _stream_process_output(proc, scanner.add)
     scanner.finish()
     proc.wait()
+    # The host notices the reaped pid within one poll; bound the join so a
+    # stalled bridge never holds the cell.
+    pause.join(timeout=5)
     if installed_packages:
         import importlib
 

@@ -13,6 +13,7 @@ import type { EvalTimeoutControlSink } from "../bridge-timeout";
 import type { RuntimeCallIdentity } from "../js/shared/runtime";
 import { bridgeValueFromToolResult, callSessionTool, type JsStatusEvent } from "../js/tool-bridge";
 import type { EvalShadowCellSession } from "../speculation/cell-session";
+import { PIP_WAIT_BRIDGE_NAME, waitForPipChild } from "./pip-wait";
 
 export interface PyToolBridgeEntry {
 	toolSession: ToolSession;
@@ -37,6 +38,11 @@ export interface PyToolBridgeEntry {
 	 * events a tool name can collide with.
 	 */
 	onTimeoutControl?: EvalTimeoutControlSink;
+	/**
+	 * Kernel runner pid. Lets the host verify a `%pip` wait request names a
+	 * real pip child of this kernel before pausing the eval watchdog.
+	 */
+	kernelPid?: number;
 	abortRequested?: () => boolean;
 }
 
@@ -194,6 +200,19 @@ async function startServer(): Promise<BridgeServer> {
 					{ ok: false, error: `No active Python tool bridge session: ${registrationKey}` },
 					{ status: 200 },
 				);
+			}
+
+			if (name === PIP_WAIT_BRIDGE_NAME) {
+				try {
+					const value = await waitForPipChild(body.args, {
+						kernelPid: entry.kernelPid,
+						onTimeoutControl: entry.onTimeoutControl,
+						signal: entry.shieldedSignal ?? entry.signal,
+					});
+					return Response.json({ ok: true, value });
+				} catch (err) {
+					return Response.json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+				}
 			}
 
 			try {
