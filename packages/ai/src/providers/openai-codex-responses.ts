@@ -5080,11 +5080,15 @@ async function openCodexSseEventStream(
 	// the retry loop's base signal remains reserved for caller cancellation, so
 	// an internal timeout stays retryable while an explicit abort fails fast.
 	let clearPreResponseTimeout: (() => void) | undefined;
+	// Count actual sends across both nested retries and the plain-JSON replay.
+	// Payload preparation may spend the budget without forfeiting the first send.
+	let requestsStarted = 0;
 	const fetchAttempt: FetchImpl = async (input, init) => {
 		let response: Response | undefined;
 		try {
 			// prepareInit is awaited by fetchWithRetry; recheck at the actual send.
-			assertAttemptAllowed();
+			if (requestsStarted > 0) assertAttemptAllowed();
+			requestsStarted += 1;
 			response = await (fetchOverride ?? fetch)(input, init);
 			return response;
 		} finally {
@@ -5124,7 +5128,7 @@ async function openCodexSseEventStream(
 			prepareInit: () => {
 				// Covers every nested HTTP retry and the plain-JSON encoding replay.
 				// Throw outside fetchWithRetry's network-error catch to stop recovery.
-				assertAttemptAllowed();
+				if (requestsStarted > 0) assertAttemptAllowed();
 				// A retried non-2xx attempt leaves its guard armed for the retry-status
 				// body read; disarm it before arming the next attempt's guard.
 				clearPreResponseTimeout?.();
