@@ -190,8 +190,11 @@ for (const switchName of ["config.readOnly", "PI_CONFIG_READONLY"] as const) {
 				if (alias === "project directory") {
 					fs.symlinkSync(agentDir, projectDir, "dir");
 				} else if (alias === "global directory") {
-					fs.mkdirSync(projectDir);
-					fs.rmdirSync(agentDir);
+					// Load opened runtime storage (agent.db) inside agentDir. Settings uses it only at load,
+					// so close it, then move the whole owned agent dir to the project dir and alias it back:
+					// the runtime DB stays reachable through agentDir while config.yml stays missing.
+					AgentStorage.close();
+					fs.renameSync(agentDir, projectDir);
 					fs.symlinkSync(projectDir, agentDir, "dir");
 					protectedTarget = path.join(projectDir, "config.yml");
 				} else {
