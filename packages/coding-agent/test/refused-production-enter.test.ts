@@ -39,6 +39,7 @@ let settingsState: SettingsTestState | undefined;
 beforeAll(async () => {
 	await initTheme();
 });
+const tempDirs: string[] = [];
 beforeEach(async () => {
 	settingsState = beginSettingsTest();
 	await Settings.init({ inMemory: true });
@@ -47,6 +48,7 @@ afterEach(async () => {
 	vi.restoreAllMocks();
 	restoreSettingsTestState(settingsState);
 	settingsState = undefined;
+	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
 function userNode(id: string, parentId: string | null, text: string): SessionTreeNode {
@@ -62,11 +64,11 @@ interface ProductionHarness {
 	pressEnter: () => Promise<void>;
 	capturedTreeSelector: () => { handleInput(key: string): void };
 }
-function createProductionHarness(sessionExtras: Record<string, unknown>): ProductionHarness {
+async function createProductionHarness(sessionExtras: Record<string, unknown>): Promise<ProductionHarness> {
 	const editor = new CustomEditor(getEditorTheme());
-	const directoryPromise = fs.mkdtemp(path.join(os.tmpdir(), "omp-refused-prod-"));
-	let directory = "";
-	const sessionManager = SessionManager.create(process.cwd(), process.cwd());
+	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-refused-prod-"));
+	tempDirs.push(directory);
+	const sessionManager = SessionManager.create(directory, directory);
 	const showError = vi.fn();
 	const session = {
 		model: { provider: "anthropic", id: "claude-test" },
@@ -154,9 +156,6 @@ function createProductionHarness(sessionExtras: Record<string, unknown>): Produc
 		submitCompletion = Promise.resolve(onSubmit?.(text));
 		return submitCompletion;
 	};
-	void directoryPromise.then(dir => {
-		directory = dir;
-	});
 	return {
 		ctx,
 		editor,
@@ -189,7 +188,7 @@ function refusingGate() {
 describe("production Enter refusal recovery", () => {
 	it("refused /btw merges the slash line back ahead of a newer draft", async () => {
 		const { gate, entered, release } = refusingGate();
-		const h = createProductionHarness({ gateUserMessage: gate });
+		const h = await createProductionHarness({ gateUserMessage: gate });
 
 		editorSetText(h, `/btw side ${SECRET}?`);
 		const submitting = h.pressEnter();
@@ -214,9 +213,29 @@ describe("production Enter refusal recovery", () => {
 
 	it("refused /compact merges the exact slash line back ahead of a newer draft", async () => {
 		const { gate, entered, release } = refusingGate();
-		const h = createProductionHarness({ gateUserMessage: gate });
-		h.ctx.sessionManager.appendMessage({ role: "user", content: "first", timestamp: Date.now() });
-		h.ctx.sessionManager.appendMessage({ role: "assistant", content: "second", timestamp: Date.now() });
+		const h = await createProductionHarness({ gateUserMessage: gate });
+		h.ctx.sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "first" }],
+			timestamp: Date.now(),
+		});
+		h.ctx.sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "second" }],
+			api: "anthropic",
+			provider: "anthropic",
+			model: "claude-test",
+			stopReason: "stop",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		});
 
 		editorSetText(h, `/compact focus ${SECRET}`);
 		const submitting = h.pressEnter();
@@ -234,9 +253,29 @@ describe("production Enter refusal recovery", () => {
 
 	it("refused /handoff merges the exact slash line back ahead of a newer draft", async () => {
 		const { gate, entered, release } = refusingGate();
-		const h = createProductionHarness({ gateUserMessage: gate });
-		h.ctx.sessionManager.appendMessage({ role: "user", content: "first", timestamp: Date.now() });
-		h.ctx.sessionManager.appendMessage({ role: "assistant", content: "second", timestamp: Date.now() });
+		const h = await createProductionHarness({ gateUserMessage: gate });
+		h.ctx.sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "first" }],
+			timestamp: Date.now(),
+		});
+		h.ctx.sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "second" }],
+			api: "anthropic",
+			provider: "anthropic",
+			model: "claude-test",
+			stopReason: "stop",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		});
 
 		editorSetText(h, `/handoff focus ${SECRET}`);
 		const submitting = h.pressEnter();
@@ -261,7 +300,7 @@ describe("production Enter refusal recovery", () => {
 			await release.promise;
 			throw new UserMessageRefusedError(NOTICE);
 		});
-		const h = createProductionHarness({ prompt, followUp });
+		const h = await createProductionHarness({ prompt, followUp });
 
 		editorSetText(h, `=> 1. clean first\n2. bad ${SECRET}`);
 		const submitting = h.pressEnter();
@@ -285,13 +324,19 @@ describe("production Enter refusal recovery", () => {
 	it("refused /tree instructions reopen the hook editor prefilled and never navigate", async () => {
 		cfgBranchSummaryEnabled.set(Settings.instance, true);
 		const { gate, entered, release } = refusingGate();
-		const h = createProductionHarness({ gateUserMessage: gate });
+		const h = await createProductionHarness({ gateUserMessage: gate });
 		const root = userNode("root", null, "Root prompt");
 		const getTree = vi.spyOn(h.ctx.sessionManager, "getTree").mockReturnValue([root]);
 		vi.spyOn(h.ctx.sessionManager, "getLeafId").mockReturnValue("other-leaf");
 		vi.spyOn(h.ctx.sessionManager, "getEntry").mockReturnValue(root.entry);
 		const showHookSelector = vi.fn(async () => "Summarize with custom prompt");
-		const showHookEditor = vi.fn(async (_title: string, _prefill?: string) => `custom ${SECRET}`);
+		// The first answer carries the refused text; the reopen (prefilled with
+		// it) is cancelled, returning to the tree selector. A mock that always
+		// returns text would refuse forever and never settle.
+		const showHookEditor = vi.fn(
+			async (_title: string, _prefill?: string): Promise<string | undefined> => `custom ${SECRET}`,
+		);
+		showHookEditor.mockResolvedValueOnce(`custom ${SECRET}`).mockResolvedValueOnce(undefined);
 		Object.assign(h.ctx, { showHookSelector, showHookEditor });
 
 		editorSetText(h, "/tree");
@@ -305,6 +350,11 @@ describe("production Enter refusal recovery", () => {
 		// must survive prefilled in the reopened editor.
 		release();
 		await submitting;
+		// The tree flow detaches from the editor submission
+		// (showTreeSelector returns void), so `submitting` settles before the
+		// refusal is handled: pump microtasks until the reopened editor is
+		// answered instead of asserting on a half-settled flow.
+		for (let i = 0; i < 1000 && showHookEditor.mock.calls.length < 2; i++) await Promise.resolve();
 
 		expect(h.showError).toHaveBeenCalledWith(NOTICE);
 		expect(showHookEditor).toHaveBeenCalledTimes(2);
