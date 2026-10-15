@@ -214,7 +214,7 @@ async function createContext() {
 		isPythonMode: false,
 		hideToolActivity: false,
 		toolOutputExpanded: false,
-		settings: { set: vi.fn() },
+		settings: { set: vi.fn(), getGlobalConfigReadOnlyReason: () => undefined },
 		chatContainer: { children: [], setToolActivityVisible: vi.fn() },
 		handleHotkeysCommand: vi.fn(),
 		handlePlanModeCommand: vi.fn(),
