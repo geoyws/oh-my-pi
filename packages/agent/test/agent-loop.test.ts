@@ -8638,7 +8638,9 @@ describe("agentLoop steering during the provider wait", () => {
 
 		expect(firstRequestAborted).toBe(true);
 		expect(contexts.length).toBe(2);
-		expect(resolverCalls).toBe(2);
+		// The replacement reuses the credential the cancelled request already
+		// resolved: resolver work (account selection, OAuth refresh) runs once.
+		expect(resolverCalls).toBe(1);
 		// The steer is in context for the re-issued call, and the queue is empty
 		// before that call starts, so it cannot interrupt its own replacement.
 		expect(contexts[1]?.messages.some(m => m.role === "user" && m.content === "actually, do X instead")).toBe(true);

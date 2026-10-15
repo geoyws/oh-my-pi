@@ -2732,7 +2732,7 @@ async function streamAssistantResponse(
 				} catch {
 					// Provider cancellation failures cannot change the discarded request.
 				}
-				return new SteerInterruption();
+				return new SteerInterruption(resolvedCredential);
 			};
 
 			try {
