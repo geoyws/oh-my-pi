@@ -1586,7 +1586,7 @@ export class Settings {
 		// to settle so simultaneous failures produce one catchable error without
 		// abandoning the other rejection.
 		const [globalResult, projectResult] = await Promise.allSettled([
-			this.#persist && !this.isGlobalConfigReadOnly() ? this.#loadGlobalSettings() : Promise.resolve(),
+			this.#persist ? this.#loadGlobalSettings() : Promise.resolve(),
 			this.#loadProjectSettings(),
 		]);
 		if (globalResult.status === "rejected") throw globalResult.reason;
@@ -1602,6 +1602,8 @@ export class Settings {
 	}
 	async #loadGlobalSettings(): Promise<void> {
 		this.#storage = await AgentStorage.open(getAgentDbPath(this.#agentDir));
+		// Runtime storage is not global config; the named policy skips only config migration, quarantine and markers.
+		if (this.isGlobalConfigReadOnly()) return;
 		const existingConfig = await this.#loadExistingMainYaml();
 		if (existingConfig) {
 			this.#global = existingConfig;

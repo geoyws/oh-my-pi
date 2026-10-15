@@ -44,6 +44,9 @@ the next launch and runtime overrides cannot turn an active policy off.
 Startup does not migrate legacy settings, quarantine invalid global YAML, or
 seed migration marker files under this policy. Existing global bytes stay unchanged.
 Invalid YAML still reports an error; repair it manually rather than relying on quarantine.
+The policy covers configuration only: runtime storage in `agent.db` (model
+usage order, model performance, command usage and other caches) stays open
+and keeps recording, but legacy settings rows in it are neither migrated nor cleared.
 
 Role assignments route to `<cwd>/.omp/config.yml`, even when
 `modelRoleStorage` is global. The `.omp` directory must already exist;
