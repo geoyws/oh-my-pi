@@ -235,21 +235,28 @@ describe("worktree isolation helpers", () => {
 			const isoStart = vi
 				.spyOn(natives, "isoStart")
 				.mockRejectedValueOnce(unavailable)
-				.mockResolvedValueOnce(undefined);
+				.mockImplementation(async (_kind, _lower, merged) => {
+					// The hand-out gate resolves the copy dir, so the mock
+					// backend materialises it like a real one would.
+					await fs.mkdir(merged, { recursive: true });
+				});
 			vi.spyOn(natives, "isoIsUnavailableError").mockImplementation(message =>
 				message.startsWith("ISO_UNAVAILABLE:"),
 			);
 
 			const handle = await ensureIsolation(repo, "retry-path-unavailable");
-
-			expect(isoResolve).toHaveBeenCalledWith(null);
-			expect(isoStart.mock.calls.map(call => call[0])).toEqual([
-				natives.IsoBackendKind.Btrfs,
-				natives.IsoBackendKind.Rcopy,
-			]);
-			expect(handle.backend).toBe(natives.IsoBackendKind.Rcopy);
-			expect(handle.fellBack).toBe(true);
-			expect(handle.fallbackReason).toBe(unavailable.message);
+			try {
+				expect(isoResolve).toHaveBeenCalledWith(null);
+				expect(isoStart.mock.calls.map(call => call[0])).toEqual([
+					natives.IsoBackendKind.Btrfs,
+					natives.IsoBackendKind.Rcopy,
+				]);
+				expect(handle.backend).toBe(natives.IsoBackendKind.Rcopy);
+				expect(handle.fellBack).toBe(true);
+				expect(handle.fallbackReason).toBe(unavailable.message);
+			} finally {
+				await fs.rm(path.dirname(handle.mergedDir), { recursive: true, force: true });
+			}
 		});
 
 		it("uses compact isolation paths that do not embed long task ids", async () => {
@@ -264,7 +271,12 @@ describe("worktree isolation helpers", () => {
 				fellBack: false,
 				reason: undefined,
 			});
-			vi.spyOn(natives, "isoStart").mockResolvedValue(undefined);
+			// The hand-out gate resolves the copy dir, so the mock backend
+			// materialises it like a real one would. It lives under the
+			// temp worktree base, cleaned up with it.
+			vi.spyOn(natives, "isoStart").mockImplementation(async (_kind, _lower, merged) => {
+				await fs.mkdir(merged, { recursive: true });
+			});
 
 			try {
 				const longTaskId = "orchestrate-goal-execution.Test1-0982d2a";
