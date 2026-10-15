@@ -31,6 +31,7 @@ function bindSceneHost(host: SetupApplicationSceneHost): SetupSceneHost {
 
 function fakeContextWithConfiguredModel(): InteractiveModeContext {
 	return {
+		settings: Settings.isolated(),
 		session: {
 			modelRegistry: {
 				getAvailable: () => [{ provider: "configured", id: "model" }],

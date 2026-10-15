@@ -5,6 +5,7 @@
 ### Added
 
 - Added global configuration persistence opt-outs via `config.readOnly` and `PI_CONFIG_READONLY=1`, project role routing with explicit missing-project refusal, and nonzero CLI refusal for protected writes.
+- Under the global read-only policy, `/settings` rows stay visible but disabled with the policy reason on focus and hover, keyboard display toggles and setup refuse with the reason instead of crashing the session, and clearing a default role in `/model` no longer attempts a rejected global `defaultThinkingLevel: auto` write.
 
 - Added comprehensive browser tools for accessibility audits, React internals inspection, console/network monitoring, and performance tracing
 - Introduced tab management, disk-backed screen recording with cursor overlays, and WebMCP protocol support for cross-frame tool discovery

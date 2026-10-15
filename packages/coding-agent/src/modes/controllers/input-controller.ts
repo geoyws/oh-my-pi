@@ -2378,6 +2378,12 @@ export class InputController {
 	}
 
 	toggleToolActivityVisibility(): void {
+		// Refuse before touching view state: the preference persists globally.
+		const readOnlyReason = this.ctx.settings.getGlobalConfigReadOnlyReason();
+		if (readOnlyReason !== undefined) {
+			this.ctx.showError(`Tool activity visibility unchanged. ${readOnlyReason}`);
+			return;
+		}
 		this.ctx.hideToolActivity = !this.ctx.hideToolActivity;
 		this.ctx.settings.set("display.hideToolActivity", this.ctx.hideToolActivity);
 
@@ -2425,6 +2431,12 @@ export class InputController {
 			((this.ctx.viewSession ?? this.ctx.session)?.thinkingLevel ?? ThinkingLevel.Off) === ThinkingLevel.Off;
 		if (thinkingOff && !this.ctx.hasDisplayableThinkingContent) {
 			this.ctx.showStatus("Thinking is off — enable thinking to show blocks");
+			return;
+		}
+		// Refuse before touching view state: the preference persists globally.
+		const readOnlyReason = this.ctx.settings.getGlobalConfigReadOnlyReason();
+		if (readOnlyReason !== undefined) {
+			this.ctx.showError(`Thinking block visibility unchanged. ${readOnlyReason}`);
 			return;
 		}
 		this.ctx.hideThinkingBlock = !this.ctx.hideThinkingBlock;

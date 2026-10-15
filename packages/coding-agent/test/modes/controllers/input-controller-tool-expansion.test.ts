@@ -68,7 +68,7 @@ describe("InputController tool activity visibility", () => {
 		const ctx = {
 			hideToolActivity: false,
 			toolOutputExpanded: true,
-			settings: { set },
+			settings: { set, getGlobalConfigReadOnlyReason: () => undefined },
 			chatContainer: { children, clear, addChild, setToolActivityVisible },
 			rebuildChatFromMessages,
 			showStatus,

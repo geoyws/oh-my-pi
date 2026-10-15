@@ -14,6 +14,7 @@ import {
 	routeSgrMouseInput,
 	type SelectItem,
 	SelectList,
+	type SettingDisabled,
 	type SettingItem,
 	SettingsList,
 	type SgrMouseEvent,
@@ -547,6 +548,12 @@ export class SettingsSelectorComponent implements Component {
 		this.#pluginComponent?.invalidate();
 	}
 
+	/** Expose the active content (tab list, search list, or plugins) to the debug tree walker. */
+	get debugChildren(): readonly Component[] {
+		const content = this.#searchList ?? this.#currentList ?? this.#pluginComponent;
+		return content ? [content] : [];
+	}
+
 	/** Swap the active content (per-tab list, search list, or plugins). */
 	#setContent(build: () => void): void {
 		this.#currentList = null;
@@ -761,10 +768,11 @@ export class SettingsSelectorComponent implements Component {
 		const tabResults: { tab: SettingTab; matched: SettingItem[]; bestScore: number; order: number }[] = [];
 		this.#searchFirstMatch.clear();
 		let total = 0;
+		const disabled = this.#readOnlyDisabled();
 		for (const tab of SETTING_TABS) {
 			const candidates: SettingItem[] = [];
 			for (const def of getSettingsForTab(this.#context.settings.entries, tab)) {
-				const item = this.#defToItem(def);
+				const item = this.#defToItem(def, disabled);
 				if (item) candidates.push(item);
 			}
 			const ranked = fuzzyRank(candidates, query, getSettingItemFilterText);
@@ -882,9 +890,19 @@ export class SettingsSelectorComponent implements Component {
 	}
 
 	/**
+	 * Disabled state shared by every setting row while the host refuses writes.
+	 * Rows stay visible and focusable so their reason is reachable; the
+	 * `read-only` key is the stable machine-readable reason.
+	 */
+	#readOnlyDisabled(): SettingDisabled | undefined {
+		const message = this.#context.settings.readOnlyReason();
+		return message === undefined ? undefined : { reason: "read-only", message };
+	}
+
+	/**
 	 * Convert a setting definition to a SettingItem for the UI.
 	 */
-	#defToItem(def: SettingDef): SettingItem | null {
+	#defToItem(def: SettingDef, disabled: SettingDisabled | undefined): SettingItem | null {
 		// Check condition: applies to every variant — booleans, enums, submenus, text inputs.
 		if (def.condition && !def.condition()) {
 			return null;
@@ -897,6 +915,7 @@ export class SettingsSelectorComponent implements Component {
 			description: def.description,
 			warning: def.warning,
 			changed: this.#isChanged(def, currentValue),
+			disabled,
 		};
 
 		switch (def.type) {
@@ -1271,9 +1290,10 @@ export class SettingsSelectorComponent implements Component {
 	 */
 	#buildItemsForDefs(defs: SettingDef[]): SettingItem[] {
 		const items: SettingItem[] = [];
+		const disabled = this.#readOnlyDisabled();
 		let lastGroup: string | undefined;
 		for (const def of defs) {
-			const item = this.#defToItem(def);
+			const item = this.#defToItem(def, disabled);
 			if (!item) continue;
 			if (def.group && def.group !== lastGroup) {
 				items.push({ id: `__heading:${def.group}`, label: def.group, currentValue: "", heading: true });

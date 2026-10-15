@@ -759,12 +759,26 @@ export class Settings {
 		return this.isGlobalConfigReadOnly() ? "project" : this.get("modelRoleStorage");
 	}
 
-	#globalWriteRefusal(setting: string): Error {
-		const logical = path.resolve(this.#configPath ?? path.join(this.#agentDir, MAIN_CONFIG_FILENAMES[0]));
-		const target = resolveConfigPolicyTarget(logical);
-		return new Error(
-			`Cannot persist ${setting}: global config is read-only (${target}). Disable config.readOnly / PI_CONFIG_READONLY or assign roles in an existing ${path.resolve(getProjectAgentDir(this.#cwd))} directory.`,
+	#globalPolicyTarget(): string {
+		return resolveConfigPolicyTarget(
+			path.resolve(this.#configPath ?? path.join(this.#agentDir, MAIN_CONFIG_FILENAMES[0])),
 		);
+	}
+
+	#globalWriteRefusal(setting: string): Error {
+		return new Error(
+			`Cannot persist ${setting}: global config is read-only (${this.#globalPolicyTarget()}). Disable config.readOnly / PI_CONFIG_READONLY or assign roles in an existing ${path.resolve(getProjectAgentDir(this.#cwd))} directory.`,
+		);
+	}
+
+	/**
+	 * User-facing reason ordinary global setting writes are refused, or
+	 * `undefined` while they are writable. Interactive surfaces disable their
+	 * controls with this text; {@link set} still refuses independently.
+	 */
+	getGlobalConfigReadOnlyReason(): string | undefined {
+		if (!this.isGlobalConfigReadOnly()) return undefined;
+		return `Global config is read-only (${this.#globalPolicyTarget()}). Remove config.readOnly from that file or unset PI_CONFIG_READONLY, then restart to change settings.`;
 	}
 
 	#assertGlobalWritable(setting: string): void {
