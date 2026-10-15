@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { planSteeredRequest } from "@oh-my-pi/pi-ai/providers/openai-codex/live-steering";
-import { streamOpenAICodexResponses } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import { prewarmOpenAICodexResponses, streamOpenAICodexResponses } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import type {
 	AssistantMessage,
 	Context,
@@ -15,6 +15,8 @@ import type {
 } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import * as piUtils from "@oh-my-pi/pi-utils";
+import { ProviderRequestTelemetry } from "@oh-my-pi/pi-ai/utils/request-telemetry";
+import { transportFetch } from "@oh-my-pi/pi-ai/utils/transport-fetch";
 
 const { getAgentDir, setAgentDir, TempDir } = piUtils;
 const originalAgentDir = getAgentDir();
@@ -146,6 +148,21 @@ function oneShotSteering(text: string): { source: LiveSteering; settled: () => "
 	return { source, settled: () => outcome };
 }
 
+function measuredOptions(state: Map<string, ProviderSessionState>, steering?: LiveSteering) {
+	const model = createGpt6Model();
+	const telemetry = new ProviderRequestTelemetry(model, "ws-telemetry");
+	const calls = vi.spyOn(telemetry, "noteCall");
+	const bytes = vi.spyOn(telemetry, "noteBytes");
+	const headers = vi.spyOn(telemetry, "noteResponseHeaders");
+	const errors = vi.spyOn(telemetry, "noteCallError");
+	const base = options(state, steering);
+	return { options: { ...base, fetch: transportFetch(model, base.fetch, telemetry) }, calls, bytes, headers, errors };
+}
+
+function wireBytes(frames: Frame[]): number {
+	return frames.reduce((total, frame) => total + Buffer.byteLength(JSON.stringify(frame)), 0);
+}
+
 function options(providerSessionState: Map<string, ProviderSessionState>, liveSteering?: LiveSteering) {
 	return {
 		apiKey: createToken(),
@@ -163,7 +180,101 @@ const creates = () => ScriptedWebSocket.sent.filter(frame => frame.type === "res
 const steers = () => ScriptedWebSocket.sent.filter(frame => frame.type === "response.steer");
 
 describe("codex live steering", () => {
-	it("steers the streaming response and reads the server's automatic continuation without sending a request", async () => {
+	it("keeps prewarm outside inference accounting and counts malformed raw bytes before retry", async () => {
+		let sends = 0;
+		const malformed = "{坏 json";
+		const frames = [
+			...messageFrames("msg_retry", "recovered"),
+			{ type: "response.completed", response: { status: "completed", usage: USAGE } },
+		];
+		installSocket((_frame, socket) => {
+			if (++sends === 1) queueMicrotask(() => socket.onmessage?.({ data: malformed } as MessageEvent));
+			else socket.emit(...frames);
+		});
+		const model = createGpt6Model();
+		const record = measuredOptions(new Map());
+		await prewarmOpenAICodexResponses(model, record.options);
+		expect(record.calls).not.toHaveBeenCalled();
+		expect(record.headers).not.toHaveBeenCalled();
+		expect(record.bytes).not.toHaveBeenCalled();
+		const result = await streamOpenAICodexResponses(model, { messages: [{ role: "user", content: "hi", timestamp: 1 }] }, record.options).result();
+		expect(result.stopReason).toBe("stop");
+		expect(record.calls).toHaveBeenCalledTimes(2);
+		expect(record.errors).toHaveBeenCalledTimes(1);
+		expect(record.bytes.mock.calls.reduce((sum, [n]) => sum + n, 0)).toBe(Buffer.byteLength(malformed) + wireBytes(frames));
+	});
+
+	it("counts UTF-8 text and binary wire frames once per create on a reused socket", async () => {
+		let turn = 0;
+		const sizes: number[] = [];
+		installSocket((_frame, socket) => {
+			turn++;
+			const frames = [
+				{ type: "response.created", response: { id: "resp_" + turn } },
+				...messageFrames("msg_" + turn, "你好 🌍"),
+				{ type: "response.completed", response: { id: "resp_" + turn, status: "completed", usage: USAGE } },
+			];
+			sizes.push(wireBytes(frames));
+			queueMicrotask(() => frames.forEach((frame, i) => {
+				const text = JSON.stringify(frame);
+				socket.onmessage?.({ data: i % 2 ? Buffer.from(text) : text } as MessageEvent);
+			}));
+		});
+		const state = new Map<string, ProviderSessionState>();
+		const user: UserMessage = { role: "user", content: "hello", timestamp: 1 };
+		const first = measuredOptions(state);
+		const result = await streamOpenAICodexResponses(createGpt6Model(), { messages: [user] }, first.options).result();
+		const second = measuredOptions(state);
+		await streamOpenAICodexResponses(createGpt6Model(), { messages: [user, result, { ...user, content: "again" }] }, second.options).result();
+		for (const [i, record] of [first, second].entries()) {
+			expect(record.calls).toHaveBeenCalledTimes(1);
+			expect(record.bytes.mock.calls.reduce((sum, [n]) => sum + n, 0)).toBe(sizes[i]);
+			expect(record.headers).toHaveBeenCalled();
+			expect(record.headers.mock.calls.every(args => args.length === 0)).toBe(true);
+		}
+		expect(ScriptedWebSocket.instances).toHaveLength(1);
+	});
+
+	it("counts a failed handshake and its SSE fallback without duplicating HTTP bytes", async () => {
+		global.WebSocket = class {
+			static OPEN = 1;
+			static CONNECTING = 0;
+			readyState = 0;
+			binaryType = "nodebuffer";
+			onerror: ((event: Event) => void) | null = null;
+			constructor() {
+				queueMicrotask(() => this.onerror?.({ type: "error", message: "upgrade denied" } as unknown as Event));
+			}
+			close() { this.readyState = 3; }
+		} as unknown as typeof WebSocket;
+		const state = new Map<string, ProviderSessionState>();
+		const model = createGpt6Model();
+		const record = measuredOptions(state);
+		const body = [
+			...messageFrames("msg_sse", "fallback"),
+			{ type: "response.completed", response: { status: "completed", usage: USAGE } },
+		].map(frame => "data: " + JSON.stringify(frame) + "\n\n").join("");
+		const telemetry = new ProviderRequestTelemetry(model, "fallback");
+		const calls = vi.spyOn(telemetry, "noteCall");
+		const errors = vi.spyOn(telemetry, "noteCallError");
+		let end: Record<string, unknown> | undefined;
+		const dispose = piUtils.logger.registerLogSink(event => {
+			if (event.message === "provider request end" && event.context?.requestId === telemetry.requestId) end = event.context;
+		});
+		const fetch = transportFetch(model, (async () => new Response(body, { headers: { "content-type": "text/event-stream" } })) as FetchImpl, telemetry);
+		try {
+			const result = await streamOpenAICodexResponses(model, { messages: [{ role: "user", content: "hi", timestamp: 1 }] }, { ...record.options, fetch }).result();
+			telemetry.completed(result);
+			expect(result.stopReason).toBe("stop");
+			expect(calls).toHaveBeenCalledTimes(2);
+			expect(errors).toHaveBeenCalledTimes(1);
+			expect(end?.bytesIn).toBe(Buffer.byteLength(body));
+		} finally {
+			dispose();
+		}
+	});
+
+	it("attributes buffered steering successor bytes to attach without counting control or fabricating a create attempt", async () => {
 		installSocket((frame, socket) => {
 			if (frame.type === "response.create") {
 				// Stream part of an answer, then wait for the steer.
@@ -191,11 +302,13 @@ describe("codex live steering", () => {
 		const state = new Map<string, ProviderSessionState>();
 		const steering = oneShotSteering("use tabs");
 		const user: UserMessage = { role: "user", content: "Draft a plan", timestamp: Date.now() };
+		const firstTelemetry = measuredOptions(state, steering.source);
+		const secondTelemetry = measuredOptions(state);
 
 		const first = await streamOpenAICodexResponses(
 			model,
 			{ systemPrompt: SYSTEM, messages: [user] },
-			options(state, steering.source),
+			firstTelemetry.options,
 		).result();
 
 		expect(steering.settled()).toBe("accepted");
@@ -212,13 +325,26 @@ describe("codex live steering", () => {
 		const second = await streamOpenAICodexResponses(
 			model,
 			{ systemPrompt: SYSTEM, messages: [user, first, steerMessage] },
-			options(state),
+			secondTelemetry.options,
 		).result();
 
 		expect(second.responseId).toBe("resp_2");
 		expect(second.content).toEqual([expect.objectContaining({ type: "text", text: "Tabs it is" })]);
 		expect(creates()).toHaveLength(1);
 		expect(ScriptedWebSocket.instances).toHaveLength(1);
+		expect(firstTelemetry.calls).toHaveBeenCalledTimes(1);
+		expect(secondTelemetry.calls).not.toHaveBeenCalled();
+		expect(firstTelemetry.bytes.mock.calls.reduce((sum, [n]) => sum + n, 0)).toBe(wireBytes([
+			{ type: "response.created", response: { id: "resp_1" } },
+			...messageFrames("msg_1", "Plan"),
+			{ type: "response.incomplete", response: { id: "resp_1", status: "incomplete", incomplete_details: { reason: "steered" }, usage: USAGE } },
+		]));
+		expect(secondTelemetry.bytes.mock.calls.reduce((sum, [n]) => sum + n, 0)).toBe(wireBytes([
+			{ type: "response.created", response: { id: "resp_2" } },
+			...messageFrames("msg_2", "Tabs it is"),
+			{ type: "response.completed", response: { id: "resp_2", status: "completed", usage: USAGE } },
+		]));
+		expect(secondTelemetry.headers.mock.calls.every(args => args.length === 0)).toBe(true);
 	});
 
 	it("returns pending tool output without repeating steering the server already queued", async () => {

@@ -74,6 +74,7 @@ import { getProxyForUrl } from "../utils/proxy";
 import { createRequestDebugSession, isRequestDebugEnabled, type RequestDebugResponseLog } from "../utils/request-debug";
 import { adaptSchemaForStrict, NO_STRICT, sanitizeSchemaForOpenAIResponses, toolWireSchema } from "../utils/schema";
 import { notifyRawSseEvent } from "../utils/sse-debug";
+import { getProviderRequestTelemetry } from "../utils/transport-fetch";
 import { compactGrammarDefinition } from "./grammar";
 import {
 	type CodexLiteShapedBody,
@@ -1893,6 +1894,7 @@ async function openCodexWebSocketTransport(
 		websocketHeaders,
 		model.provider,
 		requestSetup.requestSignal,
+		getProviderRequestTelemetry(options?.fetch),
 	);
 	const timeouts: CodexWebSocketRequestTimeouts = {
 		idleTimeoutMs: requestSetup.websocketIdleTimeoutMs,
@@ -1916,6 +1918,7 @@ async function openCodexWebSocketTransport(
 					timeouts,
 					requestSetup.requestSignal,
 					onSseEvent,
+					getProviderRequestTelemetry(options?.fetch),
 				),
 				requestBodyForState: cloneJsonTree(requestContext.transformedBody),
 				transport: "websocket",
@@ -1937,6 +1940,7 @@ async function openCodexWebSocketTransport(
 				websocketHeaders,
 				model.provider,
 				requestSetup.requestSignal,
+				getProviderRequestTelemetry(options?.fetch),
 			);
 		}
 	}
@@ -1994,6 +1998,7 @@ async function openCodexWebSocketTransport(
 		timeouts,
 		requestSetup.requestSignal,
 		onSseEvent,
+		getProviderRequestTelemetry(options?.fetch),
 	);
 	return {
 		eventStream,
@@ -3935,6 +3940,8 @@ class CodexWebSocketConnection {
 	#onHandshakeHeaders?: (headers: Headers) => void;
 	#socket: Bun.WebSocket | null = null;
 	#queue: Array<Record<string, unknown> | Error | null> = [];
+	// Wire sizes travel with queued frames: steering successors can arrive before attach.
+	#frameBytes = new WeakMap<object, number>();
 	#waiters: Array<() => void> = [];
 	#connectPromise?: Promise<void>;
 	#activeRequest = false;
@@ -4151,10 +4158,13 @@ class CodexWebSocketConnection {
 				if (parsed.type === "error" && parsed.code === AIError.CODEX_NATIVE_LANE_STEER_REJECTED_CODE) {
 					this.#refuseSteerWaiters(parsed.code, typeof parsed.message === "string" ? parsed.message : undefined);
 				}
+				this.#frameBytes.set(parsed, typeof event.data === "string" ? Buffer.byteLength(event.data) : event.data.byteLength);
 				this.#push(parsed);
 			} catch (error) {
 				notifyCodexWebSocketMalformed(this.#streamObserver, event.data, error);
-				this.#push(new CodexWebSocketTransportError(`${String(error)}`));
+				const malformed = new CodexWebSocketTransportError(`${String(error)}`);
+				this.#frameBytes.set(malformed, typeof event.data === "string" ? Buffer.byteLength(event.data) : event.data.byteLength);
+				this.#push(malformed);
 			}
 		};
 
@@ -4171,6 +4181,7 @@ class CodexWebSocketConnection {
 		timeouts: CodexWebSocketRequestTimeouts,
 		signal?: AbortSignal,
 		onSseEvent?: (event: RawSseEvent) => void,
+		telemetry?: ReturnType<typeof getProviderRequestTelemetry>,
 	): AsyncGenerator<Record<string, unknown>> {
 		if (!this.#socket || this.#socket.readyState !== WebSocket.OPEN) {
 			throw new CodexWebSocketTransportError(`websocket connection is unavailable`);
@@ -4238,6 +4249,7 @@ class CodexWebSocketConnection {
 					throw new CodexWebSocketTransportError(`websocket connection is unavailable`);
 				}
 				try {
+					telemetry?.noteCall();
 					socket.send(requestPayload);
 				} catch (error) {
 					throw new CodexWebSocketTransportError(
@@ -4293,6 +4305,14 @@ class CodexWebSocketConnection {
 					}
 				}
 				const next = await this.#nextMessage(timeoutMs, timeoutReason);
+				if (next !== null) {
+					const bytes = this.#frameBytes.get(next);
+					if (bytes !== undefined) {
+						telemetry?.noteResponseHeaders();
+						telemetry?.noteBytes(bytes);
+						this.#frameBytes.delete(next);
+					}
+				}
 				if (next instanceof Error) {
 					throw next;
 				}
@@ -4361,6 +4381,9 @@ class CodexWebSocketConnection {
 					break;
 				}
 			}
+		} catch (error) {
+			telemetry?.noteCallError(error);
+			throw error;
 		} finally {
 			this.#activeRequest = false;
 			this.#streamObserver = undefined;
@@ -4652,6 +4675,7 @@ async function getOrCreateCodexWebSocketConnection(
 	headers: Headers,
 	provider: string,
 	signal?: AbortSignal,
+	telemetry?: ReturnType<typeof getProviderRequestTelemetry>,
 ): Promise<CodexWebSocketConnection> {
 	const proxy = getProxyForUrl(provider, new URL(url));
 	const headerRecord = headersToRecord(headers);
@@ -4698,7 +4722,14 @@ async function getOrCreateCodexWebSocketConnection(
 		},
 		proxy,
 	});
-	await state.connection.connect(signal);
+	try {
+		await state.connection.connect(signal);
+	} catch (error) {
+		// Failed upgrades prevent a create send; successful prewarm is not inference.
+		telemetry?.noteCall();
+		telemetry?.noteCallError(error);
+		throw error;
+	}
 	return state.connection;
 }
 
