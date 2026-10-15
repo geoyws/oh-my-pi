@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -39,6 +39,8 @@ import type {
 	ToolResultMessage,
 } from "@oh-my-pi/pi-ai/types";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { ProviderRequestTelemetry } from "@oh-my-pi/pi-ai/utils/request-telemetry";
+import { transportFetch } from "@oh-my-pi/pi-ai/utils/transport-fetch";
 import { validateToolArguments } from "@oh-my-pi/pi-ai/utils/validation";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { extractHttpStatusFromError } from "@oh-my-pi/pi-utils";
@@ -809,6 +811,136 @@ describe("GitLab Duo Workflow per-account namespace cache", () => {
 	});
 });
 
+function captureWorkflowTelemetry(fetchImpl: FetchImpl = async () => new Response("{}")) {
+	const telemetry = new ProviderRequestTelemetry(model, "gitlab-socket-test");
+	const calls = spyOn(telemetry, "noteCall");
+	const errors = spyOn(telemetry, "noteCallError");
+	const headers = spyOn(telemetry, "noteResponseHeaders");
+	const bytes = spyOn(telemetry, "noteBytes");
+	return { fetch: transportFetch(model, fetchImpl, telemetry), calls, errors, headers, bytes };
+}
+
+
+describe("GitLab Duo Workflow native request telemetry", () => {
+	function harness() {
+		const sent: string[] = [];
+		const socket: GitLabDuoWorkflowWebSocketLike = {
+			onopen: null, onmessage: null, onerror: null, onclose: null,
+			send(data) { sent.push(data); },
+			close() {},
+		};
+		const payload = buildGitLabDuoWorkflowStartRequest("telemetry-workflow", model, context);
+		const state = (): GitLabDuoWorkflowStreamState => ({
+			stream: new AssistantMessageEventStream(),
+			started: true,
+			output: {
+				role: "assistant", content: [], api: "gitlab-duo-agent", provider: "gitlab-duo-agent", model: model.id,
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+				stopReason: "stop", timestamp: 1,
+			},
+		});
+		return { socket, sent, payload, state };
+	}
+
+	it("counts start and batched tool resume once each and replaces the preserved socket owner", async () => {
+		const { socket, sent, payload, state } = harness();
+		const first = captureWorkflowTelemetry();
+		const second = captureWorkflowTelemetry();
+		const action = JSON.stringify({ requestID: "request-1", runMCPTool: { name: "mcp__omp__read", args: "{}" } });
+		const firstRun = runGitLabDuoWorkflowSocket(socket, payload, state(), { fetch: first.fetch });
+		expect(first.calls).toHaveBeenCalledTimes(1);
+		socket.onopen?.(new Event("open"));
+		expect(first.headers).not.toHaveBeenCalled();
+		socket.onmessage?.(new MessageEvent("message", { data: action }));
+		await expect(firstRun).resolves.toBe("action");
+		const secondRun = runGitLabDuoWorkflowSocket(socket, payload, state(), { fetch: second.fetch }, [
+			{ actionResponse: { requestID: "request-1" } },
+			{ actionResponse: { requestID: "request-2" } },
+		]);
+		expect(second.calls).toHaveBeenCalledTimes(1);
+		expect(second.headers).not.toHaveBeenCalled();
+		const terminal = JSON.stringify({ status: "INPUT_REQUIRED" });
+		socket.onmessage?.(new MessageEvent("message", { data: terminal }));
+		await expect(secondRun).resolves.toBe("terminal");
+		expect(sent).toHaveLength(3);
+		expect(first.bytes.mock.calls).toEqual([[Buffer.byteLength(action)]]);
+		expect(second.bytes.mock.calls).toEqual([[Buffer.byteLength(terminal)]]);
+		expect(first.headers.mock.calls).toEqual([[]]);
+		expect(second.headers.mock.calls).toEqual([[]]);
+		expect(first.errors).not.toHaveBeenCalled();
+		expect(second.errors).not.toHaveBeenCalled();
+	});
+
+	it("counts raw UTF-8, buffer views, ArrayBuffer and Blob frames before paused parsing", async () => {
+		const { socket, payload, state } = harness();
+		const accounting = captureWorkflowTelemetry();
+		const current = state();
+		current.providerSessionState = { close() {}, active: { workflowId: payload.workflowID, startPayload: payload, ws: socket, paused: true } };
+		const run = runGitLabDuoWorkflowSocket(socket, payload, current, { fetch: accounting.fetch });
+		const raw = "é🙂";
+		const bytes = new Uint8Array([1, 2, 3, 4]);
+		for (const data of [raw, bytes.subarray(1, 3), bytes.buffer, new Blob([raw])]) {
+			socket.onmessage?.(new MessageEvent("message", { data }));
+		}
+		expect(accounting.bytes.mock.calls).toEqual([[Buffer.byteLength(raw)], [2], [4], [Buffer.byteLength(raw)]]);
+		expect(current.providerSessionState.active?.pauseBuffer).toHaveLength(4);
+		socket.onclose?.(new CloseEvent("close", { code: 1006, reason: "lost" }));
+		await expect(run).resolves.toBe("closed");
+		expect(accounting.headers.mock.calls).toEqual([[]]);
+		expect(String(accounting.errors.mock.calls[0]?.[0])).toContain("1006 lost");
+	});
+
+	it("records a socket factory failure as one inference attempt while excluding REST setup", async () => {
+		let restCalls = 0;
+		const accounting = captureWorkflowTelemetry(async (input, init) => {
+			restCalls++;
+			const url = String(input);
+			if (url.includes("/direct_access")) {
+				return new Response(JSON.stringify({ gitlab_rails: { token: "rails-token" } }));
+			}
+			if (url.endsWith("/workflows") && init?.method === "POST") {
+				return new Response(JSON.stringify({ id: "factory-failure-workflow" }));
+			}
+			return new Response("{}", { status: 404 });
+		});
+		const failure = new Error("socket factory failed");
+		const result = await streamGitLabDuoWorkflow(model, context, {
+			apiKey: "redacted",
+			rootNamespaceId: "gid://gitlab/Group/1",
+			fetch: accounting.fetch,
+			webSocketFactory() { throw failure; },
+		}).result();
+		expect(result.stopReason).toBe("error");
+		expect(restCalls).toBeGreaterThan(0);
+		expect(accounting.calls).toHaveBeenCalledTimes(1);
+		expect(accounting.errors.mock.calls).toEqual([[failure]]);
+		expect(accounting.headers).not.toHaveBeenCalled();
+		expect(accounting.bytes).not.toHaveBeenCalled();
+	});
+
+
+	it("records pre-open socket errors and synchronous start/resume send failures without HTTP status", async () => {
+		for (const mode of ["open", "start", "resume"] as const) {
+			const { socket, payload, state } = harness();
+			const accounting = captureWorkflowTelemetry();
+			const failure = new Error("socket send failed");
+			if (mode !== "open") socket.send = () => { throw failure; };
+			const run = runGitLabDuoWorkflowSocket(socket, payload, state(), { fetch: accounting.fetch },
+				mode === "resume" ? { actionResponse: { requestID: "request-1" } } : undefined);
+			const rejected = expect(run).rejects.toThrow(mode === "open" ? "WebSocket error" : "socket send failed");
+			if (mode === "open") socket.onerror?.(new Event("error"));
+			else if (mode === "start") socket.onopen?.(new Event("open"));
+			await rejected;
+			expect(accounting.calls).toHaveBeenCalledTimes(1);
+			expect(accounting.errors).toHaveBeenCalledTimes(1);
+			expect(accounting.headers).not.toHaveBeenCalled();
+			expect(accounting.bytes).not.toHaveBeenCalled();
+		}
+	});
+});
+
+
 describe("GitLab Duo Workflow WebSocket state machine", () => {
 	it("opens WebSocket with direct_access GitLab Rails token", async () => {
 		let capturedUrl = "";
@@ -965,10 +1097,11 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 			return socket;
 		};
 
+		const accounting = captureWorkflowTelemetry(fetchImpl);
 		const stream = streamGitLabDuoWorkflow(model, context, {
 			apiKey: "[REDACTED]",
 			rootNamespaceId: "gid://gitlab/Group/1",
-			fetch: fetchImpl,
+			fetch: accounting.fetch,
 			webSocketFactory,
 			idleTimeoutMs: 25,
 		});
@@ -984,6 +1117,11 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 		// The second socket carried the NEW workflow id, never the stale one twice.
 		expect(startedWorkflowIds).toEqual(["workflow-1", "workflow-2"]);
 		expect(result.stopReason).not.toBe("error");
+		expect(accounting.calls).toHaveBeenCalledTimes(2);
+		expect(accounting.errors.mock.calls[0]?.[0]).toBeInstanceOf(Error);
+		expect(String(accounting.errors.mock.calls[0]?.[0])).toContain("idle timeout");
+		expect(accounting.headers.mock.calls).toEqual([[]]);
+		expect(accounting.bytes.mock.calls).toEqual([[Buffer.byteLength(JSON.stringify({ status: "INPUT_REQUIRED" }))]]);
 	});
 
 	it("restarts on a fresh workflow when the server reports the max step limit", async () => {
@@ -3173,7 +3311,9 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 			started: true,
 			providerSessionState,
 		};
-		const firstRun = runGitLabDuoWorkflowSocket(socket, startPayload, state1, { apiKey: "redacted" });
+		const firstAccounting = captureWorkflowTelemetry();
+		const secondAccounting = captureWorkflowTelemetry();
+		const firstRun = runGitLabDuoWorkflowSocket(socket, startPayload, state1, { fetch: firstAccounting.fetch });
 		socket.onopen?.(new Event("open"));
 		socket.onmessage?.(new MessageEvent("message", { data: checkpointData }));
 		const firstResult = await firstRun;
@@ -3185,6 +3325,12 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 		expect(providerSessionState?.active?.paused).toBe(true);
 		const replay = providerSessionState?.active?.pauseBuffer ?? [];
 		expect(replay.length).toBeGreaterThan(0);
+		// Raw frames arriving while paused belong to the receiving stream, not replay.
+		const buffered = JSON.stringify({ status: "RUNNING", text: "é" });
+		socket.onmessage?.(new MessageEvent("message", { data: buffered }));
+		expect(firstAccounting.calls).toHaveBeenCalledTimes(1);
+		expect(firstAccounting.headers.mock.calls).toEqual([[]]);
+		expect(firstAccounting.bytes.mock.calls).toEqual([[Buffer.byteLength(checkpointData)], [Buffer.byteLength(buffered)]]);
 
 		if (providerSessionState?.active) {
 			providerSessionState.active.paused = false;
@@ -3203,7 +3349,7 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 			socket,
 			startPayload,
 			state2,
-			{ apiKey: "redacted" },
+			{ fetch: secondAccounting.fetch },
 			undefined,
 			replay,
 		);
@@ -3211,6 +3357,13 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 
 		expect(secondResult).toBe("terminal");
 		expect(output2.content).toEqual([{ type: "text", text: "Second step." }]);
+		expect(secondAccounting.calls).not.toHaveBeenCalled();
+		expect(secondAccounting.headers).not.toHaveBeenCalled();
+		expect(secondAccounting.bytes).not.toHaveBeenCalled();
+		// The live handler now belongs to the second stream even on the same socket.
+		socket.onmessage?.(new MessageEvent("message", { data: buffered }));
+		expect(secondAccounting.bytes.mock.calls).toEqual([[Buffer.byteLength(buffered)]]);
+		expect(firstAccounting.bytes).toHaveBeenCalledTimes(2);
 	});
 
 	it("does not pause on a stale boundary replayed at the head of a later checkpoint snapshot", async () => {

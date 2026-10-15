@@ -1,4 +1,4 @@
-import { auxiliaryFetch } from "../utils/transport-fetch";
+import { auxiliaryFetch, getProviderRequestTelemetry } from "../utils/transport-fetch";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -1310,6 +1310,7 @@ async function runGitLabDuoWorkflow(
 				extraHeaders: workflowConnection.headers,
 				originBaseUrl: baseUrl,
 				webSocketFactory: options.webSocketFactory,
+				fetch: options.fetch,
 			});
 			if (providerSessionState) {
 				// Capture the CURRENT workflow id (it is reassigned across timeout/step-limit/
@@ -1827,6 +1828,7 @@ function openGitLabDuoWorkflowSocket(
 		serviceEndpoint?: boolean;
 		extraHeaders?: Record<string, string>;
 		webSocketFactory?: GitLabDuoWorkflowWebSocketFactory;
+		fetch?: FetchImpl;
 	},
 ): GitLabDuoWorkflowWebSocketLike {
 	const url = buildGitLabDuoWorkflowWebSocketUrl(baseUrl, options);
@@ -1836,7 +1838,14 @@ function openGitLabDuoWorkflowSocket(
 	});
 	const factory = options.webSocketFactory ?? defaultGitLabDuoWorkflowWebSocketFactory;
 	traceGitLabDuoWorkflow("websocket.create", { url });
-	return factory(url, { headers });
+	try {
+		return factory(url, { headers });
+	} catch (error) {
+		const telemetry = getProviderRequestTelemetry(options.fetch);
+		telemetry?.noteCall();
+		telemetry?.noteCallError(error);
+		throw error;
+	}
 }
 function defaultGitLabDuoWorkflowWebSocketFactory(
 	url: string,
@@ -1857,6 +1866,11 @@ export function runGitLabDuoWorkflowSocket(
 	replayMessages?: readonly unknown[],
 ): Promise<GitLabDuoWorkflowSocketResult> {
 	const { promise, resolve, reject } = Promise.withResolvers<GitLabDuoWorkflowSocketResult>();
+	// A preserved socket gets fresh handlers/ownership for each logical stream.
+	// Replay never crosses the raw receive boundary a second time.
+	const telemetry = getProviderRequestTelemetry(options.fetch);
+	let receivedFrame = false;
+	let closing = false;
 	let settled = false;
 	let idleTimer: NodeJS.Timeout | undefined;
 	const clearIdleTimer = (): void => {
@@ -1869,6 +1883,7 @@ export function runGitLabDuoWorkflowSocket(
 		if (settled) return;
 		settled = true;
 		clearIdleTimer();
+		if (error) telemetry?.noteCallError(error);
 		if (error) reject(error);
 		else resolve(result);
 	};
@@ -1881,11 +1896,13 @@ export function runGitLabDuoWorkflowSocket(
 		if (settled) return;
 		idleTimer = setTimeout(() => {
 			traceGitLabDuoWorkflow("websocket.idle_timeout", { timeoutMs: idleTimeoutMs });
+			telemetry?.noteCallError(new Error(`GitLab Duo Workflow WebSocket idle timeout after ${idleTimeoutMs}ms`));
 			close();
 			settle("timeout");
 		}, idleTimeoutMs);
 	};
 	const close = (): void => {
+		closing = true;
 		try {
 			ws.close();
 		} catch {
@@ -1945,9 +1962,20 @@ export function runGitLabDuoWorkflowSocket(
 	};
 	ws.onclose = event => {
 		traceGitLabDuoWorkflow("websocket.close", { code: event.code, reason: event.reason });
+		if (!settled && !closing) {
+			telemetry?.noteCallError(new Error(`GitLab Duo Workflow WebSocket closed: ${event.code} ${event.reason}`));
+		}
 		settle(state.lastApprovalStatus ? "approval" : "closed");
 	};
 	ws.onmessage = event => {
+		if (!receivedFrame) {
+			receivedFrame = true;
+			telemetry?.noteResponseHeaders();
+		}
+		const data: unknown = event.data;
+		if (typeof data === "string") telemetry?.noteBytes(Buffer.byteLength(data));
+		else if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) telemetry?.noteBytes(data.byteLength);
+		else if (data instanceof Blob) telemetry?.noteBytes(data.size);
 		resetIdleTimer();
 		if (active?.paused) {
 			active.pauseBuffer ??= [];
@@ -2001,15 +2029,19 @@ export function runGitLabDuoWorkflowSocket(
 		})();
 	} else if (resumeResponse && (!Array.isArray(resumeResponse) || resumeResponse.length > 0)) {
 		ws.onopen = null;
+		telemetry?.noteCall();
 		// Resume the live socket by returning the tool result for the single pending
 		// action of this turn. (Accepts an array for forward-compat, but the serial
 		// inline flow only ever has one.) DWS matches it by requestID to the awaiting
 		// outbox future and the workflow continues on the same connection.
 		const responses = Array.isArray(resumeResponse) ? resumeResponse : [resumeResponse];
-		for (const response of responses) {
-			ws.send(JSON.stringify(response));
+		try {
+			for (const response of responses) ws.send(JSON.stringify(response));
+		} catch (error) {
+			settle("closed", error);
 		}
 	} else {
+		telemetry?.noteCall();
 		ws.onopen = () => {
 			traceGitLabDuoWorkflow("websocket.open", {
 				workflowId: startPayload.workflowID,
@@ -2020,7 +2052,11 @@ export function runGitLabDuoWorkflowSocket(
 				mcpTools: startPayload.mcpTools.length,
 				preapprovedTools: startPayload.preapproved_tools.length,
 			});
-			ws.send(JSON.stringify({ startRequest: startPayload }));
+			try {
+				ws.send(JSON.stringify({ startRequest: startPayload }));
+			} catch (error) {
+				settle("closed", error);
+			}
 		};
 	}
 	resetIdleTimer();
