@@ -7557,6 +7557,44 @@ describe("openai-codex recovery attempt gate", () => {
 		expect(result.errorMessage).toContain(BUDGET_EXHAUSTED);
 	});
 
+	it("refuses the SSE access-program replay when its payload preparation spends the budget", async () => {
+		const accountId = "acct-gate-replay-payload";
+		let payloads = 0;
+		const options = {
+			apiKey: createCodexTestToken(accountId),
+			fetch: undefined as FetchImpl | undefined,
+			...createBudget(),
+			onPayload: async () => {
+				payloads += 1;
+				// The replay's outer gate already passed against a live budget;
+				// spend it while the replay prepares its payload, before any send.
+				if (payloads === 2) spendBudget(options);
+				return undefined;
+			},
+		};
+		const fetchMock = vi.fn<FetchImpl>(async () => {
+			if (fetchMock.mock.calls.length > 1) {
+				return new Response(createStatefulCodexSse("late", "resp_replay_payload"), { headers: SSE_HEADERS });
+			}
+			return new Response(JSON.stringify({ error: ACCESS_PROGRAM_REJECTION }), {
+				status: 403,
+				headers: { "content-type": "application/json" },
+			});
+		});
+		options.fetch = fetchMock;
+
+		const result = await streamOpenAICodexResponses(
+			accessProgramModel(accountId, false),
+			createCodexTestContext(),
+			options,
+		).result();
+
+		expect(payloads).toBe(2);
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain(BUDGET_EXHAUSTED);
+	});
+
 	it("refuses the compaction websocket-to-SSE fallback once the budget is spent", async () => {
 		const fetchMock = vi.fn<FetchImpl>(
 			async () => new Response(createCompletedCodexSse("late"), { headers: SSE_HEADERS }),
