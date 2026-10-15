@@ -123,7 +123,9 @@ describe("provider request telemetry", () => {
 		const { lines } = captureTelemetry();
 		const fetchImpl = (async () => sseResponse()) as unknown as FetchImpl;
 
-		await drain(streamSimple(model, context, { apiKey: "k", fetch: fetchImpl }));
+		const stream = streamSimple(model, context, { apiKey: "k", fetch: fetchImpl });
+		await drain(stream);
+		expect((await stream.result()).stopReason).toBe("stop");
 		await settle();
 
 		expect(lines.map(l => l.message)).toEqual(["provider request start", "provider request end"]);
@@ -216,6 +218,45 @@ describe("provider request telemetry", () => {
 		expect(String(end.fields.error)).toContain("fetch failed after auth retry");
 	});
 
+	it.each(["payload", "transport"] as const)(
+		"reports an unclassified %s failure without treating zero error flags as success",
+		async phase => {
+			const { lines } = captureTelemetry();
+			const failure = new Error("Generation failed unexpectedly");
+			let calls = 0;
+			const stream = streamSimple(model, context, {
+				apiKey: "k",
+				fetch: (async () => {
+					calls += 1;
+					throw failure;
+				}) as unknown as FetchImpl,
+				onPayload() {
+					if (phase === "payload") throw failure;
+				},
+			});
+			const events = await drain(stream);
+			const result = await stream.result();
+			await settle();
+
+			expect(result.stopReason).toBe("error");
+			expect(result.errorId).toBe(0);
+			expect(result.errorMessage).toContain(failure.message);
+			expect(events.at(-1)).toMatchObject({ type: "error", reason: "error", error: result });
+			expect(calls).toBe(phase === "payload" ? 0 : 1);
+			expect(lines.map(line => line.message)).toEqual(["provider request start", "provider request end"]);
+			expect(lines[1].fields).toMatchObject({
+				requestId: lines[0].fields.requestId,
+				outcome: "error",
+				stopReason: result.stopReason,
+				attempts: calls,
+				bytesIn: 0,
+				error: result.errorMessage,
+			});
+			expect(lines[1].fields.status).toBeUndefined();
+			expect(lines[1].fields.errorFlags).toBeUndefined();
+		},
+	);
+
 	it("reports a transport failure as outcome error with its class and text", async () => {
 		const { lines } = captureTelemetry();
 		const fetchImpl = (async () => {
@@ -251,7 +292,9 @@ describe("provider request telemetry", () => {
 			throw new DOMException("The operation was aborted.", "AbortError");
 		}) as unknown as FetchImpl;
 
-		await drain(streamSimple(model, context, { apiKey: "k", fetch: fetchImpl, signal: controller.signal }));
+		const stream = streamSimple(model, context, { apiKey: "k", fetch: fetchImpl, signal: controller.signal });
+		await drain(stream);
+		expect((await stream.result()).stopReason).toBe("aborted");
 		await settle();
 
 		expect(lines.find(l => l.message === "provider request end")!.fields.outcome).toBe("aborted");
