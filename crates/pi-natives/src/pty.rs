@@ -1097,9 +1097,12 @@ mod spin_bound_tests {
 				task::CancelToken::new(None, None),
 				Some(pid_file.clone()),
 			),
-			// The child exits but a background descendant keeps the slave open,
-			// so EOF never comes: the reader must park in `read`, and the run
-			// must give up after `STUCK_SLAVE_IDLE` without spinning meanwhile.
+			// The child exits but a background descendant keeps the slave open.
+			// On Linux EOF then never comes: the reader must park in `read`, and
+			// the run must give up after `STUCK_SLAVE_IDLE` without spinning
+			// meanwhile. macOS revokes the controlling terminal when its session
+			// leader exits, so there the reader gets EOF/EIO at once instead, and
+			// must take it rather than re-poll the revoked descriptor.
 			"open_slave_after_exit" => (
 				// The holder ignores SIGHUP: the session leader's exit hangs up its
 				// foreground group, which would otherwise close the slave for us.
@@ -1267,6 +1270,7 @@ mod spin_bound_tests {
 	fn open_slave_after_exit_gives_up_without_spinning() {
 		let outcome = run_isolated("open_slave_after_exit");
 		assert_eq!(outcome.exit_code, Some(0), "{outcome:?}");
+		#[cfg(target_os = "linux")]
 		assert!(
 			outcome.wall >= STUCK_SLAVE_IDLE,
 			"returned before the open-slave idle cutoff, so EOF was not what it waited for: \
