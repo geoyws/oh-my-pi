@@ -36,6 +36,8 @@ import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { submitInteractiveInput } from "@oh-my-pi/pi-coding-agent/main";
 import { tryRunRpcSkillCommand } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import { restoreRefusedDraft } from "@oh-my-pi/pi-coding-agent/slash-commands/helpers/draft";
+import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
+import type { SlashCommandRuntime } from "@oh-my-pi/pi-coding-agent/slash-commands/types";
 import type { DroppedPrompt } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import { getEditorTheme } from "@oh-my-pi/pi-tui/theme/tui-adapters";
@@ -650,4 +652,77 @@ describe("before_user_message refusal", () => {
 		expect(leakedEverywhere(harness, "FAKE-SECRET")).toEqual([]);
 		expect(harness.seenSources).toContain("rpc");
 	});
+
+	/** The shared slash runtime RPC prompt and ACP session/prompt hand to `handle()`. */
+	function slashRuntime(
+		h: RefusalHarness,
+		source: "rpc" | "acp",
+	): { runtime: SlashCommandRuntime; background: Promise<void>[]; output: string[] } {
+		const background: Promise<void>[] = [];
+		const output: string[] = [];
+		const runtime: SlashCommandRuntime = {
+			session: h.session,
+			sessionManager: h.sessionManager,
+			settings: h.session.settings,
+			cwd: process.cwd(),
+			output: text => {
+				output.push(text);
+			},
+			refreshCommands: () => {},
+			reloadPlugins: async () => {},
+			userMessageSource: source,
+			// RPC dispatches provider-backed builtins in the background; ACP awaits inline.
+			...(source === "rpc" ? { runCommandInBackground: task => void background.push(task()) } : {}),
+		};
+		return { runtime, background, output };
+	}
+
+	for (const source of ["rpc", "acp"] as const) {
+		for (const command of ["compact", "handoff"] as const) {
+			it(`${source} prompt /${command} focus: refused before the summarizer, nothing committed`, async () => {
+				harness = await createHarness();
+				expect(await harness.session.prompt("first clean turn", { source })).toBe(true);
+				expect(await harness.session.prompt("second clean turn", { source })).toBe(true);
+				const callsBefore = harness.streamCalls;
+				const entriesBefore = structuredClone(harness.sessionManager.getEntries());
+				harness.seenSources.length = 0;
+				const slash = slashRuntime(harness, source);
+				const error = await executeAcpBuiltinSlashCommand(`/${command} focus ${SECRET}`, slash.runtime).then(
+					() => null,
+					(error: unknown) => error,
+				);
+				await Promise.all(slash.background);
+				expect(error).toBeInstanceOf(UserMessageRefusedError);
+				expect((error as UserMessageRefusedError).message).toBe(NOTICE);
+				expect(slash.background).toHaveLength(0);
+				expect(harness.streamCalls).toBe(callsBefore);
+				// structuredClone drops the persisted-entry symbol tags, so compare the serialized log.
+				expect(JSON.stringify(harness.sessionManager.getEntries())).toBe(JSON.stringify(entriesBefore));
+				expect(leakedEverywhere(harness, "FAKE-SECRET")).toEqual([]);
+				expect(slash.output.some(text => text.includes("FAKE-SECRET"))).toBe(false);
+				expect(harness.seenSources).toEqual([source]);
+			});
+
+			it(`${source} prompt /${command} clean focus: admitted and forwarded`, async () => {
+				harness = await createHarness();
+				const forwarded: (string | undefined)[] = [];
+				if (command === "compact") {
+					vi.spyOn(harness.session, "compact").mockImplementation(async instructions => {
+						forwarded.push(instructions);
+						return undefined as never;
+					});
+				} else {
+					vi.spyOn(harness.session, "handoff").mockImplementation(async instructions => {
+						forwarded.push(instructions);
+						return undefined;
+					});
+				}
+				const slash = slashRuntime(harness, source);
+				await executeAcpBuiltinSlashCommand(`/${command} focus on the parser`, slash.runtime);
+				await Promise.all(slash.background);
+				expect(harness.seenSources).toEqual([source]);
+				expect(forwarded).toEqual(["focus on the parser"]);
+			});
+		}
+	}
 });

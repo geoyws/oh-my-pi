@@ -1805,6 +1805,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					refreshCommands: emitAvailableCommandsUpdate,
 					reloadPlugins: reloadPluginState,
 					runCommandInBackground: task => shutdownCoordinator.track(task()),
+					userMessageSource: "rpc",
 					notifyTitleChanged: async () => {
 						output({ type: "session_info_update", title: session.sessionName, sessionId: session.sessionId });
 					},

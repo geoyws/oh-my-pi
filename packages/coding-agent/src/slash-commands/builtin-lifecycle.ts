@@ -226,6 +226,13 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		handle: async (command, runtime) => {
 			const parsed = parseCompactArgs(command.args);
 			if ("error" in parsed) return usage(parsed.error, runtime);
+			// RPC prompt and ACP session/prompt reach this shared path: the
+			// user-authored focus goes to the summarizer provider and is persisted
+			// with the compaction entry, so gate it before anything runs. A refusal
+			// throws with only the handler's notice and compacts nothing.
+			if (parsed.instructions?.trim()) {
+				await runtime.session.gateUserMessage(parsed.instructions, undefined, runtime.userMessageSource);
+			}
 			const runCompact = async (): Promise<void> => {
 				const before = runtime.session.getContextUsage?.();
 				const beforeTokens = before?.tokens;
@@ -329,6 +336,11 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 			}
 			if (runtime.session.isGeneratingHandoff) {
 				return usage("Handoff generation is already in progress.", runtime);
+			}
+			// Same contract as `/compact`: the focus reaches the handoff summarizer
+			// and the committed compaction entry, so gate it first.
+			if (command.args?.trim()) {
+				await runtime.session.gateUserMessage(command.args, undefined, runtime.userMessageSource);
 			}
 			const runHandoff = async (): Promise<void> => {
 				let result: HandoffResult | undefined;

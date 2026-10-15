@@ -381,7 +381,13 @@ export type HostFrame =
 	/** Targeted reply to fetch-transcript; `text` is decoded JSONL from `fromByte`, `newSize` the next offset base. */
 	| { t: "transcript"; reqId: number; text: string; newSize: number; error?: string }
 	| { t: "bye"; reason: string }
-	| { t: "error"; message: string };
+	/**
+	 * `refused` marks a guest prompt the host's `before_user_message` gate
+	 * refused: it is targeted at the submitting peer only and hands that peer
+	 * its own submission back so the guest can restore the draft. `message`
+	 * is then the handler's safe notice and never contains the refused text.
+	 */
+	| { t: "error"; message: string; refused?: { text: string; images?: ImageContent[] } };
 
 export type WireFrame = GuestFrame | HostFrame;
 

@@ -979,6 +979,7 @@ export class AcpAgent implements Agent {
 			output: output => this.#emitCommandOutput(record, output),
 			refreshCommands: () => this.#emitAvailableCommandsUpdate(record),
 			reloadPlugins: () => this.#reloadPluginState(record),
+			userMessageSource: "acp",
 			keepTurnOpenUntilIdle: async () => {
 				await record.session.waitForIdle();
 				// `AgentSession.#emit()` does not await listeners, so the retried
