@@ -61,6 +61,8 @@ function accountOf(request: Request): "gmail" | "unum" | "unknown" {
 interface RunOutcome {
 	/** Account behind each `/v1/messages` request, in arrival order. */
 	messages: string[];
+	/** Account behind each usage probe the stand-in answered. */
+	usageProbes: string[];
 	stdout: string;
 	stderr: string;
 	exitCode: number;
@@ -68,6 +70,7 @@ interface RunOutcome {
 
 async function runOnce(): Promise<RunOutcome> {
 	const messages: string[] = [];
+	const usageProbes: string[] = [];
 	const server = Bun.serve({
 		port: 0,
 		hostname: "127.0.0.1",
@@ -90,7 +93,16 @@ async function runOnce(): Promise<RunOutcome> {
 					{ status: 429, headers: { "retry-after": "3600", "anthropic-ratelimit-unified-status": "rejected" } },
 				);
 			}
-			// Usage and any other probe: unknown to this stand-in.
+			// Both accounts report headroom, so the first pick is the session hash
+			// and the 429 alone has to move the run. Answering here also stops the
+			// usage client falling through to production api.anthropic.com.
+			if (url.pathname.endsWith("/api/oauth/usage")) {
+				usageProbes.push(accountOf(request));
+				return Response.json({
+					five_hour: { utilization: 5, resets_at: new Date(Date.now() + 2 * HOUR_MS).toISOString() },
+					seven_day: { utilization: 5, resets_at: new Date(Date.now() + 72 * HOUR_MS).toISOString() },
+				});
+			}
 			return new Response("not found", { status: 404 });
 		},
 	});
@@ -133,6 +145,10 @@ async function runOnce(): Promise<RunOutcome> {
 					HOME: agentDir.path(),
 					NO_COLOR: "1",
 					PI_CODING_AGENT_DIR: agentDir.path(),
+					// Hermetic: anything not bound for the stand-in dies on a dead proxy.
+					HTTP_PROXY: "http://127.0.0.1:9",
+					HTTPS_PROXY: "http://127.0.0.1:9",
+					NO_PROXY: "127.0.0.1,localhost",
 				},
 				stdout: "pipe",
 				stderr: "pipe",
@@ -143,7 +159,7 @@ async function runOnce(): Promise<RunOutcome> {
 			new Response(child.stderr).text(),
 			child.exited,
 		]);
-		return { messages, stdout, stderr, exitCode };
+		return { messages, usageProbes, stdout, stderr, exitCode };
 	} finally {
 		server.stop(true);
 		await agentDir.remove();
@@ -155,6 +171,7 @@ test("a print run that starts on the rate-limited account finishes on its siblin
 	expect(run.exitCode, `${run.stdout}\n${run.stderr}`).toBe(0);
 	expect(run.stdout).toContain(REPLY);
 	expect(run.messages.filter(account => account === "unknown")).toEqual([]);
+	expect(run.usageProbes.filter(account => account === "unknown")).toEqual([]);
 	// Starts on the rate-limited account (the session id pins that), takes one
 	// 429, then the sibling; never back to the blocked account.
 	expect(run.messages[0]).toBe("gmail");
