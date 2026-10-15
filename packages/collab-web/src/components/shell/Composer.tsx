@@ -1,8 +1,8 @@
 import type { CollabUiRequest } from "@oh-my-pi/pi-wire";
 import { SendHorizontal, Square } from "lucide-react";
 import type { KeyboardEvent, ReactNode, RefObject } from "react";
-import { memo, useCallback, useLayoutEffect, useRef, useState } from "react";
-import type { ConnectionPhase, GuestClient } from "../../lib/client";
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import type { ConnectionPhase, GuestClient, GuestSnapshot } from "../../lib/client";
 
 export interface ComposerProps {
 	client: GuestClient;
@@ -14,6 +14,8 @@ export interface ComposerProps {
 	working: boolean;
 	/** Prompts queued behind the running turn. */
 	queuedMessageCount: number;
+	/** Our last prompt the host refused, to put back into the cleared composer. */
+	refusedDraft: GuestSnapshot["refusedDraft"];
 }
 
 /** Textarea metrics: line-height 20px + 8px vertical padding × 2 (kept in sync with shell.css). */
@@ -116,6 +118,15 @@ function AskEditor({ prefill, onSubmit }: AskEditorProps): ReactNode {
 	);
 }
 
+/**
+ * Text after the host handed back a refused prompt: the refused text first,
+ * then anything typed since the send cleared the composer (the TUI guest's
+ * `restoreRefusedDraft` order).
+ */
+export function withRefusedDraft(refused: string, current: string): string {
+	return current ? `${refused}\n${current}` : refused;
+}
+
 /** Memoized on its snapshot fields, so streaming frames that leave them untouched skip it. */
 export const Composer = memo(function Composer({
 	client,
@@ -124,8 +135,17 @@ export const Composer = memo(function Composer({
 	uiRequest,
 	working,
 	queuedMessageCount,
+	refusedDraft,
 }: ComposerProps): ReactNode {
 	const [text, setText] = useState("");
+	// Seeded with the draft present at mount so a remount never restores an
+	// already-restored refusal a second time.
+	const restoredDraftId = useRef(refusedDraft?.id);
+	useEffect(() => {
+		if (!refusedDraft || restoredDraftId.current === refusedDraft.id) return;
+		restoredDraftId.current = refusedDraft.id;
+		setText(current => withRefusedDraft(refusedDraft.text, current));
+	}, [refusedDraft]);
 	const taRef = useRef<HTMLTextAreaElement | null>(null);
 	const { composingRef, onCompositionStart, onCompositionEnd } = useCompositionGuard();
 

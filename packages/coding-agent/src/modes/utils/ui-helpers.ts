@@ -72,6 +72,7 @@ import type { SessionContext, StrippedToolCallsMarker } from "../../session/sess
 import { UserMessageRefusedError } from "../../session/agent-session";
 import { executeBuiltinSlashCommand, lookupBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
 import { parseSlashCommand } from "../../slash-commands/helpers/parse";
+import { restoreRefusedDraft } from "../../slash-commands/helpers/draft";
 import { buildSkillCommandPrompt, invokeSkillCommandFromText, isKnownSkillCommand } from "../skill-command";
 import {
 	createAssistantMessageComponent,
@@ -1231,14 +1232,25 @@ export class UiHelpers {
 			await this.#dispatchQueuedMessage(message);
 		} catch (error) {
 			if (error instanceof UserMessageRefusedError) {
-				// A refusal is final: drop the message and show only the safe
-				// notice instead of failing the drain (which would restore the
-				// message into the queue to fail again).
-				this.ctx.showError(error.notice);
+				// A refusal is final: never back into the queue (where the drain
+				// would fail it again), but the composer cleared it on /queue, so
+				// the text goes back into the editor.
+				this.#handBackRefused(message, error);
 				return;
 			}
 			throw error;
 		}
+	}
+
+	/**
+	 * Shows the refusal's safe notice and puts the refused queued text back
+	 * into the editor, ahead of anything typed since it was queued. The text
+	 * was never sent or persisted.
+	 */
+	#handBackRefused(message: CompactionQueuedMessage, error: UserMessageRefusedError): void {
+		this.ctx.showError(error.notice);
+		restoreRefusedDraft(this.ctx.editor, message.text, message.images);
+		this.ctx.ui.requestRender();
 	}
 
 	async #dispatchQueuedMessage(message: CompactionQueuedMessage): Promise<void> {
@@ -1377,9 +1389,7 @@ export class UiHelpers {
 					? this.ctx.session
 							.promptCustomMessage(built.message, { ...built.options, source: "interactive" })
 							.catch((error: unknown) => {
-								// A refusal is final: drop the message and show only
-								// the safe notice instead of restoring the queue.
-								if (error instanceof UserMessageRefusedError) this.ctx.showError(error.notice);
+								if (error instanceof UserMessageRefusedError) this.#handBackRefused(firstPrompt, error);
 								else restoreQueue(error);
 							})
 					: Promise.resolve();
@@ -1396,7 +1406,7 @@ export class UiHelpers {
 					})
 					.catch((error: unknown) => {
 						disposeFirstPrompt();
-						if (error instanceof UserMessageRefusedError) this.ctx.showError(error.notice);
+						if (error instanceof UserMessageRefusedError) this.#handBackRefused(firstPrompt, error);
 						else restoreQueue(error);
 					});
 			}

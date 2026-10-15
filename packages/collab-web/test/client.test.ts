@@ -396,6 +396,22 @@ describe("GuestClient frame apply", () => {
 		expect(notices[0]).toMatchObject({ level: "error", message: "boom" });
 	});
 
+	it("a refused prompt hands its text back once per refusal, never into the transcript", () => {
+		const client = liveClient();
+		expect(client.getSnapshot().refusedDraft).toBeNull();
+		client.applyFrameForTest({ t: "error", message: "blocked: secret", refused: { text: "key=sk-1" } });
+		const first = client.getSnapshot();
+		expect(first.refusedDraft?.text).toBe("key=sk-1");
+		expect(first.notices.at(-1)).toMatchObject({ level: "error", message: "blocked: secret" });
+		expect(JSON.stringify(first.entries)).not.toContain("sk-1");
+		// A plain error keeps the draft as-is: the composer restores by id.
+		client.applyFrameForTest({ t: "error", message: "boom" });
+		expect(client.getSnapshot().refusedDraft).toBe(first.refusedDraft);
+		// The same text refused again is a new refusal the composer must restore.
+		client.applyFrameForTest({ t: "error", message: "blocked: secret", refused: { text: "key=sk-1" } });
+		expect(client.getSnapshot().refusedDraft?.id).not.toBe(first.refusedDraft?.id);
+	});
+
 	it("auto_retry_end failure surfaces an error notice", () => {
 		const client = liveClient();
 		client.applyFrameForTest({

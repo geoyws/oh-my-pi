@@ -126,6 +126,33 @@ describe("interactive refusal restore", () => {
 		expect(h.editor.getExpandedText()).toBe("refused draft\n\nnewer draft");
 		expect(h.ctx.showError).toHaveBeenCalledWith(NOTICE);
 	});
+
+	it("a message queued during compaction and refused at flush comes back into the editor", async () => {
+		const h = await createHarness(() => {});
+		const refusedShown = Promise.withResolvers<void>();
+		Object.assign(h.ctx, {
+			isKnownSlashCommand: () => false,
+			recordLocalSubmission: () => () => {},
+			loopModeEnabled: false,
+		});
+		(h.ctx.showError as Mock<(message: string) => void>).mockImplementation(() => refusedShown.resolve());
+		h.prompt.mockImplementationOnce(async () => {
+			throw new UserMessageRefusedError(NOTICE);
+		});
+		const helpers = new UiHelpers(h.ctx);
+
+		// /queue during compaction clears the composer into the queue.
+		helpers.queueCompactionMessage("refused queued", "steer");
+		expect(h.editor.getExpandedText()).toBe("");
+		h.editor.setText("typed while compacting");
+		await helpers.flushCompactionQueue({ willRetry: false });
+		await refusedShown.promise;
+
+		expect(h.ctx.showError).toHaveBeenCalledWith(NOTICE);
+		expect(h.editor.getExpandedText()).toBe("refused queued\ntyped while compacting");
+		// Final, not retried: the queue stays empty.
+		expect(h.ctx.compactionQueuedMessages).toEqual([]);
+	});
 });
 
 function makeAssistantMessage(overrides: Partial<AssistantMessage> = {}): AssistantMessage {

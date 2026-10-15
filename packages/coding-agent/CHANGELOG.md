@@ -10,6 +10,7 @@
 - Extended that refusal-restore contract to every other interactive ingress on the production Enter path: a refused `!`/`$` line, `/btw` question, `/compact` or `/handoff` instruction, or later enumerated `/queue` item merges back ahead of a newer draft (text and images) instead of being dropped or clobbering it, and refused `/tree` summarization instructions reopen the hook editor prefilled with the refused text instead of losing it.
 - Gated `/compact` and `/handoff` focus text sent through an RPC `prompt` or an ACP `session/prompt` (the shared slash path): a refusal now fails the request with only the notice before any summarizer call or compaction entry.
 - Fixed a collab guest losing its refused prompt: the host returns a refused prompt to its sender only (`error` frame with the safe notice and a `refused` payload), and the TUI guest restores the text and images ahead of any newer draft.
+- Fixed a message queued with `/queue` during compaction disappearing when the `before_user_message` gate refused it at the post-compaction flush: the refused text and images come back into the editor, ahead of anything typed since
 
 ## [18.10.1] - 2026-10-12
 
