@@ -36,7 +36,7 @@ Shell execution modes:
 
 Both stream merged stdout/stderr text through a threadsafe callback and return `{ exitCode?, cancelled, timedOut, minimized?, workingDir? }`.
 
-Persistent `Shell` also exposes `liveBackgroundJobCount()`, which silently reaps completed jobs and returns the number of live jobs tracked by the session. Hosts can retain per-call shells while ordinary background jobs remain alive. Builtin `nohup <command> &` is special: brush detaches and reparents the operand so it survives shell teardown; this is not the behavior of the system `nohup` binary.
+Persistent `Shell` also exposes `liveBackgroundJobCount()`, which silently reaps completed jobs and returns the number of live jobs tracked by the session. Hosts can retain per-call shells while ordinary background jobs remain alive. `terminateBackgroundJobs()` escalates over the tracked background jobs with an awaited TERM→KILL (150ms grace, then a bounded ~2s exit wait with job-table reaping): returning means the recorded groups are dead. `shutdown()` aborts any in-flight run and then runs the same background-job termination; it never blocks on a wedged run holding the session lock — the run's own cancel bridge owns its foreground tree, so hosts awaiting an in-flight run's settlement must track the run promise itself. Builtin `nohup <command> &` is special: brush detaches and reparents the operand so it survives shell teardown (including `terminateBackgroundJobs` and `shutdown`, which only reach job-tracked processes); this is not the behavior of the system `nohup` binary.
 
 `ShellOptions` supports `sessionEnv`, `snapshotPath`, output `minimizer`, and `filesystem`. `ShellExecuteOptions` additionally supports `command`, `cwd`, command-scoped `env`, `timeoutMs`, and `signal`. `ShellRunOptions` supports `command`, `cwd`, command-scoped `env`, `timeoutMs`, `signal`, and a run-only `filesystem` override.
 
@@ -50,8 +50,8 @@ Rust creates `brush_core::Shell` with:
 - process builtins registered unconditionally from `pi_builtins::process_builtins()` — `nohup`, `pgrep`, `pkill`, `pidwait`, `ps`, `sleep`, `timeout`, and `top` (`nohup` is withheld when `PI_DISABLE_NOHUP_BUILTIN` is set; `kill` comes from the default bash-mode set, where `pi-builtins`' richer implementation replaces brush's original),
 - in-process utility builtins registered from `pi_builtins::utility_builtins()` (see the next section),
 - an opt-in `git` builtin (`crates/pi-shell/src/git.rs`), registered when either layer below is on; anything a layer does not take runs the git binary with the original arguments:
-  - `PI_SMART_GIT` serves supported `git worktree add` invocations through `pi-vcs`: copy-on-write clone, worktree registration, and reconciliation to the target commit, with an in-process checkout fallback when cloning is unavailable;
-  - `PI_GIT_GUARD` (set by the coding agent from `bash.gitGuard`; `crates/pi-shell/src/git/guard.rs`) refuses, with exit status 1, git commands that discard or move work in a shared checkout: `stash` other than `list`/`show`, `reset --hard`, `reset` to a commit other than HEAD's, and `checkout`/`switch`/working-tree `restore` unless the repository is mid-merge/rebase/cherry-pick/revert (unmerged index entries or the operation's state files), and even then not forced or whole-tree forms. It judges the expanded argv in the directory git actually runs in (`cd` and `-C` applied); `--git-dir`/`--work-tree`/`GIT_DIR`-style redirection forfeits the conflict exemption,
+   - `PI_SMART_GIT` serves supported `git worktree add` invocations through `pi-vcs`: copy-on-write clone, worktree registration, and reconciliation to the target commit, with an in-process checkout fallback when cloning is unavailable;
+   - `PI_GIT_GUARD` (set by the coding agent from `bash.gitGuard`; `crates/pi-shell/src/git/guard.rs`) refuses, with exit status 1, git commands that discard or move work in a shared checkout: `stash` other than `list`/`show`, `reset --hard`, `reset` to a commit other than HEAD's, and `checkout`/`switch`/working-tree `restore` unless the repository is mid-merge/rebase/cherry-pick/revert (unmerged index entries or the operation's state files), and even then not forced or whole-tree forms. It judges the expanded argv in the directory git actually runs in (`cd` and `-C` applied); `--git-dir`/`--work-tree`/`GIT_DIR`-style redirection forfeits the conflict exemption,
 - skip-list for shell-sensitive vars (`PS1`, `PWD`, `SHLVL`, bash function exports, etc.),
 - a non-exported `env="$env"` fallback so PowerShell-style `$env:NAME` survives brush parameter expansion unless the user shadows `env`.
 
@@ -120,8 +120,8 @@ One-shot shell (`executeShell`) always creates and drops a fresh session per cal
 - `CancelToken` is constructed from `timeoutMs` and optional `AbortSignal`, then converted into the shared `pi_shell::cancel::CancelToken`.
 - On cancellation/timeout, shell cancellation token is triggered, descendant cleanup runs, then the task gets a 2-second graceful window (5 seconds on Windows) before forced abort.
 - Structured result flags are used:
-  - timeout -> `exitCode` omitted, `timedOut: true`.
-  - abort signal / `Shell.abort()` -> `exitCode` omitted, `cancelled: true`.
+   - timeout -> `exitCode` omitted, `timedOut: true`.
+   - abort signal / `Shell.abort()` -> `exitCode` omitted, `cancelled: true`.
 
 `Shell.abort()` behavior:
 
@@ -173,9 +173,9 @@ Concurrency guard:
 - PTY opened via `portable_pty::native_pty_system().openpty(...)`.
 - On Windows, `openpty()` is run on a helper thread with a 5s startup timeout; timeout rejects with `PTY creation timed out (5s). ConPTY may be unavailable on this system.`
 - `start()` runs the command through the configured shell:
-  - `cmd.exe`/`cmd` gets `/c`,
-  - `powershell`/`pwsh` gets `-Command`,
-  - other shells get `-lc`.
+   - `cmd.exe`/`cmd` gets `/c`,
+   - `powershell`/`pwsh` gets `-Command`,
+   - other shells get `-lc`.
 - `startArgv()` passes each argument directly to `portable_pty::CommandBuilder`.
 - PTY commands inherit the process environment after stripping Git repository-location overrides; explicit PTY `env` values can add them back.
 - Default size is `120x40`; dimensions are clamped (`cols 20..400`, `rows 5..200`) on start and resize.
@@ -287,26 +287,27 @@ Layout behavior:
 
 ### Shell + PTY + Process
 
-| JS API                                       | Rust N-API export                  | Notes                                            |
-| -------------------------------------------- | ---------------------------------- | ------------------------------------------------ |
-| `executeShell(options, onChunk?)`            | `executeShell` (`execute_shell`)   | One-shot shell execution                         |
-| `new Shell(options?)`                        | `Shell` class                      | Persistent shell session                         |
-| `shell.run(options, onChunk?)`               | `Shell::run`                       | Reuses session on keepalive control flow         |
-| `shell.abort()`                              | `Shell::abort`                     | Aborts active run for that shell instance        |
-| `shell.liveBackgroundJobCount()`             | `Shell::live_background_job_count` | Reaps jobs, then counts live background children |
-| `new PtySession()`                           | `PtySession` class                 | Stateful PTY session                             |
-| `pty.start(options, onChunk?, onStart?)`     | `PtySession::start`                | Shell-command PTY run                            |
-| `pty.startArgv(options, onChunk?, onStart?)` | `PtySession::start_argv`           | Direct executable/argv PTY run                   |
-| `pty.write(data)`                            | `PtySession::write`                | Raw stdin passthrough                            |
-| `pty.resize(cols, rows)`                     | `PtySession::resize`               | Clamped terminal dimensions                      |
-| `pty.kill()`                                 | `PtySession::kill`                 | Terminates active PTY child/targets              |
-| `Process.fromPid(pid)`                       | `Process::from_pid`                | Stable process reference lookup                  |
-| `Process.fromPath(path)`                     | `Process::from_path`               | Executable-path process lookup                   |
-| `process.killTree(signal?)`                  | `Process::kill_tree`               | Children-first process tree termination          |
-| `process.terminate(options?)`                | `Process::terminate`               | Graceful then hard process termination           |
-| `process.waitForExit(options?)`              | `Process::wait_for_exit`           | Async exit wait                                  |
-| `process.children()`                         | `Process::children`                | Direct children as `Process[]`                   |
-| `process.status()`                           | `Process::status`                  | `running` / `exited`                             |
+| JS API                                       | Rust N-API export                  | Notes                                                                                                   |
+| -------------------------------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `executeShell(options, onChunk?)`            | `executeShell` (`execute_shell`)   | One-shot shell execution                                                                                |
+| `new Shell(options?)`                        | `Shell` class                      | Persistent shell session                                                                                |
+| `shell.run(options, onChunk?)`               | `Shell::run`                       | Reuses session on keepalive control flow                                                                |
+| `shell.abort()`                              | `Shell::abort`                     | Aborts active run for that shell instance                                                               |
+| `shell.terminateBackgroundJobs()`            | `Shell::terminate_background_jobs` | Awaited TERM→KILL over tracked background jobs; return means the groups are dead                        |
+| `shell.shutdown()`                           | `Shell::shutdown`                  | Aborts the in-flight run, then terminates leftover background jobs; skips runs holding the session lock |
+| `new PtySession()`                           | `PtySession` class                 | Stateful PTY session                                                                                    |
+| `pty.start(options, onChunk?, onStart?)`     | `PtySession::start`                | Shell-command PTY run                                                                                   |
+| `pty.startArgv(options, onChunk?, onStart?)` | `PtySession::start_argv`           | Direct executable/argv PTY run                                                                          |
+| `pty.write(data)`                            | `PtySession::write`                | Raw stdin passthrough                                                                                   |
+| `pty.resize(cols, rows)`                     | `PtySession::resize`               | Clamped terminal dimensions                                                                             |
+| `pty.kill()`                                 | `PtySession::kill`                 | Terminates active PTY child/targets                                                                     |
+| `Process.fromPid(pid)`                       | `Process::from_pid`                | Stable process reference lookup                                                                         |
+| `Process.fromPath(path)`                     | `Process::from_path`               | Executable-path process lookup                                                                          |
+| `process.killTree(signal?)`                  | `Process::kill_tree`               | Children-first process tree termination                                                                 |
+| `process.terminate(options?)`                | `Process::terminate`               | Graceful then hard process termination                                                                  |
+| `process.waitForExit(options?)`              | `Process::wait_for_exit`           | Async exit wait                                                                                         |
+| `process.children()`                         | `Process::children`                | Direct children as `Process[]`                                                                          |
+| `process.status()`                           | `Process::status`                  | `running` / `exited`                                                                                    |
 
 ### Keys
 

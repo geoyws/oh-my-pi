@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "bun:test";
-import { execCommand } from "../src/exec/exec";
+import { execCommand, shutdownExecCommands } from "../src/exec/exec";
 
 const HANG = ["-e", "setTimeout(() => {}, 30_000)"];
 
@@ -52,7 +52,7 @@ describe("execCommand", () => {
 			watcher.close();
 			await fs.promises.rm(dir, { recursive: true, force: true });
 		}
-	});
+	}, 60_000);
 
 	it("abort kills the TERM-ignoring grandchild's whole group", async () => {
 		if (process.platform === "win32") return;
@@ -94,12 +94,65 @@ describe("execCommand", () => {
 				survivors = live();
 			}
 			expect(survivors).toEqual([]);
-			for (const pid of survivors) {
+		} finally {
+			// Marker-keyed (never a bare pid list): if the assertion above
+			// fails, a TERM-ignoring `while :` loop would otherwise leak here.
+			for (const pid of live()) {
 				try {
 					process.kill(pid, "SIGKILL");
 				} catch {}
 			}
+			await fs.promises.rm(dir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
+	it("signal-less child dies as a group when exec shutdown runs", async () => {
+		if (process.platform === "win32") return;
+		// The child below installs no abort and gets no timeout: without the
+		// live-group registry + shutdown path it would orphan to PID 1 when
+		// the pane closes or the session disposes. Bounded sleeps await the
+		// kernel condition (process liveness via pgrep), which has no event
+		// handle and cannot run on fake timers.
+		const marker = `EXECCMD_NOSIG_${process.pid}_${Math.random().toString(36).slice(2, 8)}`;
+		const pattern = `[${marker[0]}]${marker.slice(1)}`;
+		const live = (): number[] =>
+			Bun.spawnSync(["pgrep", "-f", pattern])
+				.stdout.toString()
+				.trim()
+				.split("\n")
+				.filter(Boolean)
+				.map(Number)
+				.filter(pid => Number.isInteger(pid) && pid > 0);
+		const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "exec-pgkill-"));
+		const script = path.join(dir, "spawn.sh");
+		await fs.promises.writeFile(
+			script,
+			`#!/bin/sh\nsh -c 'trap "" TERM; while :; do sleep 0.2; done' ${marker} & wait\n`,
+		);
+		try {
+			const pending = execCommand("/bin/sh", [script], dir);
+			const start = Date.now();
+			while (live().length === 0 && Date.now() - start < 10_000) await Bun.sleep(20);
+			expect(live().length).toBeGreaterThan(0);
+			await shutdownExecCommands();
+			const result = await pending;
+			expect(result.killed).toBe(true);
+			// Shutdown awaited the whole-group TERM→KILL escalation, so the
+			// group is already gone: a short confirmation bound, not a leak
+			// window — without the shutdown the loop below would time out.
+			const deadline = Date.now() + 5_000;
+			let survivors = live();
+			while (survivors.length > 0 && Date.now() < deadline) {
+				await Bun.sleep(50);
+				survivors = live();
+			}
+			expect(survivors).toEqual([]);
 		} finally {
+			for (const pid of live()) {
+				try {
+					process.kill(pid, "SIGKILL");
+				} catch {}
+			}
 			await fs.promises.rm(dir, { recursive: true, force: true });
 		}
 	}, 60_000);

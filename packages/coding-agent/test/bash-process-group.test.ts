@@ -166,7 +166,9 @@ describe("bash process-group kill", () => {
 			state = pidState(bgPid);
 		}
 		expect(state === "" || state.startsWith("Z")).toBe(true);
-		killPids([bgPid]);
+		// No SIGKILL of bgPid here: once reaped, the kernel may recycle the
+		// pid for an unrelated process. The marker-keyed afterEach sweep is
+		// the only cleanup and can only match this test's own grandchild.
 	}, 60_000);
 
 	it("session dispose kills running calls' groups", async () => {
@@ -188,7 +190,31 @@ describe("bash process-group kill", () => {
 		expect(await pollWhileLive(marker, 10_000)).toEqual([]);
 	}, 60_000);
 
-	it("session dispose kills retained async shells' groups", async () => {
+	it("session dispose waits for the in-flight run's group to die", async () => {
+		if (process.platform === "win32") return;
+		const marker = uniqueMarker("DISPOSEWAIT");
+		strayMarkers.push(marker);
+		const sessionId = `pgkill-disposewait-${marker}`;
+		// No user abort: dispose itself must cancel the in-flight run and
+		// wait (bounded) for the TERM→KILL escalation and reap. The
+		// grandchild ignores TERM, so returning after only the TERM wave
+		// would leave it running. No polling after dispose returns — the
+		// group must already be gone. (p)grep liveness has no event handle
+		// and cannot run on fake timers; the waits below are bounded kernel
+		// waits, and the final assertion polls nothing.
+		const promise = executeBash(termIgnoringGrandchild(marker), {
+			cwd: tempDir,
+			timeout: 0,
+			sessionKey: sessionId,
+		});
+		expect(await pollUntilLive(marker, 10_000)).not.toEqual([]);
+		await releaseShellSessions(sessionId);
+		expect(livePids(marker)).toEqual([]);
+		const result = await promise;
+		expect(result.cancelled).toBe(true);
+	}, 60_000);
+
+ 	it("session dispose kills retained async shells' groups", async () => {
 		if (process.platform === "win32") return;
 		const marker = uniqueMarker("RETAINED");
 		strayMarkers.push(marker);

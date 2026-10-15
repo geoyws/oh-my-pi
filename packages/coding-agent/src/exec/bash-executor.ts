@@ -198,6 +198,36 @@ const shellSessionQuarantines = new Map<string, Promise<unknown>>();
 const shellSessionsInUse = new Set<string>();
 
 /**
+ * Every bash-tool run currently executing on a native Shell, keyed by the
+ * session key it runs on. `Shell.shutdown()` only fires the abort token and
+ * returns at once when a run holds the session lock — the TERM→KILL waves run
+ * later on the native cancel bridge — so session dispose must also await the
+ * run itself, or a TERM-ignoring child can survive into a PPID-1 orphan.
+ * `settled` resolves when the native run settles (KILL wave and reap done).
+ * Entries leave the set then, not when the JS caller stops awaiting: an
+ * aborted `executeBash` returns early while its run is still being torn down.
+ */
+interface InFlightShellRun {
+	key: string;
+	abort: () => Promise<void>;
+	settled: Promise<void>;
+}
+const inFlightShellRuns = new Set<InFlightShellRun>();
+
+/**
+ * Upper bound on how long session dispose waits for an in-flight run's
+ * cancellation (TERM→KILL escalation and reap). Native cancellation normally
+ * settles in ~2s; an unkillable run must not stall dispose forever.
+ */
+const IN_FLIGHT_RUN_DISPOSE_WAIT_MS = 2_500;
+
+function inFlightRunDisposeDeadline(): Promise<void> {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	const timer = setTimeout(resolve, IN_FLIGHT_RUN_DISPOSE_WAIT_MS);
+	timer.unref?.();
+	return promise;
+}
+/**
  * Shells retained past their turn because a background (`nohup`/`&`) job is
  * still running. A per-call `:async:` Shell is normally dropped at teardown,
  * which SIGKILLs its children via kill-on-drop. Keeping the reference alive lets
@@ -286,9 +316,12 @@ function quarantineShellSession(
  * cancels through the native TERM→KILL bridge) and its leftover background
  * jobs are terminated with awaited TERM→KILL escalation, so no bash-tool
  * process group outlives session dispose — and, through the postmortem
- * SIGTERM/SIGHUP teardown, process exit. The maps are process-global, so
- * without this each disposed session keeps its native shell (and its
- * background jobs) for the life of the process.
+ * SIGTERM/SIGHUP teardown, process exit. In-flight runs are additionally
+ * awaited (bounded): `shutdown()` alone returns while the native cancel
+ * bridge still runs its TERM→KILL waves, so returning then would orphan a
+ * TERM-ignoring child. The maps are process-global, so without this each
+ * disposed session keeps its native shell (and its background jobs) for the
+ * life of the process.
  */
 export async function releaseShellSessions(agentSessionKey: string | undefined): Promise<void> {
 	if (!agentSessionKey) return;
@@ -305,7 +338,17 @@ export async function releaseShellSessions(agentSessionKey: string | undefined):
 			owned.push(shell);
 		}
 	}
-	await Promise.all(owned.map(shell => shell.shutdown().catch(() => undefined)));
+	// Runs still executing on this session's keys (persistent or one-shot
+	// fallback shells): abort them and wait for the native cancellation —
+	// TERM→KILL waves and reap — to complete. Bounded so an unkillable run
+	// cannot stall dispose; the shutdown below fires the same abort.
+	const inFlight = [...inFlightShellRuns].filter(run => run.key.startsWith(prefix));
+	const settleInFlight = async (): Promise<void> => {
+		if (inFlight.length === 0) return;
+		await Promise.allSettled(inFlight.map(run => run.abort()));
+		await Promise.race([Promise.allSettled(inFlight.map(run => run.settled)), inFlightRunDisposeDeadline()]);
+	};
+	await Promise.allSettled([...owned.map(shell => shell.shutdown().catch(() => undefined)), settleInFlight()]);
 }
 
 function resolveShellCwd(cwd: string | undefined): string | undefined {
@@ -749,6 +792,26 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 				}
 			},
 		);
+		// Track the run for session dispose: `releaseShellSessions` aborts and
+		// awaits exactly this promise, whose settlement follows the native
+		// TERM→KILL waves. Removed on settlement, not on early JS return, so a
+		// dispose racing an aborted call still waits for the group to die.
+		let markRunSettled!: () => void;
+		const runSettled = new Promise<void>(resolve => {
+			markRunSettled = resolve;
+		});
+		const inFlightRun: InFlightShellRun = { key: sessionKey, abort: abortShell, settled: runSettled };
+		inFlightShellRuns.add(inFlightRun);
+		// Defensive bound matching the quarantine window (#10308): a wedged
+		// native run must not pin this entry for the life of the process.
+		const leakTimer = setTimeout(() => inFlightShellRuns.delete(inFlightRun), QUARANTINE_CLEANUP_TIMEOUT_MS);
+		leakTimer.unref?.();
+		const settleRun = (): void => {
+			clearTimeout(leakTimer);
+			inFlightShellRuns.delete(inFlightRun);
+			markRunSettled();
+		};
+		runPromise.then(settleRun, settleRun);
 		options?.onStart?.(() => executionShell.pids());
 
 		const ey = new ExponentialYield();

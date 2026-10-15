@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed bash-tool child processes outliving their call or session (orphaned `bun test` runs, `while :; do :; done` loops): a call's whole process group is now signalled TERM, then KILL after a short grace, on normal end, abort, and timeout — not just the direct child. Background jobs started with plain `&` no longer survive a foreground call (use an async/background job to keep one across turns); every live bash-tool group is shut down at session dispose, including retained async shells, so nothing survives SIGTERM/SIGHUP process exit as a PPID-1 orphan.
+- Fixed bash-tool child processes outliving their call or session (orphaned `bun test` runs, `while :; do :; done` loops): a foreground call's whole process group is now signalled TERM, then KILL after a short grace, on normal end, abort, and timeout — not just the direct child. Background jobs started with plain `&` no longer survive a foreground call (use an async/background job to keep one across turns); session dispose shuts down retained async shells and waits (bounded, ~2.5s) for an in-flight run's TERM→KILL escalation and reap, and hook/extension/custom-tool (`execCommand`) groups are tracked and killed at session dispose and on SIGTERM/SIGHUP process exit. The builtin `nohup cmd &` still double-forks into a new session outside the job table and deliberately survives shell teardown.
 
 ## [18.10.1] - 2026-10-12
 

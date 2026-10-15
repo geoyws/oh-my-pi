@@ -138,6 +138,7 @@ import type { PythonResult } from "../eval/py/executor";
 import { formatEvalStateContext } from "../eval/state";
 import { WorkPoolRegistry } from "../task/workpool";
 import { type BashPtyOptions, type BashResult, releaseShellSessions } from "../exec/bash-executor";
+import { shutdownExecCommands } from "../exec/exec";
 import type { TtsrManager } from "../export/ttsr";
 import type { LoadedCustomCommand } from "../extensibility/custom-commands";
 import type { CustomTool } from "../extensibility/custom-tools/types";
@@ -5704,7 +5705,10 @@ export class AgentSession implements SettingsScope {
 		const advisorRecorderClosed = this.#advisors.recorderClosed();
 		// Awaited: return means every bash-tool process group owned by this
 		// session is dead — nothing outlives dispose into a PPID-1 orphan.
-		await releaseShellSessions(this.sessionManager.getSessionId());
+		// Live `execCommand` groups (hook/extension/custom-tool children, often
+		// signal-less) are shut down alongside: they run detached, so the
+		// kernel SIGHUP path cannot reap them.
+		await Promise.allSettled([releaseShellSessions(this.sessionManager.getSessionId()), shutdownExecCommands()]);
 		const results = await Promise.allSettled([
 			this.#disposeOwnedAsyncJobs(),
 			this.#eval.disposeKernels(),
