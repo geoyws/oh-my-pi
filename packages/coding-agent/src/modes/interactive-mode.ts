@@ -5879,6 +5879,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.showWarning("Plan mode is disabled. Enable it in settings (plan.enabled).");
 			return false;
 		}
+		// A refused first prompt must leave the mode untouched: gate it before
+		// entering (same contract as `/goal`); the Enter path restores the line.
+		if (initialPrompt) await this.session.gateUserMessage(initialPrompt, input?.images, "interactive");
 		await this.#enterPlanMode();
 		if (!initialPrompt) return false;
 		if (isKnownSkillCommand(this, initialPrompt)) {
@@ -5932,6 +5935,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.showWarning("Exit goal mode first.");
 			return false;
 		}
+		// Same contract as `/plan`: a refused first prompt leaves vibe mode off.
+		if (initialPrompt) await this.session.gateUserMessage(initialPrompt, input?.images, "interactive");
 		await this.#enterVibeMode();
 		if (!initialPrompt) return false;
 		if (isKnownSkillCommand(this, initialPrompt)) {

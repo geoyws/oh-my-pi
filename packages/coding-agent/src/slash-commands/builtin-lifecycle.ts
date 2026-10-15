@@ -1,4 +1,4 @@
-import { admitTuiSlashText, clearSubmittedText, restoreDetachedDraft } from "./helpers/draft";
+import { admitTuiSlashText, clearSubmittedText, restoreRefusedLine } from "./helpers/draft";
 import { UserMessageRefusedError } from "../session/agent-session";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -281,11 +281,17 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				await runtime.ctx.handleCompactCommand(parsed.instructions, parsed.mode);
 			} catch (error) {
 				// A `before_user_message` refusal carries only the safe notice.
-				// The composer is already empty on production Enter, so merge
-				// the exact original slash line back ahead of any newer draft
-				// instead of dropping it.
+				// The composer text is already empty on production Enter, but the
+				// line's images stay in the editor: hand the exact original slash
+				// line back ahead of any newer draft, keeping each `[Image #N]`
+				// marker on its own image.
 				if (error instanceof UserMessageRefusedError) {
-					restoreDetachedDraft(runtime.ctx.editor, command.text);
+					restoreRefusedLine(
+						runtime.ctx.editor,
+						command.text,
+						runtime.input?.images,
+						runtime.input?.imageLinks,
+					);
 					runtime.ctx.showError(error.notice);
 					runtime.ctx.ui.requestRender();
 					return;
@@ -395,10 +401,15 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 			try {
 				await runtime.ctx.handleHandoffCommand(customInstructions);
 			} catch (error) {
-				// Same refusal-restore contract as /compact above: merge the
-				// exact original slash line back into the emptied composer.
+				// Same refusal-restore contract as /compact above: hand the exact
+				// original slash line back with its image markers aligned.
 				if (error instanceof UserMessageRefusedError) {
-					restoreDetachedDraft(runtime.ctx.editor, command.text);
+					restoreRefusedLine(
+						runtime.ctx.editor,
+						command.text,
+						runtime.input?.images,
+						runtime.input?.imageLinks,
+					);
 					runtime.ctx.showError(error.notice);
 					runtime.ctx.ui.requestRender();
 					return;

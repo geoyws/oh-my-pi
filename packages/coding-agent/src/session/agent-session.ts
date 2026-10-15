@@ -7466,6 +7466,36 @@ export class AgentSession implements SettingsScope {
 
 		// Expand file-based prompt templates if requested
 		const templated = expandPromptTemplates ? expandPromptTemplate(text, [...this.#promptTemplates]) : text;
+
+		// Busy without a streaming behavior: reject before any handler runs or any
+		// user-turn state changes.
+		if (this.isStreaming && !options?.streamingBehavior) {
+			// Busy because the agent owns a turn: that turn supersedes the interrupted
+			// one (after compaction it is the queued-message drain). Busy only from
+			// another prompt's setup claims nothing yet.
+			outcome.sessionClaimed = this.agent.state.isStreaming;
+			throw new AgentBusyError();
+		}
+
+		// Captured before the gate's await so an abort() landing during the
+		// handlers, image normalization, or the vision-description call drops the
+		// prompt instead of dispatching it (checked below and in #queueUserMessage).
+		const promptGeneration = this.#promptGeneration;
+		// Pre-persistence `before_user_message` gate, ahead of every user-turn side
+		// effect (`^model` mention registration, the turn budget, advisor/plan
+		// reminder resets) and BEFORE image normalization and the vision-description
+		// provider call: a refused message changes nothing and never sends its
+		// images to any provider. Gates the exact text the turn would carry; the
+		// admitted message is marked so #promptWithMessage / #queueUserMessage skip
+		// their own gate instead of running the handlers a second time.
+		const refusalChecked =
+			!options?.synthetic &&
+			(await this.#checkUserMessageRefusal(
+				this.#modelMentions.previewMentions(templated),
+				options?.images,
+				options?.source ?? "unknown",
+			));
+		const preGated = options?.synthetic ? undefined : { refusalChecked };
 		const expandedText = options?.synthetic ? templated : this.#modelMentions.expandMentions(templated);
 
 		// Magic keywords (see modes/magic-keywords.ts): append hidden system notices after the
@@ -7498,9 +7528,9 @@ export class AgentSession implements SettingsScope {
 				throw new AgentBusyError();
 			}
 
-			// abort() can land while the images are prepared; the message is then
-			// dropped instead of queued (same contract as the idle drop below).
-			const queueGeneration = this.#promptGeneration;
+			// abort() can land while the gate runs or the images are prepared; the
+			// message is then dropped instead of queued (same contract as the idle
+			// drop below).
 			const queued = await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, {
 				timestamp: submittedAt,
 				attribution: promptAttribution,
@@ -7508,19 +7538,16 @@ export class AgentSession implements SettingsScope {
 				rawText: typedText,
 				source: options?.source,
 				onPromptAdmitted: options?.onPromptAdmitted,
-				promptGeneration: queueGeneration,
+				promptGeneration,
+				preGated,
 			});
 			outcome.sessionClaimed = queued;
-			if (!queued && this.#promptGeneration !== queueGeneration && !options?.synthetic) {
+			if (!queued && this.#promptGeneration !== promptGeneration && !options?.synthetic) {
 				this.#promptDropped?.({ text: typedText, images: options?.images });
 			}
 			return true;
 		}
 
-		// Captured before the normalization/vision-description awaits below so an
-		// abort() landing during either can be told apart from a fresh submission —
-		// see the drop check right after those awaits.
-		const preflightGeneration = this.#promptGeneration;
 		// Skip eager preludes when the user has already queued a directive
 		const hasPendingUserDirective = this.#toolChoiceQueue.inspect().includes("user-force");
 		const activeModel = this.agent.state.model;
@@ -7536,16 +7563,6 @@ export class AgentSession implements SettingsScope {
 			!options?.synthetic && !hasPendingUserDirective ? this.#todo.createEagerTodoPrelude(expandedText) : undefined;
 		const eagerTaskPrelude =
 			!options?.synthetic && !hasPendingUserDirective ? this.#todo.createEagerTaskPrelude(expandedText) : undefined;
-		// Pre-persistence `before_user_message` gate BEFORE image normalization
-		// and the vision-description provider call: a refused message must
-		// never send its images to any provider. Runs on the raw submission;
-		// the admitted message is marked so #promptWithMessage skips its own
-		// gate instead of running the handlers a second time. After the
-		// preflight-generation capture above so an abort landing during the
-		// handler await still drops the prompt at the check below.
-		const idleRefusalChecked =
-			!options?.synthetic &&
-			(await this.#checkUserMessageRefusal(expandedText, options?.images, options?.source ?? "unknown"));
 		const attachmentSourceNotices = this.#createAttachmentSourceNotices(options?.images, submittedAt);
 		const normalizedImages = await this.#normalizeImagesForModel(options?.images);
 
@@ -7565,7 +7582,7 @@ export class AgentSession implements SettingsScope {
 		// would dispatch a brand-new turn as if the abort never happened. Drop the
 		// prompt here instead — same contract as #promptWithMessage's own
 		// generation-race checks further down.
-		if (this.#promptGeneration !== preflightGeneration) {
+		if (this.#promptGeneration !== promptGeneration) {
 			outcome.sessionClaimed = false;
 			if (!options?.synthetic) {
 				this.#promptDropped?.({ text: typedText, images: options?.images });
@@ -7598,6 +7615,7 @@ export class AgentSession implements SettingsScope {
 					descriptionNotice: imageDescriptionNotice,
 				},
 				onPromptAdmitted: options?.onPromptAdmitted,
+				preGated,
 			});
 			outcome.sessionClaimed = true;
 			return true;
@@ -7648,7 +7666,7 @@ export class AgentSession implements SettingsScope {
 			dispatched = await this.#promptWithMessage(message, expandedText, {
 				...options,
 				images: normalizedImages,
-				refusalChecked: idleRefusalChecked || undefined,
+				refusalChecked: refusalChecked || undefined,
 				prependMessages:
 					preludeMessages.length > 0 ||
 					keywordNotices.length > 0 ||
@@ -8777,12 +8795,20 @@ export class AgentSession implements SettingsScope {
 			 * message is not queued, matching prompt()'s idle drop.
 			 */
 			promptGeneration?: number;
+			/**
+			 * The caller already ran the `before_user_message` gate on this exact
+			 * submission (prompt() gates before any user-turn side effect); carries
+			 * its result so the handlers do not run a second time here.
+			 */
+			preGated?: { refusalChecked: boolean };
 		},
 	): Promise<boolean> {
 		// Pre-persistence `before_user_message` gate for queued entries: runs
 		// before any state mutation or queue insertion, so a refusal throws
 		// before the message exists anywhere but the caller.
-		const refusalChecked = await this.#checkUserMessageRefusal(text, images, options?.source ?? "unknown");
+		const refusalChecked = options?.preGated
+			? options.preGated.refusalChecked
+			: await this.#checkUserMessageRefusal(text, images, options?.source ?? "unknown");
 		const markRefusalChecked = (message: AgentMessage): void => {
 			if (refusalChecked) this.#userMessageRefusalChecked.add(message);
 		};

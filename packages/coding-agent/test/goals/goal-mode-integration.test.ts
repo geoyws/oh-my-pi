@@ -399,6 +399,31 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(JSON.stringify(harness.session.sessionManager.getEntries())).not.toContain(secret);
 	});
 
+	for (const testCase of [
+		{ name: "/plan", submit: (mode: InteractiveMode, text: string) => mode.handlePlanModeCommand(text) },
+		{ name: "/vibe", submit: (mode: InteractiveMode, text: string) => mode.handleVibeModeCommand(text) },
+	]) {
+		it(`refuses a ${testCase.name} prompt before entering the mode`, async () => {
+			const secret = "FAKE-SECRET-NOT-REAL";
+			const refusal = new UserMessageRefusedError("Blocked: secret");
+			vi.spyOn(harness.session, "activateVibeTools").mockResolvedValue();
+			// The prompt's own gate refuses too, as the real session would.
+			Object.defineProperty(harness.session, "isStreaming", { configurable: true, get: () => true });
+			vi.spyOn(harness.session, "gateUserMessage").mockRejectedValue(refusal);
+			vi.spyOn(harness.session, "prompt").mockRejectedValue(refusal);
+			const entriesBefore = harness.session.sessionManager.getEntries().length;
+
+			await expect(testCase.submit(harness.mode, `ship with ${secret}`)).rejects.toBeInstanceOf(
+				UserMessageRefusedError,
+			);
+
+			expect(harness.mode.planModeEnabled).toBe(false);
+			expect(harness.mode.vibeModeEnabled).toBe(false);
+			expect(harness.session.getPlanModeState()).toBeUndefined();
+			expect(harness.session.sessionManager.getEntries()).toHaveLength(entriesBefore);
+		});
+	}
+
 	it("keeps images pasted while delayed plan setup completes in the later draft", async () => {
 		const submittedImages: ImageContent[] = [{ type: "image", data: "b2xk", mimeType: "image/png" }];
 		const submittedLinks = ["file:///submitted.png"];

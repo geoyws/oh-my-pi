@@ -8,6 +8,7 @@ import type { AssistantMessage, Context, ImageContent } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { formatModelString } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import {
@@ -279,6 +280,25 @@ describe("before_user_message refusal", () => {
 		expect(harness.sessionManager.getEntries()).toEqual(entriesBefore);
 		expect(leakedEverywhere(harness, "FAKE-SECRET")).toEqual([]);
 		expect(harness.seenSources).toEqual(["interactive"]);
+	});
+
+	it("refused idle prompt leaves user-turn state untouched (turn budget, model mentions)", async () => {
+		harness = await createHarness();
+		const mentionable = harness.session.modelRegistry.getAvailable()[0];
+		expect(mentionable).toBeDefined();
+		const selector = formatModelString(mentionable!);
+		const budgetBefore = harness.sessionManager.getTurnBudget();
+		const entriesBefore = structuredClone(harness.sessionManager.getEntries());
+
+		await expect(
+			harness.session.prompt(`ask ^${selector} with ${SECRET} +500k!`, { source: "interactive" }),
+		).rejects.toBeInstanceOf(UserMessageRefusedError);
+
+		expect(harness.streamCalls).toBe(0);
+		// No `^model` mention registered or persisted, no turn budget started.
+		expect(harness.sessionManager.getEntries()).toEqual(entriesBefore);
+		expect(harness.sessionManager.getTurnBudget()).toEqual(budgetBefore);
+		expect(harness.session.modelMentions).toEqual([]);
 	});
 
 	it("clean prompt sends normally", async () => {
