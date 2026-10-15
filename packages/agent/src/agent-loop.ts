@@ -1716,9 +1716,9 @@ async function runLoopBody(
 					steerWindow?.watch.stop();
 					if (!turnOpen) {
 						stream.push({ type: "turn_start" });
-						emitInputMessages(stream, turnMessages);
 						turnOpen = true;
 					}
+					emitInputMessages(stream, turnMessages);
 					throw error;
 				}
 				if (config.beforeModelCall && signal?.aborted) {
@@ -1763,11 +1763,13 @@ async function runLoopBody(
 					return;
 				}
 
+				// A steer re-issue keeps its turn open; its drained input still waits
+				// here so the events land only once the replacement call is prepared.
 				if (!turnOpen) {
 					stream.push({ type: "turn_start" });
-					emitInputMessages(stream, turnMessages);
 					turnOpen = true;
 				}
+				emitInputMessages(stream, turnMessages);
 
 				// Stream assistant response
 				let recovered: HarmonyRecoveredToolCall | undefined;
@@ -1876,7 +1878,10 @@ async function runLoopBody(
 									}
 								}
 							}
-							emitInputMessages(stream, drained);
+							// Defer the events to the replacement call's preparation like
+							// any other queued input: the host may still withdraw the
+							// drain if the run is interrupted before that call is ready.
+							messagesToEmit = drained;
 							steerInterruptDrainedNothing = drained.length === 0;
 							steerReissueCount++;
 							// The turn is open with no assistant message in it, so the model

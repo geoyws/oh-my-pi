@@ -455,12 +455,20 @@ describe("AgentSession queued steer delivery", () => {
 			const editor = new CustomEditor(getEditorTheme());
 			const showError = vi.fn();
 			const ctx = {
-				editor, session, viewSession: session, sessionManager,
-				skillCommands: new Map(), fileSlashCommands: new Set(),
-				compactionQueuedMessages: [], locallySubmittedUserSignatures: new Set(),
-				isBashMode: false, isPythonMode: false, loopModeEnabled: false,
+				editor,
+				session,
+				viewSession: session,
+				sessionManager,
+				skillCommands: new Map(),
+				fileSlashCommands: new Set(),
+				compactionQueuedMessages: [],
+				locallySubmittedUserSignatures: new Set(),
+				isBashMode: false,
+				isPythonMode: false,
+				loopModeEnabled: false,
 				ui: { requestRender: vi.fn(), getFocused: () => editor },
-				showError, updatePendingMessagesDisplay: vi.fn(),
+				showError,
+				updatePendingMessagesDisplay: vi.fn(),
 				withLocalSubmission: async <T>(_text: string, submit: () => Promise<T>) => submit(),
 			} as unknown as InteractiveModeContext;
 			new InputController(ctx).setupEditorSubmitHandler();

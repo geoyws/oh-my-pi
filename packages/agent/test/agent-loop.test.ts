@@ -9395,6 +9395,118 @@ describe("agentLoop steering during the provider wait", () => {
 		expect(queue.size).toBe(0);
 	});
 
+	for (const outcome of ["succeeds", "throws", "stops"] as const) {
+		it(`holds a re-issue's drained steer until its replacement preparation ${outcome}`, async () => {
+			// The drained steer is the host's to take back (interrupt withdrawal)
+			// until the replacement call is ready; emitting it at the drain hands
+			// it to the transcript while that call is still being prepared.
+			const context: AgentContext = { systemPrompt: [""], messages: [], tools: [] };
+			const queue = createSteeringQueue();
+			const mock = createMockModel();
+			const replacementEntered = Promise.withResolvers<void>();
+			const releaseReplacement = Promise.withResolvers<void>();
+			const contexts: Context[] = [];
+			let syncCalls = 0;
+			let gateCalls = 0;
+			const isSteer = (message: AgentMessage): boolean =>
+				message.role === "user" && message.content === "actually, do X instead";
+
+			const streamFn: StreamFn = (_model, llmContext) => {
+				contexts.push(llmContext);
+				const response = new AssistantMessageEventStream();
+				// Without the steer the provider stays silent, so only the steer
+				// interrupt can end the first call.
+				if (llmContext.messages.some(isSteer)) queueMicrotask(() => pushAnswer(response, "answer with steer"));
+				return response;
+			};
+			const config: AgentLoopConfig = {
+				model: mock.model,
+				convertToLlm: identityConverter,
+				interruptMode: "immediate",
+				syncContextBeforeModelCall: async () => {
+					syncCalls++;
+					if (syncCalls === 1) {
+						queue.push("actually, do X instead");
+						return;
+					}
+					replacementEntered.resolve();
+					await releaseReplacement.promise;
+					if (outcome === "throws") throw new Error("replacement preparation failed");
+				},
+				beforeModelCall: () => {
+					gateCalls++;
+					return outcome === "stops" && gateCalls === 2 ? { stop: true, reason: "gate closed" } : undefined;
+				},
+				...queue.config,
+			};
+
+			const events: AgentEvent[] = [];
+			const run = (async (): Promise<unknown> => {
+				try {
+					for await (const event of agentLoop(
+						[createUserMessage("start")],
+						context,
+						config,
+						undefined,
+						streamFn,
+					)) {
+						events.push(event);
+					}
+					return undefined;
+				} catch (error) {
+					return error;
+				}
+			})();
+
+			await replacementEntered.promise;
+			await drainWatcherTurn();
+			// The first call was cancelled and its turn stays open, but the steer it
+			// drained has not been delivered while the replacement is prepared.
+			expect(queue.size).toBe(0);
+			expect(events.filter(e => e.type === "turn_start")).toHaveLength(1);
+			expect(events.some(e => (e.type === "message_start" || e.type === "message_end") && isSteer(e.message))).toBe(
+				false,
+			);
+
+			releaseReplacement.resolve();
+			const failure = await run;
+
+			const steerEvents = events.flatMap((e, index) =>
+				(e.type === "message_start" || e.type === "message_end") && isSteer(e.message)
+					? [{ type: e.type, index }]
+					: [],
+			);
+			expect(steerEvents.map(e => e.type)).toEqual(["message_start", "message_end"]);
+			expect(events.filter(e => e.type === "turn_start")).toHaveLength(1);
+			const steerEnd = steerEvents[1]!.index;
+			const firstAssistant = events.findIndex(e => e.type === "message_start" && e.message.role === "assistant");
+			if (outcome === "throws") {
+				expect(failure).toBeInstanceOf(Error);
+				expect((failure as Error).message).toBe("replacement preparation failed");
+				expect(firstAssistant).toBe(-1);
+				expect(steerEnd).toBe(events.length - 1);
+				return;
+			}
+			expect(failure).toBeUndefined();
+			// The steer lands inside the still-open turn, ahead of what answers it.
+			expect(steerEnd).toBeLessThan(firstAssistant);
+			expect(events.filter(e => e.type === "turn_end")).toHaveLength(1);
+			expect(events.at(-1)?.type).toBe("agent_end");
+			if (outcome === "succeeds") {
+				expect(contexts.at(-1)?.messages.some(isSteer)).toBe(true);
+				expect(assistantTexts(events)).toEqual(["answer with steer"]);
+			} else {
+				expect(contexts.some(llmContext => llmContext.messages.some(isSteer))).toBe(false);
+				const stop = events[firstAssistant];
+				expect(stop?.type === "message_start" ? stop.message : undefined).toMatchObject({
+					role: "assistant",
+					stopReason: "aborted",
+					errorMessage: "gate closed",
+				});
+			}
+		});
+	}
+
 	it("stops the steering watch when setup between the response and the read loop throws", async () => {
 		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [] };
 		const queue = createSteeringQueue();
