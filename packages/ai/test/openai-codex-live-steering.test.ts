@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { planSteeredRequest } from "@oh-my-pi/pi-ai/providers/openai-codex/live-steering";
-import { prewarmOpenAICodexResponses, streamOpenAICodexResponses } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import {
+	prewarmOpenAICodexResponses,
+	streamOpenAICodexResponses,
+} from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import type {
 	AssistantMessage,
 	Context,
@@ -197,11 +200,17 @@ describe("codex live steering", () => {
 		expect(record.calls).not.toHaveBeenCalled();
 		expect(record.headers).not.toHaveBeenCalled();
 		expect(record.bytes).not.toHaveBeenCalled();
-		const result = await streamOpenAICodexResponses(model, { messages: [{ role: "user", content: "hi", timestamp: 1 }] }, record.options).result();
+		const result = await streamOpenAICodexResponses(
+			model,
+			{ messages: [{ role: "user", content: "hi", timestamp: 1 }] },
+			record.options,
+		).result();
 		expect(result.stopReason).toBe("stop");
 		expect(record.calls).toHaveBeenCalledTimes(2);
 		expect(record.errors).toHaveBeenCalledTimes(1);
-		expect(record.bytes.mock.calls.reduce((sum, [n]) => sum + n, 0)).toBe(Buffer.byteLength(malformed) + wireBytes(frames));
+		expect(record.bytes.mock.calls.reduce((sum, [n]) => sum + n, 0)).toBe(
+			Buffer.byteLength(malformed) + wireBytes(frames),
+		);
 	});
 
 	it("counts UTF-8 text and binary wire frames once per create on a reused socket", async () => {
@@ -215,17 +224,23 @@ describe("codex live steering", () => {
 				{ type: "response.completed", response: { id: "resp_" + turn, status: "completed", usage: USAGE } },
 			];
 			sizes.push(wireBytes(frames));
-			queueMicrotask(() => frames.forEach((frame, i) => {
-				const text = JSON.stringify(frame);
-				socket.onmessage?.({ data: i % 2 ? Buffer.from(text) : text } as MessageEvent);
-			}));
+			queueMicrotask(() =>
+				frames.forEach((frame, i) => {
+					const text = JSON.stringify(frame);
+					socket.onmessage?.({ data: i % 2 ? Buffer.from(text) : text } as MessageEvent);
+				}),
+			);
 		});
 		const state = new Map<string, ProviderSessionState>();
 		const user: UserMessage = { role: "user", content: "hello", timestamp: 1 };
 		const first = measuredOptions(state);
 		const result = await streamOpenAICodexResponses(createGpt6Model(), { messages: [user] }, first.options).result();
 		const second = measuredOptions(state);
-		await streamOpenAICodexResponses(createGpt6Model(), { messages: [user, result, { ...user, content: "again" }] }, second.options).result();
+		await streamOpenAICodexResponses(
+			createGpt6Model(),
+			{ messages: [user, result, { ...user, content: "again" }] },
+			second.options,
+		).result();
 		for (const [i, record] of [first, second].entries()) {
 			expect(record.calls).toHaveBeenCalledTimes(1);
 			expect(record.bytes.mock.calls.reduce((sum, [n]) => sum + n, 0)).toBe(sizes[i]);
@@ -245,7 +260,9 @@ describe("codex live steering", () => {
 			constructor() {
 				queueMicrotask(() => this.onerror?.({ type: "error", message: "upgrade denied" } as unknown as Event));
 			}
-			close() { this.readyState = 3; }
+			close() {
+				this.readyState = 3;
+			}
 		} as unknown as typeof WebSocket;
 		const state = new Map<string, ProviderSessionState>();
 		const model = createGpt6Model();
@@ -253,17 +270,28 @@ describe("codex live steering", () => {
 		const body = [
 			...messageFrames("msg_sse", "fallback"),
 			{ type: "response.completed", response: { status: "completed", usage: USAGE } },
-		].map(frame => "data: " + JSON.stringify(frame) + "\n\n").join("");
+		]
+			.map(frame => "data: " + JSON.stringify(frame) + "\n\n")
+			.join("");
 		const telemetry = new ProviderRequestTelemetry(model, "fallback");
 		const calls = vi.spyOn(telemetry, "noteCall");
 		const errors = vi.spyOn(telemetry, "noteCallError");
 		let end: Record<string, unknown> | undefined;
 		const dispose = piUtils.logger.registerLogSink(event => {
-			if (event.message === "provider request end" && event.context?.requestId === telemetry.requestId) end = event.context;
+			if (event.message === "provider request end" && event.context?.requestId === telemetry.requestId)
+				end = event.context;
 		});
-		const fetch = transportFetch(model, (async () => new Response(body, { headers: { "content-type": "text/event-stream" } })) as FetchImpl, telemetry);
+		const fetch = transportFetch(
+			model,
+			(async () => new Response(body, { headers: { "content-type": "text/event-stream" } })) as FetchImpl,
+			telemetry,
+		);
 		try {
-			const result = await streamOpenAICodexResponses(model, { messages: [{ role: "user", content: "hi", timestamp: 1 }] }, { ...record.options, fetch }).result();
+			const result = await streamOpenAICodexResponses(
+				model,
+				{ messages: [{ role: "user", content: "hi", timestamp: 1 }] },
+				{ ...record.options, fetch },
+			).result();
 			telemetry.completed(result);
 			expect(result.stopReason).toBe("stop");
 			expect(calls).toHaveBeenCalledTimes(2);
@@ -334,16 +362,28 @@ describe("codex live steering", () => {
 		expect(ScriptedWebSocket.instances).toHaveLength(1);
 		expect(firstTelemetry.calls).toHaveBeenCalledTimes(1);
 		expect(secondTelemetry.calls).not.toHaveBeenCalled();
-		expect(firstTelemetry.bytes.mock.calls.reduce((sum, [n]) => sum + n, 0)).toBe(wireBytes([
-			{ type: "response.created", response: { id: "resp_1" } },
-			...messageFrames("msg_1", "Plan"),
-			{ type: "response.incomplete", response: { id: "resp_1", status: "incomplete", incomplete_details: { reason: "steered" }, usage: USAGE } },
-		]));
-		expect(secondTelemetry.bytes.mock.calls.reduce((sum, [n]) => sum + n, 0)).toBe(wireBytes([
-			{ type: "response.created", response: { id: "resp_2" } },
-			...messageFrames("msg_2", "Tabs it is"),
-			{ type: "response.completed", response: { id: "resp_2", status: "completed", usage: USAGE } },
-		]));
+		expect(firstTelemetry.bytes.mock.calls.reduce((sum, [n]) => sum + n, 0)).toBe(
+			wireBytes([
+				{ type: "response.created", response: { id: "resp_1" } },
+				...messageFrames("msg_1", "Plan"),
+				{
+					type: "response.incomplete",
+					response: {
+						id: "resp_1",
+						status: "incomplete",
+						incomplete_details: { reason: "steered" },
+						usage: USAGE,
+					},
+				},
+			]),
+		);
+		expect(secondTelemetry.bytes.mock.calls.reduce((sum, [n]) => sum + n, 0)).toBe(
+			wireBytes([
+				{ type: "response.created", response: { id: "resp_2" } },
+				...messageFrames("msg_2", "Tabs it is"),
+				{ type: "response.completed", response: { id: "resp_2", status: "completed", usage: USAGE } },
+			]),
+		);
 		expect(secondTelemetry.headers.mock.calls.every(args => args.length === 0)).toBe(true);
 	});
 

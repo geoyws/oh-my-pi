@@ -148,28 +148,31 @@ describe("Apple local inference telemetry", () => {
 		expect(end.ttfbMs).toBeUndefined();
 	});
 
-	it.each(["throw", "callback", "event"] as const)("records a real bridge %s failure once and returns the failure to the consumer", async mode => {
-		capture();
-		const failure = new Error("Local generation failed");
-		const noteError = vi.spyOn(ProviderRequestTelemetry.prototype, "noteCallError");
-		const bridge = vi.spyOn(natives, "appleFmGenerate").mockImplementation((_request, callback) => {
-			if (mode === "throw") throw failure;
-			queueMicrotask(() => {
-				if (mode === "callback") callback(failure, "");
-				else callback(null, JSON.stringify({ type: "error", code: "runtime", message: failure.message }));
+	it.each(["throw", "callback", "event"] as const)(
+		"records a real bridge %s failure once and returns the failure to the consumer",
+		async mode => {
+			capture();
+			const failure = new Error("Local generation failed");
+			const noteError = vi.spyOn(ProviderRequestTelemetry.prototype, "noteCallError");
+			const bridge = vi.spyOn(natives, "appleFmGenerate").mockImplementation((_request, callback) => {
+				if (mode === "throw") throw failure;
+				queueMicrotask(() => {
+					if (mode === "callback") callback(failure, "");
+					else callback(null, JSON.stringify({ type: "error", code: "runtime", message: failure.message }));
+				});
+				return 1;
 			});
-			return 1;
-		});
-		const result = await stream(model, BEDROCK_TEST_CONTEXT, { apiKey: "local" }).result();
-		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toContain(failure.message);
-		expect(bridge).toHaveBeenCalledTimes(1);
-		expect(noteError).toHaveBeenCalledTimes(1);
-		if (mode !== "event") expect(noteError).toHaveBeenCalledWith(failure);
-		expect(lines.map(line => line.message)).toEqual(["provider request start", "provider request end"]);
-		expect(lines[1].fields).toMatchObject({ attempts: 1, bytesIn: 0, outcome: "error" });
-		expect(lines[1].fields.status).toBeUndefined();
-	});
+			const result = await stream(model, BEDROCK_TEST_CONTEXT, { apiKey: "local" }).result();
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain(failure.message);
+			expect(bridge).toHaveBeenCalledTimes(1);
+			expect(noteError).toHaveBeenCalledTimes(1);
+			if (mode !== "event") expect(noteError).toHaveBeenCalledWith(failure);
+			expect(lines.map(line => line.message)).toEqual(["provider request start", "provider request end"]);
+			expect(lines[1].fields).toMatchObject({ attempts: 1, bytesIn: 0, outcome: "error" });
+			expect(lines[1].fields.status).toBeUndefined();
+		},
+	);
 
 	it("does not count a local attempt when payload preparation rejects before bridge invocation", async () => {
 		capture();

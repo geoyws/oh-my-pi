@@ -4158,12 +4158,18 @@ class CodexWebSocketConnection {
 				if (parsed.type === "error" && parsed.code === AIError.CODEX_NATIVE_LANE_STEER_REJECTED_CODE) {
 					this.#refuseSteerWaiters(parsed.code, typeof parsed.message === "string" ? parsed.message : undefined);
 				}
-				this.#frameBytes.set(parsed, typeof event.data === "string" ? Buffer.byteLength(event.data) : event.data.byteLength);
+				this.#frameBytes.set(
+					parsed,
+					typeof event.data === "string" ? Buffer.byteLength(event.data) : event.data.byteLength,
+				);
 				this.#push(parsed);
 			} catch (error) {
 				notifyCodexWebSocketMalformed(this.#streamObserver, event.data, error);
 				const malformed = new CodexWebSocketTransportError(`${String(error)}`);
-				this.#frameBytes.set(malformed, typeof event.data === "string" ? Buffer.byteLength(event.data) : event.data.byteLength);
+				this.#frameBytes.set(
+					malformed,
+					typeof event.data === "string" ? Buffer.byteLength(event.data) : event.data.byteLength,
+				);
 				this.#push(malformed);
 			}
 		};

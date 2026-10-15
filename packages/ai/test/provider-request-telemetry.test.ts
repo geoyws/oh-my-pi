@@ -104,9 +104,18 @@ describe("provider request telemetry", () => {
 		telemetry.failed(new Error("terminal"));
 		const attempts = lines.filter(line => line.message === "provider request attempt");
 		expect(attempts).toHaveLength(1);
-		expect(attempts[0].fields).toMatchObject({ attempt: 2, previousStatus: 503, previousError: "native disconnected" });
+		expect(attempts[0].fields).toMatchObject({
+			attempt: 2,
+			previousStatus: 503,
+			previousError: "native disconnected",
+		});
 		const end = lines.find(line => line.message === "provider request end")!;
-		expect(end.fields).toMatchObject({ attempts: 2, status: 200, bytesIn: 7 + Buffer.byteLength(SSE_BODY), outcome: "error" });
+		expect(end.fields).toMatchObject({
+			attempts: 2,
+			status: 200,
+			bytesIn: 7 + Buffer.byteLength(SSE_BODY),
+			outcome: "error",
+		});
 		expect(typeof end.fields.ttfbMs).toBe("number");
 	});
 

@@ -269,26 +269,42 @@ it("counts only native RunSSE attempts and exact bytes across a retry, excluding
 			await request.arrayBuffer();
 			if (new URL(request.url).pathname.endsWith("/RunSSE")) {
 				requests++;
-				return new Response(new ReadableStream<Uint8Array>({
-					start(controller) { streamReady.resolve(controller); },
-				}), { headers: { "content-type": "application/connect+proto" } });
+				return new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							streamReady.resolve(controller);
+						},
+					}),
+					{ headers: { "content-type": "application/connect+proto" } },
+				);
 			}
 			appends++;
 			const controller = await streamReady.promise;
 			streamReady = Promise.withResolvers<ReadableStreamDefaultController<Uint8Array>>();
 			controller.enqueue(requests === 1 ? failure : success);
 			controller.close();
-			return new Response("auxiliary body must not count".repeat(100), { headers: { "content-type": "application/proto" } });
+			return new Response("auxiliary body must not count".repeat(100), {
+				headers: { "content-type": "application/proto" },
+			});
 		},
 	});
 	try {
 		const model = makeModel(server.url.toString());
 		const telemetry = new ProviderRequestTelemetry(model, "native-http1");
-		const fetch = transportFetch(model, async () => {
-			fetchCalls++;
-			throw new Error("native HTTP/1 must retain its existing fetch path");
-		}, telemetry);
-		const response = streamCursor(model, context, { apiKey: "test-token", transport: "http1", fetch, maxRetryDelayMs: 1 });
+		const fetch = transportFetch(
+			model,
+			async () => {
+				fetchCalls++;
+				throw new Error("native HTTP/1 must retain its existing fetch path");
+			},
+			telemetry,
+		);
+		const response = streamCursor(model, context, {
+			apiKey: "test-token",
+			transport: "http1",
+			fetch,
+			maxRetryDelayMs: 1,
+		});
 		telemetry.observe(response);
 		const { result } = await drain(response);
 		await Promise.resolve();
@@ -297,7 +313,12 @@ it("counts only native RunSSE attempts and exact bytes across a retry, excluding
 		expect(appends).toBeGreaterThanOrEqual(1);
 		expect(fetchCalls).toBe(0);
 		const end = lines.find(line => line.message === "provider request end")!;
-		expect(end.fields).toMatchObject({ attempts: 2, bytesIn: failure.byteLength + success.byteLength, status: 200, outcome: "ok" });
+		expect(end.fields).toMatchObject({
+			attempts: 2,
+			bytesIn: failure.byteLength + success.byteLength,
+			status: 200,
+			outcome: "ok",
+		});
 		expect(typeof end.fields.ttfbMs).toBe("number");
 		const attempts = lines.filter(line => line.message === "provider request attempt");
 		expect(attempts).toHaveLength(1);
@@ -312,7 +333,8 @@ it("counts only native RunSSE attempts and exact bytes across a retry, excluding
 it("records native RunSSE HTTP failure headers without inventing received bytes", async () => {
 	const lines: Array<{ message: string; fields: Record<string, unknown> }> = [];
 	const dispose = logger.registerLogSink(event => {
-		if (event.message.startsWith("provider request")) lines.push({ message: event.message, fields: event.context ?? {} });
+		if (event.message.startsWith("provider request"))
+			lines.push({ message: event.message, fields: event.context ?? {} });
 	});
 	const server = Bun.serve({
 		port: 0,
@@ -322,7 +344,9 @@ it("records native RunSSE HTTP failure headers without inventing received bytes"
 		const model = makeModel(server.url.toString());
 		const telemetry = new ProviderRequestTelemetry(model, "native-http-failure");
 		const response = streamCursor(model, context, {
-			apiKey: "test-token", transport: "http1", fetch: transportFetch(model, undefined, telemetry),
+			apiKey: "test-token",
+			transport: "http1",
+			fetch: transportFetch(model, undefined, telemetry),
 		});
 		telemetry.observe(response);
 		const { result } = await drain(response);

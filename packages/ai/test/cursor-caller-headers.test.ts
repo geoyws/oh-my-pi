@@ -198,7 +198,9 @@ describe("Cursor caller headers reach the wire", () => {
 describe("Cursor native HTTP/2 request telemetry", () => {
 	for (const retry of [false, true]) {
 		it(
-			retry ? "counts native retry attempts and bytes from both responses" : "counts native response bytes without calling wrapped fetch",
+			retry
+				? "counts native retry attempts and bytes from both responses"
+				: "counts native response bytes without calling wrapped fetch",
 			async () => {
 				const lines: Array<{ message: string; fields: Record<string, unknown> }> = [];
 				const dispose = logger.registerLogSink(event => {
@@ -219,24 +221,44 @@ describe("Cursor native HTTP/2 request telemetry", () => {
 					});
 					const model = makeModel(baseUrl);
 					const telemetry = new ProviderRequestTelemetry(model, "native-h2");
-					const fetch = transportFetch(model, async () => {
-						fetchCalls++;
-						throw new Error("native HTTP/2 must not invoke fetch");
-					}, telemetry);
-					const response = streamCursor(model, context, { apiKey: "test-token", transport: "http2", fetch, maxRetryDelayMs: 1 });
+					const fetch = transportFetch(
+						model,
+						async () => {
+							fetchCalls++;
+							throw new Error("native HTTP/2 must not invoke fetch");
+						},
+						telemetry,
+					);
+					const response = streamCursor(model, context, {
+						apiKey: "test-token",
+						transport: "http2",
+						fetch,
+						maxRetryDelayMs: 1,
+					});
 					telemetry.observe(response);
-					for await (const _event of response) { /* drain */ }
+					for await (const _event of response) {
+						/* drain */
+					}
 					expect((await response.result()).stopReason).toBe("stop");
 					await Promise.resolve();
 					expect(fetchCalls).toBe(0);
 					expect(requests).toBe(retry ? 2 : 1);
 					const end = lines.find(line => line.message === "provider request end")!;
-					expect(end.fields).toMatchObject({ attempts: requests, bytesIn: success.byteLength + (retry ? failure.byteLength : 0), status: 200, outcome: "ok" });
+					expect(end.fields).toMatchObject({
+						attempts: requests,
+						bytesIn: success.byteLength + (retry ? failure.byteLength : 0),
+						status: 200,
+						outcome: "ok",
+					});
 					expect(typeof end.fields.ttfbMs).toBe("number");
 					const attempts = lines.filter(line => line.message === "provider request attempt");
 					expect(attempts).toHaveLength(retry ? 1 : 0);
 					if (retry) {
-						expect(attempts[0].fields).toMatchObject({ attempt: 2, previousStatus: 200, requestId: end.fields.requestId });
+						expect(attempts[0].fields).toMatchObject({
+							attempt: 2,
+							previousStatus: 200,
+							requestId: end.fields.requestId,
+						});
 						expect(attempts[0].fields.previousError).toBeDefined();
 					}
 				} finally {
@@ -251,7 +273,8 @@ describe("Cursor native HTTP/2 request telemetry", () => {
 it("retains native HTTP/2 bytes and headers on a terminal inference failure", async () => {
 	const lines: Array<{ message: string; fields: Record<string, unknown> }> = [];
 	const dispose = logger.registerLogSink(event => {
-		if (event.message.startsWith("provider request")) lines.push({ message: event.message, fields: event.context ?? {} });
+		if (event.message.startsWith("provider request"))
+			lines.push({ message: event.message, fields: event.context ?? {} });
 	});
 	const body = frameConnectMessage(Buffer.from(JSON.stringify({ error: { code: "permission_denied" } })), 2);
 	try {
@@ -262,14 +285,21 @@ it("retains native HTTP/2 bytes and headers on a terminal inference failure", as
 		const model = makeModel(baseUrl);
 		const telemetry = new ProviderRequestTelemetry(model, "native-failure");
 		const response = streamCursor(model, context, {
-			apiKey: "test-token", transport: "http2", fetch: transportFetch(model, undefined, telemetry),
+			apiKey: "test-token",
+			transport: "http2",
+			fetch: transportFetch(model, undefined, telemetry),
 		});
 		telemetry.observe(response);
-		for await (const _event of response) { /* drain */ }
+		for await (const _event of response) {
+			/* drain */
+		}
 		expect((await response.result()).stopReason).toBe("error");
 		await Promise.resolve();
 		expect(lines.find(line => line.message === "provider request end")!.fields).toMatchObject({
-			attempts: 1, bytesIn: body.byteLength, status: 200, outcome: "error",
+			attempts: 1,
+			bytesIn: body.byteLength,
+			status: 200,
+			outcome: "error",
 		});
 		expect(lines.filter(line => line.message === "provider request attempt")).toHaveLength(0);
 	} finally {
