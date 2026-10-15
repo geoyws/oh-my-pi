@@ -23,7 +23,7 @@ import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
-import type { SingleResult, TaskParams } from "@oh-my-pi/pi-tui/tools/task";
+import type { SingleResult, TaskParams, TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { isRecord } from "@oh-my-pi/pi-utils";
 
@@ -521,6 +521,37 @@ describe("task.batch spawning", () => {
 		await job.promise;
 		expect(job.status).toBe("completed");
 		expect(capturedContext).toBe("Shared notes.");
+	});
+
+	it("keeps the agent's extracted tool data on the background job's completion card", async () => {
+		mockDiscovery();
+		const extractedToolData = { yield: [{ data: { finding: "kept" }, status: "success" }] };
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options =>
+			makeResult(options.id ?? "?", { extractedToolData }),
+		);
+
+		const manager = createManager();
+		const tool = await TaskTool.create(
+			createSession({ manager, settings: { "async.enabled": true, "task.batch": true } }),
+		);
+		const updates: Array<{ text: string; details: TaskToolDetails }> = [];
+		const result = await tool.execute(
+			"tc-extracted",
+			{ context: "Shared notes.", tasks: [{ name: "Yielder", task: "Yield data." }] } as TaskParams,
+			undefined,
+			update => {
+				if (update.details) updates.push({ text: getFirstText(update), details: update.details });
+			},
+		);
+
+		const job = manager.getJob(result.details!.async!.jobId)!;
+		await job.promise;
+		expect(job.status).toBe("completed");
+		const completion = updates.find(u => u.text === "Background task Yielder complete.");
+		expect(completion).toBeDefined();
+		const progress = completion!.details.progress?.find(p => p.id === "Yielder");
+		expect(progress?.status).toBe("completed");
+		expect(progress?.extractedToolData).toEqual(extractedToolData);
 	});
 
 	it("accepts the flat single-spawn form at runtime under batch mode", async () => {

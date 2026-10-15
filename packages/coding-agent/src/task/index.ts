@@ -1219,6 +1219,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					progress.contextWindow = singleResult?.contextWindow;
 					progress.cost = singleResult?.usage?.cost.total ?? 0;
 					progress.retryFailure = singleResult?.retryFailure;
+					progress.extractedToolData = singleResult?.extractedToolData;
 					progress.retryState = undefined;
 					progress.providerRetryState = undefined;
 					progress.modelRole = singleResult?.modelRole ?? progress.modelRole;
