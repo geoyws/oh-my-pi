@@ -513,6 +513,7 @@ These affect where coding-agent stores data and which process-local settings ove
 | `PI_CODING_AGENT_DIR`                               | Full agent-directory override for the default profile only; named profiles ignore it                                       |
 | `PI_CODING_AGENT_SESSION_DIR`                       | Initial session-directory override consumed by launch argument parsing                                                     |
 | `PI_CONFIG_FILES`                                   | Platform path-list of settings overlays (`:` on Unix, `;` on Windows); loaded in order before explicit `--config` overlays |
+| `PI_CONFIG_READONLY`                                | Only `1`: startup global-config opt-out; project roles, `agent.db` still write ([policy](./settings.md#global-read-only-policy)) |
 | `OMP_AUTORESEARCH_DB_DIR`                           | Directory override for per-project autoresearch DB and project-artifact roots                                              |
 | `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME` | On macOS/Linux, redirect corresponding OMP paths only when the target `omp` root (or named-profile root) already exists    |
 | `PWD`                                               | Used when matching canonical current working directory in path helpers                                                     |
