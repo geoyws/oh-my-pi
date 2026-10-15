@@ -43,7 +43,7 @@ describe("settings YAML source preservation", () => {
 	});
 
 	it("preserves flow-map sibling bytes while changing a role", async () => {
-		const source = 'modelRoles: {default: "old/model",  smol: \'keep/smol\'} # roles\n';
+		const source = "modelRoles: {default: \"old/model\",  smol: 'keep/smol'} # roles\n";
 		await Bun.write(config, source);
 		const settings = await Settings.init({ cwd, agentDir });
 		settings.setModelRole("default", "new/model");
@@ -57,7 +57,8 @@ describe("settings YAML source preservation", () => {
 		fs.symlinkSync(target, projectConfig, "file");
 		const settings = await Settings.init({ cwd, agentDir });
 		settings.setProjectModelRole("default", "new/model");
-		const external = '# external project\nmodelRoles:\n    default: "old/model" # role\n    smol: \'external/smol\'\n\ncustom: { x: "keep" }';
+		const external =
+			'# external project\nmodelRoles:\n    default: "old/model" # role\n    smol: \'external/smol\'\n\ncustom: { x: "keep" }';
 		await Bun.write(target, external);
 		await settings.flush();
 		expect(await Bun.file(target).text()).toBe(external.replace('"old/model"', '"new/model"'));
@@ -67,11 +68,19 @@ describe("settings YAML source preservation", () => {
 	for (const newline of ["\n", "\r\n"]) {
 		for (const eof of [false, true]) {
 			it("changes only a quoted theme leaf with " + JSON.stringify({ newline, eof }), async () => {
-				const source = [
-					"# hand-authored settings", "theme:", '    dark: "titanium"  # selected theme',
-					"    light: 'paper'", "", "extension:", "    prose: |-", "          indented prose",
-					"    list: [one, 'two']", "# tail",
-				].join(newline) + (eof ? newline : "");
+				const source =
+					[
+						"# hand-authored settings",
+						"theme:",
+						'    dark: "titanium"  # selected theme',
+						"    light: 'paper'",
+						"",
+						"extension:",
+						"    prose: |-",
+						"          indented prose",
+						"    list: [one, 'two']",
+						"# tail",
+					].join(newline) + (eof ? newline : "");
 				await Bun.write(config, source);
 				const settings = await Settings.init({ cwd, agentDir });
 				settings.set("theme.dark", "anthracite");
@@ -83,7 +92,8 @@ describe("settings YAML source preservation", () => {
 
 	for (const project of [false, true]) {
 		it("changes only a role leaf in " + (project ? "project" : "global") + " YAML", async () => {
-			const source = '# roles\nmodelRoles:\n    default: "old/model" # retain\n    smol: \'keep/smol\'\n\nother: { x: "keep" }';
+			const source =
+				'# roles\nmodelRoles:\n    default: "old/model" # retain\n    smol: \'keep/smol\'\n\nother: { x: "keep" }';
 			const target = project ? projectConfig : config;
 			await Bun.write(target, source);
 			const settings = await Settings.init({ cwd, agentDir });
@@ -97,22 +107,30 @@ describe("settings YAML source preservation", () => {
 			'&roles { default: "old/model", smol: keep/smol }',
 			'&roles\n    default: "old/model"\n    smol: keep/smol',
 		]) {
-			it("detaches an edited " + (project ? "project" : "global") + " alias without anchor collateral: " + anchor, async () => {
-				const source = "# shared role defaults\ndefaults: " + anchor + "\nmodelRoles: *roles # local assignment\nuntouched: *roles\n";
-				const target = project ? projectConfig : config;
-				await Bun.write(target, source);
-				const settings = await Settings.init({ cwd, agentDir });
-				if (project) settings.setProjectModelRole("default", "new/model");
-				else settings.setModelRole("default", "new/model");
-				await settings.flush();
-				const output = await Bun.file(target).text();
-				expect(output).toBe(source.replace("modelRoles: *roles", "modelRoles: { default: new/model, smol: keep/smol }"));
-				expect(YAML.parse(output)).toEqual({
-					defaults: { default: "old/model", smol: "keep/smol" },
-					modelRoles: { default: "new/model", smol: "keep/smol" },
-					untouched: { default: "old/model", smol: "keep/smol" },
-				});
-			});
+			it(
+				"detaches an edited " + (project ? "project" : "global") + " alias without anchor collateral: " + anchor,
+				async () => {
+					const source =
+						"# shared role defaults\ndefaults: " +
+						anchor +
+						"\nmodelRoles: *roles # local assignment\nuntouched: *roles\n";
+					const target = project ? projectConfig : config;
+					await Bun.write(target, source);
+					const settings = await Settings.init({ cwd, agentDir });
+					if (project) settings.setProjectModelRole("default", "new/model");
+					else settings.setModelRole("default", "new/model");
+					await settings.flush();
+					const output = await Bun.file(target).text();
+					expect(output).toBe(
+						source.replace("modelRoles: *roles", "modelRoles: { default: new/model, smol: keep/smol }"),
+					);
+					expect(YAML.parse(output)).toEqual({
+						defaults: { default: "old/model", smol: "keep/smol" },
+						modelRoles: { default: "new/model", smol: "keep/smol" },
+						untouched: { default: "old/model", smol: "keep/smol" },
+					});
+				},
+			);
 		}
 	}
 
@@ -122,7 +140,9 @@ describe("settings YAML source preservation", () => {
 		const settings = await Settings.init({ cwd, agentDir });
 		settings.setModelRole("smol", "new/smol");
 		await settings.flush();
-		expect(await Bun.file(config).text()).toBe(source.replace("    default: 'keep/default'\n", "    default: 'keep/default'\n    smol: new/smol\n"));
+		expect(await Bun.file(config).text()).toBe(
+			source.replace("    default: 'keep/default'\n", "    default: 'keep/default'\n    smol: new/smol\n"),
+		);
 		settings.setModelRole("smol", undefined);
 		await settings.flush();
 		expect(await Bun.file(config).text()).toBe(source);
@@ -130,7 +150,7 @@ describe("settings YAML source preservation", () => {
 
 	it("preserves an existing config.yaml filename and its source", async () => {
 		const target = path.join(agentDir, "config.yaml");
-		const source = '# alternate filename\ntheme: { dark: "titanium", light: \'paper\' }\n';
+		const source = "# alternate filename\ntheme: { dark: \"titanium\", light: 'paper' }\n";
 		await Bun.write(target, source);
 		const settings = await Settings.init({ cwd, agentDir });
 		settings.set("theme.dark", "anthracite");
@@ -146,7 +166,8 @@ describe("settings YAML source preservation", () => {
 			if (symlink) fs.symlinkSync(target, config, "file");
 			const settings = await Settings.init({ cwd, agentDir });
 			settings.set("theme.dark", "anthracite");
-			const external = '# external comment\ntheme:\n    dark: "titanium" # still old\n    light: \'paper\'\n\ncustom: [a, "b"]';
+			const external =
+				'# external comment\ntheme:\n    dark: "titanium" # still old\n    light: \'paper\'\n\ncustom: [a, "b"]';
 			await Bun.write(target, external);
 			await settings.flush();
 			expect(await Bun.file(target).text()).toBe(external.replace('"titanium"', '"anthracite"'));
@@ -198,12 +219,15 @@ describe("settings YAML source preservation", () => {
 	});
 
 	it("removes migrated legacy keys without reformatting unrelated source", async () => {
-		const source = '# keep heading\nqueueMode: one-at-a-time\nlastChangelogVersion: "18.0.0"\n\ntheme:\n    dark: "titanium"\n# tail\n';
+		const source =
+			'# keep heading\nqueueMode: one-at-a-time\nlastChangelogVersion: "18.0.0"\n\ntheme:\n    dark: "titanium"\n# tail\n';
 		await Bun.write(config, source);
 		const settings = await Settings.init({ cwd, agentDir });
 		settings.set("theme.dark", "anthracite");
 		await settings.flush();
-		expect(await Bun.file(config).text()).toBe('# keep heading\n\ntheme:\n    dark: "anthracite"\nsteeringMode: one-at-a-time\n# tail\n');
+		expect(await Bun.file(config).text()).toBe(
+			'# keep heading\n\ntheme:\n    dark: "anthracite"\nsteeringMode: one-at-a-time\n# tail\n',
+		);
 	});
 
 	it("keeps legacy JSON migration on the fresh-file path", async () => {

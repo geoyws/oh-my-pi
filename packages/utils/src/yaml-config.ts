@@ -47,8 +47,11 @@ export function reconcileYamlConfig(source: string, value: unknown): string {
 	findIndent(document.contents);
 	const render = (next: unknown, previous?: Node, flow = false): string => {
 		const output = new Document(next);
-		if (isScalar(previous) && isScalar(output.contents) &&
-			(previous.type === "QUOTE_DOUBLE" || previous.type === "QUOTE_SINGLE")) {
+		if (
+			isScalar(previous) &&
+			isScalar(output.contents) &&
+			(previous.type === "QUOTE_DOUBLE" || previous.type === "QUOTE_SINGLE")
+		) {
 			output.contents.type = previous.type;
 		}
 		if (flow && (isMap(output.contents) || isSeq(output.contents))) output.contents.flow = true;
@@ -81,7 +84,12 @@ export function reconcileYamlConfig(source: string, value: unknown): string {
 			const child = isNode(pair.value) ? pair.value : null;
 			if (Object.hasOwn(next, key) && next[key] !== undefined) {
 				if (child) reconcile(child, next[key]);
-				else edits.push({ start: pair.key.range[1] + 1, end: pair.key.range[1] + 1, text: " " + render(next[key], undefined, true) });
+				else
+					edits.push({
+						start: pair.key.range[1] + 1,
+						end: pair.key.range[1] + 1,
+						text: " " + render(next[key], undefined, true),
+					});
 				continue;
 			}
 			const end = child?.range?.[node.flow ? 1 : 2] ?? pair.key.range[2];
@@ -107,9 +115,15 @@ export function reconcileYamlConfig(source: string, value: unknown): string {
 		if (!node.range) throw new Error("YAML mapping has no source range");
 		if (node.flow) {
 			const offset = node.range[1] - 1;
-			const retained = node.items.some(pair => isScalar(pair.key) && Object.hasOwn(next, String(pair.key.value)) && next[String(pair.key.value)] !== undefined);
+			const retained = node.items.some(
+				pair =>
+					isScalar(pair.key) &&
+					Object.hasOwn(next, String(pair.key.value)) &&
+					next[String(pair.key.value)] !== undefined,
+			);
 			const prefix = retained ? ", " : "";
-			const text = prefix + added.map(([key, item]) => render(key) + ": " + render(item, undefined, true)).join(", ");
+			const text =
+				prefix + added.map(([key, item]) => render(key) + ": " + render(item, undefined, true)).join(", ");
 			edits.push({ start: offset, end: offset, text });
 		} else {
 			const last = node.items.at(-1);
@@ -117,7 +131,14 @@ export function reconcileYamlConfig(source: string, value: unknown): string {
 			const offset = lastNode?.range?.[2] ?? node.range[1];
 			const first = node.items[0]?.key;
 			const padding = " ".repeat(isNode(first) && first.range ? column(first.range[0]) : 0);
-			const text = added.map(([key, item]) => render({ [key]: item }).split(newline).map(line => padding + line).join(newline)).join(newline);
+			const text = added
+				.map(([key, item]) =>
+					render({ [key]: item })
+						.split(newline)
+						.map(line => padding + line)
+						.join(newline),
+				)
+				.join(newline);
 			const before = offset > 0 && source[offset - 1] !== "\n" ? newline : "";
 			const after = offset < source.length || source.endsWith("\n") ? newline : "";
 			edits.push({ start: offset, end: offset, text: before + text + after });

@@ -15,7 +15,9 @@ beforeEach(() => {
 	fs.mkdirSync(agentDir);
 	fs.mkdirSync(cwd);
 });
-afterEach(async () => { await temp.remove(); });
+afterEach(async () => {
+	await temp.remove();
+});
 
 async function run(args: string[], readonlyEnv: string) {
 	const proc = Bun.spawn([process.execPath, cliEntry, "config", ...args], {
@@ -31,7 +33,9 @@ async function run(args: string[], readonlyEnv: string) {
 		stderr: "pipe",
 	});
 	const [exitCode, output, error] = await Promise.all([
-		proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text(),
+		proc.exited,
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
 	]);
 	return { exitCode, output: Bun.stripANSI(output), error: Bun.stripANSI(error) };
 }
@@ -40,9 +44,13 @@ for (const switchName of ["config.readOnly", "PI_CONFIG_READONLY"] as const) {
 	describe(`${switchName} CLI refusal`, () => {
 		it("config set exits nonzero, names the global target, and never reports success", async () => {
 			const config = path.join(agentDir, "config.yml");
-			const bytes = switchName === "config.readOnly" ? "config: { readOnly: true }\nautoResume: true\n" : "autoResume: true\n";
+			const bytes =
+				switchName === "config.readOnly" ? "config: { readOnly: true }\nautoResume: true\n" : "autoResume: true\n";
 			fs.writeFileSync(config, bytes);
-			const result = await run(["set", "autoResume", "false", "--json"], switchName === "PI_CONFIG_READONLY" ? "1" : "");
+			const result = await run(
+				["set", "autoResume", "false", "--json"],
+				switchName === "PI_CONFIG_READONLY" ? "1" : "",
+			);
 			expect(result.exitCode).not.toBe(0);
 			expect(result.error).toContain("autoResume");
 			expect(result.error).toContain("read-only");

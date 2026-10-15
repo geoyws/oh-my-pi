@@ -189,7 +189,6 @@ describe("Settings", () => {
 			expect(await Bun.file(yamlConfigPath).exists()).toBe(false);
 			expect((await readSettings()).setupVersion).toBe(1);
 		});
-
 	});
 
 	describe("status line segment validation", () => {

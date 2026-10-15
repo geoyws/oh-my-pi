@@ -704,8 +704,14 @@ export class Settings {
 	#globalWriteRefusal(setting: string): Error {
 		const logical = path.resolve(this.#configPath ?? path.join(this.#agentDir, MAIN_CONFIG_FILENAMES[0]));
 		let target = logical;
-		try { target = fs.realpathSync(logical); } catch { /* Missing targets retain their absolute path. */ }
-		return new Error(`Cannot persist ${setting}: global config is read-only (${target}). Disable config.readOnly / PI_CONFIG_READONLY or assign roles in an existing ${path.resolve(getProjectAgentDir(this.#cwd))} directory.`);
+		try {
+			target = fs.realpathSync(logical);
+		} catch {
+			/* Missing targets retain their absolute path. */
+		}
+		return new Error(
+			`Cannot persist ${setting}: global config is read-only (${target}). Disable config.readOnly / PI_CONFIG_READONLY or assign roles in an existing ${path.resolve(getProjectAgentDir(this.#cwd))} directory.`,
+		);
 	}
 
 	#assertGlobalWritable(setting: string): void {
@@ -720,12 +726,15 @@ export class Settings {
 			throw this.#globalWriteRefusal(`modelRoles.${role}`);
 		}
 		const projectPath = path.join(projectDir, "config.yml");
-		if (this.#configPath && fs.existsSync(projectPath) && fs.existsSync(this.#configPath) &&
-			fs.realpathSync(projectPath) === fs.realpathSync(this.#configPath)) {
+		if (
+			this.#configPath &&
+			fs.existsSync(projectPath) &&
+			fs.existsSync(this.#configPath) &&
+			fs.realpathSync(projectPath) === fs.realpathSync(this.#configPath)
+		) {
 			throw this.#globalWriteRefusal(`modelRoles.${role}`);
 		}
 	}
-
 
 	/**
 	 * Get a setting value (sync).
@@ -1504,7 +1513,8 @@ export class Settings {
 			}
 			this.#configOverlay = (await this.#readConfigOverlays(false)).settings;
 			this.#rebuildMerged();
-			this.#globalReadOnly ||= getByPath(this.#global, ["config", "readOnly"]) === true || this.get("config.readOnly") === true;
+			this.#globalReadOnly ||=
+				getByPath(this.#global, ["config", "readOnly"]) === true || this.get("config.readOnly") === true;
 			if (failedMain && this.isGlobalConfigReadOnly()) {
 				this.#unwrapYamlLoadResult(failedMain.filePath, failedMain.result);
 			}
@@ -1861,7 +1871,11 @@ export class Settings {
 
 	async #loadYamlIfPresentForStartup(filePath: string): Promise<RawSettings | null> {
 		const result = await this.#loadYamlIfPresent(filePath);
-		if (result.kind !== "invalid" || !this.#persist || (filePath === this.#configPath && this.isGlobalConfigReadOnly())) {
+		if (
+			result.kind !== "invalid" ||
+			!this.#persist ||
+			(filePath === this.#configPath && this.isGlobalConfigReadOnly())
+		) {
 			return this.#unwrapYamlLoadResult(filePath, result);
 		}
 		return await this.#withYamlWriteLock(filePath, async writePath => {

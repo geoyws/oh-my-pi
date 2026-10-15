@@ -1070,7 +1070,11 @@ export class SelectorController {
 				onAssign: async (model, role, thinkingLevel, selector, scope?: ModelRoleSelectionScope) => {
 					const releaseDefaultMutation = role === "default" ? await this.#acquireDefaultRoleMutation() : undefined;
 					const configuredStorage = this.ctx.settings.getModelRoleStorage();
-					const targetScope = this.ctx.settings.isGlobalConfigReadOnly() ? "project" : configuredStorage === "project" ? (scope ?? "project") : "global";
+					const targetScope = this.ctx.settings.isGlobalConfigReadOnly()
+						? "project"
+						: configuredStorage === "project"
+							? (scope ?? "project")
+							: "global";
 					const selectorValue = selector ?? `${model.provider}/${model.id}`;
 					const scopeLabel =
 						configuredStorage === "project" ? `${targetScope === "project" ? "Project" : "Global"} ` : "";
@@ -1100,7 +1104,9 @@ export class SelectorController {
 									formatModelSelectorValue(selectorValue, concreteThinking),
 								);
 								if (isAuto) {
-									this.ctx.settings.isGlobalConfigReadOnly() ? this.ctx.settings.override("defaultThinkingLevel", AUTO_THINKING) : this.ctx.settings.set("defaultThinkingLevel", AUTO_THINKING);
+									this.ctx.settings.isGlobalConfigReadOnly()
+										? this.ctx.settings.override("defaultThinkingLevel", AUTO_THINKING)
+										: this.ctx.settings.set("defaultThinkingLevel", AUTO_THINKING);
 								}
 							} else if (shadowedProject) {
 								this.ctx.settings.setProjectModelRole(
@@ -1108,7 +1114,9 @@ export class SelectorController {
 									formatModelSelectorValue(selectorValue, concreteThinking),
 								);
 								if (isAuto) {
-									this.ctx.settings.isGlobalConfigReadOnly() ? this.ctx.settings.override("defaultThinkingLevel", AUTO_THINKING) : this.ctx.settings.set("defaultThinkingLevel", AUTO_THINKING);
+									this.ctx.settings.isGlobalConfigReadOnly()
+										? this.ctx.settings.override("defaultThinkingLevel", AUTO_THINKING)
+										: this.ctx.settings.set("defaultThinkingLevel", AUTO_THINKING);
 								}
 							} else {
 								const { switched } = await this.ctx.session.setModel(model, role, {
@@ -1124,7 +1132,10 @@ export class SelectorController {
 									);
 								}
 								if (isAuto) {
-									this.ctx.session.setThinkingLevel(AUTO_THINKING, !this.ctx.settings.isGlobalConfigReadOnly());
+									this.ctx.session.setThinkingLevel(
+										AUTO_THINKING,
+										!this.ctx.settings.isGlobalConfigReadOnly(),
+									);
 								} else if (concreteThinking && concreteThinking !== ThinkingLevel.Inherit) {
 									this.ctx.session.setThinkingLevel(concreteThinking);
 								}
@@ -1157,7 +1168,11 @@ export class SelectorController {
 				onUnassign: async (role, scope?: ModelRoleSelectionScope) => {
 					const releaseDefaultMutation = role === "default" ? await this.#acquireDefaultRoleMutation() : undefined;
 					const configuredStorage = this.ctx.settings.getModelRoleStorage();
-					const targetScope = this.ctx.settings.isGlobalConfigReadOnly() ? "project" : configuredStorage === "project" ? (scope ?? "project") : "global";
+					const targetScope = this.ctx.settings.isGlobalConfigReadOnly()
+						? "project"
+						: configuredStorage === "project"
+							? (scope ?? "project")
+							: "global";
 					const scopeLabel =
 						configuredStorage === "project" ? `${targetScope === "project" ? "Project" : "Global"} ` : "";
 					try {

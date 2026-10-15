@@ -91,7 +91,11 @@ for (const switchName of ["config.readOnly", "PI_CONFIG_READONLY"] as const) {
 			fs.symlinkSync(target, config);
 			const settings = await load();
 			let error: unknown;
-			try { settings.setModelRole("smol", "provider/project:low"); } catch (caught) { error = caught; }
+			try {
+				settings.setModelRole("smol", "provider/project:low");
+			} catch (caught) {
+				error = caught;
+			}
 			expect(error).toBeInstanceOf(Error);
 			expect((error as Error).message).toContain("modelRoles.smol");
 			expect((error as Error).message).toContain(fs.realpathSync(target));
@@ -145,7 +149,9 @@ it("retains writable project-directory creation", async () => {
 	const settings = await load();
 	settings.setProjectModelRole("default", "provider/project:high");
 	await settings.flush();
-	expect(YAML.parse(fs.readFileSync(path.join(getProjectAgentDir(cwd), "config.yml"), "utf8")).modelRoles.default).toBe("provider/project:high");
+	expect(
+		YAML.parse(fs.readFileSync(path.join(getProjectAgentDir(cwd), "config.yml"), "utf8")).modelRoles.default,
+	).toBe("provider/project:high");
 });
 
 it("keeps programmatic readOnly stronger than the named policy", async () => {
