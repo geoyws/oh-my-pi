@@ -409,7 +409,9 @@ describe("GuestClient frame apply", () => {
 		expect(client.getSnapshot().refusedDraft).toBe(first.refusedDraft);
 		// The same text refused again is a new refusal the composer must restore.
 		client.applyFrameForTest({ t: "error", message: "blocked: secret", refused: { text: "key=sk-1" } });
-		expect(client.getSnapshot().refusedDraft?.id).not.toBe(first.refusedDraft?.id);
+		const second = client.getSnapshot().refusedDraft;
+		expect(second?.text).toBe("key=sk-1");
+		expect(second).not.toBe(first.refusedDraft);
 	});
 
 	it("auto_retry_end failure surfaces an error notice", () => {

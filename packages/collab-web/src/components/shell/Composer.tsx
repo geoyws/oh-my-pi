@@ -139,11 +139,12 @@ export const Composer = memo(function Composer({
 }: ComposerProps): ReactNode {
 	const [text, setText] = useState("");
 	// Seeded with the draft present at mount so a remount never restores an
-	// already-restored refusal a second time.
-	const restoredDraftId = useRef(refusedDraft?.id);
+	// already-restored refusal a second time. Compared by identity: each
+	// refusal is a new object, even when a rejoin swaps in a new client.
+	const restoredDraft = useRef(refusedDraft);
 	useEffect(() => {
-		if (!refusedDraft || restoredDraftId.current === refusedDraft.id) return;
-		restoredDraftId.current = refusedDraft.id;
+		if (!refusedDraft || restoredDraft.current === refusedDraft) return;
+		restoredDraft.current = refusedDraft;
 		setText(current => withRefusedDraft(refusedDraft.text, current));
 	}, [refusedDraft]);
 	const taRef = useRef<HTMLTextAreaElement | null>(null);

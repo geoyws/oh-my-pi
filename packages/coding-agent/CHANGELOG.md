@@ -11,6 +11,8 @@
 - Gated `/compact` and `/handoff` focus text sent through an RPC `prompt` or an ACP `session/prompt` (the shared slash path): a refusal now fails the request with only the notice before any summarizer call or compaction entry.
 - Fixed a collab guest losing its refused prompt: the host returns a refused prompt to its sender only (`error` frame with the safe notice and a `refused` payload), and the TUI guest restores the text and images ahead of any newer draft.
 - Fixed a message queued with `/queue` during compaction disappearing when the `before_user_message` gate refused it at the post-compaction flush: the refused text and images come back into the editor, ahead of anything typed since
+- Gated `/goal <objective>`, `/goal set <objective>` and `--goal` objectives with `before_user_message` before the goal is created or replaced: a refused objective is never written to the session or steered into a running turn, and the `/goal` line comes back into the editor
+- Fixed a refused `!` or `$` line coming back with its attached images doubled
 
 ## [18.10.1] - 2026-10-12
 

@@ -6383,6 +6383,9 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	/** Enter through the same goal activation path as `/goal set`, then start its first turn. */
 	async startGoalAtStartup(objective: string): Promise<void> {
+		// The objective is persisted with the goal record and replayed into
+		// later turns: gate it before the goal is created (see #startGoalFromObjective).
+		await this.session.gateUserMessage(objective, undefined, "interactive");
 		await this.#enterGoalMode({ objective, silent: true });
 		if (!this.goalModeEnabled) return;
 		this.#resetGoalContinuationSuppression();
@@ -6394,6 +6397,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		objective: string,
 		input?: Pick<SubmittedUserInput, "images" | "imageLinks">,
 	): Promise<boolean> {
+		// The objective is user-authored text that createGoal persists to the
+		// session JSONL (and, mid-stream, steers into the provider) before the
+		// prompt below would reach its own gate. A refusal throws here, before
+		// anything is written; the Enter path restores the `/goal` line.
+		await this.session.gateUserMessage(objective, input?.images, "interactive");
 		await this.#enterGoalMode({ objective, silent: true });
 		this.#resetGoalContinuationSuppression();
 		if (this.session.isStreaming) {
@@ -6420,6 +6428,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		objective: string,
 		input?: Pick<SubmittedUserInput, "images" | "imageLinks">,
 	): Promise<boolean> {
+		// Same pre-persistence gate as #startGoalFromObjective: replaceGoal
+		// writes the objective before the prompt's own gate would run.
+		await this.session.gateUserMessage(objective, input?.images, "interactive");
 		const state = await this.session.goalRuntime.replaceGoal({ objective });
 		this.session.setGoalModeState(state);
 		this.goalModeEnabled = true;

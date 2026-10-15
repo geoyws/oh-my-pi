@@ -72,10 +72,12 @@ export interface GuestSnapshot {
 	notices: readonly Notice[];
 	/**
 	 * Latest prompt of ours the host's `before_user_message` gate refused,
-	 * handed back so the composer (already cleared on send) can restore it;
-	 * `id` changes per refusal. Never part of the transcript.
+	 * handed back so the composer (already cleared on send) can restore it.
+	 * A fresh object per refusal: the composer restores each one once, by
+	 * identity, so ids can never collide across clients. Never part of the
+	 * transcript.
 	 */
-	refusedDraft: { id: number; text: string } | null;
+	refusedDraft: { text: string } | null;
 	/** Snapshot download progress between `welcome` and its final chunk, else null. */
 	loading: { received: number; total: number } | null;
 }
@@ -161,7 +163,7 @@ export class GuestClient {
 	#uiRequest: CollabUiRequest | null = null;
 	#uiRequestQueue: CollabUiRequest[] = [];
 	#notices: readonly Notice[] = [];
-	#refusedDraft: { id: number; text: string } | null = null;
+	#refusedDraft: { text: string } | null = null;
 	#snapshot: GuestSnapshot;
 	/**
 	 * Published entries array, cached across commits: rebuilt only when
@@ -479,7 +481,7 @@ export class GuestClient {
 					return; // #end already committed
 				}
 				this.#pushNotice("error", frame.message);
-				if (frame.refused) this.#refusedDraft = { id: ++this.#noticeSeq, text: frame.refused.text };
+				if (frame.refused) this.#refusedDraft = { text: frame.refused.text };
 				break;
 			default:
 				// unknown frame type from a newer host — ignore

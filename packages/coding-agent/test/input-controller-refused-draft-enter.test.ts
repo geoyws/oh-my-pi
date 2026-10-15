@@ -162,7 +162,7 @@ describe("refused interactive submissions preserve a newer draft", () => {
 		expect(editor.pendingImages).toEqual([newerImage, refusedImage]);
 	});
 
-	it("Enter ! refusal merges the full line back ahead of a newer draft", async () => {
+	it("Enter ! refusal merges the full line and its image back once, ahead of a newer draft", async () => {
 		const editor = new CustomEditor(getEditorTheme());
 		const { commands } = await createSkillCommands();
 		const entered = Promise.withResolvers<void>();
@@ -179,7 +179,10 @@ describe("refused interactive submissions preserve a newer draft", () => {
 			},
 		});
 
-		editor.setText(`!echo ${SECRET}`);
+		editor.setText(`!echo ${SECRET} [Image #1]`);
+		// Enter resets only the text: the submitted image stays in the editor.
+		editor.pendingImages.push(refusedImage);
+		editor.pendingImageLinks.push(undefined);
 		const submitting = pressEnter();
 		await entered.promise;
 		// Typed into the emptied composer while the gate awaited.
@@ -194,7 +197,9 @@ describe("refused interactive submissions preserve a newer draft", () => {
 		const restored = editor.getExpandedText();
 		expect(restored).toContain(`!echo ${SECRET}`);
 		expect(restored).toContain("newer draft");
-		expect(editor.pendingImages).toEqual([newerImage]);
+		expect(editor.pendingImages.filter(image => image === refusedImage)).toHaveLength(1);
+		expect(editor.pendingImages).toContain(newerImage);
+		expect(editor.pendingImages).toHaveLength(2);
 	});
 
 	it("Enter $ refusal merges the full line back ahead of a newer draft", async () => {

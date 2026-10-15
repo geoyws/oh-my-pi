@@ -1170,6 +1170,9 @@ export class InputController {
 						await this.ctx.session.gateUserMessage(text, inputImages, "interactive");
 					} catch (error) {
 						if (error instanceof UserMessageRefusedError) {
+							// Enter left the submitted images in the editor (only the text
+							// was reset): take them out first so the restore adds them once.
+							this.#dropSubmittedPending(inputImages, inputImageLinks);
 							if (this.#restoreRefusedSubmission(error, text, inputImages, inputImageLinks)) {
 								this.ctx.updatePendingMessagesDisplay();
 								this.ctx.ui.requestRender();
@@ -1207,6 +1210,8 @@ export class InputController {
 						await this.ctx.session.gateUserMessage(text, inputImages, "interactive");
 					} catch (error) {
 						if (error instanceof UserMessageRefusedError) {
+							// Same as `!`: the submitted images are still the live prefix.
+							this.#dropSubmittedPending(inputImages, inputImageLinks);
 							if (this.#restoreRefusedSubmission(error, text, inputImages, inputImageLinks)) {
 								this.ctx.updatePendingMessagesDisplay();
 								this.ctx.ui.requestRender();
