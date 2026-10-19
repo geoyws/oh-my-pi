@@ -352,40 +352,40 @@ describe("libkitty end-to-end", () => {
 			await mode.init({ suppressWelcomeIntro: true });
 			void mode.getUserInput();
 			await term.waitForRender();
-			// The status line's model segment: name, then the thinking display
-			// after the dot separator (the breadcrumb names the model without it).
-			const modelRow = () =>
-				plainRows(term.getViewport()).find(row => row.includes(`Sonnet 4.5${theme.sep.dot}`)) ?? "";
-			const settle = async (painted: (row: string) => boolean) => {
-				await term.waitForRender(() => painted(modelRow()));
-				if (!painted(modelRow()))
-					dump("viewport while waiting for the model segment", plainRows(term.getViewport()));
+			// The painted row carrying a given thinking display (the model
+			// segment's level text), found by that display rather than the model
+			// name, whose painted shape varies with the layout.
+			const rows = () => plainRows(term.getViewport());
+			const rowWith = (display: string) => rows().find(row => row.includes(display)) ?? "";
+			const settle = async (painted: () => boolean) => {
+				await term.waitForRender(painted);
+				if (!painted()) dump("viewport while waiting for the thinking display", rows());
 			};
 
 			session.setThinkingLevel(Effort.High);
-			await settle(row => row.includes(theme.thinking.high));
-			expect(modelRow()).toContain(theme.thinking.high);
-			expect(modelRow()).not.toContain("auto");
+			await settle(() => rowWith(theme.thinking.high) !== "");
+			expect(rowWith(theme.thinking.high)).toContain(theme.thinking.high);
+			expect(rowWith(theme.thinking.high)).not.toContain("auto");
 
 			session.setThinkingLevel(AUTO_THINKING);
 			const provisional = session.thinkingLevel as Effort;
 			const pending = `${theme.thinking.autoPending} auto`;
-			await settle(row => row.includes(pending));
-			expect(modelRow()).toContain(pending);
+			await settle(() => rowWith(pending) !== "");
+			expect(rowWith(pending)).toContain(pending);
 
 			classifierSpy.mockResolvedValue(provisional);
 			await session.prompt("Implement a focused parser fix");
 			const resolved = `auto (${provisional})`;
-			await settle(row => row.includes(resolved));
-			expect(modelRow()).toContain(resolved);
+			await settle(() => rowWith(resolved) !== "");
+			expect(rowWith(resolved)).toContain(resolved);
 
 			// Re-selecting auto keeps the same concrete effort but drops the
 			// resolution: the painted bar must return to pending, not stay stale.
 			session.setThinkingLevel(AUTO_THINKING);
 			expect(session.thinkingLevel).toBe(provisional);
-			await settle(row => !row.includes(resolved));
-			expect(modelRow()).toContain(pending);
-			expect(modelRow()).not.toContain(resolved);
+			await settle(() => rowWith(resolved) === "" && rowWith(pending) !== "");
+			expect(rowWith(pending)).toContain(pending);
+			expect(rowWith(resolved)).toBe("");
 		} finally {
 			promptSpy.mockRestore();
 			classifierSpy.mockRestore();
