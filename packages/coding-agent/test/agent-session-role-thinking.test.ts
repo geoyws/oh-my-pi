@@ -13,6 +13,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { AUTO_THINKING, clampAutoThinkingEffort, resolveProvisionalAutoLevel } from "@oh-my-pi/pi-tui/thinking";
 import { thinkingLevelLabel } from "@oh-my-pi/pi-tui/status-line/segments";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import * as advisorModule from "../src/advisor";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 import { cfgDefaultThinkingLevel } from "@oh-my-pi/pi-coding-agent/session/settings";
@@ -623,6 +624,55 @@ describe("AgentSession role model thinking behavior", () => {
 		// Resumes in auto and pending — not frozen to the last resolved level, and
 		// not pre-seeded; the next user turn reclassifies.
 		expect(session.autoResolvedThinkingLevel()).toBeUndefined();
+	});
+
+	it("restores requested auto with its resolved effort when a session switch rolls back", async () => {
+		const model = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		// Target transcript pinned to an explicit low, so the switch replaces the
+		// thinking state before it fails.
+		const target = SessionManager.create(tempDir.path(), tempDir.path());
+		target.appendThinkingLevelChange(Effort.Low, Effort.Low);
+		target.appendMessage(createAssistantMessage("target"));
+		await target.flush();
+		const targetFile = target.getSessionFile()!;
+
+		session = new AgentSession({
+			agent: new Agent({
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [], thinkingLevel: Effort.High },
+			}),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings: Settings.isolated(),
+			modelRegistry,
+		});
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		vi.spyOn(autoThinkingClassifier, "classifyDifficulty").mockResolvedValue(Effort.Medium);
+		session.setThinkingLevel(AUTO_THINKING);
+		await session.prompt("Implement a focused parser fix");
+		session.sessionManager.appendMessage(createAssistantMessage("done"));
+		await session.sessionManager.flush();
+		expect(thinkingLevelLabel(session)).toBe("auto (medium)");
+		const sourceFile = session.sessionFile;
+		const journal = () => session.sessionManager.getEntries().filter(entry => entry.type === "thinking_level_change");
+		const journalBefore = journal();
+
+		// Failure seam after the target's thinking was restored: the advisor cost
+		// hand-over is the switch's last fallible step before commit.
+		const failure = new Error("advisor cost load failed");
+		const realLoad = advisorModule.loadAdvisorTranscriptCosts;
+		vi.spyOn(advisorModule, "loadAdvisorTranscriptCosts").mockImplementation(async (file, options) => {
+			if (file === targetFile) throw failure;
+			return realLoad(file, options);
+		});
+		await expect(session.switchSession(targetFile)).rejects.toThrow(failure);
+
+		expect(session.sessionFile).toBe(sourceFile);
+		expect(session.configuredThinkingLevel()).toBe(AUTO_THINKING);
+		expect(session.autoResolvedThinkingLevel()).toBe(Effort.Medium);
+		expect(session.thinkingLevel).toBe(Effort.Medium);
+		expect(session.agent.state.thinkingLevel).toBe(Effort.Medium);
+		expect(thinkingLevelLabel(session)).toBe("auto (medium)");
+		expect(journal()).toEqual(journalBefore);
 	});
 
 	it("keeps a manual concrete pin (not auto) on resume even when the global default is auto", async () => {
