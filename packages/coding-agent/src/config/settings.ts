@@ -3517,6 +3517,8 @@ const codeModeSignal = new SettingSignal("providers.openai-codex.codeMode");
 const CODE_MODE_SIGNAL_PATHS: readonly SettingPath[] = [
 	"providers.openai-codex.codeMode",
 	"providers.openai-codex.codeModeDirectTools",
+	"tools.codeMode",
+	"tools.codeModeDirectTools",
 	"eval.js",
 	"edit.mode",
 ];

@@ -39,7 +39,12 @@ import {
 	PERMISSION_REQUIRED_TOOLS,
 } from "./acp-permission-gate";
 import type { ClientBridge, ClientBridgePermissionOutcome } from "./client-bridge";
-import { buildToolNamespacesInfo, resolveCodeMode, type ToolNamespacesInfo } from "./code-mode";
+import {
+	buildToolNamespacesInfo,
+	type CodeModeResolution,
+	resolveCodeMode,
+	type ToolNamespacesInfo,
+} from "./code-mode";
 import { toolReadsSkillUris } from "../system-prompt";
 
 import type { CustomMessage } from "./messages";
@@ -711,22 +716,26 @@ export class SessionTools {
 		}
 	}
 
+	/** Resolves the Code Mode partition from every activation setting for one model and enabled set. */
+	#resolveCodeMode(model: Model | undefined, enabledToolNames: readonly string[]): CodeModeResolution {
+		const settings = this.#host.settings;
+		return resolveCodeMode({
+			provider: model?.provider ?? "",
+			toolMode: model?.toolMode,
+			setting: settings.get("providers.openai-codex.codeMode"),
+			extraDirectTools: settings.get("providers.openai-codex.codeModeDirectTools"),
+			anyProviderSetting: settings.get("tools.codeMode"),
+			anyProviderDirectTools: settings.get("tools.codeModeDirectTools"),
+			enabledToolNames,
+			evalTransportAvailable: this.#hasCodeModeEvalTransport(),
+		});
+	}
+
 	/** Whether a model transition crosses a Code Mode presentation boundary. */
 	codeModeChangesBetween(previousModel: Model | undefined, nextModel: Model): boolean {
 		const enabledToolNames = this.getEnabledToolNames();
-		const setting = this.#host.settings.get("providers.openai-codex.codeMode");
-		const extraDirectTools = this.#host.settings.get("providers.openai-codex.codeModeDirectTools");
-		const resolve = (model: Model | undefined) =>
-			resolveCodeMode({
-				provider: model?.provider ?? "",
-				toolMode: model?.toolMode,
-				setting,
-				extraDirectTools,
-				enabledToolNames,
-				evalTransportAvailable: this.#hasCodeModeEvalTransport(),
-			});
-		const previous = resolve(previousModel);
-		const next = resolve(nextModel);
+		const previous = this.#resolveCodeMode(previousModel, enabledToolNames);
+		const next = this.#resolveCodeMode(nextModel, enabledToolNames);
 		if (previous.active !== next.active) return true;
 		if (!next.active) return false;
 		if (previous.directToolNames.size !== next.directToolNames.size) return true;
@@ -899,14 +908,7 @@ export class SessionTools {
 	async #applyActiveToolsByName(toolNames: string[], forcePromptRefresh = false, signal?: AbortSignal): Promise<void> {
 		signal?.throwIfAborted();
 		toolNames = normalizeToolNames(toolNames);
-		const codeMode = resolveCodeMode({
-			provider: this.#host.model()?.provider ?? "",
-			toolMode: this.#host.model()?.toolMode,
-			setting: this.#host.settings.get("providers.openai-codex.codeMode"),
-			extraDirectTools: this.#host.settings.get("providers.openai-codex.codeModeDirectTools"),
-			enabledToolNames: toolNames,
-			evalTransportAvailable: this.#hasCodeModeEvalTransport(),
-		});
+		const codeMode = this.#resolveCodeMode(this.#host.model(), toolNames);
 		let builtInWriteAvailable = this.#builtInToolNames.has("write");
 		const fullWriteSelected =
 			toolNames.includes("write") &&

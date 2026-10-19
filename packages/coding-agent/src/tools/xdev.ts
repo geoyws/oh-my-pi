@@ -187,7 +187,8 @@ function sanitizeCatalogSummary(summary: string, maxBytes?: number): string {
 	return `${body}${SUMMARY_ELLIPSIS}`;
 }
 
-function promptCatalogSummary(inst: Tool, maxBytes?: number): string {
+/** One-line, control-free catalog summary for a tool, bounded to `maxBytes` when given. */
+export function promptCatalogSummary(inst: Tool, maxBytes?: number): string {
 	const summary =
 		toolSummary(inst)
 			.split("\n")

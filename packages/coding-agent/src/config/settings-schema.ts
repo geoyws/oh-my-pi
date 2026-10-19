@@ -4757,6 +4757,52 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"tools.codeMode": {
+		type: "enum",
+		values: ["off", "on"] as const,
+		default: "off",
+		ui: {
+			tab: "tools",
+			group: "Discovery & MCP",
+			label: "Code Mode (Any Provider)",
+			description:
+				"Route every enabled tool outside the direct set through eval's tool.<name>() bridge on any provider, so the provider tool block carries eval plus the direct set. Needs JavaScript eval. The direct set is eval, ask, todo, yield, think, checkpoint, rewind and new_context plus Code Mode Direct Tools.",
+		},
+	},
+
+	"tools.codeModeDirectTools": {
+		type: "array",
+		default: ["read", "bash", "edit", "grep", "glob"],
+		ui: {
+			tab: "tools",
+			group: "Discovery & MCP",
+			label: "Code Mode Direct Tools",
+			description:
+				"Extra tools kept directly callable while Code Mode (Any Provider) is on. Names not enabled in the session are ignored.",
+		},
+	},
+
+	"tools.codeModeStubs": {
+		type: "enum",
+		values: ["inline", "on-demand"] as const,
+		default: "inline",
+		ui: {
+			tab: "tools",
+			group: "Discovery & MCP",
+			label: "Code Mode Stubs",
+			description:
+				"How eval advertises bridged tools under Code Mode. Inline embeds every typed signature in the eval description. On-demand lists one line per tool and serves the typed stub with its docs when a cell calls tool.$stub(name).",
+			options: [
+				{ value: "inline", label: "Inline", description: "Embed every bridged signature in the eval description." },
+				{
+					value: "on-demand",
+					label: "On Demand",
+					description: "List bridged tools; fetch typed stubs with docs via tool.$stub(name).",
+				},
+			],
+		},
+	},
+
 	// MCP
 	"mcp.enableProjectConfig": {
 		type: "boolean",

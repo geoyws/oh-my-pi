@@ -90,6 +90,8 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 		get(_target, prop) {
 			if (prop === "defined") return () => [...__tools.keys()];
 			if (prop === "undefine") return name => __tools.delete(name);
+			// Reserved like `defined`/`undefine`: Code Mode typed stubs served on demand.
+			if (prop === "$stub") return async (...names) => globalThis.__omp_call_tool__("__stub__", { names: names.flat() });
 			if (typeof prop !== "string") return undefined;
 			return async args => globalThis.__omp_call_tool__(prop, args ?? {});
 		},

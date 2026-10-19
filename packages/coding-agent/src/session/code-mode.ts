@@ -1,7 +1,10 @@
 /**
- * Codex Code Mode: collapse the direct tool surface for code_mode_only models
- * to a small keep-set and expose every other session tool through the eval
- * bridge, mirroring codex-rs ToolMode::CodeModeOnly.
+ * Code Mode: collapse the direct tool surface to a small keep-set and expose
+ * every other session tool through the eval bridge, mirroring codex-rs
+ * ToolMode::CodeModeOnly. Two activations share one partition:
+ * `providers.openai-codex.codeMode` (Codex `code_mode_only` models) and the
+ * provider-agnostic `tools.codeMode`, whose direct set adds
+ * `tools.codeModeDirectTools` to {@link CODE_MODE_KEEP_TOOLS}.
  */
 
 import { logger } from "@oh-my-pi/pi-utils";
@@ -34,6 +37,7 @@ export const CODE_MODE_KEEP_TOOLS: Record<string, true> = {
 	__status__: true,
 	__cancel__: true,
 	__workpool__: true,
+	__stub__: true,
 };
 
 export interface CodeModeResolution {
@@ -47,22 +51,32 @@ export function resolveCodeMode(args: {
 	toolMode?: string;
 	setting: "off" | "on" | "auto";
 	extraDirectTools?: readonly string[];
+	/** Provider-agnostic `tools.codeMode`; `on` activates Code Mode for every provider. */
+	anyProviderSetting?: "off" | "on";
+	/** `tools.codeModeDirectTools`: direct names added while `anyProviderSetting` is `on`. */
+	anyProviderDirectTools?: readonly string[];
 	enabledToolNames: readonly string[];
 	evalTransportAvailable: boolean;
 }): CodeModeResolution {
-	const active =
+	const transport = args.enabledToolNames.includes("eval") && args.evalTransportAvailable;
+	const codexActive =
 		args.provider === "openai-codex" &&
-		args.enabledToolNames.includes("eval") &&
-		args.evalTransportAvailable &&
 		(args.setting === "on" || (args.setting === "auto" && args.toolMode === "code_mode_only"));
-	if (!active) return { active: false, directToolNames: new Set(args.enabledToolNames) };
+	const anyProviderActive = args.anyProviderSetting === "on";
+	if (!transport || (!codexActive && !anyProviderActive)) {
+		return { active: false, directToolNames: new Set(args.enabledToolNames) };
+	}
 	const direct = new Set<string>();
 	for (const name of args.enabledToolNames) {
 		if (CODE_MODE_KEEP_TOOLS[name] === true) direct.add(name);
 	}
-	for (const name of args.extraDirectTools ?? []) {
-		if (args.enabledToolNames.includes(name)) direct.add(name);
-	}
+	const addDirect = (names: readonly string[] | undefined): void => {
+		for (const name of names ?? []) {
+			if (args.enabledToolNames.includes(name)) direct.add(name);
+		}
+	};
+	if (codexActive) addDirect(args.extraDirectTools);
+	if (anyProviderActive) addDirect(args.anyProviderDirectTools);
 	return { active: true, directToolNames: direct };
 }
 

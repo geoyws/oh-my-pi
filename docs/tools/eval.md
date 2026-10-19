@@ -8,9 +8,9 @@
 - Entry and dynamic schema: `packages/coding-agent/src/tools/eval.ts`
 - Backend enablement: `packages/coding-agent/src/tools/eval-backends.ts`
 - Model-facing prompt: `packages/coding-agent/src/prompts/tools/eval.md`
-- Code Mode transport (Codex `code_mode_only` sessions demote non-essential tools into an eval bridge): `packages/coding-agent/src/tools/eval-format/code-mode-declarations.ts`, prompt `packages/coding-agent/src/prompts/tools/eval-code-mode.md`
+- Code Mode transport (Codex `code_mode_only` sessions, or any provider with `tools.codeMode: on`, demote non-essential tools into an eval bridge): partition `packages/coding-agent/src/session/code-mode.ts`, inline signatures `packages/tui/src/tools/eval-format/code-mode-declarations.ts`, on-demand stubs (`tools.codeModeStubs: on-demand`, `tool.$stub(name)`) `packages/coding-agent/src/eval/stub-bridge.ts`, prompt `packages/coding-agent/src/prompts/tools/eval-code-mode.md`
 - Shared contracts: `packages/coding-agent/src/eval/backend.ts`, `types.ts`, `executor-base.ts`, `kernel-base.ts`
-- Host bridges: `packages/coding-agent/src/eval/agent-bridge.ts`, `completion-bridge.ts`, `concurrency-bridge.ts`, `budget-bridge.ts`
+- Host bridges: `packages/coding-agent/src/eval/agent-bridge.ts`, `completion-bridge.ts`, `concurrency-bridge.ts`, `budget-bridge.ts`, `stub-bridge.ts`
 - JavaScript: `packages/coding-agent/src/eval/js/`
 - Python: `packages/coding-agent/src/eval/py/`
 - Output/truncation: `packages/coding-agent/src/session/streaming-output.ts`
