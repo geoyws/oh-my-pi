@@ -263,7 +263,12 @@ export function buildJobResult(
 	const alreadyConsumed = new Set(jobResults.filter(job => manager.isJobResultConsumed(job.id)).map(job => job.id));
 
 	let usage: CoordinationDetails["usage"];
-	if (op !== "jobs") {
+	// Only a recovering `wait` consumes and bills: a `cancel` kill often lands
+	// while the run is still settling, so consuming there would mark the
+	// settlement consumed before its result (and partial usage) exists — a
+	// later `wait` then finds nothing although the usage was never billed.
+	// `jobs` stays a read-only listing.
+	if (op === "wait") {
 		manager.consumeJobResults(jobResults.filter(j => j.status !== "running").map(j => j.id));
 		// Bill only results this call recovered for the first time, so a job's
 		// usage is never summed twice across repeated waits or after delivery.
