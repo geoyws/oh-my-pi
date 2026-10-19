@@ -14,7 +14,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { statusLineHost } from "@oh-my-pi/pi-coding-agent/modes/status-line-host";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal";
 
@@ -345,19 +345,13 @@ describe("libkitty end-to-end", () => {
 
 	it("paints requested auto apart from an explicit pin and repaints when only its resolution clears", async () => {
 		authStorage.keys.setRuntime("anthropic", "test-key");
-		// This harness builds AgentSession directly; its state.model can lack the
-		// catalog's thinking metadata, and the model segment paints no thinking
-		// display without it (as the status-line cache test sets up). Restore the
-		// bundled metadata before any effort is applied so clamping sees it too.
-		const stateModel = session.state.model as { thinking?: unknown } | undefined;
-		if (stateModel && !stateModel.thinking) {
-			const thinking = getBundledModel("anthropic", "claude-sonnet-4-5")?.thinking;
-			if (!thinking) throw new Error("Expected bundled claude-sonnet-4-5 thinking metadata");
-			stateModel.thinking = thinking;
-		}
 		// The default compact mode swaps the model icon for the level glyph and
-		// drops the ` · <level>` text this test reads; show the text form.
+		// drops the ` · <level>` text this test reads; show the text form. The bar
+		// captured its settings when beforeEach built the mode, and the mode's live
+		// settings listener watches the session's isolated Settings, not this
+		// global override, so hand the bar the overridden settings directly.
 		cfgStatusLineCompactThinkingLevel.override(settings, false);
+		mode.statusLine.updateSettings(statusLineHost.getSettings());
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
 		const classifierSpy = vi.spyOn(autoThinkingClassifier, "classifyDifficulty");
 		try {
