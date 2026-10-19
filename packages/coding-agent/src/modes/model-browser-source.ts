@@ -7,12 +7,7 @@ import { buildServiceTierByFamily } from "../config/service-tier";
 import type { Settings } from "../config/settings";
 import { describeModelCompactionPoint } from "../session/model-compaction-threshold";
 
-import {
-	cfgCycleOrder,
-	cfgDisabledProviders,
-	cfgModelProviderOrder,
-	cfgModelRoleStorage,
-} from "../config/model-settings";
+import { cfgCycleOrder, cfgDisabledProviders, cfgModelProviderOrder } from "../config/model-settings";
 import {
 	cfgDefaultThinkingLevel,
 	cfgRetryFallbackChains,
@@ -73,7 +68,7 @@ export function createModelBrowserSource(
 			return cfgRetryFallbackChains.get(settings);
 		},
 		get modelRoleStorage() {
-			return cfgModelRoleStorage.get(settings);
+			return settings.getModelRoleStorage();
 		},
 		get cycleOrder() {
 			return cfgCycleOrder.get(settings);

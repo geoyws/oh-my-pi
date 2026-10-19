@@ -14,6 +14,7 @@ import {
 	routeSgrMouseInput,
 	type SelectItem,
 	SelectList,
+	type SettingDisabled,
 	type SettingItem,
 	SettingsList,
 	type SgrMouseEvent,
@@ -680,6 +681,12 @@ export class SettingsSelectorComponent implements Component {
 		this.#pluginComponent?.invalidate();
 	}
 
+	/** Expose the active content (tab list, search list, or plugins) to the debug tree walker. */
+	get debugChildren(): readonly Component[] {
+		const content = this.#searchList ?? this.#currentList ?? this.#pluginComponent;
+		return content ? [content] : [];
+	}
+
 	/** Swap the active content (per-tab list, search list, or plugins). */
 	#setContent(build: () => void): void {
 		this.#currentList = null;
@@ -1058,6 +1065,8 @@ export class SettingsSelectorComponent implements Component {
 	): void {
 		const def = getSettingDef(this.#context.settings.entries, id);
 		if (!def) return;
+		// Read-only rows are disabled: refuse pointer changes like they refuse activation.
+		if (this.#readOnlyDisabled()) return;
 		if (value === null) {
 			if (list.openSubmenu) list.handleInput(ESCAPE);
 			this.#context.settings.unset(def.path);
@@ -1333,14 +1342,17 @@ export class SettingsSelectorComponent implements Component {
 		const tabResults: { tab: SettingTab; matched: SettingItem[]; bestScore: number; order: number }[] = [];
 		this.#searchFirstMatch.clear();
 		let total = 0;
-		this.#searchCorpora ??= SETTING_TABS.map(tab => {
-			const candidates: SettingItem[] = [];
-			for (const def of getSettingsForTab(this.#context.settings.entries, tab)) {
-				const item = this.#defToItem(def);
-				if (item) candidates.push(item);
-			}
-			return { tab, corpus: new FuzzyCorpus(candidates, getSettingItemFilterText) };
-		});
+		if (!this.#searchCorpora) {
+			const disabled = this.#readOnlyDisabled();
+			this.#searchCorpora = SETTING_TABS.map(tab => {
+				const candidates: SettingItem[] = [];
+				for (const def of getSettingsForTab(this.#context.settings.entries, tab)) {
+					const item = this.#defToItem(def, disabled);
+					if (item) candidates.push(item);
+				}
+				return { tab, corpus: new FuzzyCorpus(candidates, getSettingItemFilterText) };
+			});
+		}
 		for (let order = 0; order < this.#searchCorpora.length; order++) {
 			const { tab, corpus } = this.#searchCorpora[order]!;
 			const ranked = corpus.rank(query);
@@ -1460,9 +1472,19 @@ export class SettingsSelectorComponent implements Component {
 	}
 
 	/**
+	 * Disabled state shared by every setting row while the host refuses writes.
+	 * Rows stay visible and focusable so their reason is reachable; the
+	 * `read-only` key is the stable machine-readable reason.
+	 */
+	#readOnlyDisabled(): SettingDisabled | undefined {
+		const message = this.#context.settings.readOnlyReason();
+		return message === undefined ? undefined : { reason: "read-only", message };
+	}
+
+	/**
 	 * Convert a setting definition to a SettingItem for the UI.
 	 */
-	#defToItem(def: SettingDef): SettingItem | null {
+	#defToItem(def: SettingDef, disabled: SettingDisabled | undefined): SettingItem | null {
 		// Check condition: applies to every variant — booleans, enums, submenus, text inputs.
 		if (def.condition && !def.condition()) {
 			return null;
@@ -1477,6 +1499,7 @@ export class SettingsSelectorComponent implements Component {
 			warning: def.warning,
 			changed,
 			defaultLabel: changed ? this.#defaultLabel(def) : undefined,
+			disabled,
 		};
 
 		switch (def.type) {
@@ -1855,9 +1878,10 @@ export class SettingsSelectorComponent implements Component {
 	#buildItemsForDefs(defs: SettingDef[]): SettingItem[] {
 		this.#changedCounts.clear();
 		const items: SettingItem[] = [];
+		const disabled = this.#readOnlyDisabled();
 		let lastGroup: string | undefined;
 		for (const def of defs) {
-			const item = this.#defToItem(def);
+			const item = this.#defToItem(def, disabled);
 			if (!item) continue;
 			if (def.group && def.group !== lastGroup) {
 				items.push({ id: `__heading:${def.group}`, label: def.group, currentValue: "", heading: true });

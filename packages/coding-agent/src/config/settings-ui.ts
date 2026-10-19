@@ -81,6 +81,7 @@ export function createSettingsHost(): SettingsHost {
 		get: path => lookup(path)?.layered(settings),
 		set: (path, value) => resolve(path).set(settings, value),
 		unset: path => resolve(path).unset(settings),
+		readOnlyReason: () => settings.getGlobalConfigReadOnlyReason(),
 		normalizeProviderLimits: normalizeProviderMaxInFlightRequests,
 		validateProviderLimits: validateProviderMaxInFlightRequests,
 	};
