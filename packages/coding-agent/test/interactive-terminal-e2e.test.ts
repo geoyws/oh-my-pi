@@ -5,7 +5,8 @@ import { Effort, type AssistantMessage, type ToolResultMessage, type Usage } fro
 import * as autoThinkingClassifier from "@oh-my-pi/pi-coding-agent/auto-thinking/classifier";
 import { AUTO_THINKING } from "@oh-my-pi/pi-tui/thinking";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { cfgStatusLineCompactThinkingLevel } from "@oh-my-pi/pi-coding-agent/modes/settings";
 import { Composer } from "@oh-my-pi/pi-tui/prompt/composer";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import { initTheme, theme } from "@oh-my-pi/pi-tui/theme";
@@ -342,41 +343,53 @@ describe("libkitty end-to-end", () => {
 
 	it("paints requested auto apart from an explicit pin and repaints when only its resolution clears", async () => {
 		authStorage.keys.setRuntime("anthropic", "test-key");
+		// The default compact mode swaps the model icon for the level glyph and
+		// drops the ` · <level>` text this test reads; show the text form.
+		cfgStatusLineCompactThinkingLevel.override(settings, false);
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
 		const classifierSpy = vi.spyOn(autoThinkingClassifier, "classifyDifficulty");
 		try {
 			await mode.init({ suppressWelcomeIntro: true });
 			void mode.getUserInput();
 			await term.waitForRender();
-			const modelRow = () => plainRows(term.getViewport()).find(row => row.includes("Sonnet 4.5")) ?? "";
+			// The status line's model segment: name, then the thinking display
+			// after the dot separator (the breadcrumb names the model without it).
+			const modelRow = () =>
+				plainRows(term.getViewport()).find(row => row.includes(`Sonnet 4.5${theme.sep.dot}`)) ?? "";
+			const settle = async (painted: (row: string) => boolean) => {
+				await term.waitForRender(() => painted(modelRow()));
+				if (!painted(modelRow()))
+					dump("viewport while waiting for the model segment", plainRows(term.getViewport()));
+			};
 
 			session.setThinkingLevel(Effort.High);
-			await term.waitForRender(() => modelRow().includes(theme.thinking.high));
+			await settle(row => row.includes(theme.thinking.high));
 			expect(modelRow()).toContain(theme.thinking.high);
 			expect(modelRow()).not.toContain("auto");
 
 			session.setThinkingLevel(AUTO_THINKING);
 			const provisional = session.thinkingLevel as Effort;
 			const pending = `${theme.thinking.autoPending} auto`;
-			await term.waitForRender(() => modelRow().includes(pending));
+			await settle(row => row.includes(pending));
 			expect(modelRow()).toContain(pending);
 
 			classifierSpy.mockResolvedValue(provisional);
 			await session.prompt("Implement a focused parser fix");
 			const resolved = `auto (${provisional})`;
-			await term.waitForRender(() => modelRow().includes(resolved));
+			await settle(row => row.includes(resolved));
 			expect(modelRow()).toContain(resolved);
 
 			// Re-selecting auto keeps the same concrete effort but drops the
 			// resolution: the painted bar must return to pending, not stay stale.
 			session.setThinkingLevel(AUTO_THINKING);
 			expect(session.thinkingLevel).toBe(provisional);
-			await term.waitForRender(() => !modelRow().includes(resolved));
+			await settle(row => !row.includes(resolved));
 			expect(modelRow()).toContain(pending);
 			expect(modelRow()).not.toContain(resolved);
 		} finally {
 			promptSpy.mockRestore();
 			classifierSpy.mockRestore();
+			cfgStatusLineCompactThinkingLevel.clearOverride(settings);
 		}
 	});
 });

@@ -629,9 +629,11 @@ describe("AgentSession role model thinking behavior", () => {
 	it("restores requested auto with its resolved effort when a session switch rolls back", async () => {
 		const model = getAnthropicModelOrThrow("claude-sonnet-4-5");
 		authStorage.keys.setRuntime("anthropic", "test-key");
-		// Target transcript pinned to an explicit low, so the switch replaces the
-		// thinking state before it fails.
+		// Target transcript on a registry-resolvable model (the helper's assistant
+		// message names `anthropic/mock`), pinned to an explicit low, so the switch
+		// replaces the thinking state before it fails.
 		const target = SessionManager.create(tempDir.path(), tempDir.path());
+		target.appendModelChange(`${model.provider}/${model.id}`);
 		target.appendThinkingLevelChange(Effort.Low, Effort.Low);
 		target.appendMessage(createAssistantMessage("target"));
 		await target.flush();
