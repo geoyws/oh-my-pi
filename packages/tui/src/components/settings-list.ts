@@ -758,7 +758,7 @@ export class SettingsList implements Component {
 					label,
 					value: [span(value, changed ? "accent" : "muted")],
 					detail: detail.length > 0 ? detail : undefined,
-					...(item.disabled ? { disabled: item.disabled.message } : {}),
+					disabled: item.disabled ? true : undefined,
 				},
 				undefined,
 				item.id,

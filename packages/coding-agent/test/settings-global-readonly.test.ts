@@ -109,9 +109,9 @@ for (const switchName of ["config.readOnly", "PI_CONFIG_READONLY"] as const) {
 			if (!storage) throw new Error("runtime storage unavailable under the global read-only policy");
 			storage.recordModelUsage("provider/mru");
 			expect(storage.getModelUsageOrder()).toEqual(["provider/mru"]);
-			storage.recordCommandUsage("model");
-			storage.recordCommandUsage("model");
-			expect(storage.listCommandUsage()).toEqual({ model: 2 });
+			storage.recordUsage("command", "model");
+			storage.recordUsage("command", "model");
+			expect(storage.listUsage("command")).toEqual({ model: 2 });
 			settings.cancelPendingSaves();
 			AgentStorage.close();
 
@@ -119,7 +119,7 @@ for (const switchName of ["config.readOnly", "PI_CONFIG_READONLY"] as const) {
 			const reopenedStorage = reopened.getStorage();
 			if (!reopenedStorage) throw new Error("runtime storage unavailable after reopen");
 			expect(reopenedStorage.getModelUsageOrder()).toEqual(["provider/mru"]);
-			expect(reopenedStorage.listCommandUsage()).toEqual({ model: 2 });
+			expect(reopenedStorage.listUsage("command")).toEqual({ model: 2 });
 			expect(reopenedStorage.getSettings()).toEqual({ autoResume: false });
 			await reopened.flush();
 
