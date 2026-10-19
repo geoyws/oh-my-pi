@@ -14,6 +14,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createAssistantMessage } from "./helpers/agent-session-setup";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal";
 
 function plainRows(rows: readonly string[]): string[] {
@@ -363,10 +364,17 @@ describe("libkitty end-to-end", () => {
 			};
 
 			session.setThinkingLevel(Effort.High);
-			// A fresh session paints no model segment until a turn has run; warm
+			// A fresh session paints no model segment until history exists. Warm
 			// up with one turn under the explicit pin (no classification, since
-			// auto is off; agent.prompt is mocked).
+			// auto is off; agent.prompt is mocked, so it records no reply), then
+			// seed that reply into the transcript, agent state and chat the way the
+			// other viewport tests here do.
 			await session.prompt("Warm up the status line");
+			const warm = createAssistantMessage("warm");
+			session.sessionManager.appendMessage(warm);
+			session.agent.replaceMessages([...session.agent.state.messages, warm]);
+			mode.addMessageToChat(warm);
+			mode.ui.requestRender(true);
 			await settle(() => rowWith(theme.thinking.high) !== "");
 			expect(classifierSpy).not.toHaveBeenCalled();
 			expect(rowWith(theme.thinking.high)).toContain(theme.thinking.high);
