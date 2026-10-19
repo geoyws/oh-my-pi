@@ -9,14 +9,6 @@
 
 ### Fixed
 
-- Fixed native judges ignoring configured `headers`: the judge chain now resolves model headers and passes them to the System One transport, so gateway-authenticated and header-routed judge providers work without extra configuration.
-- Added support for buffered cloud transcription using OpenAI-compatible models
-- Added visual change detection capabilities for video processing using FFMPEG and SVG overlaying
-- Prevented LSP client from hanging when a request is aborted while waiting for a previous write
-- Fixed an eval cell being able to disarm its own timeout: a cell could emit the bridge's `timeout-pause` status event itself (`__omp_emit_status__` in JS, an `application/x-omp-status` display bundle in Python) and run unbounded. Pause authority is now carried by a dedicated host-only control channel rather than by the `op` string on the shared status path, so neither a runtime-emitted event nor an ordinary tool that happens to be *named* `timeout-pause` can suspend the deadline. Genuine `agent()`/`completion()`/`tool.*` waits are still exempt from the budget for as long as they take.
-- Fixed an eval cell timeout leaving the JS worker's own child processes running: terminating the worker now sweeps the process group it leads, so anything the timed-out cell spawned is reaped with it. Ordinary teardown already contained the Python kernel's group; the JS worker was the gap.
-- Eval runtime termination now waits a bounded window for the runtime's exit and logs the surviving pid when it cannot be confirmed, instead of reporting a kill it never observed.
-- Compiled bytecode binaries now start correctly when bundled dependencies use `import.meta.resolve` ([#12133](https://github.com/can1357/oh-my-pi/pull/12133) by [@andrebrait](https://github.com/andrebrait)).
 - Fixed concurrent prompts both passing the final idle check when no `before_user_message` handler was registered: completed admission now reaches turn setup without another await, keeping the busy check and in-flight ownership synchronous. Late-registered handlers still run before the final check, and messages are marked checked only when handlers actually ran.
 - Fixed a `before_user_message` refusal of `/compact` or `/handoff` with pasted images misaligning `[Image #N]` markers when a newer draft with its own image was typed meanwhile: the refused line goes back ahead of the newer draft with its images left in place, so each marker keeps its own image (shared with the `!`/`$` hand-back)
 - Fixed refused prompts changing user-turn state before the refusal: `/plan <prompt>` and `/vibe <prompt>` gate the prompt before entering their mode, and a refused prompt no longer registers or persists `^model` mentions, starts a `+Nk` turn budget, or resets advisor/plan-reminder state; a prompt sent while busy without a streaming behavior is rejected before any handler runs
