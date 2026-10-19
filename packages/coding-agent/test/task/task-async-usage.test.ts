@@ -299,11 +299,11 @@ describe("async task child usage", () => {
 		expect(running.details?.usage).toBeUndefined();
 
 		expect(manager.cancel("WorkerC")).toBe(true);
-	await job.promise;
-	// A cancelled settlement waits for its owner: a live `wait` must recover
-	// it (billing partial usage on first consume) instead of throwing
-	// "nothing to wait for".
-	expect(undeliveredJobs(manager, undefined).map(j => j.id)).toContain("WorkerC");
+		await job.promise;
+		// A cancelled settlement waits for its owner: a live `wait` must recover
+		// it (billing partial usage on first consume) instead of throwing
+		// "nothing to wait for".
+		expect(undeliveredJobs(manager, undefined).map(j => j.id)).toContain("WorkerC");
 
 		const cancelled = buildJobResult(session, manager, "wait", [job], []);
 		expect(cancelled.details?.jobs?.[0]?.status).toBe("cancelled");
