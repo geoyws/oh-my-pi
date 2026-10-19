@@ -1,3 +1,4 @@
+import * as os from "node:os";
 import { setFeedModelBadgeEnabled } from "../src/render/render-utils";
 import { setShimmerMode } from "../src/theme/shimmer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
@@ -70,6 +71,108 @@ describe("task progress rendering", () => {
 		vi.restoreAllMocks();
 		setFeedModelBadgeEnabled(false);
 		setShimmerMode("classic");
+	});
+
+	it("shortens current and recent path arguments without rewriting search patterns", async () => {
+		const theme = (await getThemeByName("dark"))!;
+		const file = `${os.homedir()}/private/file`;
+		for (const [key, recent, args, expected] of [
+			["file_path", false, file, "~/private/file"],
+			["path", true, file, "~/private/file"],
+			["command", false, `cat <${file}`, "cat <~/private/file"],
+			["task", false, `Inspect ${file}`, "Inspect ~/private/file"],
+			["prompt", false, `Explain ${file}`, "Explain ~/private/file"],
+			["pattern", false, file, file],
+		] as const) {
+			const progress = runningProgress(
+				recent
+					? { recentTools: [{ tool: "read", args, argsKey: key, endMs: 1 }] }
+					: { currentTool: "read", currentToolArgs: args, currentToolArgsKey: key },
+			);
+			const text = Bun.stripANSI(
+				taskToolRenderer
+					.renderResult(
+						{ content: [], details: detailsFor(progress) },
+						{ expanded: false, isPartial: true },
+						theme,
+					)
+					.render(180)
+					.join("\n"),
+			);
+			expect(text).toContain(expected);
+			if (key !== "pattern") expect(text).not.toContain(os.homedir());
+		}
+	});
+
+	it("shows each call's own intent on the card, never an earlier call's", async () => {
+		const theme = (await getThemeByName("dark"))!;
+		const file = `${os.homedir()}/private/file`;
+		const render = (progress: AgentProgress) =>
+			Bun.stripANSI(
+				taskToolRenderer
+					.renderResult(
+						{ content: [], details: detailsFor(progress) },
+						{ expanded: false, isPartial: true },
+						theme,
+					)
+					.render(180)
+					.join("\n"),
+			);
+		// `lastIntent` still holds the earlier search's intent, which this call did not carry.
+		const current = render(
+			runningProgress({
+				lastIntent: "Searching the workspace",
+				currentTool: "read",
+				currentToolArgs: file,
+				currentToolArgsKey: "path",
+			}),
+		);
+		expect(current).toContain("~/private/file");
+		expect(current).not.toContain("Searching the workspace");
+
+		const ownIntent = render(
+			runningProgress({
+				lastIntent: "Searching the workspace",
+				currentTool: "read",
+				currentToolArgs: file,
+				currentToolArgsKey: "path",
+				currentToolIntent: "Reading the private file",
+			}),
+		);
+		expect(ownIntent).toContain("Reading the private file");
+
+		const recent = render(
+			runningProgress({
+				lastIntent: "Searching the workspace",
+				recentTools: [{ tool: "read", args: file, argsKey: "path", endMs: 1 }],
+			}),
+		);
+		expect(recent).toContain("~/private/file");
+		expect(recent).not.toContain("Searching the workspace");
+	});
+
+	it("shortens home paths in keyless arguments and in each call's intent on the card", async () => {
+		const theme = (await getThemeByName("dark"))!;
+		const file = `${os.homedir()}/private/file`;
+		for (const progress of [
+			runningProgress({ currentTool: "read", currentToolArgs: file }),
+			runningProgress({ recentTools: [{ tool: "read", args: file, endMs: 1 }] }),
+			runningProgress({ currentTool: "read", currentToolArgs: "x", currentToolIntent: `Reading ${file}` }),
+			runningProgress({ recentTools: [{ tool: "read", args: "x", intent: `Reading ${file}`, endMs: 1 }] }),
+		]) {
+			const text = Bun.stripANSI(
+				taskToolRenderer
+					.renderResult(
+						{ content: [], details: detailsFor(progress) },
+						{ expanded: false, isPartial: true },
+						theme,
+					)
+					.render(180)
+					.join("\n"),
+			);
+			expect(text).toContain("~/private/file");
+			expect(text).not.toContain(os.homedir());
+		}
 	});
 
 	it("places the model and advisor before the live agent title without displacing stats", async () => {
@@ -714,6 +817,46 @@ describe("task progress rendering", () => {
 				expect(visibleWidth(row)).toBeLessThanOrEqual(40);
 			}
 		}
+	});
+
+	it("badges a provider-internal retry wait like a retry and names the model", async () => {
+		const theme = (await getThemeByName("dark"))!;
+		const renderText = (progress: AgentProgress): string =>
+			Bun.stripANSI(
+				taskToolRenderer
+					.renderResult(
+						{ content: [], details: detailsFor(progress) },
+						{ expanded: false, isPartial: true },
+						theme,
+					)
+					.render(120)
+					.join("\n"),
+			);
+		const counted = renderText(
+			runningProgress({
+				id: "RetryWaitWorker",
+				providerRetryState: {
+					waitId: 2,
+					delayMs: 3_600_000,
+					model: "claude-sonnet-4-5",
+					startedAtMs: Date.now(),
+					attempt: 2,
+					maxAttempts: 10,
+				},
+			}),
+		);
+		expect(counted).toContain("retrying");
+		expect(counted).toContain("provider retrying 2/10 in");
+		expect(counted).toContain("claude-sonnet-4-5");
+		// Without a loop counter the label stays bare rather than inventing one.
+		const bare = renderText(
+			runningProgress({
+				id: "RetryWaitWorker",
+				providerRetryState: { waitId: 3, delayMs: 3_600_000, model: "gpt-5", startedAtMs: Date.now() },
+			}),
+		);
+		expect(bare).toContain("provider retrying in");
+		expect(bare).not.toMatch(/provider retrying \d/);
 	});
 });
 

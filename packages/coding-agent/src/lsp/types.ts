@@ -350,7 +350,12 @@ export interface ServerConfig {
 		statusRequestTimeoutMs?: number;
 	};
 	capabilities?: ServerCapabilities;
-	/** If true, this is a linter/formatter server (e.g., Biome) - used only for diagnostics/actions, not type intelligence */
+	/**
+	 * Marks a dedicated linter/formatter server (e.g. Biome, efm-langserver, ruff).
+	 * Excluded from type-intelligence (definition, hover, references), but preferred
+	 * over type-checkers when selecting the `formatOnWrite` formatter, so a configured
+	 * external formatter wins for file types a type-checker also claims.
+	 */
 	isLinter?: boolean;
 	/** Resolved absolute path to the command binary (set during config loading) */
 	resolvedCommand?: string;
@@ -365,7 +370,7 @@ export interface ServerConfig {
 // Transport
 // =============================================================================
 
-/** Minimal write sink for the server-bound byte stream (satisfied by `Bun.FileSink` and the mux socket adapter). */
+/** Minimal write sink for the server-bound byte stream (satisfied by `Bun.FileSink` and the mux link adapter). */
 export interface LspWriteSink {
 	write(data: string | Uint8Array): number | Promise<number>;
 	flush(): number | void | Promise<number | void>;
@@ -373,7 +378,7 @@ export interface LspWriteSink {
 
 /**
  * Byte transport carrying one LSP JSON-RPC link. Structurally satisfied by
- * `ptree.ChildProcess<"pipe">` (local server spawn) and by the socket adapter
+ * `ptree.ChildProcess<"pipe">` (local server spawn) and by the IPC link adapter
  * in `mux/daemon.ts` (broker-shared server). `exited` may reject (ptree kill).
  */
 export interface LspTransport {
@@ -433,12 +438,13 @@ export interface LspClient {
 	dynamicCapabilityRegistrations?: Map<string, string>;
 	openFiles: Map<string, OpenFile>;
 	pendingRequests: Map<number | string, PendingRequest>;
-	messageBuffer: Uint8Array;
 	isReading: boolean;
 	/** Lifecycle state: "connecting" until initialize completes, then "ready"; "error" on init failure or reader death. */
 	status: "connecting" | "ready" | "error";
 	serverCapabilities?: LspServerCapabilities;
 	lastActivity: number;
+	/** Wall-clock time when this server process started; absent only on external test doubles. */
+	startedAt?: number;
 	/** Serializes outbound JSON-RPC writes to the server process. */
 	writeQueue: Promise<void>;
 	/** Tracks active work-done progress tokens from the server */

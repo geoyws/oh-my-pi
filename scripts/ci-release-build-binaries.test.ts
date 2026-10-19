@@ -57,13 +57,13 @@ describe("Windows release binary target", () => {
 });
 
 /**
- * Bytecode compilation is only observable in the artifact: Bun writes a JSC
- * code cache keyed by a synthetic `$bunfs` source URL that renames the
- * entrypoint to `.js`, and a bundle of the same graph without `bytecode: true`
- * never contains that record. Comparing the two executables therefore proves
- * real precompiled bytecode rather than merely a working ESM bundle. Only the
- * basename is matched because the `$bunfs` prefix and separators differ on
- * Windows.
+ * Bytecode compilation is only observable in the artifact: Bun annotates each
+ * bytecode-compiled module in the embedded bundle with a `// @bun @bytecode`
+ * pragma, and a bundle of the same graph without `bytecode: true` carries no
+ * such module record. Comparing the two executables therefore proves real
+ * precompiled bytecode rather than merely a working ESM bundle. Counts are
+ * compared instead of matched absolutely because the embedded standalone
+ * runtime itself carries a fixed number of copies of the marker.
  */
 it("compiles dependency import.meta.resolve calls into runnable precompiled bytecode", async () => {
 	using temp = TempDir.createSync("@omp-bytecode-");
@@ -75,12 +75,12 @@ it("compiles dependency import.meta.resolve calls into runnable precompiled byte
 	const plainOutfile = temp.join(`probe-without-bytecode${executableSuffix}`);
 	await Bun.write(dependency, 'export const resolved = import.meta.resolve("node:fs");\n');
 	await Bun.write(entrypoint, 'import { resolved } from "./bytecode-probe-dep.ts";\nconsole.log(resolved);\n');
-
 	await compileCodingAgent({
 		repoRoot: temp.path(),
 		entrypoint,
 		outfile,
 		transformersVersion: "unused",
+		native: null,
 	});
 	// Same module graph minus `bytecode`. The fixture imports no external or
 	// legacy-Pi module, so the remaining compile options cannot account for the
@@ -99,14 +99,47 @@ it("compiles dependency import.meta.resolve calls into runnable precompiled byte
 		throw: false,
 	});
 	expect(plain.success).toBe(true);
-
 	const result = await $`${outfile}`.quiet().nothrow();
 	expect(result.exitCode).toBe(0);
 	expect(result.text().trim()).toBe("node:fs");
-
-	const codeCacheRecord = Buffer.from(`${entryName}.js`);
+	const countBytecodePragmas = (artifact: Buffer): number => {
+		const pragma = "// @bun @bytecode";
+		let count = 0;
+		let index = artifact.indexOf(pragma);
+		while (index >= 0) {
+			count++;
+			index = artifact.indexOf(pragma, index + pragma.length);
+		}
+		return count;
+	};
 	const withBytecode = Buffer.from(await Bun.file(outfile).arrayBuffer());
 	const withoutBytecode = Buffer.from(await Bun.file(plainOutfile).arrayBuffer());
-	expect(withoutBytecode.includes(codeCacheRecord)).toBe(false);
-	expect(withBytecode.includes(codeCacheRecord)).toBe(true);
+	expect(countBytecodePragmas(withBytecode)).toBeGreaterThan(countBytecodePragmas(withoutBytecode));
 }, 30_000);
+
+it("runs code behind a lazy import() from a split chunk of the compiled binary", async () => {
+	using temp = TempDir.createSync("@omp-split-chunk-");
+	const entrypoint = temp.join("entry.ts");
+	const outfile = temp.join(process.platform === "win32" ? "probe.exe" : "probe");
+	// The probe's dynamic import() is the chunk boundary under test: with
+	// `splitting`, lazy.ts compiles into a separate embedded chunk.
+	await Bun.write(temp.join("lazy.ts"), 'export const value = ["lazy", "chunk"].join(" ");\n');
+	await Bun.write(entrypoint, 'const { value } = await import("./lazy.ts");\nconsole.log(value);\n');
+	await compileCodingAgent({
+		repoRoot: temp.path(),
+		entrypoint,
+		outfile,
+		transformersVersion: "unused",
+		native: null,
+	});
+	const result = await $`${outfile}`.quiet().nothrow();
+	expect(result.exitCode).toBe(0);
+	expect(result.text().trim()).toBe("lazy chunk");
+}, 30_000);
+describe("macOS release binary entitlements", () => {
+	it("allows Xcode MCP automation through Apple Events", async () => {
+		const entitlements = await Bun.file(path.join(repoRoot, "scripts/macos-entitlements.plist")).text();
+
+		expect(entitlements).toContain("<key>com.apple.security.automation.apple-events</key>\n\t<true/>");
+	});
+});

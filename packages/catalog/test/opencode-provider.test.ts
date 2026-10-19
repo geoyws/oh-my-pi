@@ -4,13 +4,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { sendsImageInputOnWire } from "@oh-my-pi/pi-ai/providers/vision-guard";
-import { resolveModelPolicy } from "@oh-my-pi/pi-catalog/compat/resolve";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { readModelCache, writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { resolveProviderModels } from "@oh-my-pi/pi-catalog/model-manager";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { getBundledModels } from "@oh-my-pi/pi-catalog/models";
-import { PROVIDER_DESCRIPTORS } from "@oh-my-pi/pi-catalog/provider-models/descriptors";
 import {
 	fetchWellKnownModels,
 	MODELS_DEV_PROVIDER_DESCRIPTORS,
@@ -492,13 +490,51 @@ describe("Shared models.dev catalog fallback", () => {
 });
 
 describe("OpenCode provider discovery", () => {
-	test("treats the OpenCode model endpoints as authoritative catalogs", () => {
-		for (const providerId of ["opencode-go", "opencode-zen"]) {
-			const descriptor = PROVIDER_DESCRIPTORS.find(item => item.providerId === providerId);
-			expect(descriptor?.dynamicModelsAuthoritative).toBe(true);
-		}
-		expect(opencodeGoModelManagerOptions().dynamicModelsAuthoritative).toBe(true);
-		expect(opencodeZenModelManagerOptions().dynamicModelsAuthoritative).toBe(true);
+	test("discovers the Zen Jev judge seed beside the served roster", async () => {
+		const fetchMock: FetchImpl = async () =>
+			Response.json({ data: [{ id: "gpt-5.6-sol", name: "GPT-5.6 Sol", context_length: 400_000 }] });
+		const options = opencodeZenModelManagerOptions({ apiKey: "user_test", fetch: fetchMock });
+		const models = ((await options.fetchDynamicModels?.()) ?? []).map(spec => buildModel(spec));
+
+		const jevRows = models.filter(model => model.id === "jev-1.13");
+		expect(jevRows).toHaveLength(1);
+		expect(jevRows[0]).toMatchObject({
+			name: "Jev 1.13",
+			api: "typesafe",
+			baseUrl: "https://opencode.ai/zen",
+			kind: "judge",
+			cost: { input: 0.042, output: 0 },
+		});
+
+		const proxied = opencodeZenModelManagerOptions({
+			apiKey: "user_test",
+			baseUrl: "https://proxy.example/zen/v1",
+			fetch: fetchMock,
+		});
+		const proxiedModels = ((await proxied.fetchDynamicModels?.()) ?? []).map(spec => buildModel(spec));
+		expect(proxiedModels.find(model => model.id === "jev-1.13")?.baseUrl).toBe("https://proxy.example/zen");
+	});
+
+	test("keeps one Zen System One jev row when the models route also lists it", async () => {
+		const fetchMock: FetchImpl = async () =>
+			Response.json({
+				data: [
+					{ id: "gpt-5.6-sol", name: "GPT-5.6 Sol", context_length: 400_000 },
+					{ id: "jev-1.13", name: "Jev 1.13", context_length: 32_000 },
+				],
+			});
+		const options = opencodeZenModelManagerOptions({ apiKey: "user_test", fetch: fetchMock });
+		const models = ((await options.fetchDynamicModels?.()) ?? []).map(spec => buildModel(spec));
+
+		const jevRows = models.filter(model => model.id === "jev-1.13");
+		expect(jevRows).toHaveLength(1);
+		expect(jevRows[0]).toMatchObject({ api: "typesafe", kind: "judge" });
+	});
+
+	test("returns null from a failed Zen discovery instead of the jev seed alone", async () => {
+		const fetchMock: FetchImpl = async () => new Response("unavailable", { status: 503 });
+		const options = opencodeZenModelManagerOptions({ apiKey: "user_test", fetch: fetchMock });
+		expect(await options.fetchDynamicModels?.()).toBeNull();
 	});
 
 	test("invalidates cached GLM-5.3 Flash effort metadata on upgrade (issue #9960)", async () => {
@@ -677,6 +713,24 @@ describe("OpenCode provider discovery", () => {
 			api: "openai-responses",
 			baseUrl: "https://opencode.ai/zen/v1",
 		});
+	});
+
+	test("routes gateway-listed Union Alpha to Messages on Go and Zen (#12359)", async () => {
+		for (const [makeOptions, baseUrl] of [
+			[opencodeGoModelManagerOptions, "https://opencode.ai/zen/go"],
+			[opencodeZenModelManagerOptions, "https://opencode.ai/zen"],
+		] as const) {
+			const options = makeOptions({
+				apiKey: "test-key",
+				fetch: async () => modelListResponse(["union-alpha"]),
+			});
+			const models = await options.fetchDynamicModels?.();
+			expect(models?.find(model => model.id === "union-alpha")).toMatchObject({
+				api: "anthropic-messages",
+				baseUrl,
+			});
+			expect(options.dropCachedModelIdsOnStaticMismatch).toContain("union-alpha");
+		}
 	});
 
 	test("routes gateway-listed OpenCode Zen GPT-6 Astra to Responses (#12030)", async () => {
@@ -903,29 +957,17 @@ describe("OpenCode provider discovery", () => {
 
 			expect(freeOptions.cacheProviderId).not.toBe(paidOptions.cacheProviderId);
 			expect(freeResult.stale).toBe(false);
-			expect(freeResult.models.map(model => model.id).sort()).toEqual([...LIVE_FREE_MODEL_IDS].sort());
+			expect(freeResult.models.map(model => model.id).sort()).toEqual(
+				[...LIVE_FREE_MODEL_IDS, "jev-1.13", "jev-1.13-free"].sort(),
+			);
 			expect(paidResult.stale).toBe(false);
-			expect(paidResult.models.map(model => model.id).sort()).toEqual([...LIVE_PAID_MODEL_IDS].sort());
+			expect(paidResult.models.map(model => model.id).sort()).toEqual(
+				[...LIVE_PAID_MODEL_IDS, "jev-1.13", "jev-1.13-free"].sort(),
+			);
 			expect([freeFetches, paidFetches]).toEqual([1, 1]);
 		} finally {
 			await fs.rm(tempDir, { recursive: true, force: true });
 		}
-	});
-	test("resolves the OpenCode Go long-usage fallback policy from KDL", () => {
-		const policy = resolveModelPolicy({
-			id: "deepseek-v4-flash",
-			name: "DeepSeek V4 Flash",
-			api: "openai-completions",
-			provider: "opencode-go",
-			baseUrl: "https://opencode.ai/zen/v1",
-			reasoning: true,
-			input: ["text"],
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: 128_000,
-			maxTokens: 16_384,
-		});
-
-		expect(policy.catalog).toMatchObject({ longUsageLimitFallback: true });
 	});
 
 	test("serves image input on the OpenCode Go DeepSeek Flash lanes", () => {
@@ -1004,9 +1046,62 @@ describe("issue #10416 — retired bare opencode provider", () => {
 
 		expect(merged.map(model => `${model.provider}/${model.id}`)).toEqual(["fixture-provider/live-fallback-model"]);
 	});
+});
 
-	test("the split OpenCode providers remain populated", () => {
-		expect(getBundledModels("opencode-go").length).toBeGreaterThan(0);
-		expect(getBundledModels("opencode-zen").length).toBeGreaterThan(0);
+describe("mergePreviousSnapshotModels — static-seed-complete providers", () => {
+	// CoralBricks' reviewed KDL seed is the complete documented fallback
+	// catalog (`bundle="always"`; `/v1/models` is key-protected), and
+	// Yolo-Auto's is the same. A host-retired id must not return as a
+	// previous-snapshot zombie while other providers' unfetched rows are
+	// still restored.
+	test("drops previous-snapshot rows for providers whose seed is the complete fallback catalog", () => {
+		const coralZombie = buildModel({
+			id: "retired-coral-model",
+			name: "Retired Coral Model",
+			api: "openai-completions",
+			provider: "coralbricks",
+			baseUrl: "https://inference.coralbricks.ai/v1",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 0.15, output: 0.5, cacheRead: 0, cacheWrite: 0.23 },
+			contextWindow: 1_048_576,
+			maxTokens: 131_072,
+		});
+		const yoloZombie = buildModel({
+			id: "retired-yolo-model",
+			name: "Retired Yolo Model",
+			api: "openai-completions",
+			provider: "yolo-auto",
+			baseUrl: "https://yolo.invalid/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 16_384,
+		});
+		const kept = buildModel({
+			id: "kept-fallback-model",
+			name: "Kept Fallback Model",
+			api: "openai-completions",
+			provider: "fixture-provider",
+			baseUrl: "https://fixture.invalid/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 16_384,
+		});
+
+		const merged = mergePreviousSnapshotModels(
+			[],
+			{
+				coralbricks: { [coralZombie.id]: coralZombie },
+				"yolo-auto": { [yoloZombie.id]: yoloZombie },
+				"fixture-provider": { [kept.id]: kept },
+			},
+			new Set(),
+		);
+
+		expect(merged.map(model => `${model.provider}/${model.id}`)).toEqual(["fixture-provider/kept-fallback-model"]);
 	});
 });

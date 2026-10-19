@@ -1,4 +1,5 @@
 import type { AgentEvent, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import type { ProviderRetryWaitStreamRole } from "./settings-stream-fn";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Effort } from "@oh-my-pi/pi-ai";
 import type { Rule } from "../capability/rule";
@@ -8,6 +9,7 @@ import type { GoalModeState } from "../goals/state";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { TodoItem } from "@oh-my-pi/pi-tui/tools/todo";
 import type { CustomMessage } from "./messages";
+import type { CacheWarmingRefreshEnd, CacheWarmingRefreshStart } from "./cache-warmer";
 
 /** Session-specific events that extend the core AgentEvent. */
 export type AgentSessionEvent =
@@ -15,6 +17,18 @@ export type AgentSessionEvent =
 	| (Extract<AgentEvent, { type: "agent_end" }> & {
 			/** False when an async delivery will resume the session before its true final settle. */
 			isTerminal?: boolean;
+			/**
+			 * True when the agent finished its turn: the end is terminal, or the session resumes
+			 * only for queued input or background-job results. False while the agent continues its
+			 * own work (retry, compaction continuation, stop-time reminders).
+			 */
+			yielded?: boolean;
+			/**
+			 * True on a non-terminal end whose only possible resume is a background-job result
+			 * (no queued input, no continuation the agent scheduled itself). The wake is not
+			 * guaranteed: a cancelled or suppressed job never delivers one.
+			 */
+			awaitingAsyncWork?: boolean;
 	  })
 	| {
 			type: "auto_compaction_start";
@@ -46,7 +60,29 @@ export type AgentSessionEvent =
 			finalError?: string;
 			retryErrors?: RetryErrorUpdate[];
 	  }
-	| { type: "retry_fallback_applied"; from: string; to: string; role: string }
+	/**
+	 * A provider-internal retry backoff (pi-ai's own stream retry) is sleeping.
+	 * Distinct from `auto_retry_start`: no turn has been superseded and no
+	 * assistant context is pruned — the same turn is still in flight.
+	 */
+	| {
+			type: "provider_retry_wait_start";
+			/** Correlation id pairing this start with its `_end`. Monotonic per session. */
+			waitId: number;
+			/** Which stream role observed the backoff; only `main` waits render a turn countdown. */
+			role: ProviderRetryWaitStreamRole;
+			delayMs: number;
+			model: string;
+			provider: string;
+			api: string;
+			/** Retry position, when the waiting retry loop tracks one. */
+			attempt?: number;
+			maxAttempts?: number;
+	  }
+	| { type: "provider_retry_wait_end"; aborted: boolean; waitId: number }
+	| ({ type: "cache_warming_start" } & CacheWarmingRefreshStart)
+	| ({ type: "cache_warming_end" } & CacheWarmingRefreshEnd)
+	| { type: "retry_fallback_applied"; from: string; to: string; role: string; reason?: string }
 	| { type: "retry_fallback_succeeded"; model: string; role: string }
 	| { type: "model_changed" }
 	| { type: "config_warnings_changed" }
@@ -65,7 +101,15 @@ export type AgentSessionEvent =
 			/** The level `auto` resolved to this turn, once classified. */
 			resolved?: Effort;
 	  }
-	| { type: "goal_updated"; goal: Goal | null; state?: GoalModeState };
+	| { type: "goal_updated"; goal: Goal | null; state?: GoalModeState }
+	// Coalesced snapshot of the displayable steering/follow-up queue: emitted
+	// whenever it differs from the last `queue_update` (enqueue, dequeue on
+	// delivery, remove, clear/restore, live-steering adoption/withdrawal, or
+	// session switch), never on a no-op mutation. Mirrors
+	// `AgentSession.getQueuedMessages()`; `liveSteered` counts the leading
+	// `steering` entries already sent into the streaming response, which
+	// `remove_queued_message` cannot reach.
+	| { type: "queue_update"; steering: string[]; followUp: string[]; liveSteered: number };
 
 /** Listener function for agent session events. */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;

@@ -3,6 +3,8 @@ import { CommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/c
 import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 
+const keybindings = { getKeys: () => ["escape"] };
+
 function createContainer() {
 	return {
 		children: [] as unknown[],
@@ -57,9 +59,11 @@ describe("/handoff command", () => {
 					}
 				}),
 				abortHandoff,
+				gateUserMessage: vi.fn(async () => {}),
 			},
 			loadingAnimation: undefined,
 			statusContainer,
+			keybindings,
 			chatContainer,
 			ui: { requestRender, requestComponentRender: vi.fn() },
 			editor: { onEscape: originalOnEscape },
@@ -68,6 +72,7 @@ describe("/handoff command", () => {
 			updateEditorTopBorder: vi.fn(),
 			updateEditorBorderColor: vi.fn(),
 			reloadTodos: vi.fn(async () => undefined),
+			flushCompactionQueue: vi.fn(async () => undefined),
 			showStatus: vi.fn(),
 			showWarning: vi.fn(),
 			showError: vi.fn(),
@@ -109,6 +114,7 @@ describe("/handoff command", () => {
 				loadingAnimation = value;
 			},
 			statusContainer,
+			keybindings,
 			ui: { requestRender: vi.fn(), requestComponentRender: vi.fn() },
 			clearTransientSessionUi: vi.fn(() => {
 				loadingAnimation?.stop();
@@ -123,6 +129,7 @@ describe("/handoff command", () => {
 			statusLine: { invalidate: vi.fn() },
 			updateEditorBorderColor: vi.fn(),
 			reloadTodos: vi.fn(async () => undefined),
+			flushCompactionQueue: vi.fn(async () => undefined),
 			present: vi.fn(),
 			showStatus: vi.fn(),
 			showWarning: vi.fn(),
@@ -161,6 +168,7 @@ describe("/handoff command", () => {
 				loadingAnimation = value;
 			},
 			statusContainer,
+			keybindings,
 			ui: { requestRender: vi.fn(), requestComponentRender: vi.fn() },
 			clearTransientSessionUi: vi.fn(() => {
 				loadingAnimation?.stop();
@@ -182,6 +190,7 @@ describe("/handoff command", () => {
 			statusLine: { invalidate: vi.fn() },
 			updateEditorBorderColor: vi.fn(),
 			reloadTodos: vi.fn(async () => undefined),
+			flushCompactionQueue: vi.fn(async () => undefined),
 			present: vi.fn(),
 			showStatus: vi.fn(),
 			showWarning: vi.fn(),
@@ -225,6 +234,7 @@ describe("/handoff command", () => {
 				activeRetryLoader = value;
 			},
 			statusContainer,
+			keybindings,
 			ui: { requestRender: vi.fn(), requestComponentRender: vi.fn() },
 			clearTransientSessionUi: vi.fn(() => {
 				statusContainer.disposeChildren();
@@ -238,6 +248,7 @@ describe("/handoff command", () => {
 			statusLine: { invalidate: vi.fn() },
 			updateEditorBorderColor: vi.fn(),
 			reloadTodos: vi.fn(async () => undefined),
+			flushCompactionQueue: vi.fn(async () => undefined),
 			present: vi.fn(),
 			showStatus: vi.fn(),
 			showWarning: vi.fn(),
@@ -250,6 +261,70 @@ describe("/handoff command", () => {
 		expect(statusContainer.children).toEqual([retryLoader]);
 		expect(activeRetryLoader).toBe(retryLoader);
 		expect(ensureLoadingAnimation).not.toHaveBeenCalled();
+	});
+
+	it("drops a dismounted provider-retry countdown so the working row is not left blank", async () => {
+		// The countdown now gates `ensureLoadingAnimation()` the same way the
+		// maintenance loaders do. Handoff cleanup disposes the status children, so
+		// a still-set reference would make the reconciler yield to a loader that is
+		// no longer mounted and the status row would stay empty mid-turn.
+		const statusContainer = createContainer();
+		const countdown = { stop: vi.fn() };
+		const freshWorkingLoader = { stop: vi.fn() };
+		let isStreaming = false;
+		let activeCountdown: { stop: () => void } | undefined;
+		let countdownAtEnsureCall: { stop: () => void } | undefined;
+		const ctx = {
+			keybindings,
+			sessionManager: {
+				getEntries: () => [{ type: "message" }, { type: "message" }],
+			},
+			session: {
+				get isStreaming() {
+					return isStreaming;
+				},
+				handoff: vi.fn(async () => ({ document: "## Goal\nContinue" })),
+			},
+			loadingAnimation: undefined,
+			autoCompactionLoader: undefined,
+			retryLoader: undefined,
+			get providerRetryLoader() {
+				return activeCountdown;
+			},
+			set providerRetryLoader(value: { stop: () => void } | undefined) {
+				activeCountdown = value;
+			},
+			statusContainer,
+			ui: { requestRender: vi.fn(), requestComponentRender: vi.fn() },
+			clearTransientSessionUi: vi.fn(() => {
+				statusContainer.disposeChildren();
+			}),
+			renderInitialMessages: vi.fn(async () => {
+				// A replicated provider backoff starts while handoff replay yields,
+				// then the handoff cleanup disposes the container underneath it.
+				isStreaming = true;
+				activeCountdown = countdown;
+			}),
+			ensureLoadingAnimation: vi.fn(() => {
+				countdownAtEnsureCall = activeCountdown;
+				statusContainer.addChild(freshWorkingLoader);
+			}),
+			statusLine: { invalidate: vi.fn() },
+			updateEditorBorderColor: vi.fn(),
+			reloadTodos: vi.fn(async () => undefined),
+			flushCompactionQueue: vi.fn(async () => undefined),
+			present: vi.fn(),
+			showStatus: vi.fn(),
+			showWarning: vi.fn(),
+			showError: vi.fn(),
+		} as unknown as InteractiveModeContext;
+		const controller = new CommandController(ctx);
+
+		await controller.handleHandoffCommand();
+
+		expect(countdown.stop).toHaveBeenCalledTimes(1);
+		expect(countdownAtEnsureCall).toBeUndefined();
+		expect(statusContainer.children).toEqual([freshWorkingLoader]);
 	});
 
 	it("surfaces a provider failure named AbortError as a real error, not a cancellation", async () => {
@@ -273,10 +348,12 @@ describe("/handoff command", () => {
 			},
 			loadingAnimation: undefined,
 			statusContainer,
+			keybindings,
 			chatContainer: createContainer(),
 			ui: { requestRender: vi.fn(), requestComponentRender: vi.fn() },
 			editor: { onEscape: vi.fn() },
 			showError,
+			flushCompactionQueue: vi.fn(async () => undefined),
 			showStatus: vi.fn(),
 			showWarning: vi.fn(),
 		} as unknown as InteractiveModeContext;
@@ -302,6 +379,7 @@ describe("/handoff command", () => {
 			session: { isStreaming: true, handoff },
 			loadingAnimation: undefined,
 			statusContainer,
+			keybindings,
 			ui: { requestRender: vi.fn(), requestComponentRender: vi.fn() },
 			showWarning,
 			showError: vi.fn(),
@@ -333,6 +411,7 @@ describe("/handoff command", () => {
 			autoCompactionLoader,
 			retryLoader: undefined,
 			statusContainer,
+			keybindings,
 			ui: { requestRender: vi.fn(), requestComponentRender: vi.fn() },
 			showWarning,
 			showError: vi.fn(),

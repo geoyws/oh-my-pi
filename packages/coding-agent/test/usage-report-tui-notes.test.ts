@@ -173,6 +173,7 @@ describe("renderUsageReports (#3268 TUI aggregate)", () => {
 		expect(text).toContain("$123.45 used");
 		expect(text).toContain("2 accts");
 	});
+
 	it("keeps distinct Claude profiles and aggregate quota in the usage detail", () => {
 		const exhausted = {
 			...limit("Weekly", "7d", 7 * 24 * HOUR, 1),

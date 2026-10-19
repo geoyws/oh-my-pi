@@ -3,6 +3,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { shouldSendServiceTier } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { fetchCodexModels } from "@oh-my-pi/pi-catalog/discovery/codex";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
@@ -120,6 +121,31 @@ describe("Codex model discovery", () => {
 		expect(terra).toMatchObject({ preferWebsockets: true, useResponsesLite: true });
 		const legacy = result?.models.find(model => model.id === "gpt-5.5");
 		expect(legacy?.useResponsesLite).toBeUndefined();
+	});
+
+	it("gates Ultrafast on the discovered service_tiers list", async () => {
+		const fetchFn: typeof fetch = Object.assign(
+			async () =>
+				Response.json({
+					models: [
+						{
+							slug: "gpt-6.1-sol",
+							service_tiers: [
+								{ id: "priority", name: "Fast", description: "1.5x speed, increased usage" },
+								{ id: "ultrafast", name: "Ultrafast", description: "The fastest available responses." },
+							],
+						},
+						{ slug: "gpt-6-sol", service_tiers: [{ id: "priority", name: "Fast", description: "" }] },
+						{ slug: "gpt-5.5" },
+					],
+				}),
+			{ preconnect() {} },
+		);
+		const result = await fetchCodexModels({ accessToken: "test-token", fetchFn });
+		const ultrafastBySlug = Object.fromEntries(
+			result!.models.map(spec => [spec.id, shouldSendServiceTier("ultrafast", buildModel(spec))]),
+		);
+		expect(ultrafastBySlug).toEqual({ "gpt-6.1-sol": true, "gpt-6-sol": false, "gpt-5.5": false });
 	});
 
 	it("floors GPT-5.6 luna/sol/terra at the 1M window when upstream omits context_window (#5705)", async () => {
@@ -254,12 +280,89 @@ describe("Codex model discovery", () => {
 			// retains the standard window; the registry expands it only when
 			// extended context is enabled.
 			expect(builtModel.cost).toEqual({ input: 10, output: 50, cacheRead: 1, cacheWrite: 0 });
-			expect(builtModel.serviceTierCost).toEqual({ flex: 0.5, priority: 2.5 });
+			expect(builtModel.serviceTierCost).toEqual({ flex: 0.5, priority: 2.5, ultrafast: 8 });
 			expect(builtModel).toMatchObject({
 				contextWindow: 272_000,
 				maxTokens: 128_000,
 			});
 		}
+	});
+
+	it("applies GPT-6 / GPT-6.1 Sol and Luna pricing to discovered plain and worker routes", async () => {
+		const fetchFn: typeof fetch = Object.assign(
+			async () =>
+				Response.json({
+					// GPT-6 plain rows are bundled, so their `-wm` listing also yields
+					// the plain route; GPT-6.1 Sol is not yet bundled and ships both.
+					models: ["gpt-6-sol-wm", "gpt-6-luna-wm", "gpt-6.1-sol", "gpt-6.1-sol-wm"].map(slug => ({
+						slug,
+						display_name: slug,
+						default_reasoning_level: "medium",
+						supported_reasoning_levels: ["low", "medium", "high"],
+						input_modalities: ["text", "image"],
+						supported_in_api: true,
+					})),
+				}),
+			{ preconnect() {} },
+		);
+		const result = await fetchCodexModels({
+			accessToken: "test-token",
+			baseUrl: "https://codex.example/backend-api",
+			fetchFn,
+		});
+
+		expect(result?.models.map(model => model.id).sort()).toEqual([
+			"gpt-6-luna",
+			"gpt-6-luna-wm",
+			"gpt-6-sol",
+			"gpt-6-sol-wm",
+			"gpt-6.1-sol",
+			"gpt-6.1-sol-wm",
+		]);
+		for (const model of result!.models) {
+			// Discovery has no rates; the generated KDL policy supplies them
+			// when the discovered spec becomes a usable model.
+			expect(model.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+			const builtModel = buildModel(model);
+			expect(builtModel.cost).toEqual(
+				model.id.startsWith("gpt-6.1-sol")
+					? { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 0 }
+					: model.id.startsWith("gpt-6-sol")
+						? { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 0 }
+						: { input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0 },
+			);
+			// GPT-6.1 Sol ships Ultrafast at Codex's 8x included-usage rate;
+			// GPT-6 Sol and Luna have only Fast and Flex.
+			expect(builtModel.serviceTierCost).toEqual(
+				model.id.startsWith("gpt-6.1-sol")
+					? { flex: 0.5, priority: 2.5, ultrafast: 8 }
+					: { flex: 0.5, priority: 2.5 },
+			);
+		}
+	});
+
+	it("defaults Codex GPT-6.1 Sol to the 500K window while Astra stays at 272K (#15421)", async () => {
+		const fetchFn: typeof fetch = Object.assign(
+			async () =>
+				Response.json({
+					// Discovery may still report the pre-2026-10-11 272K default.
+					models: ["gpt-6.1-sol", "gpt-6.1-sol-wm", "gpt-6-astra"].map(slug => ({
+						slug,
+						context_window: 272_000,
+						max_context_window: 872_000,
+					})),
+				}),
+			{ preconnect() {} },
+		);
+		const result = await fetchCodexModels({ accessToken: "test-token", fetchFn });
+		const windows = Object.fromEntries(
+			(result?.models ?? []).map(model => [model.id, buildModel(model).contextWindow]),
+		);
+		expect(windows).toMatchObject({
+			"gpt-6.1-sol": 500_000,
+			"gpt-6.1-sol-wm": 500_000,
+			"gpt-6-astra": 272_000,
+		});
 	});
 
 	it("floors stale reported windows for GPT-5.6 luna/sol/terra and honors reports above the floor", async () => {
@@ -439,6 +542,58 @@ describe("Codex model discovery", () => {
 					.map(model => model.id)
 					.sort(),
 			).toEqual(["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"]);
+		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps per-account Codex cyber entitlements on shared and exclusive models", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-codex-access-"));
+		const fetchFn: typeof fetch = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit) => {
+				const accountId = new Headers(init?.headers).get("chatgpt-account-id");
+				const models = [
+					{
+						slug: "gpt-6-sol",
+						display_name: "GPT-6 Sol",
+						available_access_programs: {
+							cyber: accountId === "account-a" ? ["standard", "daybreak_blue"] : ["standard"],
+						},
+					},
+				];
+				if (accountId === "account-a") {
+					models.push({
+						slug: "gpt-daybreak-blue-latest",
+						display_name: "Daybreak Blue",
+						available_access_programs: { cyber: ["daybreak_blue"] },
+					});
+				}
+				return Response.json({ models });
+			},
+			{ preconnect() {} },
+		);
+		try {
+			const result = await resolveProviderModels(
+				{
+					...openaiCodexModelManagerOptions({
+						resolveAccounts: async () => [
+							{ accessToken: "token-a", accountId: "account-a" },
+							{ accessToken: "token-b", accountId: "account-b" },
+						],
+						fetch: fetchFn,
+					}),
+					cacheDbPath: path.join(tempDir, "models.db"),
+				},
+				"online",
+			);
+
+			expect(result.models.find(model => model.id === "gpt-6-sol")?.accountAccess).toEqual({
+				"account-a": { cyberPrograms: ["standard", "daybreak_blue"] },
+				"account-b": { cyberPrograms: ["standard"] },
+			});
+			expect(result.models.find(model => model.id === "gpt-daybreak-blue-latest")?.accountAccess).toEqual({
+				"account-a": { cyberPrograms: ["daybreak_blue"] },
+			});
 		} finally {
 			await fs.rm(tempDir, { recursive: true, force: true });
 		}

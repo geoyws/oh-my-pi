@@ -49,7 +49,7 @@ function createLoopContext(options: {
 			customCommands: [],
 			promptTemplates: [],
 			prompt,
-			maybeStartTitleGeneration: vi.fn(),
+			gateUserMessage: vi.fn(async () => {}),
 		},
 		sessionManager: { putBlob: vi.fn() },
 		loopModeEnabled: true,

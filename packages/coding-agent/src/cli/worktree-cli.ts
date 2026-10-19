@@ -24,7 +24,14 @@ import { getWorktreesDir, isEnoent } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { Settings } from "../config/settings";
 import { hasLiveIsolationOwner, ISOLATION_OWNER_FILE, readRetainedMountBackend } from "../task/isolation-ownership";
-import { formatIsolationBackend, parseIsolationBackend } from "../task/worktree";
+import {
+	formatIsolationBackend,
+	initializedWorktreeSubmodules,
+	initWorktreeSubmodules,
+	parseIsolationBackend,
+} from "../task/worktree";
+
+import { cfgIsolationBackend, cfgWorktreeClone } from "../task/settings";
 
 type WorktreeKind = "pr-checkout" | "task-isolation" | "empty" | "stray";
 
@@ -145,11 +152,31 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 				: `checking out '${ref}'`;
 		console.log(`Preparing worktree (${preparation})`);
 	}
+	const cloneSetting = cfgWorktreeClone.get(settings);
+	// A clone copies initialized submodule gitfiles verbatim, which dangle
+	// from a main checkout or point into a linked worktree's source. Start
+	// from a plain checkout and initialize private submodule clones instead.
+	const submodulePaths = cloneSetting ? await initializedWorktreeSubmodules(repository.info().repoRoot) : [];
 	const result = await repository.worktreeAdd(worktreePath, ref, {
 		detach,
-		clone: settings.get("worktree.clone"),
-		backend: parseIsolationBackend(settings.get("isolation.backend")),
+		clone: submodulePaths.length === 0 && cloneSetting,
+		backend: parseIsolationBackend(cfgIsolationBackend.get(settings)),
 	});
+	let submoduleError: string | undefined;
+	if (submodulePaths.length > 0) {
+		try {
+			const inited = await initWorktreeSubmodules(worktreePath, submodulePaths);
+			if (inited.skipped.length > 0) {
+				console.error(
+					chalk.dim(
+						`warning: worktree submodules not present at ${ref}, left uninitialized: ${inited.skipped.join(", ")}`,
+					),
+				);
+			}
+		} catch (error) {
+			submoduleError = error instanceof Error ? error.message : String(error);
+		}
+	}
 	if (!options.quiet) {
 		console.log(`HEAD is now at ${shortSha} ${subject}`);
 		if (result.clonedWith != null) {
@@ -159,6 +186,13 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 	if (result.cloneError) {
 		console.error(chalk.dim(`warning: worktree clone fell back to plain checkout: ${result.cloneError}`));
 	}
+	if (submoduleError) {
+		console.error(chalk.dim(`warning: worktree submodules were left uninitialized: ${submoduleError}`));
+	}
+	const hook = await vcs.runPostCheckoutHook(worktreePath, commit.sha);
+	process.stderr.write(hook.stdout);
+	process.stderr.write(hook.stderr);
+	if (hook.exitCode !== 0) process.exitCode = hook.exitCode;
 }
 
 export async function listWorktrees(options: ListWorktreesOptions): Promise<void> {

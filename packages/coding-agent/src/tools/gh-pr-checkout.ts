@@ -6,7 +6,12 @@ import type { IsoBackendKind, VcsGitRepo, VcsWorktreeEntry } from "@oh-my-pi/pi-
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { getWorktreeDir, hashPath, isEnoent, logger } from "@oh-my-pi/pi-utils";
 import { github } from "../utils/github";
-import { formatIsolationBackend, parseIsolationBackend } from "../task/worktree";
+import {
+	formatIsolationBackend,
+	initializedWorktreeSubmodules,
+	initWorktreeSubmodules,
+	parseIsolationBackend,
+} from "../task/worktree";
 import { withRepoLock } from "../utils/repo-lock";
 import type { ToolSession } from ".";
 import type { GhPrCheckoutSummary, GhToolDetails } from "@oh-my-pi/pi-tui/tools/github";
@@ -31,6 +36,8 @@ import { GH_PR_FIELDS_NO_COMMENTS } from "./gh-view";
 import { invalidateAllForNumber } from "./github-cache";
 import { throwIfAborted } from "./tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+
+import { cfgIsolationBackend, cfgWorktreeClone } from "../task/settings";
 
 export const GH_REPO_CLONE_FIELDS = ["nameWithOwner", "sshUrl", "url"];
 export const GH_PR_CHECKOUT_FIELDS = [
@@ -495,16 +502,38 @@ export async function checkoutPullRequest(
 			if (!existingWorktree) {
 				finalWorktreePath = await resolveAvailableWorktreePath(worktreePath, existingWorktrees);
 				await fs.mkdir(path.dirname(finalWorktreePath), { recursive: true });
+				const cloneSetting = cfgWorktreeClone.get(session.settings);
+				// A clone copies initialized submodule gitfiles verbatim, which
+				// dangle from a main checkout or point into a linked worktree's
+				// source. Start from a plain checkout and initialize private
+				// submodule clones instead.
+				const submodulePaths = cloneSetting ? await initializedWorktreeSubmodules(repository.info().repoRoot) : [];
 				const result = await repository.worktreeAdd(
 					finalWorktreePath,
 					localBranch,
 					{
 						detach: false,
-						clone: session.settings.get("worktree.clone"),
-						backend: parseIsolationBackend(session.settings.get("isolation.backend")),
+						clone: submodulePaths.length === 0 && cloneSetting,
+						backend: parseIsolationBackend(cfgIsolationBackend.get(session.settings)),
 					},
 					signal,
 				);
+				if (submodulePaths.length > 0) {
+					try {
+						const inited = await initWorktreeSubmodules(finalWorktreePath, submodulePaths);
+						if (inited.skipped.length > 0) {
+							logger.warn("worktree submodules not present at the target commit, left uninitialized", {
+								path: finalWorktreePath,
+								submodules: inited.skipped,
+							});
+						}
+					} catch (error) {
+						logger.warn("worktree submodules were left uninitialized", {
+							path: finalWorktreePath,
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
+				}
 				clonedWith = result.clonedWith ?? undefined;
 				if (result.cloneError) {
 					logger.warn("worktree clone fell back to plain checkout", {

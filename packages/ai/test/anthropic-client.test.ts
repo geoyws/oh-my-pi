@@ -182,6 +182,30 @@ describe("AnthropicMessagesClient retries", () => {
 		expect(response.status).toBe(200);
 		expect(calls.length).toBe(2);
 	});
+
+	it("reports its own retry sleeps through providerRetryWait", async () => {
+		const { calls, fetch } = createFetchMock([
+			new Response(anthropicOverloadedErrorBody, { status: 529, headers: { "retry-after-ms": "1" } }),
+			new Response("{}", { status: 200 }),
+		]);
+		const waits: Array<{ delayMs: number; attempt?: number; maxAttempts?: number }> = [];
+		const client = new AnthropicMessagesClient({
+			apiKey: "sk-test",
+			maxRetries: 5,
+			fetch,
+			providerRetryWait: async (delayMs, _signal, info) => {
+				waits.push({ delayMs, attempt: info?.attempt, maxAttempts: info?.maxAttempts });
+			},
+		});
+
+		const response = await client.messages.create(params).asResponse();
+
+		// A 529 overload is the commonest silent backoff: the hook is the only
+		// thing that makes this sleep visible above the transport.
+		expect(response.status).toBe(200);
+		expect(calls.length).toBe(2);
+		expect(waits).toEqual([{ delayMs: 1, attempt: 1, maxAttempts: 5 }]);
+	});
 });
 
 describe("AnthropicMessagesClient timeout and abort", () => {
@@ -217,6 +241,34 @@ describe("AnthropicMessagesClient timeout and abort", () => {
 			.asResponse()
 			.catch(err => err);
 
+		expect((error as Error).message).toBe("Request was aborted.");
+		expect(calls.length).toBe(1);
+	});
+
+	it("prefers the caller abort over an exhausted operation budget on the retry path", async () => {
+		// The abort lands mid-flight, after the loop-top check but before the
+		// retry backoff: the backoff must surface the abort, not re-label it
+		// as a budget exhaustion the session would replay.
+		const controller = new AbortController();
+		const { calls, fetch } = createFetchMock([
+			new Response(anthropicOverloadedErrorBody, { status: 429, headers: { "retry-after-ms": "1" } }),
+		]);
+		const abortingFetch = ((input: string | URL | Request, init?: RequestInit) => {
+			controller.abort();
+			return fetch(input, init);
+		}) as typeof fetch;
+		const client = new AnthropicMessagesClient({ apiKey: "sk-test", maxRetries: 5, fetch: abortingFetch });
+
+		const error = await client.messages
+			.create(params, {
+				signal: controller.signal,
+				operationTimeoutMs: 900_000,
+				operationDeadlineAt: Date.now() - 1,
+			})
+			.asResponse()
+			.catch(err => err);
+
+		expect(error).toBeInstanceOf(AIError.AbortError);
 		expect((error as Error).message).toBe("Request was aborted.");
 		expect(calls.length).toBe(1);
 	});

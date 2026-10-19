@@ -189,6 +189,65 @@ describe.skipIf(!PYTHON_AVAILABLE)("EvalTool python timeout containment", () => 
 		}
 	}, 120_000);
 
+	it("pauses the cell deadline while %pip runs, but not a forged pip wait", async () => {
+		const python = new EvalTool(makeSession("py-timeout-pip-pause"));
+		const probe = await python.execute("pip-probe", { language: "py", code: "%pip --version" });
+		if (!/pip \d/.test(textOf(probe))) return; // interpreter without pip: nothing to pause
+
+		// A package index that answers only after the cell budget has elapsed,
+		// so pip is genuinely busy past the deadline without any network.
+		const indexDelayMs = 3_000;
+		const index = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch() {
+				await Bun.sleep(indexDelayMs);
+				return new Response("not found", { status: 404 });
+			},
+		});
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-py-pip-"));
+		try {
+			const startedAt = Date.now();
+			const install = await python.execute("pip-slow-index", {
+				language: "py",
+				code: `%pip download --no-deps --retries 0 --timeout 30 --index-url http://127.0.0.1:${index.port}/simple -d ${JSON.stringify(dir)} omp-no-such-pkg`,
+				timeout: 1,
+			});
+			const text = textOf(install);
+			expect(text).not.toContain("timed out");
+			expect(Date.now() - startedAt).toBeGreaterThanOrEqual(indexDelayMs);
+			// pip itself ran to completion and reported the missing package.
+			expect(text).toContain("omp-no-such-pkg");
+
+			// Cell code holding the pip wait with a non-pip child is refused, so
+			// the 1s deadline still applies to its 5s sleep.
+			const forgedAt = Date.now();
+			const forged = await python.execute("pip-forged-wait", {
+				language: "py",
+				code: [
+					"import json, os, subprocess, threading, time, urllib.request",
+					"child = subprocess.Popen(['sh', '-c', 'sleep 5', '-m', 'pip'])",
+					"body = json.dumps({'session': os.environ['PI_TOOL_BRIDGE_SESSION'], 'run': __omp_current_run_id__(),",
+					"    'name': '__omp_pip_wait__', 'args': {'pid': child.pid}}).encode()",
+					"req = urllib.request.Request(os.environ['PI_TOOL_BRIDGE_URL'] + '/v1/tool', data=body, method='POST',",
+					"    headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + os.environ['PI_TOOL_BRIDGE_TOKEN']})",
+					"opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))",
+					"threading.Thread(target=lambda: opener.open(req).read(), daemon=True).start()",
+					"try:",
+					"    time.sleep(5)",
+					"finally:",
+					"    child.kill()",
+				].join("\n"),
+				timeout: 1,
+			});
+			expect(textOf(forged)).toContain("timed out");
+			expect(Date.now() - forgedAt).toBeLessThan(4_500);
+		} finally {
+			index.stop(true);
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	}, 120_000);
+
 	/**
 	 * Boundary between the two recovery paths. A cell the runner *can* interrupt
 	 * keeps its kernel, so the cell's children are not orphaned: the runtime

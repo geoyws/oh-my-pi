@@ -20,19 +20,22 @@
  *   `retry-after`, otherwise exponential backoff (0.5s * 2^n, capped at 8s,
  *   with up to 25% jitter).
  */
-import { scheduler } from "node:timers/promises";
 import * as AIError from "../error";
 import { AnthropicApiError, AnthropicConnectionError, AnthropicConnectionTimeoutError } from "../error";
+import { type OperationDeadlineOptions, operationDeadlineExceeded } from "../utils/operation-deadline";
+import { waitForRetry } from "../utils/retry-wait";
 
 export { AnthropicApiError, AnthropicConnectionError, AnthropicConnectionTimeoutError };
 
-import type { FetchImpl } from "../types";
+import type { FetchImpl, ProviderRetryWaitFn } from "../types";
 import type { MessageCreateParams } from "./anthropic-wire";
 
 /** Default pre-response timeout, matching the SDK's 10-minute default. */
 const DEFAULT_TIMEOUT_MS = 600_000;
 /** Default retry budget, matching the SDK's default. */
 const DEFAULT_MAX_RETRIES = 2;
+/** Endpoint every request targets when the caller supplies no `baseURL`. */
+const DEFAULT_BASE_URL = "https://api.anthropic.com";
 const INITIAL_RETRY_DELAY_S = 0.5;
 const MAX_RETRY_DELAY_S = 8;
 
@@ -49,6 +52,13 @@ export interface AnthropicRequestOptions {
 	 * the original error is surfaced. Non-positive values disable the cap. Defaults to 60000.
 	 */
 	maxRetryDelayMs?: number;
+	/**
+	 * Whole-operation budget and its absolute deadline, forwarded by the caller
+	 * so client-level retries count against the same budget as the provider loop
+	 * that wraps them. Omitted disables the check.
+	 */
+	operationTimeoutMs?: number;
+	operationDeadlineAt?: number;
 	/** Per-request headers merged after client defaults. */
 	headers?: Record<string, string>;
 }
@@ -91,6 +101,12 @@ export interface AnthropicClientOptions {
 	defaultHeaders?: Record<string, string>;
 	fetch?: FetchImpl;
 	fetchOptions?: AnthropicFetchOptions;
+	/**
+	 * Reports this client's own retry sleeps (429/529/5xx and connection
+	 * errors). Without it the sleeps are invisible above the transport, so a
+	 * multi-second overload backoff reads as a hung request.
+	 */
+	providerRetryWait?: ProviderRetryWaitFn;
 }
 
 function createAbortError(): Error {
@@ -186,21 +202,43 @@ export class AnthropicMessages {
 export interface AnthropicMessagesClientLike {
 	messages: { create(params: MessageCreateParams, options?: AnthropicRequestOptions): unknown };
 	beta?: { messages: { create(params: MessageCreateParams, options?: AnthropicRequestOptions): unknown } };
+	/**
+	 * Endpoint the client targets, when it exposes one. SDK-style clients
+	 * (`Anthropic`, `AnthropicVertex`) and {@link AnthropicMessagesClient}
+	 * publish it; a client that exposes none keeps its transport opaque, and the
+	 * provider must not assume the model's own routing on its behalf.
+	 */
+	baseURL?: string;
 }
 
 export class AnthropicMessagesClient implements AnthropicMessagesClientLike {
 	readonly messages: AnthropicMessages;
 	readonly beta: { readonly messages: AnthropicMessages };
-	#options: AnthropicClientOptions;
+	#http: AnthropicHttpClient;
+	/** Endpoint shared with the HTTP transport. */
+	get baseURL(): string {
+		return this.#http.baseURL;
+	}
 
 	constructor(options: AnthropicClientOptions) {
-		this.#options = options;
+		this.#http = new AnthropicHttpClient(options);
 		this.messages = new AnthropicMessages(this, "/v1/messages");
 		this.beta = { messages: new AnthropicMessages(this, "/v1/messages?beta=true") };
 	}
 
 	request(path: string, params: MessageCreateParams, options?: AnthropicRequestOptions): AnthropicApiRequest {
-		return new AnthropicApiRequest(() => this.#send(path, params, options));
+		return new AnthropicApiRequest(() => this.#http.request("POST", path, params, options));
+	}
+}
+
+/** Shared Anthropic HTTP transport for Messages and resource APIs. */
+export class AnthropicHttpClient {
+	#options: AnthropicClientOptions;
+	readonly baseURL: string;
+
+	constructor(options: AnthropicClientOptions) {
+		this.#options = options;
+		this.baseURL = options.baseURL ?? DEFAULT_BASE_URL;
 	}
 
 	#buildHeaders(requestHeaders?: Record<string, string>): Record<string, string> {
@@ -214,31 +252,43 @@ export class AnthropicMessagesClient implements AnthropicMessagesClientLike {
 			headers.Authorization = `Bearer ${opts.authToken}`;
 		}
 		Object.assign(headers, defaults);
-		Object.assign(headers, requestHeaders);
+		if (requestHeaders) {
+			for (const key in requestHeaders) {
+				for (const existing in headers) {
+					if (existing !== key && existing.toLowerCase() === key.toLowerCase()) delete headers[existing];
+				}
+				headers[key] = requestHeaders[key];
+			}
+		}
 		return headers;
 	}
 
-	async #send(path: string, params: MessageCreateParams, options?: AnthropicRequestOptions): Promise<Response> {
+	async request(
+		method: "GET" | "POST",
+		path: string,
+		params?: unknown,
+		options?: AnthropicRequestOptions,
+	): Promise<Response> {
 		const opts = this.#options;
 		const fetchFn: FetchImpl = opts.fetch ?? fetch;
 		const callerSignal = options?.signal;
 		const timeoutMs = options?.timeout ?? opts.timeout ?? DEFAULT_TIMEOUT_MS;
 		const maxRetries = Math.max(0, options?.maxRetries ?? opts.maxRetries ?? DEFAULT_MAX_RETRIES);
 		const maxRetryDelayMs = options?.maxRetryDelayMs ?? opts.maxRetryDelayMs ?? 60_000;
-		const url = `${opts.baseURL ?? "https://api.anthropic.com"}${path}`;
+		const url = `${this.baseURL}${path}`;
 		const headers = this.#buildHeaders(options?.headers);
-		const body = JSON.stringify(params);
+		const body = params === undefined ? undefined : JSON.stringify(params);
 
 		for (let attempt = 0; ; attempt++) {
 			if (callerSignal?.aborted) throw createAbortError();
 
 			let response: Response;
 			try {
-				response = await this.#fetchOnce(fetchFn, url, headers, body, timeoutMs, callerSignal);
+				response = await this.#fetchOnce(fetchFn, url, method, headers, body, timeoutMs, callerSignal);
 			} catch (error) {
 				if (callerSignal?.aborted) throw createAbortError();
 				if (attempt < maxRetries) {
-					await this.#backoff(attempt, undefined, callerSignal);
+					await this.#backoff(attempt, maxRetries, undefined, callerSignal, options);
 					continue;
 				}
 				if (error instanceof AIError.AnthropicConnectionTimeoutError) throw error;
@@ -257,7 +307,7 @@ export class AnthropicMessagesClient implements AnthropicMessagesClientLike {
 					throw await AIError.AnthropicApiError.fromResponse(response, callerSignal);
 				}
 				await response.body?.cancel().catch(() => {});
-				await this.#backoff(attempt, response.headers, callerSignal);
+				await this.#backoff(attempt, maxRetries, response.headers, callerSignal, options);
 				continue;
 			}
 
@@ -268,8 +318,9 @@ export class AnthropicMessagesClient implements AnthropicMessagesClientLike {
 	async #fetchOnce(
 		fetchFn: FetchImpl,
 		url: string,
+		method: "GET" | "POST",
 		headers: Record<string, string>,
-		body: string,
+		body: string | undefined,
 		timeoutMs: number,
 		callerSignal: AbortSignal | undefined,
 	): Promise<Response> {
@@ -284,7 +335,7 @@ export class AnthropicMessagesClient implements AnthropicMessagesClientLike {
 		try {
 			return await fetchFn(url, {
 				...this.#options.fetchOptions,
-				method: "POST",
+				method,
 				headers,
 				body,
 				signal: controller.signal,
@@ -300,12 +351,27 @@ export class AnthropicMessagesClient implements AnthropicMessagesClientLike {
 
 	async #backoff(
 		attempt: number,
+		maxRetries: number,
 		responseHeaders: Headers | undefined,
 		signal: AbortSignal | undefined,
+		deadline: OperationDeadlineOptions | undefined,
 	): Promise<void> {
 		const delayMs = retryDelayFromHeaders(responseHeaders) ?? calculateAnthropicRetryDelayMs(attempt);
+		// A caller abort wins over the budget: an already-cancelled request must
+		// surface as aborted, not as a budget exhaustion the session would replay.
+		if (signal?.aborted) throw createAbortError();
+		// Client retries nest inside the caller's provider retry loop, so they
+		// spend the same whole-operation budget: refuse a sleep that would cross
+		// it rather than stacking another wait under one the caller already took.
+		const deadlineError = operationDeadlineExceeded(deadline, delayMs);
+		if (deadlineError) throw deadlineError;
 		try {
-			await scheduler.wait(delayMs, { signal });
+			// The hook only observes the wait: same delay, same signal, and an
+			// abort still surfaces as the canonical abort error below.
+			await waitForRetry(this.#options.providerRetryWait, delayMs, signal, {
+				attempt: attempt + 1,
+				maxAttempts: maxRetries,
+			});
 		} catch {
 			throw createAbortError();
 		}

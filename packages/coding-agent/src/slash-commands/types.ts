@@ -1,5 +1,6 @@
 import type { Settings } from "../config/settings";
 import type { SlashCommandIconName } from "@oh-my-pi/pi-tui/theme/symbols";
+import type { UserMessageSource } from "../extensibility/extensions/types";
 import type { InteractiveModeContext, SubmittedUserInput } from "../modes/types";
 import type { AgentSession } from "../session/agent-session";
 import type { SessionManager } from "../session/session-manager";
@@ -23,6 +24,12 @@ export interface BuiltinSlashCommand {
 	allowArgs?: boolean;
 	/** Subcommands for dropdown completion (e.g. /mcp add, /mcp list). */
 	subcommands?: SubcommandDef[];
+	/**
+	 * The bare command is a complete invocation (`/fork`). Subcommand completion
+	 * then waits for a typed prefix, so Enter on `/name ` submits the bare command
+	 * instead of accepting the first subcommand from the dropdown.
+	 */
+	subcommandOptional?: boolean;
 	/** Static inline hint when command takes a simple argument (no subcommands). */
 	inlineHint?: string;
 	/** TUI-only dynamic status text for command-name autocomplete. Static `description` remains canonical for ACP/help. */
@@ -97,8 +104,24 @@ export interface SlashCommandRuntime {
 	 * return immediately and leave the serialized queue free for `abort`.
 	 */
 	runCommandInBackground?: (task: () => Promise<void>) => void;
+	/**
+	 * Ingress reported to `before_user_message` when a builtin's `handle()`
+	 * forwards user-authored text (the `/compact` or `/handoff` focus) to a
+	 * provider. RPC sets `"rpc"`, ACP sets `"acp"`; absent means `"unknown"`.
+	 */
+	userMessageSource?: UserMessageSource;
 	notifyTitleChanged?: () => Promise<void> | void;
-	notifyConfigChanged?: () => Promise<void> | void;
+	/**
+	 * Push the host's view of the session config (model, thinking level, mode).
+	 *
+	 * `handledBySessionEvent` marks changes the host may already learn from an
+	 * `AgentSession` lifetime event (`model_changed`/`thinking_level_changed`).
+	 * ACP installs a session-lifetime subscription that turns those into a
+	 * `config_option_update`, so it skips this explicit push once subscribed —
+	 * pre-bootstrap sessions still get it. Hosts without such a subscription
+	 * (RPC) ignore the flag and always push.
+	 */
+	notifyConfigChanged?: (options?: { handledBySessionEvent?: boolean }) => Promise<void> | void;
 }
 
 /**

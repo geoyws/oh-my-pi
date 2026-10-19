@@ -15,7 +15,7 @@ import { githubToolRenderer } from "./github";
 import { globToolRenderer } from "./glob";
 import { goalToolRenderer } from "./goal";
 import { grepToolRenderer } from "./grep";
-import { hubToolRenderer } from "./hub";
+import { waitToolRenderer } from "./wait";
 import { lspToolRenderer } from "./lsp";
 import { recallToolRenderer, reflectToolRenderer, retainToolRenderer } from "./memory";
 import { readToolRenderer } from "./read";
@@ -27,6 +27,7 @@ import { todoToolRenderer } from "./todo";
 import { createVibeToolRenderer } from "./vibe";
 import { webSearchToolRenderer } from "./web-search";
 import { writeToolRenderer } from "./write";
+import { yieldToolRenderer } from "./yield";
 import { setXdevRendererLookup } from "./xdev";
 
 export * from "./renderer";
@@ -45,7 +46,7 @@ export const toolRenderers: Record<string, ToolRenderer> = {
 	glob: globToolRenderer,
 	grep: grepToolRenderer,
 	lsp: lspToolRenderer,
-	hub: hubToolRenderer,
+	wait: waitToolRenderer,
 	read: readToolRenderer,
 	// Keyed by xd:// resolution-device names: the write dispatch delegates here
 	// by dispatch tool, and historical `resolve` tool transcripts still render
@@ -67,6 +68,7 @@ export const toolRenderers: Record<string, ToolRenderer> = {
 	vibe_kill: createVibeToolRenderer("kill"),
 	vibe_list: createVibeToolRenderer("list"),
 	write: writeToolRenderer,
+	yield: yieldToolRenderer,
 };
 
 // Wire the xd:// render delegation without the xdev module importing this registry.

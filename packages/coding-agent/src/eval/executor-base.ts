@@ -1,8 +1,13 @@
 import { logger } from "@oh-my-pi/pi-utils";
 import { Settings } from "../config/settings";
 import { type OutputArtifactError, OutputSink } from "@oh-my-pi/pi-tui/tools/streaming-output";
+import { statusEventKey } from "@oh-my-pi/pi-tui/tools/eval";
 import type { ToolSession } from "../tools";
-import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
+import {
+	resolveOutputMaxColumns,
+	resolveOutputSinkArtifactMaxBytes,
+	resolveOutputSinkHeadBytes,
+} from "../tools/output-meta";
 import {
 	EVAL_TIMEOUT_PAUSE_OP,
 	EVAL_TIMEOUT_RESUME_OP,
@@ -31,6 +36,31 @@ export class EvalKernelNotRunningError extends Error {
 	}
 }
 
+/**
+ * A cell's display outputs in emission order. Progress snapshots (see
+ * `statusEventKey`) replace their earlier snapshot in place, so a long `wait()`
+ * over agents keeps one event per handle instead of one per poll tick. Shared
+ * by the kernel (Python) and VM (JS) executors.
+ */
+export class DisplayOutputCollector<T extends KernelDisplayOutput> {
+	readonly outputs: T[] = [];
+	readonly #snapshotIndex = new Map<string, number>();
+
+	push(output: T): void {
+		const display: KernelDisplayOutput = output;
+		const key = display.type === "status" ? statusEventKey(display.event) : undefined;
+		if (key !== undefined) {
+			const index = this.#snapshotIndex.get(key);
+			if (index !== undefined) {
+				this.outputs[index] = output;
+				return;
+			}
+			this.#snapshotIndex.set(key, this.outputs.length);
+		}
+		this.outputs.push(output);
+	}
+}
+
 /** Managed-env values a kernel patch may carry (`null` clears, `undefined` skips). */
 export type KernelEnvPatch = Record<string, string | null | undefined>;
 
@@ -40,6 +70,7 @@ export type KernelEnvPatch = Record<string, string | null | undefined>;
  */
 export interface KernelExecutorBaseOptions {
 	cwd?: string;
+	filename?: string;
 	timeoutMs?: number;
 	deadlineMs?: number;
 	idleTimeoutMs?: number;
@@ -60,6 +91,8 @@ export interface KernelExecutionResult {
 	cancelled: boolean;
 	truncated: boolean;
 	artifactId: string | undefined;
+	/** Bytes the artifact cap dropped from the saved file's middle (the artifact is a head/tail sample). */
+	artifactElidedBytes?: number;
 	artifactError?: OutputArtifactError;
 	totalLines: number;
 	totalBytes: number;
@@ -75,6 +108,7 @@ export interface GenericKernel<TEnv> {
 		code: string,
 		options: {
 			cwd?: string;
+			filename?: string;
 			env?: TEnv;
 			id: string;
 			signal?: AbortSignal;
@@ -88,6 +122,8 @@ export interface GenericKernel<TEnv> {
 		kernelKilled?: boolean;
 		stdinRequested?: boolean;
 	}>;
+	/** Runner process id, when the kernel runs as a host child process. */
+	readonly pid?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -381,39 +417,6 @@ export interface SessionOwners {
 	hasFallbackOwner: boolean;
 }
 
-/**
- * Resolve the session key an owner's eval cell runs on, forking `reset` away
- * from shared kernels.
- *
- * Eval sessions are shared across agents by design (subagents inherit the
- * parent's eval session id), so honoring `reset` on a co-owned kernel would
- * destroy every other agent's state — including cells executing at that
- * moment. When the requester does not exclusively own the live base session,
- * its reset resolves to a deterministic per-owner fork key: the requester
- * starts a fresh private kernel while co-owners keep the shared one. Once
- * forked, the owner keeps resolving to its fork, and per-owner dispose reaps
- * the fork since the requester is its only registered owner.
- */
-export function resolveOwnerScopedSessionKey(options: {
-	baseKey: string;
-	ownerId: string | undefined;
-	reset: boolean;
-	/** True when a live or starting session exists under `key`. */
-	hasSession: (key: string) => boolean;
-	/** Owner registry for the session under `key`, when inspectable. */
-	getOwners: (key: string) => SessionOwners | undefined;
-}): string {
-	const { baseKey, ownerId } = options;
-	if (ownerId === undefined) return baseKey;
-	const forkKey = `${baseKey}\0fork\0${ownerId}`;
-	if (options.hasSession(forkKey)) return forkKey;
-	if (!options.reset) return baseKey;
-	const base = options.getOwners(baseKey);
-	if (!base) return baseKey;
-	const exclusive = !base.hasFallbackOwner && base.ownerIds.size === 1 && base.ownerIds.has(ownerId);
-	return exclusive ? baseKey : forkKey;
-}
-
 // ---------------------------------------------------------------------------
 // Base executor implementation
 // ---------------------------------------------------------------------------
@@ -457,10 +460,12 @@ export async function executeWithKernelBase<
 		artifactPath: options?.artifactPath,
 		artifactId: options?.artifactId,
 		headBytes: resolveOutputSinkHeadBytes(settings),
+		artifactMaxBytes: resolveOutputSinkArtifactMaxBytes(settings),
 		maxColumns: resolveOutputMaxColumns(settings),
 	});
 
-	const displayOutputs: KernelDisplayOutput[] = [];
+	const display = new DisplayOutputCollector<KernelDisplayOutput>();
+	const displayOutputs = display.outputs;
 	const deadlineMs = getExecutionDeadlineMs(options);
 	const remainingMs = getRemainingTimeoutMs(deadlineMs);
 	const executionTimeoutMs = remainingMs !== undefined && remainingMs > 0 ? remainingMs : undefined;
@@ -512,7 +517,7 @@ export async function executeWithKernelBase<
 	const emitHostStatus = (event: JsStatusEvent): void => {
 		if (rejectTimeoutControlCollision(event, `${errorLogLabel} tool status`)) return;
 		options?.onStatus?.(event);
-		displayOutputs.push({ type: "status", event });
+		display.push({ type: "status", event });
 	};
 
 	/**
@@ -525,7 +530,7 @@ export async function executeWithKernelBase<
 			if (rejectRuntimeTimeoutControl(output.event, errorLogLabel)) return;
 			options?.onStatus?.(output.event);
 		}
-		displayOutputs.push(output);
+		display.push(output);
 	};
 
 	const emitStatus: (event: JsStatusEvent) => void = options?.emitStatus ?? emitHostStatus;
@@ -547,6 +552,7 @@ export async function executeWithKernelBase<
 					shieldedSignal: abortShield.signal,
 					emitStatus,
 					onTimeoutControl: handleTimeoutControl,
+					kernelPid: kernel.pid,
 					shadowCell: getActiveEvalShadowCell(),
 					abortRequested: () => {
 						return abortShield.abortRequested;
@@ -561,6 +567,7 @@ export async function executeWithKernelBase<
 
 		const result = await kernel.execute(code, {
 			cwd: options?.cwd,
+			filename: options?.filename,
 			env: buildKernelEnvPatch(options ?? ({} as TOptions)),
 			id: runId,
 			signal: abortShield.signal,
@@ -582,6 +589,7 @@ export async function executeWithKernelBase<
 				truncated: dumped.truncated,
 				output: dumped.output,
 				artifactId: dumped.artifactId ?? undefined,
+				artifactElidedBytes: dumped.artifactElidedBytes,
 				artifactError: dumped.artifactError,
 				totalLines: dumped.totalLines,
 				totalBytes: dumped.totalBytes,
@@ -600,6 +608,7 @@ export async function executeWithKernelBase<
 				truncated: dumped.truncated,
 				output: dumped.output,
 				artifactId: dumped.artifactId ?? undefined,
+				artifactElidedBytes: dumped.artifactElidedBytes,
 				artifactError: dumped.artifactError,
 				totalLines: dumped.totalLines,
 				totalBytes: dumped.totalBytes,
@@ -618,6 +627,7 @@ export async function executeWithKernelBase<
 			truncated: dumped.truncated,
 			output: dumped.output,
 			artifactId: dumped.artifactId ?? undefined,
+			artifactElidedBytes: dumped.artifactElidedBytes,
 			artifactError: dumped.artifactError,
 			totalLines: dumped.totalLines,
 			totalBytes: dumped.totalBytes,
@@ -638,6 +648,7 @@ export async function executeWithKernelBase<
 				truncated: dumped.truncated,
 				output: dumped.output,
 				artifactId: dumped.artifactId ?? undefined,
+				artifactElidedBytes: dumped.artifactElidedBytes,
 				artifactError: dumped.artifactError,
 				totalLines: dumped.totalLines,
 				totalBytes: dumped.totalBytes,

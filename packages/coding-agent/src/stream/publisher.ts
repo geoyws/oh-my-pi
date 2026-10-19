@@ -1,15 +1,13 @@
-import * as net from "node:net";
-import type { StreamChatMessage, StreamRow } from "@oh-my-pi/pi-wire";
-import { STREAM_HISTORY_LIMIT } from "@oh-my-pi/pi-wire";
-import type { TUI, TuiPaint } from "@oh-my-pi/pi-tui";
+import { IpcConnection } from "@oh-my-pi/pi-natives";
+import type { StreamChatMessage } from "@oh-my-pi/pi-wire";
+import type { TUI } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
+import { STREAM_FLUSH_INTERVAL_MS, StreamPaintEncoder } from "./paint-encoder";
 import { streamSocketEndpoint } from "./paths";
-import { encodeStreamFrame, STREAM_LOCAL_PROTO, type StreamSessionFrame, type StreamStreamerFrame } from "./protocol";
+import { STREAM_LOCAL_PROTO, type StreamSessionFrame, type StreamStreamerFrame } from "./protocol";
 import type { StreamRedactor } from "./redactor";
 
 const CONNECT_TIMEOUT_MS = 500;
-const FLUSH_INTERVAL_MS = 50;
-const IMAGE_PLACEHOLDER = "\u{10eeee}";
 const QUIET_CONNECT_ERRORS: Record<string, true> = {
 	ENOENT: true,
 	ECONNREFUSED: true,
@@ -32,9 +30,11 @@ export interface LazyStreamPublisherOptions extends Omit<StreamPublisherOptions,
 }
 
 interface OpenedStreamSocket {
-	socket: net.Socket;
+	conn: IpcConnection;
 	takeQueuedFrames(): StreamStreamerFrame[];
 	setFrameHandler(handler: (frame: StreamStreamerFrame) => void): void;
+	/** Fires once when the connection closes; replays immediately if it already did. */
+	setCloseHandler(handler: (reason: string | null) => void): void;
 }
 
 function errorCode(error: unknown): string | undefined {
@@ -72,17 +72,25 @@ async function openStreamSocket(options: Omit<StreamPublisherOptions, "redactor"
 		return null;
 	}
 
-	const socket = net.createConnection(endpoint);
-	let input = "";
+	let conn: IpcConnection;
+	try {
+		conn = await IpcConnection.connect(endpoint, { framing: "lines", timeoutMs: CONNECT_TIMEOUT_MS });
+	} catch (error) {
+		logConnectFailure(error);
+		return null;
+	}
+
 	let settled = false;
 	let frameHandler: ((frame: StreamStreamerFrame) => void) | undefined;
+	let closeHandler: ((reason: string | null) => void) | undefined;
+	let closeReason: string | null | undefined;
 	const queuedFrames: StreamStreamerFrame[] = [];
 	const { promise, resolve } = Promise.withResolvers<OpenedStreamSocket | null>();
 	const timer = setTimeout(() => {
 		if (settled) return;
 		settled = true;
 		logger.debug("stream: local publisher connection timed out");
-		socket.destroy();
+		conn.destroy();
 		resolve(null);
 	}, CONNECT_TIMEOUT_MS);
 	timer.unref();
@@ -92,157 +100,74 @@ async function openStreamSocket(options: Omit<StreamPublisherOptions, "redactor"
 		settled = true;
 		clearTimeout(timer);
 		if (error !== undefined) logConnectFailure(error);
-		socket.destroy();
+		conn.destroy();
 		resolve(null);
 	};
 
-	socket.on("error", error => {
-		if (!settled) finishNull(error);
-	});
-	socket.once("connect", () => {
-		const hello: StreamSessionFrame = {
-			t: "hello",
-			proto: STREAM_LOCAL_PROTO,
-			sessionId: options.sessionId,
-			title: options.title,
-			cols: options.tui.terminal.columns,
-			rows: options.tui.terminal.rows,
-		};
-		socket.write(encodeStreamFrame(hello));
-	});
-	socket.on("data", chunk => {
-		input += chunk.toString("utf8");
-		for (;;) {
-			const newline = input.indexOf("\n");
-			if (newline < 0) break;
-			const line = input.slice(0, newline);
-			input = input.slice(newline + 1);
-			if (!line) continue;
-			const frame = parseFrame(line);
-			if (!frame) continue;
-			if (!settled) {
-				if (frame.t !== "welcome") {
-					finishNull(new Error("streamer did not welcome session"));
-					return;
-				}
-				if (frame.proto !== STREAM_LOCAL_PROTO) {
-					finishNull(new Error(`streamer protocol mismatch: ${frame.proto}`));
-					return;
-				}
-				settled = true;
-				clearTimeout(timer);
-				resolve({
-					socket,
-					takeQueuedFrames: () => queuedFrames.splice(0),
-					setFrameHandler: handler => {
-						frameHandler = handler;
-					},
-				});
-				continue;
+	const handleLine = (line: string): void => {
+		const frame = parseFrame(line);
+		if (!frame) return;
+		if (!settled) {
+			if (frame.t !== "welcome") {
+				finishNull(new Error("streamer did not welcome session"));
+				return;
 			}
-			if (frameHandler) frameHandler(frame);
-			else queuedFrames.push(frame);
+			if (frame.proto !== STREAM_LOCAL_PROTO) {
+				finishNull(new Error(`streamer protocol mismatch: ${frame.proto}`));
+				return;
+			}
+			settled = true;
+			clearTimeout(timer);
+			resolve({
+				conn,
+				takeQueuedFrames: () => queuedFrames.splice(0),
+				setFrameHandler: handler => {
+					frameHandler = handler;
+				},
+				setCloseHandler: handler => {
+					closeHandler = handler;
+					if (closeReason !== undefined) handler(closeReason);
+				},
+			});
+			return;
 		}
-	});
-	socket.once("close", () => {
-		if (!settled) finishNull();
-	});
+		if (frameHandler) frameHandler(frame);
+		else queuedFrames.push(frame);
+	};
+	conn.start(
+		frame => {
+			if (!conn.closed) handleLine(frame);
+		},
+		reason => {
+			closeReason = reason;
+			if (!settled) finishNull(reason === null ? undefined : new Error(reason));
+			else closeHandler?.(reason);
+		},
+	);
+	const hello: StreamSessionFrame = {
+		t: "hello",
+		proto: STREAM_LOCAL_PROTO,
+		sessionId: options.sessionId,
+		title: options.title,
+		cols: options.tui.terminal.columns,
+		rows: options.tui.terminal.rows,
+	};
+	conn.send(JSON.stringify(hello));
 	return promise;
-}
-
-/**
- * Convert one prepared terminal row into the stream-safe ANSI subset. Only SGR
- * and OSC 8 survive. Graphics placements become a visible text marker; OSC 66
- * contributes its visible payload without its terminal-specific scaling.
- */
-export function normalizeStreamRow(row: string): string {
-	if (row.includes(IMAGE_PLACEHOLDER)) return "[image]";
-	let output = "";
-	let image = false;
-	for (let index = 0; index < row.length;) {
-		if (row.charCodeAt(index) !== 0x1b) {
-			const code = row.charCodeAt(index);
-			if ((code >= 0x20 && (code < 0x7f || code > 0x9f)) || code === 0x09) output += row[index];
-			index++;
-			continue;
-		}
-		const kind = row[index + 1];
-		if (kind === "[") {
-			let end = index + 2;
-			while (end < row.length && (row.charCodeAt(end) < 0x40 || row.charCodeAt(end) > 0x7e)) end++;
-			if (end >= row.length) break;
-			if (row[end] === "m") output += row.slice(index, end + 1);
-			index = end + 1;
-			continue;
-		}
-		if (kind === "]" || kind === "_" || kind === "P") {
-			let end = index + 2;
-			const tmuxDcs = kind === "P" && row.startsWith("tmux;", end);
-			while (end < row.length) {
-				const bell = row.charCodeAt(end) === 0x07;
-				const escapedTmuxEsc = tmuxDcs && end > index + 2 && row[end - 1] === "\x1b";
-				const st = row[end] === "\x1b" && row[end + 1] === "\\" && !escapedTmuxEsc;
-				if (bell || st) break;
-				end++;
-			}
-			const terminatedBySt = row[end] === "\x1b";
-			const sequenceEnd = Math.min(row.length, end + (terminatedBySt ? 2 : 1));
-			const payload = row.slice(index + 2, end);
-			if (kind === "]" && payload.startsWith("8;")) {
-				output += row.slice(index, sequenceEnd);
-			} else if (kind === "]" && payload.startsWith("66;")) {
-				const separator = payload.indexOf(";", 3);
-				if (separator >= 0) output += payload.slice(separator + 1);
-			} else if (kind === "]" && /(?:^|;)File=/.test(payload)) {
-				image = true;
-			} else if (kind === "_") {
-				const graphics = payload.startsWith("G") ? payload.slice(1) : "";
-				if (/(?:^|,)a=[pT](?:,|$)/.test(graphics) || /(?:^|,)U=1(?:,|$)/.test(graphics)) {
-					image = true;
-				}
-			} else if (kind === "P" && /^[0-9;]*q/.test(payload)) {
-				image = true;
-			} else if (kind === "P" && payload.startsWith("tmux;")) {
-				const nested = normalizeStreamRow(payload.slice(5).replaceAll("\x1b\x1b", "\x1b"));
-				if (nested === "[image]") image = true;
-				else output += nested;
-			}
-			index = sequenceEnd;
-			continue;
-		}
-		// ESC controls are paint mechanics rather than row content. Consume any
-		// intermediate bytes as well as the final byte (for example ESC ( 0).
-		let end = index + 1;
-		while (end < row.length && row.charCodeAt(end) >= 0x20 && row.charCodeAt(end) <= 0x2f) end++;
-		index = Math.min(row.length, end + 1);
-	}
-	return image ? "[image]" : output;
 }
 
 /** Publishes one interactive session's already-redacted terminal rows. */
 export class StreamPublisher {
-	readonly #socket: net.Socket;
+	readonly #conn: IpcConnection;
 	readonly #tui: TUI;
-	readonly #redactor: StreamRedactor;
+	readonly #encoder: StreamPaintEncoder;
 	readonly #onStatus: StreamPublisherOptions["onStatus"];
 	readonly #onChat: StreamPublisherOptions["onChat"];
 	#disposed = false;
 	#flushTimer: NodeJS.Timeout | undefined;
-	#pendingViewport: StreamRow[] | undefined;
-	#pendingHistory: StreamRow[] = [];
-	#pendingHistorySkipped = 0;
-	#pendingReset = false;
-	#pendingForceFull = false;
-	#pendingColumns: number;
-	#pendingRows: number;
-	#lastColumns: number;
-	#lastRows: number;
-	#lastViewport: StreamRow[] | undefined;
-	#lastAlt: boolean | undefined;
-	#pendingAlt = false;
 	#backpressured = false;
-	/** Raw → normalized+redacted rows of the previous paint; most rows repeat frame to frame. */
-	#rowCache = new Map<string, StreamRow>();
+	#awaitingDrain = false;
+	#unsubscribePaint: (() => void) | undefined;
 
 	static async connect(options: StreamPublisherOptions): Promise<StreamPublisher | null> {
 		const opened = await openStreamSocket(options);
@@ -259,7 +184,7 @@ export class StreamPublisher {
 			redactor = await options.loadRedactor();
 		} catch (error) {
 			logger.debug("stream: could not initialize row redaction", { error: String(error) });
-			opened.socket.destroy();
+			opened.conn.destroy();
 			return null;
 		}
 		return StreamPublisher.#create(opened, options, redactor);
@@ -270,72 +195,39 @@ export class StreamPublisher {
 		options: Omit<StreamPublisherOptions, "redactor">,
 		redactor: StreamRedactor,
 	): StreamPublisher | null {
-		if (opened.socket.destroyed) return null;
-		const publisher = new StreamPublisher(opened.socket, options, redactor);
+		if (opened.conn.closed) return null;
+		const publisher = new StreamPublisher(opened.conn, options, redactor);
 		opened.setFrameHandler(frame => publisher.#handleFrame(frame));
+		opened.setCloseHandler(reason => {
+			if (reason !== null) logger.debug("stream: local publisher connection failed", { reason });
+			publisher.#detach();
+		});
 		publisher.#onStatus({ viewers: 0 });
-		publisher.#tui.setPaintListener(paint => publisher.#handlePaint(paint));
+		publisher.#unsubscribePaint = publisher.#tui.addPaintListener(paint => {
+			if (publisher.#disposed) return;
+			publisher.#encoder.push(paint);
+			publisher.#scheduleFlush();
+		});
 		for (const frame of opened.takeQueuedFrames()) publisher.#handleFrame(frame);
 		return publisher;
 	}
 
-	constructor(socket: net.Socket, options: Omit<StreamPublisherOptions, "redactor">, redactor: StreamRedactor) {
-		this.#socket = socket;
+	constructor(conn: IpcConnection, options: Omit<StreamPublisherOptions, "redactor">, redactor: StreamRedactor) {
+		this.#conn = conn;
 		this.#tui = options.tui;
-		this.#redactor = redactor;
+		this.#encoder = new StreamPaintEncoder(
+			{ columns: options.tui.terminal.columns, rows: options.tui.terminal.rows },
+			redactor,
+		);
 		this.#onStatus = options.onStatus;
 		this.#onChat = options.onChat;
-		this.#pendingColumns = this.#lastColumns = options.tui.terminal.columns;
-		this.#pendingRows = this.#lastRows = options.tui.terminal.rows;
-		socket.on("drain", () => this.#handleDrain());
-		socket.on("error", error => {
-			logger.debug("stream: local publisher socket failed", { error: String(error) });
-			this.#detach();
-		});
-		socket.on("close", () => this.#detach());
 	}
 
-	#normalizeRows(rows: readonly string[]): StreamRow[] {
-		return rows.map(row => this.#redactor.redactRow(normalizeStreamRow(row)));
-	}
-
-	#normalizeViewport(rows: readonly string[]): StreamRow[] {
-		const cache = new Map<string, StreamRow>();
-		const out = rows.map(row => {
-			let normalized = cache.get(row) ?? this.#rowCache.get(row);
-			if (normalized === undefined) normalized = this.#redactor.redactRow(normalizeStreamRow(row));
-			cache.set(row, normalized);
-			return normalized;
-		});
-		this.#rowCache = cache;
-		return out;
-	}
-
-	#handlePaint(paint: TuiPaint): void {
+	/** Swap the row redactor and force a full repaint so the live viewport is re-redacted. */
+	setRedactor(redactor: StreamRedactor): void {
 		if (this.#disposed) return;
-		if (paint.reset) {
-			this.#pendingReset = true;
-			this.#pendingForceFull = true;
-			this.#pendingHistory = [];
-			this.#pendingHistorySkipped = 0;
-		}
-		if (paint.history.length > 0) {
-			this.#pendingHistory.push(...this.#normalizeRows(paint.history));
-			const capacity = this.#pendingHistorySkipped > 0 ? STREAM_HISTORY_LIMIT - 1 : STREAM_HISTORY_LIMIT;
-			if (this.#pendingHistory.length > capacity) {
-				this.#pendingHistorySkipped += this.#pendingHistory.length - (STREAM_HISTORY_LIMIT - 1);
-				this.#pendingHistory = this.#pendingHistory.slice(-(STREAM_HISTORY_LIMIT - 1));
-			}
-		}
-		if (paint.columns !== this.#pendingColumns || paint.rows !== this.#pendingRows) this.#pendingForceFull = true;
-		if (this.#lastAlt !== undefined && paint.alt !== this.#lastAlt) this.#pendingForceFull = true;
-		if (paint.alt) this.#pendingForceFull = true;
-		this.#lastAlt = paint.alt;
-		this.#pendingAlt = paint.alt;
-		this.#pendingColumns = paint.columns;
-		this.#pendingRows = paint.rows;
-		this.#pendingViewport = this.#normalizeViewport(paint.viewport);
-		this.#scheduleFlush();
+		this.#encoder.setRedactor(redactor);
+		this.#tui.requestRender(true);
 	}
 
 	#scheduleFlush(): void {
@@ -343,87 +235,34 @@ export class StreamPublisher {
 		this.#flushTimer = setTimeout(() => {
 			this.#flushTimer = undefined;
 			this.#flush();
-		}, FLUSH_INTERVAL_MS);
+		}, STREAM_FLUSH_INTERVAL_MS);
 		this.#flushTimer.unref();
 	}
 
-	#write(frame: StreamSessionFrame, screenFrame = false): boolean {
-		if (this.#disposed || (screenFrame && this.#backpressured)) return false;
-		try {
-			if (!this.#socket.write(encodeStreamFrame(frame))) this.#backpressured = true;
-			return true;
-		} catch (error) {
-			logger.debug("stream: local publisher write failed", { error: String(error) });
-			this.#detach();
-			return false;
-		}
+	#write(frame: StreamSessionFrame): void {
+		if (this.#disposed) return;
+		if (this.#conn.send(JSON.stringify(frame))) return;
+		this.#backpressured = true;
+		if (this.#awaitingDrain) return;
+		this.#awaitingDrain = true;
+		void this.#conn.drained().then(() => {
+			this.#awaitingDrain = false;
+			this.#handleDrain();
+		});
 	}
 
 	#flush(): void {
 		if (this.#disposed) return;
-		if (this.#pendingReset) this.#write({ t: "reset" });
-		if (this.#pendingHistory.length > 0 || this.#pendingHistorySkipped > 0) {
-			const rows =
-				this.#pendingHistorySkipped > 0
-					? [`… (${this.#pendingHistorySkipped} rows skipped)`, ...this.#pendingHistory]
-					: this.#pendingHistory;
-			this.#write({ t: "history", rows });
-		}
-		const resized = this.#pendingColumns !== this.#lastColumns || this.#pendingRows !== this.#lastRows;
-		if (resized) {
-			this.#write({ t: "resize", cols: this.#pendingColumns, rows: this.#pendingRows });
-			this.#lastColumns = this.#pendingColumns;
-			this.#lastRows = this.#pendingRows;
-		}
-
-		const viewport = this.#pendingViewport;
-		const forceFull = this.#pendingForceFull || this.#pendingReset || resized || this.#pendingAlt;
-		this.#pendingReset = false;
-		this.#pendingHistory = [];
-		this.#pendingHistorySkipped = 0;
-		this.#pendingForceFull = false;
-		this.#pendingViewport = undefined;
-		if (!viewport) return;
-		if (this.#backpressured) {
-			this.#pendingViewport = viewport;
-			this.#pendingForceFull = true;
-			return;
-		}
-
-		if (!this.#lastViewport || forceFull) {
-			if (this.#write({ t: "viewport", rows: viewport }, true)) this.#lastViewport = viewport;
-			return;
-		}
-		const ops: [number, StreamRow][] = [];
-		for (let index = 0; index < viewport.length; index++) {
-			if (viewport[index] !== this.#lastViewport[index]) ops.push([index, viewport[index]!]);
-		}
-		const changed = ops.length + Math.max(0, this.#lastViewport.length - viewport.length);
-		if (changed === 0) return;
-		if (changed > viewport.length / 2) {
-			if (this.#write({ t: "viewport", rows: viewport }, true)) this.#lastViewport = viewport;
-		} else if (this.#write({ t: "patch", ops, rows: viewport.length }, true)) {
-			this.#lastViewport = viewport;
-		}
+		for (const frame of this.#encoder.drain({ screen: !this.#backpressured })) this.#write(frame);
 	}
 
 	#handleDrain(): void {
 		if (this.#disposed || !this.#backpressured) return;
 		this.#backpressured = false;
-		if (
-			this.#flushTimer ||
-			this.#pendingReset ||
-			this.#pendingHistory.length > 0 ||
-			this.#pendingHistorySkipped > 0 ||
-			this.#pendingViewport
-		) {
-			clearTimeout(this.#flushTimer);
-			this.#flushTimer = undefined;
-			this.#pendingForceFull = true;
-			this.#flush();
-			return;
-		}
-		if (this.#lastViewport) this.#write({ t: "viewport", rows: this.#lastViewport }, true);
+		clearTimeout(this.#flushTimer);
+		this.#flushTimer = undefined;
+		this.#encoder.resync();
+		this.#flush();
 	}
 
 	#handleFrame(frame: StreamStreamerFrame): void {
@@ -444,22 +283,24 @@ export class StreamPublisher {
 	}
 
 	#detach(): void {
-		if (this.#disposed) return;
-		this.#disposed = true;
-		if (this.#flushTimer) clearTimeout(this.#flushTimer);
-		this.#flushTimer = undefined;
-		this.#tui.setPaintListener(null);
-		this.#onStatus(null);
-		this.#socket.destroy();
+		if (!this.#release()) return;
+		this.#conn.destroy();
 	}
 
 	dispose(): void {
-		if (this.#disposed) return;
+		if (!this.#release()) return;
+		this.#conn.end();
+	}
+
+	/** Stop observing paints; false when already released. */
+	#release(): boolean {
+		if (this.#disposed) return false;
 		this.#disposed = true;
-		if (this.#flushTimer) clearTimeout(this.#flushTimer);
+		clearTimeout(this.#flushTimer);
 		this.#flushTimer = undefined;
-		this.#tui.setPaintListener(null);
+		this.#unsubscribePaint?.();
+		this.#unsubscribePaint = undefined;
 		this.#onStatus(null);
-		this.#socket.end();
+		return true;
 	}
 }

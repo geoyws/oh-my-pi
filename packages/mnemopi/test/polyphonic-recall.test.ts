@@ -1,11 +1,8 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { type BeamMemoryState, initBeam } from "@oh-my-pi/pi-mnemopi/core/beam";
-import {
-	PolyphonicRecallEngine,
-	polyphonicRecall,
-	polyphonicRecallIsEnabled,
-} from "@oh-my-pi/pi-mnemopi/core/polyphonic-recall";
+import { PolyphonicRecallEngine, polyphonicRecall } from "@oh-my-pi/pi-mnemopi/core/polyphonic-recall";
 import { closeQuietly, openDatabase } from "@oh-my-pi/pi-mnemopi/db";
+import { currentLoopPhase } from "@oh-my-pi/pi-utils";
 
 function makeBeam(): BeamMemoryState {
 	const db = openDatabase(":memory:", { create: true, readwrite: true });
@@ -80,11 +77,7 @@ function seedPolyphonicFixture(beam: BeamMemoryState): PolyphonicRecallEngine {
 	return engine;
 }
 
-const previousPolyphonic = process.env.MNEMOPI_POLYPHONIC_RECALL;
-
 afterEach(() => {
-	if (previousPolyphonic === undefined) delete process.env.MNEMOPI_POLYPHONIC_RECALL;
-	else process.env.MNEMOPI_POLYPHONIC_RECALL = previousPolyphonic;
 	delete process.env.MNEMOPI_VOICE_VECTOR;
 	delete process.env.MNEMOPI_VOICE_GRAPH;
 	delete process.env.MNEMOPI_VOICE_FACT;
@@ -92,15 +85,6 @@ afterEach(() => {
 });
 
 describe("PolyphonicRecallEngine", () => {
-	it("reads the polyphonic recall gate per call", () => {
-		delete process.env.MNEMOPI_POLYPHONIC_RECALL;
-		expect(polyphonicRecallIsEnabled()).toBe(false);
-		process.env.MNEMOPI_POLYPHONIC_RECALL = "0";
-		expect(polyphonicRecallIsEnabled()).toBe(false);
-		process.env.MNEMOPI_POLYPHONIC_RECALL = "1";
-		expect(polyphonicRecallIsEnabled()).toBe(true);
-	});
-
 	it("fuses the four voices with RRF and preserves voice attribution order", () => {
 		const beam = makeBeam();
 		try {
@@ -112,6 +96,33 @@ describe("PolyphonicRecallEngine", () => {
 			expect(results[2]?.voice_scores).toEqual({ temporal: 1 / 61 });
 			expect(results[0]?.score).toBeGreaterThan(results[1]?.score ?? 0);
 			expect(results[0]?.content).toContain("graph traversal");
+		} finally {
+			closeQuietly(beam.db);
+		}
+	});
+
+	it("reports its synchronous fan-out and fusion to the loop watchdog as mnemopi.recall", () => {
+		const beam = makeBeam();
+		try {
+			seedPolyphonicFixture(beam);
+			const recall = PolyphonicRecallEngine.prototype.recall;
+			const phases: (string | undefined)[] = [];
+			const spy = spyOn(PolyphonicRecallEngine.prototype, "recall").mockImplementation(function (
+				this: PolyphonicRecallEngine,
+				...args
+			) {
+				phases.push(currentLoopPhase());
+				return recall.apply(this, args);
+			});
+			try {
+				polyphonicRecall(beam, "Alice recent", 10, { queryEmbedding: [1, 0] });
+
+				expect(phases.length).toBeGreaterThan(0);
+				expect(phases.every(phase => phase === "mnemopi.recall")).toBe(true);
+				expect(currentLoopPhase()).toBeUndefined();
+			} finally {
+				spy.mockRestore();
+			}
 		} finally {
 			closeQuietly(beam.db);
 		}
@@ -221,22 +232,6 @@ describe("PolyphonicRecallEngine", () => {
 			const results = engine.recall("Alice", null, 5);
 
 			expect(results.map(result => result.id)).toEqual(["wm-global-fact"]);
-		} finally {
-			closeQuietly(beam.db);
-		}
-	});
-
-	it("caches an engine on Beam state and hydrates result content", () => {
-		const beam = makeBeam();
-		try {
-			seedPolyphonicFixture(beam).close();
-			const first = polyphonicRecall(beam, "Alice", 5, { queryEmbedding: [1, 0] });
-			const cached = beam.caches.polyphonicEngine;
-			const second = polyphonicRecall(beam, "Alice", 5, { queryEmbedding: [1, 0] });
-			expect(cached).toBeInstanceOf(PolyphonicRecallEngine);
-			expect(beam.caches.polyphonicEngine).toBe(cached);
-			expect(first[0]?.content).toBe(second[0]?.content);
-			expect(first[0]?.voice_scores).toEqual(second[0]?.voice_scores);
 		} finally {
 			closeQuietly(beam.db);
 		}

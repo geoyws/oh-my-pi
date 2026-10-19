@@ -45,17 +45,21 @@ export interface ModelMentionHost {
 	sessionManager: SessionManager;
 	modelRegistry: ModelRegistry;
 	scopedModels(): ReadonlyArray<Model>;
+	/** User-authorized model agents inherited from the parent session. */
+	inheritedAgents?: readonly AgentDefinition[];
 }
 
 /** Owns branch-local pseudonyms for models explicitly tagged by the user. */
 export class ModelMentionRegistry {
 	readonly #host: ModelMentionHost;
+	readonly #inheritedAgents: readonly AgentDefinition[];
 	#mentions: ModelMention[] = [];
 	readonly #bySelector = new Map<string, ModelMention>();
 	readonly #agents = new Set<string>();
 
 	constructor(host: ModelMentionHost) {
 		this.#host = host;
+		this.#inheritedAgents = host.inheritedAgents ?? [];
 	}
 
 	/** Rebuild pseudonyms after resume, rewind, or a session switch. */
@@ -63,6 +67,9 @@ export class ModelMentionRegistry {
 		this.#mentions = readModelMentions(this.#host.sessionManager.getBranch());
 		this.#bySelector.clear();
 		this.#agents.clear();
+		for (const agent of this.#inheritedAgents) {
+			this.#agents.add(agent.name);
+		}
 		for (const mention of this.#mentions) {
 			this.#bySelector.set(mention.selector, mention);
 			this.#agents.add(mention.agent);
@@ -83,34 +90,59 @@ export class ModelMentionRegistry {
 
 	/** Register user-tagged models and replace their tokens with persisted agent tags. */
 	expandMentions(text: string): string {
+		return this.#expand(text, true);
+	}
+
+	/**
+	 * The text {@link expandMentions} would produce right now, without registering or
+	 * persisting anything: lets a submission be gated before it touches the session.
+	 */
+	previewMentions(text: string): string {
+		return this.#expand(text, false);
+	}
+
+	#expand(text: string, commit: boolean): string {
 		if (!text.includes("^")) return text;
+		const previewed = commit ? undefined : new Map<string, ModelMention>();
+		const previewedAgents = commit ? undefined : new Set<string>();
 		return text.replace(MODEL_MENTION_RE, (token, delimiter: string, selector: string) => {
-			let mention = this.#bySelector.get(selector);
+			let mention = this.#bySelector.get(selector) ?? previewed?.get(selector);
 			if (!mention) {
 				const model = this.findMentionable(selector);
 				if (!model) return token;
 				let next = 1;
-				while (this.#agents.has(`m${next}`)) next++;
+				while (this.#agents.has(`m${next}`) || previewedAgents?.has(`m${next}`)) next++;
 				mention = { agent: `m${next}`, selector, name: modelMentionDisplayName(model) };
-				this.#host.sessionManager.appendCustomEntry(MODEL_MENTION_ENTRY_TYPE, mention);
-				this.#mentions.push(mention);
-				this.#bySelector.set(selector, mention);
-				this.#agents.add(mention.agent);
+				if (previewed && previewedAgents) {
+					previewed.set(selector, mention);
+					previewedAgents.add(mention.agent);
+				} else {
+					this.#host.sessionManager.appendCustomEntry(MODEL_MENTION_ENTRY_TYPE, mention);
+					this.#mentions.push(mention);
+					this.#bySelector.set(selector, mention);
+					this.#agents.add(mention.agent);
+				}
 			}
 			return `${delimiter}${modelMentionTag(mention)}`;
 		});
 	}
 
-	/** Expose tagged models as general-purpose task agents without changing the bundled template. */
+	/** Expose inherited and session-tagged models as general-purpose task agents. */
 	sessionAgents(): AgentDefinition[] {
 		const task = getBundledAgent("task");
 		if (!task) throw new Error("Bundled task agent is unavailable");
-		return this.#mentions.map(mention => ({
-			...task,
-			name: mention.agent,
-			description: prompt.render(modelMentionDescription, { name: mention.name, selector: mention.selector }),
-			model: [mention.selector],
-			filePath: undefined,
-		}));
+		const inheritedNames = new Set(this.#inheritedAgents.map(agent => agent.name));
+		return [
+			...this.#inheritedAgents,
+			...this.#mentions
+				.filter(mention => !inheritedNames.has(mention.agent))
+				.map(mention => ({
+					...task,
+					name: mention.agent,
+					description: prompt.render(modelMentionDescription, { name: mention.name, selector: mention.selector }),
+					model: [mention.selector],
+					filePath: undefined,
+				})),
+		];
 	}
 }

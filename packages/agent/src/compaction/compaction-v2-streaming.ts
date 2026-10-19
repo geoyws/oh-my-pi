@@ -20,10 +20,12 @@ import {
 import {
 	getOpenAIPromptCacheKey,
 	getOpenAIResponsesRoutingSessionId,
+	isForeignEncryptedReasoningError,
 	parseAzureDeploymentNameMap,
 	resolveOpenAIRequestSetup,
 } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { captureOpenAIHttpError } from "@oh-my-pi/pi-ai/utils/openai-http";
+import { isBedrockOpenAIUrl } from "@oh-my-pi/pi-catalog/hosts";
 import {
 	applyCodexResidencyHeader,
 	CODEX_BASE_URL,
@@ -32,7 +34,9 @@ import {
 	OPENAI_HEADER_VALUES,
 	OPENAI_HEADERS,
 } from "@oh-my-pi/pi-catalog/wire/codex";
-import { $env, isUnexpectedSocketCloseMessage, logger, stringifyJson } from "@oh-my-pi/pi-utils";
+import { $env, isUnexpectedSocketCloseMessage, logger, ptree, stringifyJson } from "@oh-my-pi/pi-utils";
+import { appendAzureApiVersion, resolveAzureOpenAiBaseUrl } from "./azure-openai-endpoint";
+import { prepareBedrockCompactionRequest } from "./bedrock";
 
 // ============================================================================
 // Types & Configuration
@@ -47,7 +51,6 @@ export const V2_COMPACTION_MAX_RETRIES = 2;
 /** Timeout for V2 streaming compaction (5 minutes, same as V1). */
 export const V2_COMPACTION_TIMEOUT_MS = 300_000;
 
-const DEFAULT_AZURE_API_VERSION = "v1";
 const OPENAI_REMOTE_COMPACTION_PRESERVE_KEY = "openaiRemoteCompaction";
 const COMPACTION_TRIGGER_ITEM = { type: "compaction_trigger" } as const;
 // OpenAI image metering depends on detail and dimensions; charge the common
@@ -75,6 +78,8 @@ export interface CompactionV2Usage {
 export interface CompactionV2Request {
 	body: OpenAICodexCompactionBody;
 	input: unknown[];
+	/** Serialized user-written turns to keep next to the compaction item; defaults to `input`. */
+	retainedUserItems: unknown[];
 	retainedMessageBudget: number;
 	sessionId?: string;
 	promptCacheKey?: string;
@@ -96,7 +101,7 @@ export interface CompactionV2Response {
 /** Resolve the streaming Responses endpoint for a V2-capable model. */
 export function getCompactionV2Endpoint(model: Model): string | undefined {
 	if (model.remoteCompaction?.enabled === false) return undefined;
-	if (!isOpenAiV2CompatibleModel(model)) return undefined;
+	if (!isOpenAiRemoteCompactionApi(compactionV2Api(model))) return undefined;
 
 	const configuredEndpoint = model.remoteCompaction?.v2Endpoint ?? model.remoteCompaction?.streamingEndpoint;
 	if (configuredEndpoint && configuredEndpoint.length > 0) return configuredEndpoint;
@@ -115,7 +120,15 @@ export function getCompactionV2Endpoint(model: Model): string | undefined {
 export function shouldUseCompactionV2Streaming(
 	model: Model,
 ): model is Model<"openai-responses" | "azure-openai-responses" | "openai-codex-responses"> {
-	if (model.remoteCompaction?.v2StreamingEnabled !== true) return false;
+	const v2StreamingEnabled = model.remoteCompaction?.v2StreamingEnabled;
+	if (v2StreamingEnabled === false) return false;
+	// Amazon Bedrock's OpenAI routes accept `compaction_trigger` without an opt-in.
+	if (
+		v2StreamingEnabled !== true &&
+		!(compactionV2Api(model) === "openai-responses" && isBedrockOpenAIUrl(model.baseUrl))
+	) {
+		return false;
+	}
 	return getCompactionV2Endpoint(model) !== undefined;
 }
 
@@ -123,8 +136,8 @@ function compactionV2Api(model: Model): Api | undefined {
 	return model.remoteCompaction?.api ?? model.api;
 }
 
-function isOpenAiV2CompatibleModel(model: Model): boolean {
-	const api = compactionV2Api(model);
+/** APIs that speak the OpenAI Responses compaction protocol (V1 `/responses/compact` and V2 streaming). */
+export function isOpenAiRemoteCompactionApi(api: Api | undefined): boolean {
 	return api === "openai-responses" || api === "azure-openai-responses" || api === "openai-codex-responses";
 }
 
@@ -150,25 +163,6 @@ function resolveOpenAiCodexResponsesEndpoint(baseUrl: string | undefined): strin
 	if (normalizedBase.endsWith("/codex/responses")) return normalizedBase;
 	if (normalizedBase.endsWith("/codex")) return `${normalizedBase}/responses`;
 	return `${normalizedBase}/codex/responses`;
-}
-
-function resolveAzureOpenAiBaseUrl(model: Model): string {
-	const baseUrl = $env.AZURE_OPENAI_BASE_URL?.trim() || undefined;
-	const resourceName = $env.AZURE_OPENAI_RESOURCE_NAME;
-	const resolvedBaseUrl =
-		baseUrl ?? (resourceName ? `https://${resourceName}.openai.azure.com/openai/v1` : undefined) ?? model.baseUrl;
-	if (!resolvedBaseUrl) {
-		throw new Error(
-			"Azure OpenAI base URL is required. Set AZURE_OPENAI_BASE_URL or AZURE_OPENAI_RESOURCE_NAME, or configure model.baseUrl.",
-		);
-	}
-	return resolvedBaseUrl.replace(/\/+$/, "");
-}
-
-function appendAzureApiVersion(endpoint: string): string {
-	if (/[?&]api-version=/.test(endpoint)) return endpoint;
-	const separator = endpoint.includes("?") ? "&" : "?";
-	return `${endpoint}${separator}api-version=${encodeURIComponent($env.AZURE_OPENAI_API_VERSION || DEFAULT_AZURE_API_VERSION)}`;
 }
 
 function resolveCompactionV2Model(model: Model): string {
@@ -199,6 +193,7 @@ export function buildCompactionV2Request(
 		sessionId?: string;
 		promptCacheKey?: string;
 		retainedMessageBudget?: number;
+		retainedUserItems?: unknown[];
 	},
 ): CompactionV2Request {
 	const cacheOptions = { sessionId: options?.sessionId, promptCacheKey: options?.promptCacheKey };
@@ -232,12 +227,14 @@ export function buildCompactionV2RequestFromBody(
 		sessionId?: string;
 		promptCacheKey?: string;
 		retainedMessageBudget?: number;
+		retainedUserItems?: unknown[];
 	},
 ): CompactionV2Request {
 	const input = Array.isArray(body.input) ? body.input : [];
 	return {
 		body: { ...body, model: resolveCompactionV2Model(model), input },
 		input,
+		retainedUserItems: options?.retainedUserItems ?? input,
 		retainedMessageBudget: resolveCompactionV2RetainedMessageBudget(options?.retainedMessageBudget),
 		sessionId: options?.sessionId,
 		promptCacheKey: options?.promptCacheKey,
@@ -247,13 +244,6 @@ export function buildCompactionV2RequestFromBody(
 // ============================================================================
 // Streaming Request Handler
 // ============================================================================
-
-/** Race the caller's signal against the V2 request timeout. */
-function withRequestTimeout(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal | undefined {
-	if (timeoutMs <= 0) return signal;
-	const timeout = AbortSignal.timeout(timeoutMs);
-	return signal ? AbortSignal.any([signal, timeout]) : timeout;
-}
 
 /** Request V2 compaction over the normal OpenAI Responses streaming endpoint. */
 export async function requestCompactionV2Streaming(
@@ -270,12 +260,19 @@ export async function requestCompactionV2Streaming(
 		preferWebsockets?: boolean;
 	},
 ): Promise<CompactionV2Response> {
+	let fetchImpl: FetchImpl = options?.fetch ?? globalThis.fetch;
+	if (isBedrockOpenAIUrl(model.baseUrl)) {
+		({
+			model,
+			apiKey,
+			fetch: fetchImpl,
+		} = await prepareBedrockCompactionRequest(model, apiKey, options?.fetch, signal));
+	}
 	const endpoint = getCompactionV2Endpoint(model);
 	if (!endpoint) {
 		throw new Error(`Model ${model.id} does not support V2 streaming compaction`);
 	}
 
-	const fetchImpl = options?.fetch ?? globalThis.fetch;
 	const retryWait = options?.retryWait ?? ((delayMs: number) => Bun.sleep(delayMs));
 	const isCodexResponses = compactionV2Api(model) === "openai-codex-responses" || model.provider === "openai-codex";
 	const codexMetadata =
@@ -293,7 +290,7 @@ export async function requestCompactionV2Streaming(
 	let lastError: Error | undefined;
 
 	for (let attempt = 0; attempt <= V2_COMPACTION_MAX_RETRIES; attempt++) {
-		const timeoutSignal = withRequestTimeout(signal, options?.timeoutMs ?? V2_COMPACTION_TIMEOUT_MS);
+		const timeoutSignal = ptree.combineSignals(signal, options?.timeoutMs ?? V2_COMPACTION_TIMEOUT_MS);
 		try {
 			return await attemptCompactionV2Streaming(endpoint, apiKey, model, request, fetchImpl, timeoutSignal, {
 				codexMetadata,
@@ -368,14 +365,17 @@ async function attemptCompactionV2Streaming(
 		return collectCompactionV2Events(eventStream, request);
 	}
 
-	const response = await fetchImpl(endpoint, {
-		method: "POST",
-		headers: buildCompactionV2Headers(model, apiKey, request, options.codexMetadata),
-		body: stringifyJson(body),
-		signal,
-	});
-
-	if (!response.ok) {
+	const sendV2Compaction = (input: unknown[]): Promise<Response> =>
+		fetchImpl(endpoint, {
+			method: "POST",
+			headers: buildCompactionV2Headers(model, apiKey, request, options.codexMetadata),
+			body: stringifyJson({
+				...body,
+				input: [...input, COMPACTION_TRIGGER_ITEM],
+			}),
+			signal,
+		});
+	const failV2Compaction = async (response: Response): Promise<never> => {
 		const cause = await captureOpenAIHttpError(response);
 		logger.warn("V2 remote compaction failed", {
 			endpoint,
@@ -391,6 +391,43 @@ async function attemptCompactionV2Streaming(
 				cause,
 			},
 		);
+	};
+	let response = await sendV2Compaction(request.input);
+	// Turns stored before their credential was recorded still replay
+	// caller-bound `encrypted_content` no build-time comparison can drop.
+	// On the server's foreign-caller 400, resend once with every encrypted
+	// reasoning blob stripped — before any output is consumed, so the
+	// single response stream stays intact. A second failure (or any other
+	// error, or a request with nothing to strip) surfaces normally.
+	if (!response.ok) {
+		const cause = await captureOpenAIHttpError(response);
+		const failure = new AIError.ProviderHttpError(
+			`V2 remote compaction failed (${response.status} ${response.statusText})`,
+			response.status,
+			{
+				headers: response.headers,
+				cause,
+			},
+		);
+		const stripped = stripEncryptedReasoningResponseItems(request.input as Array<Record<string, unknown>>);
+		// Match the unwrapped capture: it carries the status, the decoded
+		// body, and the server's wording; the wrapper above has none of those.
+		if (!isForeignEncryptedReasoningError(cause) || stripped.length === request.input.length) {
+			logger.warn("V2 remote compaction failed", {
+				endpoint,
+				status: response.status,
+				statusText: response.statusText,
+				errorText: cause.captured.bodyText ?? "",
+			});
+			throw failure;
+		}
+		logger.debug("V2 remote compaction foreign encrypted reasoning rejected; retrying stripped", {
+			endpoint,
+			model: model.id,
+			provider: model.provider,
+		});
+		response = await sendV2Compaction(stripped);
+		if (!response.ok) await failV2Compaction(response);
 	}
 
 	return collectCompactionV2Output(response, request);
@@ -416,7 +453,16 @@ function buildCompactionV2Headers(
 			: {
 					"content-type": "application/json",
 					...resolveOpenAIRequestSetup(
-						{ provider: model.provider, id: model.id, baseUrl: model.baseUrl, headers: model.headers },
+						{
+							provider: model.provider,
+							id: model.id,
+							baseUrl: model.baseUrl,
+							headers: model.headers,
+							compat: {
+								sessionHeader:
+									model.compat && "sessionHeader" in model.compat ? model.compat.sessionHeader : undefined,
+							},
+						},
 						{ apiKey, messages: [], sessionId: request.sessionId ?? routingSessionId, promptCacheSessionId },
 					).headers,
 				};
@@ -545,7 +591,7 @@ function finishCompactionV2Collection(
 
 	const compactionItem = state.compactionItems[0];
 	const { replacementHistory, retainedImageCount } = buildCompactionV2ReplacementHistory(
-		request.input,
+		request.retainedUserItems,
 		compactionItem,
 		request.retainedMessageBudget,
 	);
@@ -597,6 +643,14 @@ function handleCompactionV2Event(
 	if (type === "response.failed" || type === "response.incomplete") {
 		throw new Error(formatCompactionV2Failure(event, type));
 	}
+
+	// A standalone `error` event terminates the stream. Keep its status so a
+	// deterministic 4xx (e.g. context_too_large) is not retried as a dropped stream.
+	if (type === "error") {
+		const message = formatCompactionV2Failure(event, type);
+		const status = numberField(event, "status");
+		throw status === undefined ? new Error(message) : new AIError.ProviderHttpError(message, status);
+	}
 }
 
 function parseCompactionV2Usage(event: Record<string, unknown>): CompactionV2Usage | undefined {
@@ -629,8 +683,9 @@ function formatCompactionV2Failure(event: Record<string, unknown>, type: string)
 		: response && isRecord(response.error)
 			? response.error
 			: undefined;
-	const message = error ? stringField(error, "message") : undefined;
-	const code = error ? (stringField(error, "code") ?? stringField(error, "type")) : undefined;
+	// Responses `error` events carry code/message at the top level.
+	const message = stringField(error ?? event, "message");
+	const code = error ? (stringField(error, "code") ?? stringField(error, "type")) : stringField(event, "code");
 	return `V2 compaction stream ${type}${code ? ` (${code})` : ""}${message ? `: ${message}` : ""}`;
 }
 
@@ -665,15 +720,14 @@ function isRetryableCompactionError(error: Error): boolean {
 // Replacement History
 // ============================================================================
 
-/** Build Codex-style V2 replacement history from prompt input plus compaction output. */
+/** Build Codex-style V2 replacement history from retention candidates plus compaction output. */
 export function buildCompactionV2ReplacementHistory(
 	input: unknown[],
 	compactionItem: Record<string, unknown>,
 	retainedMessageBudget = V2_RETAINED_MESSAGE_TOKEN_BUDGET,
 ): { replacementHistory: Array<Record<string, unknown>>; retainedImageCount: number } {
 	const retained = input.filter(
-		(item): item is Record<string, unknown> =>
-			isRecord(item) && isRetainedForCompactionV2(item) && shouldKeepCompactionV2HistoryItem(item),
+		(item): item is Record<string, unknown> => isRecord(item) && isRetainedUserMessageForCompactionV2(item),
 	);
 	const replacementHistory = truncateRetainedMessagesForCompactionV2(
 		retained,
@@ -684,17 +738,11 @@ export function buildCompactionV2ReplacementHistory(
 	return { replacementHistory, retainedImageCount };
 }
 
-function isRetainedForCompactionV2(item: Record<string, unknown>): boolean {
-	if (item.type !== "message") return false;
-	const role = stringField(item, "role");
-	return role === "user" || role === "developer" || role === "system";
-}
-
-function shouldKeepCompactionV2HistoryItem(item: Record<string, unknown>): boolean {
-	if (item.type !== "message") return item.type === "compaction";
-	const role = stringField(item, "role");
-	if (role !== "user") return false;
-	return !isContextualUserMessage(item);
+function isRetainedUserMessageForCompactionV2(item: Record<string, unknown>): boolean {
+	// Responses input messages may omit `type`: omp serializes turns as
+	// `{ role, content }`, which the API reads as `type: "message"`.
+	const isMessage = item.type === "message" || (item.type === undefined && typeof item.role === "string");
+	return isMessage && item.role === "user" && !isContextualUserMessage(item);
 }
 
 function isContextualUserMessage(item: Record<string, unknown>): boolean {
@@ -809,16 +857,59 @@ function approxTokenCount(text: string): number {
 	return Math.ceil(text.length / 4);
 }
 
+/**
+ * Drop caller-bound `reasoning` items (`encrypted_content` is issued to the
+ * credential that produced the turn) from already-serialized Responses
+ * history. Shared by the history builders and the V2/V1 stripped send
+ * retries. Message, function-call, and custom-tool items replay untouched.
+ */
+export function stripEncryptedReasoningResponseItems(
+	items: Array<Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+	return items.filter(item => {
+		if (!item || typeof item !== "object") return true;
+		return !(item.type === "reasoning" && typeof item.encrypted_content === "string");
+	});
+}
+
+/**
+ * Whether a preserved compaction prefix must lose its caller-bound reasoning
+ * before replaying under `servingCredentialId`. An unknown serving
+ * credential can never prove ownership of another caller's blobs, so it
+ * strips everything; a known one replays a prefix stored under the same row
+ * (or a prefix that never recorded its row) untouched.
+ */
+export function shouldStripCompactionPrefixItems(
+	servingCredentialId: number | undefined,
+	recordedCredentialId: number | undefined,
+): boolean {
+	return (
+		servingCredentialId === undefined ||
+		(recordedCredentialId !== undefined && recordedCredentialId !== servingCredentialId)
+	);
+}
+
 // ============================================================================
 // Preserve Data
 // ============================================================================
 
-/** Store V2 replacement history in the OpenAI remote-compaction preserve slot. */
-export function storeCompactionV2PreserveData(response: CompactionV2Response, model: Model): Record<string, unknown> {
+/**
+ * Store V2 replacement history in the OpenAI remote-compaction preserve slot.
+ * `credentialId` records the credential row that served the compaction, so a
+ * later compaction under a different credential can drop caller-bound
+ * `encrypted_content` carried in the preserved prefix instead of replaying it
+ * to a caller it was not issued to.
+ */
+export function storeCompactionV2PreserveData(
+	response: CompactionV2Response,
+	model: Model,
+	credentialId?: number,
+): Record<string, unknown> {
 	return {
 		[OPENAI_REMOTE_COMPACTION_PRESERVE_KEY]: {
 			version: "v2",
 			provider: model.provider,
+			...(credentialId !== undefined ? { credentialId } : {}),
 			replacementHistory: response.replacementHistory,
 			usedTokens: response.usedTokens,
 			usage: response.usage,
@@ -828,19 +919,27 @@ export function storeCompactionV2PreserveData(response: CompactionV2Response, mo
 }
 
 /** Retrieve preserved OpenAI replacement history that V2 can extend. */
-export function getCompactionV2PreserveData(
-	preserveData: Record<string, unknown> | undefined,
-): { provider: string; replacementHistory: Array<Record<string, unknown>>; usedTokens: number } | undefined {
+export function getCompactionV2PreserveData(preserveData: Record<string, unknown> | undefined):
+	| {
+			provider: string;
+			replacementHistory: Array<Record<string, unknown>>;
+			usedTokens: number;
+			/** Credential row that served the compaction which stored this history, when recorded. */
+			credentialId?: number;
+	  }
+	| undefined {
 	const candidate = preserveData?.[OPENAI_REMOTE_COMPACTION_PRESERVE_KEY];
 	if (!isRecord(candidate)) return undefined;
 	const provider = stringField(candidate, "provider");
 	if (!provider) return undefined;
 	if (!Array.isArray(candidate.replacementHistory)) return undefined;
+	const credentialId = numberField(candidate, "credentialId");
 
 	return {
 		provider,
 		replacementHistory: candidate.replacementHistory as Array<Record<string, unknown>>,
 		usedTokens: numberField(candidate, "usedTokens") ?? 0,
+		...(credentialId !== undefined ? { credentialId } : {}),
 	};
 }
 

@@ -1,11 +1,21 @@
+import type { CollabUiRequest } from "@oh-my-pi/pi-wire";
 import { SendHorizontal, Square } from "lucide-react";
 import type { KeyboardEvent, ReactNode, RefObject } from "react";
-import { useCallback, useLayoutEffect, useRef, useState } from "react";
-import type { GuestClient, GuestSnapshot } from "../../lib/client";
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import type { ConnectionPhase, GuestClient, GuestSnapshot } from "../../lib/client";
 
 export interface ComposerProps {
 	client: GuestClient;
-	snapshot: GuestSnapshot;
+	phase: ConnectionPhase;
+	readOnly: boolean;
+	/** Pending host-side UI request this guest can answer. */
+	uiRequest: CollabUiRequest | null;
+	/** Host agent turn in flight. */
+	working: boolean;
+	/** Prompts queued behind the running turn. */
+	queuedMessageCount: number;
+	/** Our last prompt the host refused, to put back into the cleared composer. */
+	refusedDraft: GuestSnapshot["refusedDraft"];
 }
 
 /** Textarea metrics: line-height 20px + 8px vertical padding × 2 (kept in sync with shell.css). */
@@ -108,17 +118,42 @@ function AskEditor({ prefill, onSubmit }: AskEditorProps): ReactNode {
 	);
 }
 
-export function Composer({ client, snapshot }: ComposerProps): ReactNode {
+/**
+ * Text after the host handed back a refused prompt: the refused text first,
+ * then anything typed since the send cleared the composer (the TUI guest's
+ * `restoreRefusedDraft` order).
+ */
+export function withRefusedDraft(refused: string, current: string): string {
+	return current ? `${refused}\n${current}` : refused;
+}
+
+/** Memoized on its snapshot fields, so streaming frames that leave them untouched skip it. */
+export const Composer = memo(function Composer({
+	client,
+	phase,
+	readOnly,
+	uiRequest,
+	working,
+	queuedMessageCount,
+	refusedDraft,
+}: ComposerProps): ReactNode {
 	const [text, setText] = useState("");
+	// Seeded with the draft present at mount so a remount never restores an
+	// already-restored refusal a second time. Compared by identity: each
+	// refusal is a new object, even when a rejoin swaps in a new client.
+	const restoredDraft = useRef(refusedDraft);
+	useEffect(() => {
+		if (!refusedDraft || restoredDraft.current === refusedDraft) return;
+		restoredDraft.current = refusedDraft;
+		setText(current => withRefusedDraft(refusedDraft.text, current));
+	}, [refusedDraft]);
 	const taRef = useRef<HTMLTextAreaElement | null>(null);
 	const { composingRef, onCompositionStart, onCompositionEnd } = useCompositionGuard();
 
-	const live = snapshot.phase === "live";
-	const readOnly = snapshot.readOnly;
-	const uiRequest = snapshot.uiRequest;
+	const live = phase === "live";
 	const canPrompt = live && !readOnly;
-	const busy = snapshot.working;
-	const queued = snapshot.state?.queuedMessageCount ?? 0;
+	const busy = working;
+	const queued = queuedMessageCount;
 	const canSend = canPrompt && text.trim().length > 0;
 
 	useLayoutEffect(() => {
@@ -208,10 +243,10 @@ export function Composer({ client, snapshot }: ComposerProps): ReactNode {
 					onCompositionEnd={onCompositionEnd}
 					placeholder={
 						readOnly
-							? "read-only session — watching only"
+							? "Read-only session — watching only"
 							: live
-								? "prompt the host agent…"
-								: "waiting for session…"
+								? "Prompt the host agent…"
+								: "Waiting for the session…"
 					}
 					disabled={!canPrompt}
 					rows={1}
@@ -247,4 +282,4 @@ export function Composer({ client, snapshot }: ComposerProps): ReactNode {
 			</div>
 		</div>
 	);
-}
+});

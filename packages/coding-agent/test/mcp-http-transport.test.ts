@@ -6,7 +6,10 @@ import { postmortem } from "@oh-my-pi/pi-utils";
 
 const encoder = new TextEncoder();
 const REQUEST_TIMEOUT_MS = 50;
-const GUARD_TIMEOUT_MS = 500;
+// Load-robust deadline for tests that are not about timeouts: a busy runner
+// must not turn a healthy (but slow) response into a timeout failure.
+const NON_TIMEOUT_TEST_TIMEOUT_MS = 5_000;
+const GUARD_TIMEOUT_MS = 5_000;
 
 let server: Bun.Server<undefined> | null = null;
 
@@ -19,7 +22,7 @@ afterEach(() => {
 	server = null;
 });
 
-async function connectedTransport(timeout = REQUEST_TIMEOUT_MS): Promise<HttpTransport> {
+async function connectedTransport(timeout = NON_TIMEOUT_TEST_TIMEOUT_MS): Promise<HttpTransport> {
 	if (!server) throw new Error("Test server was not started");
 	const transport = new HttpTransport({
 		type: "http",
@@ -101,6 +104,47 @@ describe("MCP Streamable HTTP initialization", () => {
 
 		expect(requests).toEqual(["initialize", "notifications/initialized", "GET"]);
 		await connection.transport.close();
+	});
+
+	it("aborts a stalled GET SSE listener start on the caller signal when timeouts are disabled", async () => {
+		const listenerStarted = Promise.withResolvers<void>();
+		server = Bun.serve({
+			port: 0,
+			async fetch(req) {
+				if (req.method === "GET") {
+					listenerStarted.resolve();
+					// Never answers: with timeouts disabled only the caller signal can end the handshake.
+					return Promise.withResolvers<Response>().promise;
+				}
+				if (req.method === "DELETE") return new Response(null, { status: 204 });
+				const body = (await req.json()) as { id?: string | number; method: string };
+				if (body.method === "initialize") {
+					const response = {
+						jsonrpc: "2.0",
+						id: body.id,
+						result: {
+							protocolVersion: "2025-11-25",
+							capabilities: {},
+							serverInfo: { name: "stalled-listener", version: "1.0.0" },
+						},
+					};
+					return new Response(JSON.stringify(response), {
+						headers: { "Content-Type": "application/json", "Mcp-Session-Id": "stalled-listener" },
+					});
+				}
+				return new Response(null, { status: 202 });
+			},
+		});
+
+		const controller = new AbortController();
+		const connection = connectToServer(
+			"stalled-listener",
+			{ type: "http", url: `http://127.0.0.1:${server.port}/mcp`, timeout: 0 },
+			{ signal: controller.signal },
+		);
+		await listenerStarted.promise;
+		controller.abort();
+		await expect(withPendingGuard(connection, "handshake")).rejects.toMatchObject({ name: "AbortError" });
 	});
 });
 
@@ -233,7 +277,7 @@ describe("MCP Streamable HTTP transport timeouts", () => {
 				});
 			},
 		});
-		const transport = await connectedTransport();
+		const transport = await connectedTransport(REQUEST_TIMEOUT_MS);
 
 		await expect(withPendingGuard(transport.request("tools/list"), "request")).rejects.toMatchObject({
 			transport: "http",
@@ -366,29 +410,11 @@ describe("MCP Streamable HTTP transport timeouts", () => {
 				});
 			},
 		});
-		const transport = await connectedTransport();
+		const transport = await connectedTransport(REQUEST_TIMEOUT_MS);
 
 		await expect(withPendingGuard(transport.notify("notifications/initialized"), "notify")).rejects.toThrow(
 			`Notify timeout after ${REQUEST_TIMEOUT_MS}ms`,
 		);
-	});
-
-	it("still resolves normal JSON response bodies", async () => {
-		server = Bun.serve({
-			port: 0,
-			fetch() {
-				return Response.json({
-					jsonrpc: "2.0",
-					id: 1,
-					result: { tools: [{ name: "fast", inputSchema: { type: "object" } }] },
-				});
-			},
-		});
-		const transport = await connectedTransport();
-
-		await expect(withPendingGuard(transport.request<ToolList>("tools/list"), "request")).resolves.toEqual({
-			tools: [{ name: "fast", inputSchema: { type: "object" } }],
-		});
 	});
 
 	it("close aborts and drains an in-flight SSE POST request", async () => {
@@ -537,7 +563,7 @@ describe("MCP Streamable HTTP transport timeouts", () => {
 				);
 			},
 		});
-		const transport = await connectedTransport();
+		const transport = await connectedTransport(REQUEST_TIMEOUT_MS);
 		transport.onNotification = method => {
 			if (method === "notifications/progress") notificationReceived.resolve();
 		};
@@ -566,7 +592,7 @@ describe("MCP Streamable HTTP transport timeouts", () => {
 				});
 			},
 		});
-		const transport = await connectedTransport();
+		const transport = await connectedTransport(REQUEST_TIMEOUT_MS);
 		const unhandled: unknown[] = [];
 		const onUnhandled = (reason: unknown) => unhandled.push(reason);
 		process.on("unhandledRejection", onUnhandled);
@@ -587,41 +613,6 @@ describe("MCP Streamable HTTP transport timeouts", () => {
 });
 
 describe("MCP Streamable HTTP protocol version header", () => {
-	it("omits MCP-Protocol-Version until the version is negotiated", async () => {
-		const seen: { version: string | null; present: boolean } = { version: null, present: true };
-		server = Bun.serve({
-			port: 0,
-			fetch(req) {
-				seen.present = req.headers.has("MCP-Protocol-Version");
-				seen.version = req.headers.get("MCP-Protocol-Version");
-				return Response.json({ jsonrpc: "2.0", id: 1, result: {} });
-			},
-		});
-		const transport = await connectedTransport();
-
-		// No setProtocolVersion yet: this stands in for the initialize request,
-		// which must not carry the header before negotiation completes.
-		await withPendingGuard(transport.request("initialize"), "request");
-		expect(seen.present).toBe(false);
-		expect(seen.version).toBeNull();
-	});
-
-	it("echoes the negotiated version on requests after setProtocolVersion", async () => {
-		const seen: { version: string | null } = { version: null };
-		server = Bun.serve({
-			port: 0,
-			fetch(req) {
-				seen.version = req.headers.get("MCP-Protocol-Version");
-				return Response.json({ jsonrpc: "2.0", id: 1, result: {} });
-			},
-		});
-		const transport = await connectedTransport();
-		transport.setProtocolVersion("2025-06-18");
-
-		await withPendingGuard(transport.request("tools/list"), "request");
-		expect(seen.version).toBe("2025-06-18");
-	});
-
 	it("never lets a configured MCP-Protocol-Version reach the server", async () => {
 		const seen: { pre: string | null; post: string | null } = { pre: null, post: null };
 		server = Bun.serve({
@@ -635,7 +626,7 @@ describe("MCP Streamable HTTP protocol version header", () => {
 		const transport = new HttpTransport({
 			type: "http",
 			url: `http://127.0.0.1:${server.port}/mcp`,
-			timeout: REQUEST_TIMEOUT_MS,
+			timeout: NON_TIMEOUT_TEST_TIMEOUT_MS,
 			headers: { "MCP-Protocol-Version": "1999-01-01" },
 		});
 		await transport.connect();
@@ -670,7 +661,7 @@ describe("MCP Streamable HTTP POST response resumption", () => {
 				return stalledBodyResponse("unavailable", { status: 503 });
 			},
 		});
-		const transport = await connectedTransport();
+		const transport = await connectedTransport(REQUEST_TIMEOUT_MS);
 		try {
 			await expect(
 				withPendingGuard(transport.request("tools/call"), "stalled resume error body"),
@@ -699,7 +690,7 @@ describe("MCP Streamable HTTP POST response resumption", () => {
 				return new Response("expired", { status: 401 });
 			},
 		});
-		const transport = await connectedTransport();
+		const transport = await connectedTransport(REQUEST_TIMEOUT_MS);
 		transport.onAuthError = () => refresh.promise;
 		try {
 			await expect(

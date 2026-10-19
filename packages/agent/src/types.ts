@@ -24,6 +24,7 @@ import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
 import type { HarmonyAuditEvent } from "@oh-my-pi/pi-ai/utils/harmony-leak";
 import type { AppendOnlyContextManager } from "./append-only-context";
 import type { AgentRunCoverage, AgentRunSummary } from "./run-collector";
+import type { SentToolDefinitions } from "./sent-tool-definitions";
 import type { AgentTelemetryConfig } from "./telemetry";
 
 /** Stream function - can return sync or Promise for async config lookup */
@@ -68,6 +69,12 @@ export interface AgentTurnEndContext {
 	message: AgentMessage;
 	/** Tool results produced by this turn, already paired with `message` in the live context. */
 	toolResults: ToolResultMessage[];
+	/**
+	 * Passive model-visible messages appended after the tool results at this
+	 * boundary. The agent loop always sends an array (possibly empty);
+	 * absent is equivalent to empty for hosts that construct the context.
+	 */
+	additionalMessages?: AgentMessage[];
 	/** True when the current tool-loop batch is continuing without yielding to post-turn steering. */
 	willContinue: boolean;
 }
@@ -153,7 +160,38 @@ export interface SteeringQueueState {
 	queued: boolean;
 	/** Best-effort origin used only to word synthetic skipped-tool results. */
 	source?: SteeringInterruptSource;
+	/**
+	 * Number of messages currently sitting in the steering queue.
+	 *
+	 * Occupancy, NOT the batch size a boundary dequeue would take: a host in
+	 * one-at-a-time steering mode still reports every queued message here. The
+	 * provider-wait watcher snapshots this count when it arms and only cancels
+	 * the request once a later peek reports a strictly larger count, so a
+	 * message left queued from an earlier turn cannot pass for a new arrival
+	 * and cannot blind the watcher to the steer typed after it.
+	 *
+	 * Omit it when the queue cannot count itself; the watcher then degrades to
+	 * the boolean edge (empty once, then occupied).
+	 */
+	pending?: number;
 }
+
+/**
+ * What the loop would do, right now, with a steering message queued at this
+ * instant. Reported through {@link AgentLoopConfig.onQueuedSteerOutcome} as
+ * the loop moves between windows, from the same gates the interrupt machinery
+ * uses, so a host can tell the user what will actually happen.
+ * - "interrupt-model-call": a model call (or its preparation) has produced no
+ *   output and the steer watch is armed; the call is cancelled and re-issued
+ *   with the steer folded in.
+ * - "interrupt-wait": a tool batch still has an unfinished interruptible wait
+ *   that queued steering cuts short; the steer injects once the batch's other
+ *   tools finish.
+ * - "after-tools": a tool batch is running with nothing steering would cut
+ *   short; the steer injects at the batch boundary.
+ * - "after-response": the steer waits for the current response to finish.
+ */
+export type QueuedSteerOutcome = "interrupt-model-call" | "interrupt-wait" | "after-tools" | "after-response";
 
 /**
  * Configuration for the agent loop.
@@ -162,9 +200,14 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model;
 
 	/**
-	 * When to interrupt tool execution for steering messages.
-	 * - "immediate" = check after each tool call (default)
-	 * - "wait" = defer steering until the current turn completes
+	 * When a queued steering message may cut the current work short.
+	 * - "immediate" = cut interruptible waits short and raise the cooperative
+	 *   `steeringSignal` for other running tools, and cancel a provider request
+	 *   that has not streamed anything yet — still waiting or in retry backoff —
+	 *   so the loop re-issues it with the steer in context instead of parking
+	 *   the message (default)
+	 * - "wait" = let non-interruptible tools finish undisturbed; interruptible
+	 *   waits are still cut short, since they have no work to complete
 	 */
 	interruptMode?: "immediate" | "wait";
 
@@ -238,6 +281,9 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 */
 	transformProviderContext?: (context: Context, model: Model) => Context | Promise<Context>;
 
+	/** Remembers sent tool definitions to fill {@link Context.inactiveTools}. */
+	sentToolDefinitions?: SentToolDefinitions;
+
 	/**
 	 * Resolves the API key or resolver for the current model before each LLM call.
 	 *
@@ -249,28 +295,43 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	/**
 	 * Returns steering messages to inject into the conversation mid-run.
 	 *
-	 * Called at injection boundaries only (loop start and after a tool batch
-	 * fully settles), so dequeued messages are immediately injected. The
-	 * mid-batch interrupt poll uses {@link hasSteeringMessages} instead and
-	 * never consumes the queue.
+	 * Called at injection boundaries (loop start and after a tool batch fully
+	 * settles) and, additionally, right after steering cancelled a model call
+	 * that had streamed nothing — that drain empties the queue before the call
+	 * is re-issued, so the message cannot interrupt its own replacement. The
+	 * mid-batch interrupt poll and the provider-wait watch use
+	 * {@link hasSteeringMessages} instead and never consume the queue.
 	 */
 	getSteeringMessages?: (signal?: AbortSignal) => Promise<AgentMessage[]>;
 
 	/**
 	 * Peeks whether steering messages are queued, without consuming them.
 	 *
-	 * Polled while a tool batch runs (unless interruptMode is "wait") to decide
-	 * whether to abort in-flight and skip not-yet-started *interruptible* waits;
+	 * Polled while a tool batch runs (in "wait" mode, only when the batch holds an
+	 * interruptible tool) to decide whether to abort in-flight and skip
+	 * not-yet-started *interruptible* waits;
 	 * every other already-emitted call still executes and the message injects
-	 * at the batch boundary. The queue keeps
-	 * owning its messages until the loop reaches the next injection boundary and
-	 * dequeues via {@link getSteeringMessages} — so callers can still cancel or
-	 * restore queued messages while in-flight tools settle, and an external
-	 * abort in that window leaves the queue intact for a post-abort continue.
+	 * at the batch boundary. Watched the same way while a model call is still
+	 * waiting on its first stream event: a request that has produced no output
+	 * is cancelled and re-issued with the steer folded in. The queue keeps
+	 * owning its messages until the loop reaches an injection boundary (or that
+	 * cancellation) and dequeues via {@link getSteeringMessages} — so callers
+	 * can still cancel or restore queued messages while in-flight tools settle,
+	 * and an external abort in either window leaves the queue intact for a
+	 * post-abort continue.
 	 *
 	 * Returning `true` is treated as user-originated steering for compatibility.
 	 * Return a {@link SteeringQueueState} when the queue can distinguish system
-	 * advisories from real user messages.
+	 * advisories from real user messages, and populate its
+	 * {@link SteeringQueueState.pending} occupancy count so the provider-wait
+	 * watch can tell a new arrival from a message that was already queued when
+	 * the request was issued.
+	 *
+	 * An asynchronous implementation must report the queue as it stood when it
+	 * was called (read it before the first `await`). The provider-wait watch
+	 * holds the request until this first answer arrives and uses it as the
+	 * baseline, so an answer read later would count a steer that arrived in the
+	 * meantime as already queued, and that steer would wait for the boundary.
 	 *
 	 * When omitted, steering never interrupts a running tool batch; queued
 	 * messages are still delivered at the next injection boundary.
@@ -278,18 +339,41 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	hasSteeringMessages?: () => boolean | SteeringQueueState | Promise<boolean | SteeringQueueState>;
 
 	/**
-	 * Wakes the in-flight tool interrupt watcher when a steering message is queued.
-	 * The callback must not consume the queue; the loop still calls
-	 * {@link hasSteeringMessages} before aborting and injects through
+	 * Wakes the loop's steering watchers — the in-flight tool interrupt watch and
+	 * the provider-wait watch — when a steering message is queued. The callback
+	 * must not consume the queue; the loop still calls
+	 * {@link hasSteeringMessages} before cancelling anything and injects through
 	 * {@link getSteeringMessages}.
+	 *
+	 * Implementations may (and the built-in `Agent` does) resolve *immediately*
+	 * while the queue is merely non-empty, so a resolution is not proof that
+	 * anything arrived. The provider-wait watch therefore re-peeks after every
+	 * resolution and throttles itself to the poll cadence when the count did
+	 * not grow, instead of resubscribing to an already-settled waiter.
 	 */
 	waitForSteeringMessages?: (signal?: AbortSignal) => Promise<void>;
+
+	/**
+	 * Called when live steering dequeues messages via {@link getSteeringMessages}
+	 * for the response being streamed. The loop records them in the transcript
+	 * after that response (or its tool batch); an abort before then leaves them
+	 * unrecorded for the host to requeue.
+	 */
+	onLiveSteeringTaken?: (messages: AgentMessage[]) => void;
+
+	/**
+	 * Notified whenever the outcome a newly queued steer would get changes
+	 * (see {@link QueuedSteerOutcome}). Synchronous and side-effect free on the
+	 * loop's side; hosts store the latest value for their queue acknowledgement.
+	 */
+	onQueuedSteerOutcome?: (outcome: QueuedSteerOutcome) => void;
 
 	/**
 	 * Peeks whether IRC messages should interrupt an interruptible waiting tool.
 	 *
 	 * Uses the same delivery rules as steering: the poll is non-consuming, only
-	 * runs for interruptible tools, and is ignored when interruptMode is "wait".
+	 * runs for interruptible tools, and cuts them short even when interruptMode
+	 * is "wait".
 	 * The host owns message injection at the next boundary.
 	 */
 	hasIrcInterrupts?: () => boolean | Promise<boolean>;
@@ -298,11 +382,24 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * process) is queued for aside injection at the next boundary.
 	 *
 	 * Same rules as {@link hasIrcInterrupts}: non-consuming, only cuts
-	 * *interruptible* waits short, ignored when interruptMode is "wait". Without
-	 * it a completion notice sits behind an hour-long `hub wait` that the agent
-	 * would have abandoned had it seen the notice.
+	 * *interruptible* waits short, in either interruptMode. Without
+	 * it a completion notice sits behind an hour-long `wait` that the agent
+	 * would have abandoned had it seen the notice. Unlike a peer IRC it never
+	 * raises {@link ToolCallContext.steeringSignal}: a queued completion must
+	 * not push ordinary foreground work (auto-background bash/eval) into the
+	 * background.
 	 */
 	hasBackgroundCompletions?: () => boolean | Promise<boolean>;
+	/**
+	 * Peeks whether a passive aside (an extension or user message queued with
+	 * `deliverAs: "aside"`) is waiting for injection at the next boundary.
+	 *
+	 * Same rules as {@link hasBackgroundCompletions}: non-consuming, ends only
+	 * *interruptible* waits, never raises {@link ToolCallContext.steeringSignal}.
+	 * The host still injects the aside once at the boundary; ordinary running
+	 * tools finish first.
+	 */
+	hasQueuedAsides?: () => boolean | Promise<boolean>;
 
 	/**
 	 * Returns follow-up messages to process after the agent would otherwise stop.
@@ -316,7 +413,8 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * Returns non-interrupting "aside" messages to inject at a step boundary.
 	 *
 	 * Polled after each tool batch (before the next LLM call) AND at the yield
-	 * check. Unlike steering, these NEVER abort in-flight tools — they are passive
+	 * check. Unlike steering, these never abort foreground tools (only an
+	 * interruptible `wait` ends early, via the peek hooks) — they are passive
 	 * notifications (e.g. background-job completions, late LSP diagnostics) that
 	 * should reach the model between requests without waiting for the agent to
 	 * fully stop. Returned messages are appended to the context with normal
@@ -333,7 +431,11 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 
 	/**
 	 * Provides tool execution context, resolved per tool call.
-	 * Use for late-bound UI or session state access.
+	 * Use for late-bound UI or session state access. The loop passes the tool
+	 * call's {@link ToolCallContext}; hosts that support passive tool context
+	 * surface its `addAdditionalContext` sink as
+	 * {@link AgentToolContext.addAdditionalContext}. The returned object is
+	 * handed to the tool as-is.
 	 */
 	getToolContext?: (toolCall?: ToolCallContext) => AgentToolContext | undefined;
 
@@ -411,6 +513,12 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * model's text output back into canonical `toolCall` blocks.
 	 */
 	dialect?: Dialect;
+	/**
+	 * Per-call owned-dialect resolver, read once per LLM call with the model
+	 * being requested. Authoritative when set: its return value (including
+	 * `undefined` = native tool calling) replaces the static {@link dialect}.
+	 */
+	getDialect?: (model: Model) => Dialect | undefined;
 	/**
 	 * When owned (in-band) tool calling is active and the model starts
 	 * fabricating a tool result inside its own turn, control how the loop reacts:
@@ -561,6 +669,14 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	transformAssistantMessage?: (message: AssistantMessage, signal?: AbortSignal) => Promise<void> | void;
 
 	/**
+	 * Declares that {@link transformAssistantMessage} never rewrites or removes a
+	 * tool call the model streamed (it may edit text or append new calls). Stream
+	 * speculation sessions and direct speculative candidates plan from streamed
+	 * calls, so they stay disabled under a transform unless this is set.
+	 */
+	transformAssistantMessagePreservesToolCalls?: boolean;
+
+	/**
 	 * Called after a tool finishes executing, before `tool_execution_end` and the
 	 * tool-result message are emitted.
 	 *
@@ -604,6 +720,13 @@ export interface ToolCallContext {
 	 * always safe (the message injects at the next batch boundary).
 	 */
 	steeringSignal?: AbortSignal;
+	/**
+	 * Loop-owned sink for passive context reported while this call executes.
+	 * Values join the call's context at the batch boundary and are injected
+	 * after the batch's tool results, in assistant tool-call order, before the
+	 * next provider request. Blank values are ignored.
+	 */
+	addAdditionalContext?: (context: string) => void;
 }
 
 /** A single tool-call content block emitted by an assistant message. */
@@ -698,7 +821,22 @@ export interface SpeculativeExecutionHost {
 		commitDefault: () => Promise<AgentToolResult<unknown>>,
 	): Promise<SpeculativeCommitDecision>;
 	discard?(context: SpeculativeDiscardContext): void | Promise<void>;
+	/**
+	 * Authorize a stream session to start effectful work (e.g. subagents) from
+	 * partially streamed arguments. The session owns that work and must abort it
+	 * when the finalized call is invalid, blocked, or changed. Hosts without this
+	 * hook deny every launch.
+	 */
+	authorizeLaunch?(context: SpeculativeLaunchContext): SpeculativeAuthorization | Promise<SpeculativeAuthorization>;
 	close?(reason: string): void | Promise<void>;
+}
+
+/** Effectful work a tool-owned stream session asks to start before its outer call dispatches. */
+export interface SpeculativeLaunchContext {
+	tool: SpeculativeToolReference;
+	toolCall: AgentToolCall;
+	/** Arguments the launch was planned from: the streamed prefix of the outer call. */
+	args: Readonly<Record<string, unknown>>;
 }
 
 export interface ToolSpeculationStreamContext {
@@ -747,6 +885,8 @@ export interface ToolSpeculationStreamSession {
 export interface SpeculativeOperationSink {
 	readonly maxInFlight: number;
 	admit(definition: SpeculativeChildDefinition): Promise<SpeculativeChildHandle | undefined>;
+	/** Host-gated permission for effectful stream work; see {@link SpeculativeExecutionHost.authorizeLaunch}. */
+	authorizeLaunch?(context: SpeculativeLaunchContext): Promise<SpeculativeAuthorization>;
 	discardChildren?(parentToolCallId: string, reason: string): void | Promise<void>;
 	close(reason: string): void | Promise<void>;
 }
@@ -806,11 +946,20 @@ export interface SpeculativeToolExecutionConfig {
  * written back to the tool-call block on the assistant message, and seen by
  * history, scheduling, execution events, and `tool.execute` alike. It is
  * ignored when `block` is true.
+ *
+ * Set `additionalContext` to attach passive model-visible context to this call.
+ * Non-empty values from a tool batch are injected in assistant tool-call order,
+ * a value identical to an earlier one in the batch only once,
+ * after every result settles and before the next provider request. It is
+ * dropped when the call is blocked or skipped, or when its final result is an
+ * error (including an approval denial raised by the tool's own gate). Within a
+ * call it follows any context the tool reported during execution.
  */
 export interface BeforeToolCallResult {
 	block?: boolean;
 	reason?: string;
 	args?: Record<string, unknown>;
+	additionalContext?: string;
 }
 
 /**
@@ -830,6 +979,13 @@ export interface AfterToolCallResult {
 	isError?: boolean;
 	/** If provided, replaces the contextually-useless flag carried with the tool result. */
 	useless?: boolean;
+	/**
+	 * Trusted post-tool instructions for the next provider request. Delivered
+	 * outside the tool result, after all calls in the batch settle. Unlike
+	 * `BeforeToolCallResult.additionalContext`, this is retained for error
+	 * results because the callback receives the finalized outcome.
+	 */
+	additionalContext?: string;
 }
 
 /** Context passed to `beforeToolCall`. */
@@ -978,6 +1134,16 @@ export type ToolApproval = ToolApprovalDecision | ((args: unknown) => ToolApprov
  * Apps can extend via declaration merging.
  */
 export interface AgentToolContext {
+	/**
+	 * Attach trusted, agent-authored instructions to the next provider request.
+	 * The host emits them after tool results with developer/system priority where
+	 * the selected transport supports it. Do not use this channel for raw tool
+	 * output, retrieved documents, web content, or other untrusted data; return
+	 * those through the ordinary tool result instead. Hosts populate it from
+	 * {@link ToolCallContext.addAdditionalContext} (or their own collector for
+	 * calls dispatched outside the loop); absent when the host has no sink.
+	 */
+	addAdditionalContext?(context: string): void;
 	/** Present only while the matching outer tool owns its finalized stream session. */
 	[SPECULATIVE_STREAM_SESSION]?: ToolSpeculationStreamSession;
 }
@@ -1032,6 +1198,12 @@ export interface AgentTool<
 	/** Short one-line summary used for tool discovery indexes. */
 	summary?: string;
 	/**
+	 * On-demand documentation topics (`topic → markdown`), readable as
+	 * `xd://<tool>/<topic>`. Lets a tool keep large sub-surfaces out of its
+	 * description and advertise only a one-line pointer per topic.
+	 */
+	docTopics?(): Readonly<Record<string, string>>;
+	/**
 	 * Concurrency mode for tool scheduling when multiple calls are in one turn.
 	 * - "shared": can run alongside other shared tools (default)
 	 * - "exclusive": runs alone; other tools wait until it finishes
@@ -1044,7 +1216,7 @@ export interface AgentTool<
 	 * before ordinary dispatch commits its result.
 	 */
 	speculation?: ToolSpeculationPolicy;
-	/** If true, argument validation errors are non-fatal: raw args are passed to execute() instead of returning an error to the LLM. */
+	/** If true, schema validation errors are non-fatal: raw args are passed to execute() instead of returning an error to the LLM. Malformed argument JSON still returns the parse error. */
 	lenientArgValidation?: boolean;
 	/**
 	 * Whether the agent loop may abort this tool mid-execution — or skip it
@@ -1055,7 +1227,7 @@ export interface AgentTool<
 	 * cleanly (e.g. `job` poll), so the abort surfaces the tool's current
 	 * snapshot rather than corrupting a side effect. Every other call runs to
 	 * completion even when steering is queued; the message lands at the next
-	 * batch boundary. Honored only when `interruptMode` is "immediate".
+	 * batch boundary. Honored in both `interruptMode`s.
 	 */
 	interruptible?: boolean | ((args: Partial<Static<TParameters>>) => boolean);
 	/**

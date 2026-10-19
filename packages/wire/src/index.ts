@@ -195,6 +195,27 @@ export type AgentEvent =
 	| { type: "auto_compaction_end"; aborted: boolean; willRetry: boolean; errorMessage?: string; skipped?: boolean }
 	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
+	/**
+	 * A provider-internal retry backoff is sleeping inside the SAME turn (the
+	 * provider re-issues the request itself). Distinct from `auto_retry_start`:
+	 * nothing was superseded, so a guest only swaps its status line for the
+	 * countdown instead of retracting the turn.
+	 */
+	| {
+			type: "provider_retry_wait_start";
+			/** Correlation id pairing this start with its `_end`. Monotonic per session. */
+			waitId: number;
+			/** Stream role that observed the backoff; only `main` waits render a turn countdown. */
+			role: "main" | "advisor" | "side";
+			delayMs: number;
+			model: string;
+			provider: string;
+			api: string;
+			/** Retry position, when the waiting retry loop tracks one. */
+			attempt?: number;
+			maxAttempts?: number;
+	  }
+	| { type: "provider_retry_wait_end"; aborted: boolean; waitId: number }
 	| { type: "thinking_level_changed"; thinkingLevel?: string };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -261,8 +282,12 @@ export interface AgentProgress {
 	lastIntent?: string;
 	currentTool?: string;
 	currentToolArgs?: string;
+	/** Argument key selected for the display preview, when known. */
+	currentToolArgsKey?: string;
+	/** Intent the model attached to the current call; undefined when that call carried none. */
+	currentToolIntent?: string;
 	currentToolStartMs?: number;
-	recentTools: { tool: string; args: string; endMs: number }[];
+	recentTools: { tool: string; args: string; argsKey?: string; intent?: string; isError?: boolean; endMs: number }[];
 	recentOutput: string[];
 	toolCount: number;
 	requests: number;
@@ -377,7 +402,13 @@ export type HostFrame =
 	/** Targeted reply to fetch-transcript; `text` is decoded JSONL from `fromByte`, `newSize` the next offset base. */
 	| { t: "transcript"; reqId: number; text: string; newSize: number; error?: string }
 	| { t: "bye"; reason: string }
-	| { t: "error"; message: string };
+	/**
+	 * `refused` marks a guest prompt the host's `before_user_message` gate
+	 * refused: it is targeted at the submitting peer only and hands that peer
+	 * its own submission back so the guest can restore the draft. `message`
+	 * is then the handler's safe notice and never contains the refused text.
+	 */
+	| { t: "error"; message: string; refused?: { text: string; images?: ImageContent[] } };
 
 export type WireFrame = GuestFrame | HostFrame;
 
@@ -393,8 +424,12 @@ export type WireFrame = GuestFrame | HostFrame;
  *   answered by the `ui-response` guest frame. Guests that predate the
  *   grammar would silently drop `ui-request` (asks hang forever on the
  *   host), so they must be rejected at hello.
+ * - `4`: hosts replicate `provider_retry_wait_start`/`provider_retry_wait_end`
+ *   agent events (a provider-internal retry backoff inside one turn). Guests
+ *   that predate them have no handler for the type, so they must be rejected
+ *   at hello rather than fed an event they cannot dispatch.
  */
-export const COLLAB_PROTO = 3;
+export const COLLAB_PROTO = 4;
 
 /** Parameter key used for intent tracing (e.g. prompt explanation/reasoning) */
 export const INTENT_FIELD = "i";
@@ -444,3 +479,4 @@ export type RelayControlToGuest = { t: "room-closed" };
 export type RelayControlMessage = RelayControlToHost | RelayControlToGuest;
 
 export * from "./stream";
+export * from "./tsp";

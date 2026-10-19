@@ -94,6 +94,8 @@ export function streamOpenAIAnthropicShim(
 					repetitionPenalty: options?.repetitionPenalty,
 					maxTokens: options?.maxTokens ?? model.maxTokens ?? undefined,
 					signal: options?.signal,
+					operationTimeoutMs: options?.operationTimeoutMs,
+					operationDeadlineAt: options?.operationDeadlineAt,
 					headers: mergedHeaders,
 					cacheRetention: config.forwardCacheOptions ? options?.cacheRetention : undefined,
 					metadata: config.forwardCacheOptions ? options?.metadata : undefined,
@@ -103,6 +105,7 @@ export function streamOpenAIAnthropicShim(
 					onResponse: options?.onResponse,
 					onSseEvent: options?.onSseEvent,
 					fetch: options?.fetch,
+					providerRetryWait: options?.providerRetryWait,
 					thinkingEnabled,
 					thinkingBudgetTokens: thinkingBudget,
 					reasoning: config.anthropicThinkingMode ? reasoningEffort : undefined,
@@ -134,6 +137,8 @@ export function streamOpenAIAnthropicShim(
 					repetitionPenalty: options?.repetitionPenalty,
 					maxTokens: options?.maxTokens ?? model.maxTokens ?? undefined,
 					signal: options?.signal,
+					operationTimeoutMs: options?.operationTimeoutMs,
+					operationDeadlineAt: options?.operationDeadlineAt,
 					headers: mergedHeaders,
 					cacheRetention: config.forwardCacheOptions ? options?.cacheRetention : undefined,
 					metadata: config.forwardCacheOptions ? options?.metadata : undefined,
@@ -143,10 +148,12 @@ export function streamOpenAIAnthropicShim(
 					onResponse: options?.onResponse,
 					onSseEvent: options?.onSseEvent,
 					fetch: options?.fetch,
+					providerRetryWait: options?.providerRetryWait,
 					reasoning: reasoningEffort,
 					toolChoice: options?.toolChoice,
 					serviceTier: options?.serviceTier,
 					disableReasoning: options?.disableReasoning,
+					waitForTerminalDrain: options?.waitForTerminalDrain,
 				});
 
 				for await (const event of innerStream) {

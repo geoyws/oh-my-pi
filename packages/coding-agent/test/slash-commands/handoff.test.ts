@@ -1,9 +1,6 @@
 import { describe, expect, it, vi } from "bun:test";
 import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
-import {
-	ACP_BUILTIN_SLASH_COMMANDS,
-	executeAcpBuiltinSlashCommand,
-} from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
+import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
 import type { SlashCommandRuntime } from "@oh-my-pi/pi-coding-agent/slash-commands/types";
 
 function acpRuntime({
@@ -22,8 +19,10 @@ function acpRuntime({
 		return handoffResult;
 	});
 	const output = vi.fn();
+	// Admitting `before_user_message` gate: refusal is covered in user-message-refusal.test.ts.
+	const gateUserMessage = vi.fn(async () => {});
 	const runtime = {
-		session: { isStreaming, isGeneratingHandoff, handoff },
+		session: { isStreaming, isGeneratingHandoff, handoff, gateUserMessage },
 		output,
 	} as unknown as SlashCommandRuntime;
 	return { handoff, output, runtime };
@@ -114,11 +113,5 @@ describe("/handoff dispatch (ACP)", () => {
 		const h = acpRuntime({ handoffError: new Error("Nothing to hand off (no messages yet)") });
 		await executeAcpBuiltinSlashCommand("/handoff", h.runtime);
 		expect(h.output).toHaveBeenCalledWith("Handoff failed: Nothing to hand off (no messages yet)");
-	});
-
-	it("is advertised with the focus hint and the ACP description", () => {
-		const advertised = ACP_BUILTIN_SLASH_COMMANDS.find(c => c.name === "handoff");
-		expect(advertised?.input?.hint).toBe("[focus instructions]");
-		expect(advertised?.description).toBe("Summarize the session into a handoff document and compact in place");
 	});
 });

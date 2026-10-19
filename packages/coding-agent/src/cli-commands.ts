@@ -38,6 +38,11 @@ export const commands: CommandEntry[] = [
 		help: commandHelp.acpHelp,
 	},
 	{
+		name: "auth",
+		load: () => import("./commands/auth").then(m => m.default),
+		help: commandHelp.authHelp,
+	},
+	{
 		name: "auth-broker",
 		load: () => import("./commands/auth-broker").then(m => m.default),
 		help: commandHelp.authBrokerHelp,
@@ -51,6 +56,11 @@ export const commands: CommandEntry[] = [
 		name: "agents",
 		load: () => import("./commands/agents").then(m => m.default),
 		help: commandHelp.agentsHelp,
+	},
+	{
+		name: "anonymize",
+		load: () => import("./commands/anonymize").then(m => m.default),
+		help: commandHelp.anonymizeHelp,
 	},
 	{
 		name: "bench",
@@ -156,6 +166,11 @@ export const commands: CommandEntry[] = [
 		help: commandHelp.joinHelp,
 	},
 	{
+		name: "login",
+		load: () => import("./commands/login").then(m => m.default),
+		help: commandHelp.loginHelp,
+	},
+	{
 		name: "models",
 		load: () => import("./commands/models").then(m => m.default),
 		help: commandHelp.modelsHelp,
@@ -165,6 +180,11 @@ export const commands: CommandEntry[] = [
 		load: () => import("./commands/plugin").then(m => m.default),
 		aliases: ["plugins"],
 		help: commandHelp.pluginHelp,
+	},
+	{
+		name: "predict",
+		load: () => import("./commands/predict").then(m => m.default),
+		help: commandHelp.predictHelp,
 	},
 	{
 		name: "ps",
@@ -177,9 +197,24 @@ export const commands: CommandEntry[] = [
 		help: commandHelp.sayHelp,
 	},
 	{
+		name: "clip",
+		load: () => import("./commands/clip").then(m => m.default),
+		help: commandHelp.clipHelp,
+	},
+	{
+		name: "play",
+		load: () => import("./commands/play").then(m => m.default),
+		help: commandHelp.playHelp,
+	},
+	{
 		name: "share",
 		load: () => import("./commands/share").then(m => m.default),
 		help: commandHelp.shareHelp,
+	},
+	{
+		name: "session",
+		load: () => import("./commands/session").then(m => m.default),
+		help: commandHelp.sessionHelp,
 	},
 	{
 		name: "setup",
@@ -200,6 +235,12 @@ export const commands: CommandEntry[] = [
 		name: "render",
 		load: () => import("./commands/render").then(m => m.default),
 		help: commandHelp.renderHelp,
+	},
+	{
+		name: "skill",
+		load: () => import("./commands/skill").then(m => m.default),
+		aliases: ["skills"],
+		help: commandHelp.skillHelp,
 	},
 	{
 		name: "ssh",
@@ -235,6 +276,11 @@ export const commands: CommandEntry[] = [
 		name: "token",
 		load: () => import("./commands/token").then(m => m.default),
 		help: commandHelp.tokenHelp,
+	},
+	{
+		name: "toks",
+		load: () => import("./commands/toks").then(m => m.default),
+		help: commandHelp.toksHelp,
 	},
 	{
 		name: "ttsr",
@@ -293,7 +339,7 @@ const RESERVED_TOP_LEVEL_WORDS: Record<string, string> = {
 	discover:
 		'`omp discover` is not a top-level command. Use `omp plugin discover [marketplace]` to browse available plugins, or run `omp launch discover` if you meant to send "discover" as a prompt.',
 	upgrade:
-		'`omp upgrade` is not a top-level command. Use `omp plugin upgrade [name@marketplace]` to upgrade plugins, or run `omp launch upgrade` if you meant to send "upgrade" as a prompt.',
+		'`omp upgrade` is not a top-level command. Use `omp plugin upgrade [name]` to upgrade plugins, or run `omp launch upgrade` if you meant to send "upgrade" as a prompt.',
 	enable:
 		'`omp enable` is not a top-level command. Use `omp plugin enable <name@marketplace>` to enable a plugin, or run `omp launch enable` if you meant to send "enable" as a prompt.',
 	disable:

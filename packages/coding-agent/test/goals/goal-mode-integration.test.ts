@@ -10,7 +10,7 @@ import { GoalTool } from "@oh-my-pi/pi-coding-agent/goals/tools/goal-tool";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { SubmittedUserInput } from "@oh-my-pi/pi-coding-agent/modes/types";
-import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AgentSession, UserMessageRefusedError } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { normalizeCustomMessagePayload } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -57,7 +57,7 @@ async function createSharedFixture(): Promise<SharedFixture> {
 	const baseDir = TempDir.createSync("@pi-goal-mode-shared-");
 	const authStorage = await AuthStorage.create(path.join(baseDir.path(), "testauth.db"));
 	// The real prompt path gates on a resolvable key; never rely on ambient env.
-	authStorage.setRuntimeApiKey("anthropic", "test-key");
+	authStorage.keys.setRuntime("anthropic", "test-key");
 	const modelRegistry = new ModelRegistry(authStorage);
 	const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
 	if (!model) {
@@ -174,6 +174,33 @@ describe("InteractiveMode goal mode integration", () => {
 		vi.useRealTimers();
 		vi.restoreAllMocks();
 		await harness.cleanup();
+	});
+
+	it("starts a CLI goal before the first model turn with its goal tool active", async () => {
+		const objective = "Inspect the importer";
+		const prompt = vi.spyOn(harness.session, "prompt").mockImplementation(async () => {
+			expect(harness.mode.goalModeEnabled).toBe(true);
+			expect(harness.session.getGoalModeState()?.goal.objective).toBe(objective);
+			expect(harness.session.getGoalModeState()?.enabled).toBe(true);
+			expect(harness.session.getActiveToolNames()).toContain("goal");
+			return true;
+		});
+
+		await harness.mode.startGoalAtStartup(objective);
+
+		expect(prompt).toHaveBeenCalledWith(objective, { streamingBehavior: "steer" });
+		expect(harness.session.getGoalModeState()?.goal.status).toBe("active");
+	});
+
+	it("never submits a startup objective when plan mode blocks goal activation", async () => {
+		harness.mode.planModeEnabled = true;
+		const prompt = vi.spyOn(harness.session, "prompt").mockResolvedValue(true);
+
+		await harness.mode.startGoalAtStartup("Inspect the importer");
+
+		expect(harness.mode.goalModeEnabled).toBe(false);
+		expect(harness.session.getGoalModeState()).toBeUndefined();
+		expect(prompt).not.toHaveBeenCalled();
 	});
 
 	it("toggles goal tool exposure when goal mode enters and pauses", async () => {
@@ -338,6 +365,65 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(harness.mode.editor.pendingImageLinks).toEqual(imageLinks);
 	});
 
+	it("refuses a /goal objective before the goal is created, persisted or prompted", async () => {
+		const secret = "FAKE-SECRET-NOT-REAL";
+		const commandText = `/goal ship with ${secret}`;
+		vi.spyOn(harness.session, "gateUserMessage").mockRejectedValue(new UserMessageRefusedError("Blocked: secret"));
+		const createGoal = vi.spyOn(harness.session.goalRuntime, "createGoal");
+		const prompt = vi.spyOn(harness.session, "prompt").mockResolvedValue(true);
+		const showError = vi.spyOn(harness.mode, "showError");
+		harness.mode.editor.setText(commandText);
+
+		await executeBuiltinSlashCommand(commandText, { ctx: harness.mode });
+
+		expect(showError).toHaveBeenCalledWith("Blocked: secret");
+		expect(harness.mode.editor.getText()).toBe(commandText);
+		expect(createGoal).not.toHaveBeenCalled();
+		expect(prompt).not.toHaveBeenCalled();
+		expect(harness.session.getGoalModeState()).toBeUndefined();
+		expect(JSON.stringify(harness.session.sessionManager.getEntries())).not.toContain(secret);
+	});
+
+	it("refuses a /goal set replacement before the active goal is replaced", async () => {
+		const secret = "FAKE-SECRET-NOT-REAL";
+		await harness.mode.handleGoalModeCommand("Ship the release");
+		vi.spyOn(harness.session, "gateUserMessage").mockRejectedValue(new UserMessageRefusedError("Blocked: secret"));
+		const replaceGoal = vi.spyOn(harness.session.goalRuntime, "replaceGoal");
+
+		await expect(harness.mode.handleGoalModeCommand(`set replace with ${secret}`)).rejects.toBeInstanceOf(
+			UserMessageRefusedError,
+		);
+
+		expect(replaceGoal).not.toHaveBeenCalled();
+		expect(harness.session.getGoalModeState()?.goal.objective).toBe("Ship the release");
+		expect(JSON.stringify(harness.session.sessionManager.getEntries())).not.toContain(secret);
+	});
+
+	for (const testCase of [
+		{ name: "/plan", submit: (mode: InteractiveMode, text: string) => mode.handlePlanModeCommand(text) },
+		{ name: "/vibe", submit: (mode: InteractiveMode, text: string) => mode.handleVibeModeCommand(text) },
+	]) {
+		it(`refuses a ${testCase.name} prompt before entering the mode`, async () => {
+			const secret = "FAKE-SECRET-NOT-REAL";
+			const refusal = new UserMessageRefusedError("Blocked: secret");
+			vi.spyOn(harness.session, "activateVibeTools").mockResolvedValue();
+			// The prompt's own gate refuses too, as the real session would.
+			Object.defineProperty(harness.session, "isStreaming", { configurable: true, get: () => true });
+			vi.spyOn(harness.session, "gateUserMessage").mockRejectedValue(refusal);
+			vi.spyOn(harness.session, "prompt").mockRejectedValue(refusal);
+			const entriesBefore = harness.session.sessionManager.getEntries().length;
+
+			await expect(testCase.submit(harness.mode, `ship with ${secret}`)).rejects.toBeInstanceOf(
+				UserMessageRefusedError,
+			);
+
+			expect(harness.mode.planModeEnabled).toBe(false);
+			expect(harness.mode.vibeModeEnabled).toBe(false);
+			expect(harness.session.getPlanModeState()).toBeUndefined();
+			expect(harness.session.sessionManager.getEntries()).toHaveLength(entriesBefore);
+		});
+	}
+
 	it("keeps images pasted while delayed plan setup completes in the later draft", async () => {
 		const submittedImages: ImageContent[] = [{ type: "image", data: "b2xk", mimeType: "image/png" }];
 		const submittedLinks = ["file:///submitted.png"];
@@ -495,6 +581,80 @@ describe("InteractiveMode goal mode integration", () => {
 
 		streaming = false;
 		harness.mode.onInputCallback?.(harness.mode.startPendingSubmission({ text: "cleanup" }));
+		await waiter.inputPromise;
+	});
+
+	it("waits for input rather than continuing an active goal with only blocked work", async () => {
+		await harness.mode.handleGoalModeCommand("Ship the release");
+		harness.session.setTodoPhases([
+			{
+				name: "Approval",
+				tasks: [
+					{ content: "Prepare the proposal", status: "completed" },
+					{ content: "Apply the approved change", status: "blocked", blocker: "Awaiting user approval" },
+				],
+			},
+		]);
+
+		vi.useFakeTimers();
+		const waiter = await armInputWaiter(harness.mode);
+		vi.advanceTimersByTime(800);
+		await waitForMicrotasks();
+		expect(waiter.getResolvedInput()).toBeUndefined();
+
+		harness.mode.onInputCallback?.(harness.mode.startPendingSubmission({ text: "Approved" }));
+		await waiter.inputPromise;
+	});
+
+	it("drops an armed continuation when work becomes blocked, then resumes after input", async () => {
+		await harness.mode.handleGoalModeCommand("Ship the release");
+		harness.session.setTodoPhases([
+			{ name: "Approval", tasks: [{ content: "Apply the change", status: "pending" }] },
+		]);
+
+		vi.useFakeTimers();
+		const waiter = await armInputWaiter(harness.mode);
+		harness.session.setTodoPhases([
+			{
+				name: "Approval",
+				tasks: [{ content: "Apply the change", status: "blocked", blocker: "Awaiting user approval" }],
+			},
+		]);
+		vi.advanceTimersByTime(800);
+		await waitForMicrotasks();
+		expect(waiter.getResolvedInput()).toBeUndefined();
+
+		const approval = harness.mode.startPendingSubmission({ text: "Approved" });
+		harness.mode.onInputCallback?.(approval);
+		await waiter.inputPromise;
+		harness.mode.finishPendingSubmission(approval);
+		harness.session.setTodoPhases([
+			{ name: "Approval", tasks: [{ content: "Apply the change", status: "pending" }] },
+		]);
+		const resumed = await armInputWaiter(harness.mode);
+		vi.advanceTimersByTime(800);
+		await waitForMicrotasks();
+		expect(resumed.getResolvedInput()?.customType).toBe("goal-continuation");
+		await resumed.inputPromise;
+	});
+
+	it("continues an active goal when actionable work remains alongside blocked work", async () => {
+		await harness.mode.handleGoalModeCommand("Ship the release");
+		harness.session.setTodoPhases([
+			{
+				name: "Release",
+				tasks: [
+					{ content: "Get approval", status: "blocked", blocker: "Awaiting user approval" },
+					{ content: "Run independent checks", status: "pending" },
+				],
+			},
+		]);
+
+		vi.useFakeTimers();
+		const waiter = await armInputWaiter(harness.mode);
+		vi.advanceTimersByTime(800);
+		await waitForMicrotasks();
+		expect(waiter.getResolvedInput()?.customType).toBe("goal-continuation");
 		await waiter.inputPromise;
 	});
 

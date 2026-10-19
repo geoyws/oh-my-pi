@@ -1,6 +1,6 @@
 /** Shared inference request identity headers. */
 
-import { USER_AGENT } from "@oh-my-pi/pi-utils";
+import { APP_NAME, APP_URL, USER_AGENT } from "@oh-my-pi/pi-utils";
 
 /** Options controlling provider and protocol inference headers. */
 export interface InferenceHeaderOptions {
@@ -18,6 +18,25 @@ export function setHeaderIfAbsent(headers: Record<string, string>, name: string,
 	headers[name] = value;
 }
 
+/**
+ * Label a request with the conversation id under the model's resolved
+ * `compat.sessionHeader` (KDL `session-header`). A header the caller or config
+ * already set wins; without a conversation id nothing is sent.
+ */
+export function applySessionHeader(
+	headers: Record<string, string> | Headers,
+	compat: object | undefined,
+	sessionId: string | undefined,
+): void {
+	const name = compat && "sessionHeader" in compat ? compat.sessionHeader : undefined;
+	if (typeof name !== "string" || !sessionId) return;
+	if (headers instanceof Headers) {
+		if (!headers.has(name)) headers.set(name, sessionId);
+		return;
+	}
+	setHeaderIfAbsent(headers, name, sessionId);
+}
+
 function setHeader(headers: Record<string, string>, name: string, value: string): void {
 	const normalizedName = name.toLowerCase();
 	for (const existingName in headers) {
@@ -33,6 +52,12 @@ function setHeader(headers: Record<string, string>, name: string, value: string)
  * understood by the active inference protocol and host.
  */
 export function applyInferenceHeaders(headers: Record<string, string>, options: InferenceHeaderOptions): void {
+	if (options.provider === "vercel-ai-gateway") {
+		// Vercel AI Gateway app attribution; caller/config headers take precedence.
+		setHeaderIfAbsent(headers, "http-referer", APP_URL);
+		setHeaderIfAbsent(headers, "x-title", APP_NAME);
+	}
+
 	const isOpenCode = options.provider === "opencode-go" || options.provider === "opencode-zen";
 	const sessionId = options.sessionId;
 	if (!sessionId) return;

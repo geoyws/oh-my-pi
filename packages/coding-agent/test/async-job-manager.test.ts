@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test, vi } from "bun:test";
 import { scheduler } from "node:timers/promises";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { AsyncJobError, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import { buildAsyncResultBatchMessage } from "@oh-my-pi/pi-coding-agent/session/async-job-delivery";
 
 async function waitForJobEviction(manager: AsyncJobManager, jobId: string): Promise<void> {
 	const deadline = Date.now() + 2_000;
@@ -175,22 +176,35 @@ describe("AsyncJobManager", () => {
 		]);
 	});
 
-	test("preserves agentId in a delayed delivery rebuilt after eviction", async () => {
-		// Regression: a collision-suffixed job id (e.g. `Foo-t1` -> `Foo-t1-2`)
-		// still writes artifacts under the unsuffixed `agentId`. When the row
-		// is evicted before a retried delivery lands, the delivery must be
-		// rebuilt from a snapshot that still carries `agentId`, or the
-		// reconstructed job falls back to the suffixed `jobId` and the
-		// advertised `agent://` URL points at nothing on disk (PR #10625
-		// review).
+	test("preserves native metadata in a delayed delivery rebuilt after eviction", async () => {
+		// A collision-suffixed job id still writes artifacts under the
+		// unsuffixed agentId. Force the first delivery to fail, wait for the
+		// short test-only retention to evict the live row, then inspect the
+		// reconstructed AsyncJob received by the successful sink.
 		let sinkCalls = 0;
-		const delivered: Array<{ jobId: string; agentId: string | undefined }> = [];
+		const delivered: Array<{
+			jobId: string;
+			reconstructedJobId: string | undefined;
+			status: string | undefined;
+			agentId: string | undefined;
+			details: unknown;
+		}> = [];
 		const manager = new AsyncJobManager({
 			retentionMs: 25,
-			onJobComplete: async (jobId, _text, job) => {
+			onJobComplete: async (jobId, text, job) => {
 				sinkCalls += 1;
 				if (sinkCalls === 1) throw new Error("simulated delivery failure");
-				delivered.push({ jobId, agentId: job?.agentId });
+				expect(manager.getJob(jobId)).toBeUndefined();
+				const message = buildAsyncResultBatchMessage([
+					{ jobId, result: text, job, durationMs: job ? Date.now() - job.startTime : undefined, epoch: 0 },
+				]);
+				delivered.push({
+					jobId,
+					reconstructedJobId: job?.id,
+					status: job?.status,
+					agentId: job?.agentId,
+					details: message?.details?.jobs[0],
+				});
 			},
 		});
 
@@ -204,7 +218,22 @@ describe("AsyncJobManager", () => {
 		await manager.drainDeliveries({ timeoutMs: 2_000 });
 
 		expect(sinkCalls).toBe(2);
-		expect(delivered).toEqual([{ jobId: "Foo-t1-2", agentId: "Foo-t1" }]);
+		expect(delivered).toEqual([
+			{
+				jobId: "Foo-t1-2",
+				reconstructedJobId: "Foo-t1-2",
+				status: "completed",
+				agentId: "Foo-t1",
+				details: {
+					jobId: "Foo-t1-2",
+					type: "task",
+					status: "completed",
+					agentId: "Foo-t1",
+					label: "agent task",
+					durationMs: expect.any(Number),
+				},
+			},
+		]);
 	});
 
 	test("defers retained artifacts cleanup until this job's delivery settles", async () => {
@@ -523,6 +552,49 @@ describe("AsyncJobManager", () => {
 		expect(manager.getJob(jobId)).toBeUndefined();
 	});
 
+	test("never recycles auto ids after settled jobs are evicted", async () => {
+		const manager = new AsyncJobManager({ retentionMs: 0, onJobComplete: async () => {} });
+		const first = manager.register("bash", "first", async () => "one");
+		const second = manager.register("bash", "second", async () => "two");
+		await manager.waitForAll();
+		expect(manager.getJob(first)).toBeUndefined();
+		expect(manager.getJob(second)).toBeUndefined();
+
+		const third = manager.register("bash", "third", async () => "three");
+		expect([first, second, third]).toEqual(["bg_1", "bg_2", "bg_3"]);
+		await manager.dispose();
+	});
+
+	test("keeps a foreground-backed job out of listings and delivery unless promoted", async () => {
+		const completions: string[] = [];
+		const manager = new AsyncJobManager({
+			onJobComplete: async jobId => {
+				completions.push(jobId);
+			},
+		});
+
+		// Released before its body settles (the foreground waiter wins the race).
+		const pending = Promise.withResolvers<string>();
+		const racing = manager.register("bash", "racing foreground", () => pending.promise, { foreground: true });
+		expect(manager.getAllJobs()).toEqual([]);
+		expect(manager.getRunningJobs()).toEqual([]);
+		manager.releaseForegroundJob(racing);
+		pending.resolve("done");
+		await manager.waitForAll();
+		expect(manager.getJob(racing)).toBeUndefined();
+
+		// Settled before promotion: stays hidden until promoted, then delivers once.
+		const promoted = manager.register("bash", "promoted", async () => "slow", { foreground: true });
+		expect(promoted).toBe(racing);
+		await manager.waitForAll();
+		expect(manager.getRecentJobs()).toEqual([]);
+		expect(manager.backgroundJob(promoted)).toBeTrue();
+		expect(manager.getAllJobs().map(job => job.id)).toEqual([promoted]);
+		await manager.drainDeliveries({ timeoutMs: 2_000 });
+		expect(completions).toEqual([promoted]);
+		await manager.dispose();
+	});
+
 	test("evicts a consumed settled row on the short grace instead of full retention", async () => {
 		// A settled job whose result reached its consumer (sink delivery or a
 		// foreground snapshot) must not linger in `hub jobs` reads for the full
@@ -592,7 +664,7 @@ describe("AsyncJobManager", () => {
 			await manager.waitForAll();
 			await waitForCondition(() => manager.getDeliveryState({ ownerId: "Main" }).delivering);
 
-			// Foreground `hub jobs` read consumes the result mid-park.
+			// A foreground recovery read consumes the result mid-park.
 			expect(manager.consumeJobResults([jobId])).toBe(1);
 			vi.advanceTimersByTime(1_000);
 
@@ -900,6 +972,24 @@ describe("AsyncJobManager", () => {
 		expect(defaultDeliveries).toEqual(["unowned-1"]);
 	});
 
+	test("delivers a completion that settled while a wait watched it but returned something else", async () => {
+		const delivered: string[] = [];
+		const manager = new AsyncJobManager({});
+		manager.registerDeliverySink("Main", (_jobId, text) => {
+			delivered.push(text);
+		});
+		const id = manager.register("task", "EchoPeer", async () => "received=kestrel42", { ownerId: "Main" });
+		manager.watchJobs([id]);
+		await manager.getJob(id)?.promise;
+		await manager.drainDeliveries({ timeoutMs: 500 });
+		expect(delivered).toEqual([]);
+
+		// The wait returned a peer message instead of this job's result.
+		manager.unwatchJobs([id]);
+		await manager.drainDeliveries({ timeoutMs: 500 });
+		expect(delivered).toEqual(["received=kestrel42"]);
+	});
+
 	test("dead-letters an owned delivery when its owner has no live sink", async () => {
 		const defaultDeliveries: string[] = [];
 		const manager = new AsyncJobManager({
@@ -947,52 +1037,5 @@ describe("AsyncJobManager", () => {
 		manager.cancelAll({ ownerId: "Sub" });
 		await expect(reap).resolves.toBe(true);
 		expect(manager.getJob("hung-1")?.status).toBe("cancelled");
-	});
-});
-
-describe("AsyncJobManager adaptive wait ladder", () => {
-	const newManager = () => new AsyncJobManager({ onJobComplete: async () => {} });
-
-	test("back-to-back waits climb the ladder and saturate at the top rung", () => {
-		const m = newManager();
-		const owner = "Main";
-		const t = 1_000;
-		const waits: number[] = [];
-		for (let i = 0; i < 6; i++) {
-			// Same timestamp every time → zero gap → always escalates.
-			waits.push(m.nextPollWaitMs(owner, t));
-			m.recordPollWaitEnd(owner, t);
-		}
-		expect(waits).toEqual([5_000, 10_000, 30_000, 60_000, 300_000, 300_000]);
-	});
-
-	test("a quiet gap of a minute resets back to the floor", () => {
-		const m = newManager();
-		const owner = "Main";
-
-		expect(m.nextPollWaitMs(owner, 0)).toBe(5_000);
-		m.recordPollWaitEnd(owner, 0);
-
-		// Just under the reset window → keeps climbing.
-		expect(m.nextPollWaitMs(owner, 59_999)).toBe(10_000);
-		m.recordPollWaitEnd(owner, 60_000);
-
-		// A full minute without waiting resets the climb to the floor.
-		expect(m.nextPollWaitMs(owner, 120_000)).toBe(5_000);
-	});
-
-	test("escalation is tracked independently per owner", () => {
-		const m = newManager();
-		const t = 1_000;
-
-		m.nextPollWaitMs("A", t);
-		m.recordPollWaitEnd("A", t);
-		m.nextPollWaitMs("A", t);
-		m.recordPollWaitEnd("A", t);
-
-		// A fresh owner starts at the floor regardless of A's escalation.
-		expect(m.nextPollWaitMs("B", t)).toBe(5_000);
-		// A keeps climbing from where it left off.
-		expect(m.nextPollWaitMs("A", t)).toBe(30_000);
 	});
 });

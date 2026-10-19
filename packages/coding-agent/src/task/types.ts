@@ -49,18 +49,22 @@ export const taskItemSchema = type({
 	"name?": "string",
 	agent: "string = 'task'",
 	task: "string",
+	solutionSpace: "string",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"tools?": "string[]",
+	"cwd?": "string",
 	"+": "delete",
 });
 const taskItemSchemaIsolated = type({
 	"name?": "string",
 	agent: "string = 'task'",
 	task: "string",
+	solutionSpace: "string",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"tools?": "string[]",
+	"cwd?": "string",
 	"isolated?": "boolean",
 	"+": "delete",
 });
@@ -69,19 +73,23 @@ export const taskSchema = type({
 	"name?": "string",
 	agent: "string = 'task'",
 	task: "string",
+	solutionSpace: "string",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"tools?": "string[]",
 	"isolated?": "boolean",
+	"cwd?": "string",
 	"+": "delete",
 });
 const taskSchemaNoIsolation = type({
 	"name?": "string",
 	agent: "string = 'task'",
 	task: "string",
+	solutionSpace: "string",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"tools?": "string[]",
+	"cwd?": "string",
 	"+": "delete",
 });
 const taskSchemaBatch = type({
@@ -128,11 +136,13 @@ function createTaskSchema(options: {
 				"name?": "string",
 				agent,
 				task: "string",
+				solutionSpace: "string",
 				...effortField,
 				"outputSchema?": outputSchemaInputSchema,
 				"schemaMode?": '"permissive" | "strict"',
 				...toolsField,
 				"isolated?": "boolean",
+				"cwd?": "string",
 				"+": "delete",
 			});
 			return type.raw({
@@ -145,10 +155,12 @@ function createTaskSchema(options: {
 			"name?": "string",
 			agent,
 			task: "string",
+			solutionSpace: "string",
 			...effortField,
 			"outputSchema?": outputSchemaInputSchema,
 			"schemaMode?": '"permissive" | "strict"',
 			...toolsField,
+			"cwd?": "string",
 			"+": "delete",
 		});
 		return type.raw({
@@ -162,11 +174,13 @@ function createTaskSchema(options: {
 			"name?": "string",
 			agent,
 			task: "string",
+			solutionSpace: "string",
 			...effortField,
 			"outputSchema?": outputSchemaInputSchema,
 			"schemaMode?": '"permissive" | "strict"',
 			...toolsField,
 			"isolated?": "boolean",
+			"cwd?": "string",
 			"+": "delete",
 		});
 	}
@@ -174,10 +188,12 @@ function createTaskSchema(options: {
 		"name?": "string",
 		agent,
 		task: "string",
+		solutionSpace: "string",
 		...effortField,
 		"outputSchema?": outputSchemaInputSchema,
 		"schemaMode?": '"permissive" | "strict"',
 		...toolsField,
+		"cwd?": "string",
 		"+": "delete",
 	});
 }

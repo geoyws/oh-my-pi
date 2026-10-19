@@ -6,19 +6,21 @@ import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import {
-	applyResolvedSystemPromptInputs,
-	buildSessionOptions,
-	readPipedInput,
-	submitInteractiveInput,
-} from "@oh-my-pi/pi-coding-agent/main";
+import { buildSessionOptions, readPipedInput, submitInteractiveInput } from "@oh-my-pi/pi-coding-agent/main";
 import type { SubmittedUserInput } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { UserMessageRefusedError } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { DroppedPrompt } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { restoreRefusedDraft } from "@oh-my-pi/pi-coding-agent/slash-commands/helpers/draft";
 import { discoverTitleSystemPromptFile } from "@oh-my-pi/pi-coding-agent/system-prompt";
 import type { CreateAgentSessionOptions } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
+import { getEditorTheme } from "@oh-my-pi/pi-tui/theme/tui-adapters";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
+
+const NOTICE = "Blocked: this message looks like it contains a secret. It was not sent or saved.";
 
 const cleanupDirs: string[] = [];
 
@@ -65,17 +67,6 @@ describe("readPipedInput", () => {
 	});
 });
 
-describe("applyResolvedSystemPromptInputs", () => {
-	it("routes SYSTEM.md content through template-aware session options", () => {
-		const options: CreateAgentSessionOptions = {};
-
-		applyResolvedSystemPromptInputs(options, "project system prompt", "append prompt");
-
-		expect(options.customSystemPrompt).toBe("project system prompt");
-		expect(options.appendSystemPrompt).toBe("append prompt");
-		expect(options.systemPrompt).toBeUndefined();
-	});
-});
 describe("system prompt template CLI resolution", () => {
 	async function buildPromptOptions(cwd: string, args: string[]): Promise<CreateAgentSessionOptions> {
 		const authStorage = await AuthStorage.create(":memory:");
@@ -203,7 +194,11 @@ describe("submitInteractiveInput", () => {
 
 		await submitInteractiveInput(mode, session, input);
 
-		expect(session.prompt).toHaveBeenCalledWith("loop prompt", { images: undefined, streamingBehavior: "followUp" });
+		expect(session.prompt).toHaveBeenCalledWith("loop prompt", {
+			images: undefined,
+			streamingBehavior: "followUp",
+			source: "interactive",
+		});
 		expect(mode.showError).not.toHaveBeenCalled();
 	});
 
@@ -221,49 +216,8 @@ describe("submitInteractiveInput", () => {
 		expect(session.prompt).toHaveBeenCalledWith("interrupt now", {
 			images: undefined,
 			streamingBehavior: "steer",
+			source: "interactive",
 		});
-		expect(mode.showError).not.toHaveBeenCalled();
-	});
-
-	it("queues goal-continuation as followUp when streaming", async () => {
-		const mode = createMode();
-		const session = {
-			prompt: vi.fn(async () => true),
-			promptCustomMessage: vi.fn(async () => true),
-			isStreaming: true,
-		};
-		const input = createInput({ text: "continue goal", customType: "goal-continuation" });
-
-		await submitInteractiveInput(mode, session, input);
-
-		expect(session.prompt).not.toHaveBeenCalled();
-		expect(session.promptCustomMessage).toHaveBeenCalledWith(
-			{
-				customType: "goal-continuation",
-				content: "continue goal",
-				display: false,
-				attribution: "agent",
-			},
-			{ streamingBehavior: "followUp" },
-		);
-		expect(mode.finishPendingSubmission).toHaveBeenCalledWith(input);
-		expect(mode.showError).not.toHaveBeenCalled();
-	});
-
-	it("queues a plain submission as followUp when streaming", async () => {
-		const mode = createMode();
-		const session = {
-			prompt: vi.fn(async () => true),
-			promptCustomMessage: vi.fn(async () => true),
-			isStreaming: true,
-		};
-		const input = createInput({ text: "loop prompt" });
-
-		await submitInteractiveInput(mode, session, input);
-
-		expect(session.prompt).toHaveBeenCalledWith("loop prompt", { images: undefined, streamingBehavior: "followUp" });
-		expect(session.promptCustomMessage).not.toHaveBeenCalled();
-		expect(mode.finishPendingSubmission).toHaveBeenCalledWith(input);
 		expect(mode.showError).not.toHaveBeenCalled();
 	});
 
@@ -282,7 +236,11 @@ describe("submitInteractiveInput", () => {
 
 		await submitInteractiveInput(mode, session, input);
 
-		expect(session.prompt).toHaveBeenCalledWith("/void-cmd", { images: undefined, streamingBehavior: "followUp" });
+		expect(session.prompt).toHaveBeenCalledWith("/void-cmd", {
+			images: undefined,
+			streamingBehavior: "followUp",
+			source: "interactive",
+		});
 		expect(mode.pauseLoop).toHaveBeenCalledTimes(1);
 		expect(mode.showError).not.toHaveBeenCalled();
 	});
@@ -347,28 +305,6 @@ describe("submitInteractiveInput", () => {
 		expect(mode.finishPendingSubmission).toHaveBeenCalledWith(input);
 	});
 
-	it("ignores dispatch rejection when it is not the armed body", async () => {
-		const mode = {
-			...createMode(),
-			loopPrompt: "repeat me",
-			pauseLoop: vi.fn(),
-		};
-		const session = {
-			prompt: vi.fn(async () => {
-				throw new Error("attachment too large");
-			}),
-			promptCustomMessage: vi.fn(async () => true),
-			isStreaming: false,
-		};
-		const input = createInput({ text: "/other-cmd" });
-
-		await submitInteractiveInput(mode, session, input);
-
-		expect(mode.pauseLoop).not.toHaveBeenCalled();
-		expect(mode.showError).toHaveBeenCalledWith("attachment too large");
-		expect(mode.finishPendingSubmission).toHaveBeenCalledWith(input);
-	});
-
 	it("routes a resubmitted /skill: prompt through promptCustomMessage instead of raw text (regression for #8137-style loop resubmit)", async () => {
 		const skillDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-skill-command-"));
 		cleanupDirs.push(skillDir);
@@ -406,5 +342,47 @@ describe("submitInteractiveInput", () => {
 			expect.anything(),
 		);
 		expect(mode.showError).not.toHaveBeenCalled();
+	});
+
+	it("merges a refused submission ahead of a newer draft typed during dispatch", async () => {
+		const editor = new CustomEditor(getEditorTheme());
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const mode = {
+			...createMode(),
+			restoreRefusedPrompt: vi.fn((prompt: DroppedPrompt) =>
+				restoreRefusedDraft(editor, prompt.text, prompt.images, prompt.imageLinks),
+			),
+		};
+		const session = {
+			prompt: vi.fn(async () => {
+				entered.resolve();
+				await release.promise;
+				throw new UserMessageRefusedError(NOTICE);
+			}),
+			promptCustomMessage: vi.fn(async () => true),
+			isStreaming: false,
+		};
+		const input = createInput({ text: "refused draft" });
+		const submitting = submitInteractiveInput(mode, session, input);
+		await entered.promise;
+		// Typed after Enter detached the draft, while dispatch was pending.
+		editor.setText("newer draft");
+		release.resolve();
+		await submitting;
+
+		expect(session.prompt).toHaveBeenCalledWith("refused draft", {
+			images: undefined,
+			streamingBehavior: "followUp",
+			source: "interactive",
+		});
+		expect(mode.restoreRefusedPrompt).toHaveBeenCalledWith({
+			text: "refused draft",
+			images: undefined,
+			imageLinks: undefined,
+		});
+		expect(editor.getExpandedText()).toBe("refused draft\nnewer draft");
+		expect(mode.showError).toHaveBeenCalledWith(NOTICE);
+		expect(mode.finishPendingSubmission).toHaveBeenCalledWith(input);
 	});
 });

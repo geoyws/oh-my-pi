@@ -230,6 +230,32 @@ function perFileTemplates(): string {
 		.join("\n\n");
 }
 
+/** A VRML scene drafted inside reasoning — the reported gemini-3.8-flash shape.
+ *  Per-part blocks share one keyword skeleton and differ only in numeric
+ *  literals, and the fence stays unclosed when the thought summary ends. */
+function vrmlDraft(parts: number): string {
+	const blocks = Array.from({ length: parts }, (_, i) =>
+		[
+			"    Transform {",
+			`      translation ${(i * 0.05).toFixed(2)} 0.1 ${(i % 2 ? -0.2 : 0.2).toFixed(1)}`,
+			"      children [",
+			"        Shape {",
+			"          appearance Appearance {",
+			"            material Material {",
+			`              diffuseColor 0.${i % 10} 0.${(i + 3) % 10} 0.${(i + 6) % 10}`,
+			"            }",
+			"          }",
+			"          geometry Sphere {",
+			`            radius 0.0${(i % 9) + 1}`,
+			"          }",
+			"        }",
+			"      ]",
+			"    },",
+		].join("\n"),
+	);
+	return `\`\`\`wrl\n#VRML V2.0 utf8\nTransform {\n  children [\n${blocks.join("\n")}\n\n`;
+}
+
 describe("ThinkingLoopDetector", () => {
 	test("trips on a tight near-duplicate paragraph loop via the trigram path", () => {
 		// High word-trigram overlap: the cluster check claims it before the lexical
@@ -302,6 +328,21 @@ describe("ThinkingLoopDetector", () => {
 		// letter or pictograph must never count as a loop.
 		const detector = new ThinkingLoopDetector();
 		expect(detector.push("00 ".repeat(200))).toBeNull();
+	});
+
+	test("does not trip on structurally repetitive code that differs only in literals", () => {
+		// Numbers are dropped during normalization, so code chunks reduce to the same
+		// keyword skeleton; code lines must stay out of the prose heuristics.
+		expect(feed(vrmlDraft(24), 97)).toBeNull();
+	});
+
+	test("judges a prose loop after an unclosed code draft as if the code were absent", () => {
+		// Gemini thought summaries often end inside an open fence; later prose must
+		// stay guarded rather than being swallowed as fenced code.
+		const loop = nearDuplicateLoop(12);
+		const detail = feed(loop);
+		expect(detail).not.toBeNull();
+		expect(feed(`${vrmlDraft(8)}${loop}`)).toBe(detail);
 	});
 
 	test("does not trip on short requested repetitive text", () => {
@@ -873,6 +914,34 @@ describe("thinking-loop retry budget (result path)", () => {
 			expect(result.content).toEqual([]);
 			expect(result.errorMessage).toContain(THINKING_LOOP_ERROR_MARKER);
 			expect(mock.calls.every(call => call.options?.loopGuard?.enabled !== false)).toBe(true);
+		} finally {
+			waitSpy.mockRestore();
+			clearCustomApis();
+		}
+	});
+
+	test("reports the guarded-retry backoff through providerRetryWait", async () => {
+		registerMockApi();
+		const waitSpy = spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		try {
+			const mock = createMockModel({ provider: "openrouter", id: "google/gemini-3.5-flash" });
+			for (let i = 0; i < 4; i++) mock.push(loopResponse());
+			const waits: Array<{ delayMs: number; attempt?: number; maxAttempts?: number }> = [];
+
+			const result = await completeSimple(mock.model, context(), {
+				providerRetryWait: async (delayMs, _signal, info) => {
+					waits.push({ delayMs, attempt: info?.attempt, maxAttempts: info?.maxAttempts });
+				},
+			});
+
+			expect(result.stopReason).toBe("error");
+			expect(mock.calls).toHaveLength(3);
+			// Each guarded attempt re-issues the whole request, so the caller must
+			// see both backoffs instead of two silent sleeps.
+			expect(waits).toEqual([
+				{ delayMs: 500, attempt: 1, maxAttempts: 2 },
+				{ delayMs: 1000, attempt: 2, maxAttempts: 2 },
+			]);
 		} finally {
 			waitSpy.mockRestore();
 			clearCustomApis();

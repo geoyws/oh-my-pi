@@ -8,11 +8,12 @@
  * `OMP_AUTH_BROKER_URL` / `auth.broker.url` precedence used elsewhere).
  *
  * Sub-verbs:
- *   - `serve [--bind=…]` — boots the gateway against the configured broker.
+ *   - `serve [--bind=…] [--trust-proxy-headers]` — boots the gateway against the configured broker.
+ *   - `stdio` — serves the same routes as JSON lines on stdin/stdout with this omp's own credentials
+ *     and model roles (`auth-gateway-stdio.ts`).
  *   - `token` / `token --regenerate` — manages the gateway bearer token file.
  *   - `status` — prints the locally-stored gateway token and bind hint.
  */
-import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -23,6 +24,7 @@ import {
 	type CredentialCompletionResult,
 	completeSimple,
 	type Model,
+	type OAuthRequestIdentity,
 } from "@oh-my-pi/pi-ai";
 import {
 	AuthBrokerClient,
@@ -33,12 +35,22 @@ import {
 import { DEFAULT_AUTH_GATEWAY_BIND, startAuthGateway } from "@oh-my-pi/pi-ai/auth-gateway";
 import { type GeneratedProvider, getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import { type ModelKind, modelKind } from "@oh-my-pi/pi-catalog/types";
-import { getConfigRootDir, isEnoent, logger, VERSION } from "@oh-my-pi/pi-utils";
+import { getConfigRootDir, logger, VERSION } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { ModelRegistry } from "../config/model-registry";
-import { type AuthBrokerClientConfig, resolveAuthBrokerConfig } from "../session/auth-broker-config";
+import { cfgDisabledProviders } from "../config/model-settings";
+import { resolveProviderModelReference } from "../config/model-resolver";
+import type { Settings } from "../config/settings";
+import {
+	type AuthBrokerClientConfig,
+	loadEffectiveAuthAccountPolicyConfig,
+	resolveAuthBrokerConfig,
+	resolveEffectiveSettings,
+} from "../session/auth-broker-config";
+import { runAuthGatewayStdio } from "./auth-gateway-stdio";
+import { generateToken, readTokenFile, writeTokenFile } from "./token-file";
 
-export type AuthGatewayAction = "serve" | "token" | "status" | "check";
+export type AuthGatewayAction = "serve" | "stdio" | "token" | "status" | "check";
 
 export interface AuthGatewayCommandArgs {
 	action: AuthGatewayAction;
@@ -46,6 +58,7 @@ export interface AuthGatewayCommandArgs {
 		json?: boolean;
 		bind?: string;
 		regenerate?: boolean;
+		trustProxyHeaders?: boolean;
 		/**
 		 * Disable bearer-token auth on inbound requests. Useful when the gateway
 		 * is bound to loopback (the default `127.0.0.1:4000`) and you don't want
@@ -63,32 +76,10 @@ export interface AuthGatewayCommandArgs {
 	};
 }
 
-const ACTIONS: readonly AuthGatewayAction[] = ["serve", "token", "status", "check"];
+const ACTIONS: readonly AuthGatewayAction[] = ["serve", "stdio", "token", "status", "check"];
 
 function getTokenFilePath(): string {
 	return path.join(getConfigRootDir(), "auth-gateway.token");
-}
-
-async function readToken(): Promise<string | null> {
-	try {
-		const raw = await fs.readFile(getTokenFilePath(), "utf8");
-		const trimmed = raw.trim();
-		return trimmed.length > 0 ? trimmed : null;
-	} catch (err) {
-		if (isEnoent(err)) return null;
-		throw err;
-	}
-}
-
-async function writeToken(token: string): Promise<void> {
-	const file = getTokenFilePath();
-	await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-	await fs.writeFile(file, token, { mode: 0o600 });
-	try {
-		await fs.chmod(file, 0o600);
-	} catch {
-		// Best-effort (e.g. Windows).
-	}
 }
 
 /**
@@ -114,21 +105,17 @@ async function createTokenExclusive(token: string): Promise<boolean> {
 	return true;
 }
 
-function generateToken(): string {
-	return crypto.randomBytes(32).toString("base64url");
-}
-
 async function ensureToken(): Promise<string> {
-	const existing = await readToken();
+	const existing = await readTokenFile(getTokenFilePath());
 	if (existing) return existing;
 	const token = generateToken();
 	if (await createTokenExclusive(token)) return token;
 	// Another concurrent invocation won the create race; read what they wrote.
-	const fromRace = await readToken();
+	const fromRace = await readTokenFile(getTokenFilePath());
 	if (fromRace) return fromRace;
 	// File existed-then-disappeared between EEXIST and read; last resort, write
 	// our generated token unconditionally so callers don't see an empty string.
-	await writeToken(token);
+	await writeTokenFile(getTokenFilePath(), token);
 	return token;
 }
 
@@ -188,6 +175,19 @@ export function gatewayRoutableModels(registry: ModelRegistry): Model<Api>[] {
 }
 
 /**
+ * Providers the broker holds a credential for, minus `disabledProviders`. Recomputed on
+ * every rebuild so a later login or logout reaches the served catalog.
+ */
+export function gatewayRoutableProviders(storage: AuthStorage, settings: Settings): Set<string> {
+	const disabled = new Set(cfgDisabledProviders.get(settings));
+	const providers = new Set<string>();
+	for (const entry of storage.credentials.snapshot().credentials) {
+		if (!disabled.has(entry.provider)) providers.add(entry.provider);
+	}
+	return providers;
+}
+
+/**
  * Index resolvable models by the request ids clients may send: the
  * provider-qualified `provider/id` (always) and the bare `id` (first-write-wins
  * fallback for legacy clients). Scoped to providers the gateway holds broker
@@ -204,6 +204,25 @@ export function indexModelsByRequestId(
 		if (!modelById.has(model.id)) modelById.set(model.id, model);
 	}
 	return modelById;
+}
+
+/**
+ * Resolve a client-requested model id: the exact `provider/id` or bare `id` first, then an
+ * OpenRouter routing-variant selector the catalog does not list (`openrouter/<id>:floor`,
+ * `:nitro`, …), cloned from its base model under the requested id so the suffix reaches
+ * OpenRouter — the same selectors `--model` accepts.
+ */
+export function resolveGatewayModel(
+	id: string,
+	modelById: ReadonlyMap<string, Model<Api>>,
+	routable: readonly Model<Api>[],
+): Model<Api> | undefined {
+	const exact = modelById.get(id);
+	if (exact) return exact;
+	const prefix = "openrouter/";
+	return id.startsWith(prefix)
+		? resolveProviderModelReference("openrouter", id.slice(prefix.length), routable)
+		: undefined;
 }
 
 /**
@@ -253,6 +272,8 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	// Build a broker-backed AuthStorage — same pattern as discoverAuthStorage()
 	// in sdk.ts. The gateway never touches local SQLite.
 	const accountPool = await loadAuthBrokerAccountPool();
+	const settings = await resolveEffectiveSettings();
+	const { accountPolicies, defaultReservePct } = await loadEffectiveAuthAccountPolicyConfig({ settings });
 	const client = createBrokerClient(brokerConfig);
 	const initialSnapshot = await fetchBrokerSnapshot(client);
 	const store = new RemoteAuthCredentialStore({
@@ -266,8 +287,10 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	// gateway only needs to construct the store and pass it in.
 	const storage = new AuthStorage(store, {
 		sourceLabel: `broker ${brokerConfig.url}`,
+		accountPolicies,
+		defaultReservePct,
 	});
-	await storage.reload();
+	await storage.credentials.reload();
 
 	// Build the model resolver + catalog from the ModelRegistry — the same
 	// component the TUI/CLI use — scoped to providers we hold credentials for.
@@ -279,18 +302,13 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	// transport) and custom models must never route a broker-backed gateway or
 	// shadow broker credentials. Format handlers ask `resolveModel` to translate
 	// a client-requested `model` field into a pi-ai `Model<Api>` before dispatch;
-	// `listModels` powers `/v1/models`.
-	const registry = new ModelRegistry(storage, undefined, { ignoreLocalModelConfig: true });
-	// Providers the gateway can route right now, derived live from the store on
-	// every rebuild. Captured once at boot it would freeze the served catalog:
-	// a provider logged in later stays unroutable and one logged out keeps being
-	// advertised until restart.
-	const providersWithCreds = (): Set<string> => {
-		const providers = new Set<string>();
-		for (const entry of storage.exportSnapshot().credentials) providers.add(entry.provider);
-		return providers;
-	};
+	// `listModels` powers `/v1/models`. `settings` carries `disabledProviders`, so
+	// discovery skips disabled providers too.
+	const registry = new ModelRegistry(storage, undefined, { ignoreLocalModelConfig: true, settings });
 	let modelById = new Map<string, Model<Api>>();
+	// Routable models as one stable array per rebuild: `resolveProviderModelReference` caches its
+	// index on the array identity, so variant lookups stay O(1) between rebuilds.
+	let routable: Model<Api>[] = [];
 	// Rebuild the served catalog (a `registry.refresh()` pass, then re-index
 	// against the current credential set). Credential-triggered rebuilds force
 	// `online` discovery: an account added to or removed from an
@@ -300,7 +318,9 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	// for up to a cache TTL. Periodic rebuilds stay cached.
 	const rebuildCatalog = createSerializedRebuilder(async force => {
 		await registry.refresh(force ? "online" : "online-if-uncached");
-		modelById = indexModelsByRequestId(gatewayRoutableModels(registry), providersWithCreds());
+		const providers = gatewayRoutableProviders(storage, settings);
+		routable = gatewayRoutableModels(registry).filter(model => providers.has(model.provider));
+		modelById = indexModelsByRequestId(routable, providers);
 	});
 	await rebuildCatalog();
 
@@ -308,9 +328,11 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		storage,
 		bind,
 		bearerTokens: gatewayToken ? [gatewayToken] : [],
+		trustProxyHeaders: flags.trustProxyHeaders,
 		version: VERSION,
-		resolveModel: (id: string) => modelById.get(id),
+		resolveModel: (id: string) => resolveGatewayModel(id, modelById, routable),
 		listModels: () => modelById.values(),
+		excludeProviders: new Set(cfgDisabledProviders.get(settings)),
 	});
 	process.stdout.write(`auth-gateway listening on ${handle.url}\n`);
 	if (gatewayToken) {
@@ -343,7 +365,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	const credentialSync = setInterval(() => {
 		void (async () => {
 			try {
-				if (await storage.pollExternalChanges()) await rebuildCatalog(true);
+				if (await storage.credentials.poll()) await rebuildCatalog(true);
 			} catch (error) {
 				logger.warn("auth-gateway credential sync failed", {
 					error: error instanceof Error ? error.message : String(error),
@@ -395,7 +417,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 async function runToken(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	if (flags.regenerate) {
 		const next = generateToken();
-		await writeToken(next);
+		await writeTokenFile(getTokenFilePath(), next);
 		if (flags.json) {
 			process.stdout.write(`${JSON.stringify({ token: next, path: getTokenFilePath() })}\n`);
 		} else {
@@ -412,7 +434,7 @@ async function runToken(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 }
 
 async function runStatus(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
-	const token = await readToken();
+	const token = await readTokenFile(getTokenFilePath());
 	const brokerConfig = await resolveAuthBrokerConfig();
 	const tokenFile = getTokenFilePath();
 	if (!brokerConfig) {
@@ -496,6 +518,9 @@ export async function runAuthGatewayCommand(cmd: AuthGatewayCommandArgs): Promis
 		case "serve":
 			await runServe(cmd.flags);
 			return;
+		case "stdio":
+			await runAuthGatewayStdio();
+			return;
 		case "token":
 			await runToken(cmd.flags);
 			return;
@@ -543,7 +568,7 @@ const STRICT_PROBE_MAX_CANDIDATES = 4;
 const STRICT_PROBE_PER_ATTEMPT_TIMEOUT_MS = 15_000;
 
 /**
- * Overall per-credential budget passed to {@link AuthStorage.checkCredentials}.
+ * Overall per-credential budget passed to {@link AuthStorage.health.check}.
  * Big enough to walk every candidate at the per-attempt cap with a small
  * margin for refresh/network overhead.
  */
@@ -602,6 +627,7 @@ async function probeOneModel(
 	model: Model<Api>,
 	apiKey: string,
 	outerSignal: AbortSignal,
+	oauthIdentity?: OAuthRequestIdentity,
 ): Promise<CredentialCompletionResult> {
 	const start = Date.now();
 	const attemptTimeoutSignal = AbortSignal.timeout(STRICT_PROBE_PER_ATTEMPT_TIMEOUT_MS);
@@ -618,6 +644,7 @@ async function probeOneModel(
 		},
 		{
 			apiKey,
+			oauthIdentity,
 			maxTokens: 32,
 			signal: attemptSignal,
 		},
@@ -636,7 +663,7 @@ async function probeOneModel(
 
 /**
  * Build the {@link CompletionProbe} consumed by
- * {@link AuthStorage.checkCredentials} in `--strict` mode. Walks the cheapest
+ * {@link AuthStorage.health.check} in `--strict` mode. Walks the cheapest
  * candidates per provider, retrying on "model not found / invalid model"
  * errors so a stale catalog entry doesn't masquerade as a bad credential.
  * Stops as soon as one model returns a successful response (the credential
@@ -649,6 +676,14 @@ function createStrictCompletionProbe(): CompletionProbe {
 			return { ok: null, reason: `no bearer-compatible probe model bundled for provider ${input.provider}` };
 		}
 		const apiKey = composeProbeApiKey(input.provider, input.credential);
+		const oauthIdentity =
+			input.credential.type === "oauth"
+				? {
+						orgId: input.credential.orgId,
+						region: input.credential.region,
+						inferenceRegion: input.credential.inferenceRegion,
+					}
+				: undefined;
 		let lastFailure: CredentialCompletionResult | undefined;
 		for (const model of candidates) {
 			if (input.signal.aborted) {
@@ -658,7 +693,7 @@ function createStrictCompletionProbe(): CompletionProbe {
 					modelId: model.id,
 				};
 			}
-			const result = await probeOneModel(model, apiKey, input.signal);
+			const result = await probeOneModel(model, apiKey, input.signal, oauthIdentity);
 			if (result.ok === true) return result;
 			lastFailure = result;
 			if (!RETRYABLE_MODEL_ERROR_RE.test(result.reason ?? "")) {
@@ -704,6 +739,8 @@ async function runCheck(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	}
 
 	const accountPool = await loadAuthBrokerAccountPool();
+	const settings = await resolveEffectiveSettings();
+	const { accountPolicies, defaultReservePct } = await loadEffectiveAuthAccountPolicyConfig({ settings });
 	const client = createBrokerClient(brokerConfig);
 	const initialSnapshot = await fetchBrokerSnapshot(client);
 	const store = new RemoteAuthCredentialStore({
@@ -711,14 +748,19 @@ async function runCheck(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		initialSnapshot,
 		accountPool,
 	});
-	const storage = new AuthStorage(store, { sourceLabel: `broker ${brokerConfig.url}` });
+	const storage = new AuthStorage(store, {
+		sourceLabel: `broker ${brokerConfig.url}`,
+		accountPolicies,
+		defaultReservePct,
+	});
 	try {
-		await storage.reload();
-		const results = await storage.checkCredentials(
-			flags.strict
+		await storage.credentials.reload();
+		const results = await storage.health.check({
+			excludeProviders: new Set(cfgDisabledProviders.get(settings)),
+			...(flags.strict
 				? { completionProbe: createStrictCompletionProbe(), completionTimeoutMs: STRICT_PROBE_OVERALL_TIMEOUT_MS }
-				: undefined,
-		);
+				: {}),
+		});
 
 		if (flags.json) {
 			process.stdout.write(

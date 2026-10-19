@@ -73,6 +73,14 @@ describe("InteractiveMode tiny-title prewarm", () => {
 	});
 
 	afterEach(async () => {
+		// init() defers the prewarm probe behind a setImmediate. Flush one
+		// immediate tick while this case's spies are still installed: an
+		// unflushed callback otherwise fires during a later case, with
+		// `getSessionName` already restored and this mode's tiny role still
+		// configured, and lands in that case's `prewarm` spy (flaky in CI).
+		const pendingImmediates = Promise.withResolvers<void>();
+		setImmediate(pendingImmediates.resolve);
+		await pendingImmediates.promise;
 		mode?.stop();
 		vi.restoreAllMocks();
 		await session?.dispose();
@@ -134,27 +142,5 @@ describe("InteractiveMode tiny-title prewarm", () => {
 		await immediateFlushed.promise;
 
 		expect(prewarm).not.toHaveBeenCalled();
-	});
-
-	it("paints the pending user row before starting title generation", async () => {
-		await mode.init();
-
-		const order: string[] = [];
-		vi.spyOn(mode, "startPendingSubmission").mockImplementation(input => {
-			order.push("pending-row");
-			return { text: input.text, cancelled: false, started: false };
-		});
-		const generateTitle = vi.spyOn(session, "generateTitle").mockImplementation(async () => {
-			order.push("title-gen");
-			return null;
-		});
-		const onInput = vi.fn();
-		mode.onInputCallback = onInput;
-
-		await mode.editor.onSubmit?.("investigate the failing title worker");
-
-		expect(order).toEqual(["pending-row", "title-gen"]);
-		expect(generateTitle).toHaveBeenCalledWith("investigate the failing title worker");
-		expect(onInput).toHaveBeenCalledTimes(1);
 	});
 });

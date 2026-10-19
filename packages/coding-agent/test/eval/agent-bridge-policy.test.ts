@@ -5,7 +5,11 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 import { AsyncJobManager } from "../../src/async";
 import { Settings } from "../../src/config/settings";
 import { runEvalAgent, type EvalAgentBridgeOptions, type EvalAgentResult } from "../../src/eval/agent-bridge";
-import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP } from "../../src/eval/bridge-timeout";
+import {
+	EVAL_TIMEOUT_PAUSE_OP,
+	EVAL_TIMEOUT_RESUME_OP,
+	type EvalTimeoutControlSink,
+} from "../../src/eval/bridge-timeout";
 import { runEvalWait } from "../../src/eval/handle-bridge";
 import { IdleTimeout } from "../../src/eval/idle-timeout";
 import { disposeAllVmContexts } from "../../src/eval/js/context-manager";
@@ -56,7 +60,10 @@ function isEvalAgentResult(value: unknown): value is EvalAgentResult {
 	);
 }
 
-async function runEvalAgentAndWait(args: unknown, options: EvalAgentBridgeOptions): Promise<EvalAgentResult> {
+async function runEvalAgentAndWait(
+	args: unknown,
+	options: EvalAgentBridgeOptions & { onTimeoutControl?: EvalTimeoutControlSink },
+): Promise<EvalAgentResult> {
 	const handle = await runEvalAgent(args, options);
 	const waited = await runEvalWait({ items: [{ kind: "agent", id: handle.id }] }, options);
 	const snapshot = waited.items[0];
@@ -400,7 +407,7 @@ describe("runEvalAgent", () => {
 		]);
 	});
 
-	it("keeps bridge kernels independent while inheriting non-plan LSP and IRC policy", async () => {
+	it("inherits non-plan LSP and IRC policy", async () => {
 		mockAgents();
 		const runSpy = vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => singleResult(options));
 		// makeSession() defaults to enableLsp: true and task.enableLsp: true.
@@ -413,7 +420,6 @@ describe("runEvalAgent", () => {
 		expect(options.enableLsp).toBe(true);
 		expect(options.enableIrc).toBe(true);
 		expect(options.keepAlive).toBe(true);
-		expect(options.parentEvalSessionId).toBeUndefined();
 	});
 
 	it("registers temp artifact dirs for in-memory handle results so agent URLs resolve", async () => {
@@ -865,7 +871,7 @@ describe("agent() through eval runtimes", () => {
 			{
 				session,
 				signal: idle.signal,
-				emitStatus: event => {
+				onTimeoutControl: event => {
 					ops.push(event.op);
 					if (event.op === EVAL_TIMEOUT_PAUSE_OP) idle.pause();
 					if (event.op === EVAL_TIMEOUT_RESUME_OP) idle.resume();
@@ -947,10 +953,15 @@ describe("agent() through eval runtimes", () => {
 			{
 				session,
 				signal: idle.signal,
-				emitStatus: event => {
+				onTimeoutControl: event => {
 					ops.push(event.op);
 					if (event.op === EVAL_TIMEOUT_PAUSE_OP) idle.pause();
 					if (event.op === EVAL_TIMEOUT_RESUME_OP) idle.resume();
+				},
+				// Progress snapshots arrive on the generic status sink and must not
+				// re-arm the watchdog; only the control channel above may.
+				emitStatus: event => {
+					ops.push(event.op);
 				},
 			},
 		);
@@ -1058,13 +1069,7 @@ describe("runEvalAgent isolation", () => {
 
 	function mockIsolationContext(): { repoRoot: string } {
 		const repoRoot = "/repo-root";
-		vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({
-			repoRoot,
-			baseline: {
-				root: { repoRoot, headCommit: "HEAD", staged: "", unstaged: "", untracked: [], untrackedPatch: "" },
-				nested: [],
-			},
-		});
+		vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({ repoRoot });
 		return { repoRoot };
 	}
 
@@ -1112,19 +1117,6 @@ describe("runEvalAgent isolation", () => {
 		expect(plainSpy).toHaveBeenCalledTimes(1);
 		expect(explicitOn.details.isolated).toBe(true);
 		expect(mergeSpy).toHaveBeenCalledTimes(1);
-	});
-
-	it("preserves temp artifacts for non-isolated handle outputs", async () => {
-		mockAgents();
-		const rmSpy = vi.spyOn(fs, "rm").mockResolvedValue(undefined);
-		vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => singleResult(options));
-
-		await runEvalAgentAndWait({ prompt: "plain handle", handle: true }, { session: makeSession() });
-
-		const removedArtifactsDir = rmSpy.mock.calls.some(
-			([target]) => typeof target === "string" && target.includes("omp-eval-agent-"),
-		);
-		expect(removedArtifactsDir).toBe(false);
 	});
 
 	it("forwards merge=false as patch mode and passes the worktree cwd through baseOptions", async () => {
@@ -1179,7 +1171,7 @@ describe("runEvalAgent isolation", () => {
 			{ prompt: "migration", isolated: true },
 			{
 				session: isolatedSession(),
-				emitStatus: event => {
+				onTimeoutControl: event => {
 					if (event.op === EVAL_TIMEOUT_PAUSE_OP || event.op === EVAL_TIMEOUT_RESUME_OP) ops.push(event.op);
 				},
 			},
@@ -1228,7 +1220,7 @@ describe("runEvalAgent isolation", () => {
 			{ prompt: "scout", isolated: true },
 			{
 				session: isolatedSession(),
-				emitStatus: event => {
+				onTimeoutControl: event => {
 					if (event.op === EVAL_TIMEOUT_PAUSE_OP || event.op === EVAL_TIMEOUT_RESUME_OP) ops.push(event.op);
 				},
 			},

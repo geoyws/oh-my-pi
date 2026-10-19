@@ -5,22 +5,47 @@
  */
 import { ExponentialYield } from "@oh-my-pi/pi-agent-core/utils/yield";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
-import { type MinimizerOptions, PtySession, Shell, type ShellRunResult } from "@oh-my-pi/pi-natives";
+import {
+	type MinimizerOptions,
+	PtySession,
+	Shell,
+	type ShellFilesystem,
+	type ShellRunResult,
+} from "@oh-my-pi/pi-natives";
 import { $env } from "@oh-my-pi/pi-utils/env";
 import { isCmdShell, isExecutable, type ShellConfig } from "@oh-my-pi/pi-utils/procmgr";
-import { Settings, type ShellMinimizerSettings } from "../config/settings";
+import { Settings } from "../config/settings";
 import { type OutputArtifactError, OutputSink, type OutputSummary } from "@oh-my-pi/pi-tui/tools/streaming-output";
-import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
+import {
+	resolveOutputMaxColumns,
+	resolveOutputSinkArtifactMaxBytes,
+	resolveOutputSinkHeadBytes,
+} from "../tools/output-meta";
+import { quotePosixArgv } from "../utils/shell-quote";
 import { getOrCreateSnapshot } from "../utils/shell-snapshot";
 import { TerminalGraphicsDecoder } from "../utils/terminal-graphics";
 import { loadDirenvEnv } from "./direnv";
 import { buildNonInteractiveEnv } from "./non-interactive-env";
+
+import {
+	cfgBashDirenv,
+	cfgBashDirenvLoadTimeoutMs,
+	cfgShellMinimizer,
+	cfgShellPath,
+	type ShellMinimizerSettings,
+} from "./settings";
 
 export interface BashExecutorOptions {
 	cwd?: string;
 	/** Milliseconds before aborting the command; 0 disables the executor deadline. */
 	timeout?: number;
 	onChunk?: (chunk: string) => void;
+	/**
+	 * Receives the sink's current inline view ({@link OutputSink.preview}: the
+	 * body the final result will carry so far) at the `onChunk` cadence. Use it
+	 * for live previews instead of re-buffering `onChunk` chunks.
+	 */
+	onPreview?: (text: string) => void;
 	chunkThrottleMs?: number;
 	signal?: AbortSignal;
 	/** Session key suffix to isolate shell sessions per agent */
@@ -31,6 +56,22 @@ export interface BashExecutorOptions {
 	useUserShell?: boolean;
 	/** Run supported user shells (zsh/fish) on a headless PTY; requires `useUserShell`. */
 	pty?: BashPtyOptions;
+	/**
+	 * Refuse git commands that discard or move shared work (`bash.gitGuard`),
+	 * enforced by the embedded shell's `git` builtin.
+	 */
+	gitGuard?: boolean;
+	/**
+	 * Filesystem for `scheme://` paths in this run of the embedded shell (a URL
+	 * `cwd` included). External shells and processes never see it.
+	 */
+	filesystem?: ShellFilesystem;
+	/**
+	 * Invoked once the embedded shell starts the command, with a probe of the
+	 * live pids it spawned (empty once the run ends). Not called on the
+	 * user-shell paths.
+	 */
+	onStart?: (pids: () => readonly number[]) => void;
 	/** Artifact path/id for full output storage */
 	artifactPath?: string;
 	artifactId?: string;
@@ -67,6 +108,8 @@ export interface BashResult {
 	outputLines: number;
 	outputBytes: number;
 	artifactId?: string;
+	/** Bytes the artifact cap dropped from the saved file's middle (the artifact is a head/tail sample). */
+	artifactElidedBytes?: number;
 	artifactError?: OutputArtifactError;
 	workingDir?: string;
 	/** Terminal graphics extracted from raw stdout before sanitization or truncation. */
@@ -77,6 +120,9 @@ export interface BashResult {
  *  command line, so a hostile `.envrc` can't smuggle shell syntax through
  *  `unset`. `.envrc` never produces non-identifier names in practice. */
 const SAFE_ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** A `scheme://` working directory: it exists only in the embedded shell's injected filesystem. */
+const URL_CWD_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
 
 export interface DirenvPreflightOptions {
 	/** Caller-supplied env overlay; these values win over direnv-provided ones. */
@@ -152,15 +198,56 @@ const shellSessionQuarantines = new Map<string, Promise<unknown>>();
 const shellSessionsInUse = new Set<string>();
 
 /**
+ * Every bash-tool run currently executing on a native Shell, keyed by the
+ * session key it runs on. `Shell.shutdown()` only fires the abort token and
+ * returns at once when a run holds the session lock — the TERM→KILL waves run
+ * later on the native cancel bridge — so session dispose must also await the
+ * run itself, or a TERM-ignoring child can survive into a PPID-1 orphan.
+ * `settled` resolves when the native run settles (KILL wave and reap done).
+ * Entries leave the set then, not when the JS caller stops awaiting: an
+ * aborted `executeBash` returns early while its run is still being torn down.
+ */
+interface InFlightShellRun {
+	key: string;
+	abort: () => Promise<void>;
+	settled: Promise<void>;
+}
+const inFlightShellRuns = new Set<InFlightShellRun>();
+
+/**
+ * Test-only override for the post-abort in-flight leak bound below. Lets a
+ * test age a run past the bound in milliseconds instead of waiting out the
+ * ~30s production window. Reset to `undefined` when done.
+ */
+let inFlightLeakBoundForTestMs: number | undefined;
+
+export function setInFlightLeakBoundForTest(ms: number | undefined): void {
+	inFlightLeakBoundForTestMs = ms;
+}
+
+/**
+ * Upper bound on how long session dispose waits for an in-flight run's
+ * cancellation (TERM→KILL escalation and reap). Native cancellation normally
+ * settles in ~2s; an unkillable run must not stall dispose forever.
+ */
+const IN_FLIGHT_RUN_DISPOSE_WAIT_MS = 2_500;
+
+function inFlightRunDisposeDeadline(): Promise<void> {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	const timer = setTimeout(resolve, IN_FLIGHT_RUN_DISPOSE_WAIT_MS);
+	timer.unref?.();
+	return promise;
+}
+/**
  * Shells retained past their turn because a background (`nohup`/`&`) job is
  * still running. A per-call `:async:` Shell is normally dropped at teardown,
  * which SIGKILLs its children via kill-on-drop. Keeping the reference alive lets
- * the process survive across turns; the Shell is dropped once its last
- * background job exits (reaped by the poll loop below). Children stay
- * kill-on-drop, so they still die when the harness tears the Shell down on exit.
+ * the process survive across turns; it is reaped once its last job exits and
+ * still dies with the harness. The map value is the owning session key (the
+ * `:async:` sessionKey the run used, if any) so session dispose can shut down
+ * exactly its own retained shells.
  */
-const retainedShells = new Set<Shell>();
-const RETAIN_REAP_INTERVAL_MS = 5_000;
+const retainedShells = new Map<Shell, string | undefined>();
 // Native cancellation may spend two seconds unwinding the shell before its
 // N-API chunk bridge drains. The JS watchdog must not race that teardown.
 const NATIVE_TIMEOUT_FALLBACK_GRACE_MS = 5_000;
@@ -171,8 +258,9 @@ const NATIVE_TIMEOUT_FALLBACK_GRACE_MS = 5_000;
 // leaking the session key in `brokenShellSessions`/`shellSessionQuarantines`
 // (#10308). The backing timer is unref'd so it never keeps the process alive.
 const QUARANTINE_CLEANUP_TIMEOUT_MS = 30_000;
+const RETAIN_REAP_INTERVAL_MS = 5_000;
 
-async function retainShellWithLiveBackgroundJobs(shell: Shell): Promise<void> {
+async function retainShellWithLiveBackgroundJobs(shell: Shell, owner: string | undefined): Promise<void> {
 	let live: number;
 	try {
 		live = await shell.liveBackgroundJobCount();
@@ -180,7 +268,7 @@ async function retainShellWithLiveBackgroundJobs(shell: Shell): Promise<void> {
 		return;
 	}
 	if (live <= 0) return;
-	retainedShells.add(shell);
+	retainedShells.set(shell, owner);
 	const interval = setInterval(() => {
 		void shell
 			.liveBackgroundJobCount()
@@ -230,6 +318,59 @@ function quarantineShellSession(
 			}
 		})
 		.catch(() => undefined);
+}
+
+/**
+ * Whether a shell session key belongs to an agent session: either the plain
+ * `${sid}\\n…` form or an `:async:` job key (`${sid}:async:<jobId>\\n…`). The
+ * latter never matches the plain prefix, but an in-flight async run's shell
+ * and cancellation still belong to the disposing session (mirrors the
+ * `${sid}:` match used for retained shells below).
+ */
+function shellKeyOwnedBySession(key: string, agentSessionKey: string): boolean {
+	return key.startsWith(`${agentSessionKey}\n`) || key.startsWith(`${agentSessionKey}:async:`);
+}
+
+/**
+ * Shuts down every Shell owned by an agent session (keys built with
+ * `agentSessionKey` as the {@link BashExecutorOptions.sessionKey}), plus that
+ * session's retained and in-flight `:async:` shells. Each shell is aborted (an
+ * in-flight run cancels through the native TERM→KILL bridge) and its leftover
+ * background jobs are terminated with awaited TERM→KILL escalation, so no
+ * bash-tool process group outlives session dispose — and, through the
+ * postmortem SIGTERM/SIGHUP teardown, process exit. In-flight runs are
+ * additionally awaited (bounded, however long they have been running):
+ * `shutdown()` alone returns while the native cancel bridge still runs its
+ * TERM→KILL waves, so returning then would orphan a TERM-ignoring child. The
+ * maps are process-global, so without this each disposed session keeps its
+ * native shell (and its background jobs) for the life of the process.
+ */
+export async function releaseShellSessions(agentSessionKey: string | undefined): Promise<void> {
+	if (!agentSessionKey) return;
+	const owned: Shell[] = [];
+	for (const [key, shell] of shellSessions) {
+		if (!shellKeyOwnedBySession(key, agentSessionKey)) continue;
+		shellSessions.delete(key);
+		owned.push(shell);
+	}
+	for (const [shell, owner] of retainedShells) {
+		if (owner === agentSessionKey || owner?.startsWith(`${agentSessionKey}:`) === true) {
+			retainedShells.delete(shell);
+			owned.push(shell);
+		}
+	}
+	// Runs still executing on this session's keys — persistent, one-shot
+	// fallback, and `:async:` job shells alike: abort them and wait for the
+	// native cancellation — TERM→KILL waves and reap — to complete. Bounded
+	// so an unkillable run cannot stall dispose; the shutdown below fires the
+	// same abort.
+	const inFlight = [...inFlightShellRuns].filter(run => shellKeyOwnedBySession(run.key, agentSessionKey));
+	const settleInFlight = async (): Promise<void> => {
+		if (inFlight.length === 0) return;
+		await Promise.allSettled(inFlight.map(run => run.abort()));
+		await Promise.race([Promise.allSettled(inFlight.map(run => run.settled)), inFlightRunDisposeDeadline()]);
+	};
+	await Promise.allSettled([...owned.map(shell => shell.shutdown().catch(() => undefined)), settleInFlight()]);
 }
 
 function resolveShellCwd(cwd: string | undefined): string | undefined {
@@ -350,16 +491,12 @@ function ensureInteractiveShellArgs(shell: string, args: string[]): string[] {
 	return [...effectiveArgs, "-i"];
 }
 
-function quoteShellArg(value: string): string {
-	return `'${value.replace(/'/g, "'\\''")}'`;
-}
-
 function buildUserShellCommand(shell: string, args: string[], command: string): string {
-	return [shell, ...ensureInteractiveShellArgs(shell, args), command].map(quoteShellArg).join(" ");
+	return quotePosixArgv([shell, ...ensureInteractiveShellArgs(shell, args), command]);
 }
 
 function resolveUserShellConfig(settings: Settings, baseConfig: ShellConfig): ShellConfig {
-	const customShellPath = settings.get("shellPath");
+	const customShellPath = cfgShellPath.get(settings);
 	const envShell = Bun.env.SHELL;
 	if (customShellPath || process.platform === "win32" || !envShell || envShell === baseConfig.shell) {
 		return baseConfig;
@@ -479,24 +616,31 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		supportsAutoUserShell(shell) &&
 		$env.PI_NO_PTY !== "1" &&
 		!isPersistentShellCdCommand(command);
-	const snapshotPath = bashShell ? await getOrCreateSnapshot(shell, shellEnv) : null;
-
-	const minimizer = buildMinimizerOptions(settings.getGroup("shellMinimizer"));
+	const minimizer = buildMinimizerOptions(cfgShellMinimizer.get(settings));
 
 	const commandCwd = resolveShellCwd(options?.cwd);
+	const virtualCwd = commandCwd !== undefined && URL_CWD_RE.test(commandCwd);
+	if (virtualCwd && (usePty || !options?.filesystem)) {
+		throw new Error(`Working directory ${commandCwd} needs the embedded shell with an injected filesystem`);
+	}
 	// Fold the repo's direnv/devenv env into the command + env so devenv tools
 	// land on PATH; the caller's explicit `env` still wins. Thread the caller's
 	// signal + timeout so an aborted / short-timeout call can't hang on a cold
 	// `.envrc` load before the abort listener is installed. The helper applies
-	// the configured shell `prefix` after any `unset -v` it prepends.
-	const preflight = await applyDirenvPreflight(command, commandCwd ?? process.cwd(), {
-		callerEnv: options?.env,
-		signal: options?.signal,
-		timeoutMs: settings.get("bash.direnvLoadTimeoutMs"),
-		callerTimeoutMs: options?.timeout,
-		direnvSetting: settings.get("bash.direnv"),
-		commandPrefix: prefix,
-	});
+	// the configured shell `prefix` after any `unset -v` it prepends. A URL cwd
+	// has no `.envrc` on the host. The rc snapshot is independent, so both load
+	// concurrently.
+	const [snapshotPath, preflight] = await Promise.all([
+		bashShell ? getOrCreateSnapshot(shell, shellEnv) : null,
+		applyDirenvPreflight(command, commandCwd ?? process.cwd(), {
+			callerEnv: options?.env,
+			signal: options?.signal,
+			timeoutMs: cfgBashDirenvLoadTimeoutMs.get(settings),
+			callerTimeoutMs: options?.timeout,
+			direnvSetting: virtualCwd ? "off" : cfgBashDirenv.get(settings),
+			commandPrefix: prefix,
+		}),
+	]);
 	const commandEnv = buildNonInteractiveEnv(preflight.env);
 	const runCdInPersistentShell = options?.useUserShell === true && !prefix && isPersistentShellCdCommand(command);
 	// Never wrap in cmd.exe: it is only the Windows no-bash fallback for spawn
@@ -508,13 +652,22 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 
 	// Create output sink for truncation and artifact handling
 	const graphics = new TerminalGraphicsDecoder();
-	const sink = new OutputSink({
-		onChunk: usePty ? undefined : options?.onChunk,
+	const onChunk = usePty ? undefined : options?.onChunk;
+	const onPreview = usePty ? undefined : options?.onPreview;
+	const sink: OutputSink = new OutputSink({
+		onChunk:
+			onChunk || onPreview
+				? chunk => {
+						onChunk?.(chunk);
+						onPreview?.(sink.preview());
+					}
+				: undefined,
 		artifactPath: options?.artifactPath,
 		artifactId: options?.artifactId,
 		headBytes: resolveOutputSinkHeadBytes(settings),
+		artifactMaxBytes: resolveOutputSinkArtifactMaxBytes(settings),
 		maxColumns: resolveOutputMaxColumns(settings),
-		chunkThrottleMs: !usePty && options?.onChunk ? (options.chunkThrottleMs ?? 50) : 0,
+		chunkThrottleMs: onChunk || onPreview ? (options?.chunkThrottleMs ?? 50) : 0,
 	});
 
 	// sink.push() is synchronous — buffer management, counters, and onChunk
@@ -570,12 +723,15 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		}
 	}
 
+	// The embedded shell reads its builtin switches from the session env; a
+	// different env also keys a separate persistent session.
+	const sessionEnv = options?.gitGuard ? { ...shellEnv, PI_GIT_GUARD: "1" } : shellEnv;
 	const shellOptions = {
-		sessionEnv: shellEnv,
+		sessionEnv,
 		snapshotPath: snapshotPath ?? undefined,
 		minimizer,
 	};
-	const sessionKey = buildSessionKey(shell, prefix, snapshotPath, shellEnv, options?.sessionKey, minimizer);
+	const sessionKey = buildSessionKey(shell, prefix, snapshotPath, sessionEnv, options?.sessionKey, minimizer);
 	const persistentSessionBroken = brokenShellSessions.has(sessionKey);
 	if (persistentSessionBroken) {
 		shellSessions.delete(sessionKey);
@@ -600,7 +756,13 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	const userSignal = options?.signal;
 	const runAbortController = new AbortController();
 	let abortCleanupPromise: Promise<void> | undefined;
+	// Assigned once the in-flight entry below exists. Firing the abort starts
+	// the leak-bound countdown for the entry (a run that never settles after
+	// an abort must not pin the registry forever); a healthy long run that
+	// was never aborted stays tracked so dispose still waits for it.
+	let armInFlightLeakBound: () => void = () => {};
 	const abortShell = (): Promise<void> => {
+		armInFlightLeakBound();
 		abortCleanupPromise ??= executionShell.abort().catch(() => undefined);
 		return abortCleanupPromise;
 	};
@@ -650,6 +812,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 				env: commandEnv,
 				timeoutMs: nativeTimeoutMs,
 				signal: runAbortController.signal,
+				filesystem: options?.filesystem,
 			},
 			(err, chunk) => {
 				if (!err) {
@@ -657,6 +820,47 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 				}
 			},
 		);
+		// Track the run for session dispose: `releaseShellSessions` aborts and
+		// awaits exactly this promise, whose settlement follows the native
+		// TERM→KILL waves. Removed on settlement, not on early JS return, so a
+		// dispose racing an aborted call still waits for the group to die.
+		let markRunSettled!: () => void;
+		const runSettled = new Promise<void>(resolve => {
+			markRunSettled = resolve;
+		});
+		// Dispose aborts through the run's own signal as well as the shell:
+		// `Shell.abort()` reaches only a run that has stored its native cancel
+		// token, which happens after session creation (snapshot sourcing). A
+		// dispose landing in that window would otherwise be a no-op, while the
+		// signal feeds the run's cancel token whenever it starts waiting.
+		const abortForDispose = (): Promise<void> => {
+			if (!runAbortController.signal.aborted) runAbortController.abort();
+			return abortShell();
+		};
+		const inFlightRun: InFlightShellRun = { key: sessionKey, abort: abortForDispose, settled: runSettled };
+		inFlightShellRuns.add(inFlightRun);
+		// Leak bound for a wedged run that never settles after an abort
+		// (mirrors the quarantine window, #10308). Armed only by the first
+		// `abortShell()` call — never at run start — so a healthy long run
+		// stays tracked and dispose still waits for its cancellation.
+		let leakTimer: NodeJS.Timeout | undefined;
+		armInFlightLeakBound = () => {
+			leakTimer ??= setTimeout(
+				() => inFlightShellRuns.delete(inFlightRun),
+				inFlightLeakBoundForTestMs ?? QUARANTINE_CLEANUP_TIMEOUT_MS,
+			);
+			leakTimer.unref?.();
+		};
+		const settleRun = (): void => {
+			if (leakTimer !== undefined) {
+				clearTimeout(leakTimer);
+				leakTimer = undefined;
+			}
+			inFlightShellRuns.delete(inFlightRun);
+			markRunSettled();
+		};
+		runPromise.then(settleRun, settleRun);
+		options?.onStart?.(() => executionShell.pids());
 
 		const ey = new ExponentialYield();
 		const winner = await ey.race<
@@ -757,7 +961,13 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			}
 		}
 
-		// Normal completion
+		// Normal completion of a non-retained run: reap backgrounded (`&`/`nohup`)
+		// jobs so they never outlive the call. `:async:` runs opt out — the job
+		// manager owns their lifetime — but they still die at session dispose.
+		// Awaited: return means the recorded groups are dead.
+		if (!options?.sessionKey?.includes(":async:")) {
+			await executionShell.terminateBackgroundJobs().catch(() => undefined);
+		}
 		return {
 			exitCode: winner.result.exitCode,
 			cancelled: false,
@@ -766,6 +976,11 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		};
 	} catch (err) {
 		resetSession = true;
+		// An errored run can still leave backgrounded jobs behind; reap them
+		// like a normal end unless the `:async:` job manager owns them.
+		if (!options?.sessionKey?.includes(":async:")) {
+			await executionShell.terminateBackgroundJobs().catch(() => undefined);
+		}
 		throw err;
 	} finally {
 		await sink.dispose();
@@ -784,10 +999,11 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 				// Dropping the only reference to a per-call `:async:` Shell SIGKILLs
 				// any `nohup`/`&` children (kill-on-drop). If the command left a live
 				// background job, retain the Shell so the process survives across
-				// turns; it is reaped once its last job exits and still dies with the
-				// harness. Skip on resetSession (cancel/error) — those tear down.
+				// turns; it is reaped once its last job exits, and session dispose
+				// shuts it down (see `releaseShellSessions`). Skip on resetSession
+				// (cancel/error) — those tear down.
 				if (!resetSession && shellSession) {
-					await retainShellWithLiveBackgroundJobs(shellSession);
+					await retainShellWithLiveBackgroundJobs(shellSession, options?.sessionKey);
 				}
 			}
 		}

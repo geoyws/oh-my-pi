@@ -2,7 +2,7 @@ import type { AgentMessage, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Tool, UsageLimit, UsageReport } from "@oh-my-pi/pi-ai";
 import type { Model } from "@oh-my-pi/pi-catalog/types";
 import type { CompactionBoundaries } from "./context-usage";
-import type { StatusLineSettings } from "./types";
+import type { StatusLineSettings, StatusResetExpiry } from "./types";
 
 export interface StatusAccountIdentity {
 	accountId?: string;
@@ -45,6 +45,8 @@ export interface StatusLineSession {
 			orchestrationCacheRead: number;
 			premiumRequests: number;
 			cost: number;
+			/** Portion of `cost` carried by completed subagent task results. */
+			subagentCost?: number;
 		};
 	};
 	modelRegistry: {
@@ -53,6 +55,8 @@ export interface StatusLineSession {
 	getContextUsage(): { tokens: number; contextWindow: number; percent: number | null } | undefined;
 	autoResolvedThinkingLevel(): string | undefined;
 	isFastModeActive(): boolean;
+	/** Anthropic usage-limit label (`limit reached · wrapping up · resets 14:30`, `low priority until 14:30 · 62% left`). */
+	getAnthropicSlowModeLabel?(): string | undefined;
 	getPrewalkState?(): unknown;
 	getAsyncJobSnapshot(): { running: readonly { type: string; agentId?: string }[] } | null | undefined;
 	getGoalModeState(): { goal?: { status: string; tokensUsed: number; tokenBudget?: number } } | undefined;
@@ -89,6 +93,9 @@ export interface StatusLineHost<TSession extends StatusLineSession = StatusLineS
 	lookupPullRequest(cwd: string): Promise<{ stdout: string; exitCode: number }>;
 	calculateTokensPerSecond(messages: readonly AgentMessage[], isStreaming: boolean): number | null;
 	limitMatchesActiveAccount(report: UsageReport, limit: UsageLimit, identity: StatusAccountIdentity): boolean;
+	classifyResetExpiry?(report: UsageReport, nowMs: number): StatusResetExpiry | undefined;
+	/** One-line warning for saved resets anywhere in the pool that expire within 24 hours. */
+	resetExpiryNotice?(reports: readonly UsageReport[], nowMs: number): string | undefined;
 	computeCompactionBoundaries(session: TSession, contextWindow: number, model?: Model): CompactionBoundaries | null;
 }
 

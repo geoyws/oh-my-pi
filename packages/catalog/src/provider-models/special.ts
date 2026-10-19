@@ -1,15 +1,21 @@
 import { logger, once } from "@oh-my-pi/pi-utils";
 import { buildModel } from "../build";
 import { apiRouteFor } from "../compat/behavior";
-import { seedModels } from "../compat/providers";
+import { providerEntry, seedModels } from "../compat/providers";
 import { type CodexModelDiscoveryResult, fetchCodexModels } from "../discovery/codex";
 import type { DevinModelDiscoveryOptions } from "../discovery/devin";
+import {
+	type FactoryDroidModelDiscoveryOptions,
+	factoryDroidSeedModels,
+	fetchFactoryDroidModels,
+} from "../discovery/factory-droid";
 import { fetchTypeSafeModels, TYPESAFE_DEFAULT_BASE_URL } from "../discovery/typesafe";
 import { buildGitLabDuoWorkflowFallbackModel, fetchGitLabDuoWorkflowModels } from "../discovery/gitlab-duo-workflow";
 import type { ModelManagerOptions } from "../model-manager";
 import { getBundledModel } from "../models";
 import type { Api, FetchImpl, Model, ModelSpec } from "../types";
 import { DEVIN_DEFAULT_BASE_URL } from "../wire/devin";
+import { unionAccountCatalogs } from "./account-access";
 import { toModelSpec } from "./bundled-references";
 import { resolveModelCacheProviderId } from "./cache-provider-id";
 
@@ -40,6 +46,12 @@ export interface OpenAICodexModelManagerConfig {
 	 * keeps the previous/bundled catalog instead.
 	 */
 	resolveAccounts?: () => Promise<readonly OpenAICodexAccount[] | null>;
+	/**
+	 * Codex backend base URL (e.g. a Codex-compatible gateway from `models.yml`).
+	 * Defaults to the official ChatGPT backend. Also scopes the discovery cache,
+	 * so a gateway roster never serves the official endpoint and vice versa.
+	 */
+	baseUrl?: string;
 	clientVersion?: string;
 	fetch?: FetchImpl;
 }
@@ -47,10 +59,11 @@ export interface OpenAICodexModelManagerConfig {
 export function openaiCodexModelManagerOptions(
 	config: OpenAICodexModelManagerConfig = {},
 ): ModelManagerOptions<"openai-codex-responses"> {
-	const { resolveAccounts, clientVersion, fetch } = config;
+	const { resolveAccounts, baseUrl, clientVersion, fetch } = config;
 	return {
 		providerId: "openai-codex",
-		dynamicModelsAuthoritative: true,
+		cacheProviderId: resolveModelCacheProviderId("openai-codex", { baseUrl }),
+		dynamicModelsAuthoritative: providerEntry("openai-codex")?.dynamicModelsAuthoritative === true,
 		...(resolveAccounts
 			? {
 					fetchDynamicModels: async () => {
@@ -62,6 +75,7 @@ export function openaiCodexModelManagerOptions(
 								result: await fetchCodexModels({
 									accessToken: account.accessToken,
 									accountId: account.accountId,
+									baseUrl,
 									clientVersion,
 									fetchFn: fetch,
 								}),
@@ -75,8 +89,8 @@ export function openaiCodexModelManagerOptions(
 }
 
 /**
- * Merge complete per-account Codex catalogs into one authoritative list,
- * deduped by model id (first account to expose an id wins).
+ * Merge complete per-account Codex catalogs into one authoritative list via
+ * {@link unionAccountCatalogs}.
  *
  * Returns `null` when any account's fetch failed transiently, so a partial list
  * cannot replace the previous or bundled authoritative catalog. An account
@@ -88,8 +102,7 @@ export function openaiCodexModelManagerOptions(
 function unionCodexModels(
 	results: readonly { accountId: string | undefined; result: CodexModelDiscoveryResult | null }[],
 ): ModelSpec<"openai-codex-responses">[] | null {
-	const byId = new Map<string, ModelSpec<"openai-codex-responses">>();
-	let catalogs = 0;
+	const catalogs: ModelSpec<"openai-codex-responses">[][] = [];
 	for (const { accountId, result } of results) {
 		if (!result) return null;
 		if (result.rejectedStatus !== undefined) {
@@ -99,12 +112,9 @@ function unionCodexModels(
 			});
 			continue;
 		}
-		catalogs++;
-		for (const model of result.models) {
-			if (!byId.has(model.id)) byId.set(model.id, model);
-		}
+		catalogs.push(result.models);
 	}
-	return catalogs > 0 ? [...byId.values()] : null;
+	return catalogs.length > 0 ? unionAccountCatalogs(catalogs) : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -121,7 +131,8 @@ export function cursorModelManagerOptions(config: CursorModelManagerConfig = {})
 	const { apiKey, baseUrl, clientVersion } = config;
 	return {
 		providerId: "cursor",
-		cacheProviderId: resolveModelCacheProviderId("cursor"),
+		dynamicModelsAuthoritative: true,
+		cacheProviderId: resolveModelCacheProviderId("cursor", { apiKey, baseUrl }),
 		...(apiKey
 			? {
 					fetchDynamicModels: async () => {
@@ -335,6 +346,7 @@ export function devinModelManagerOptions(config: DevinModelManagerConfig = {}): 
 	const staticModels = seedModels<"devin-agent">("devin");
 	return {
 		providerId: "devin",
+		cacheProviderId: resolveModelCacheProviderId("devin"),
 		// A configured host serves its own Cascade deployment; keep the seed on it.
 		staticModels:
 			baseUrl === undefined || baseUrl === DEVIN_DEFAULT_BASE_URL
@@ -355,6 +367,25 @@ export function devinModelManagerOptions(config: DevinModelManagerConfig = {}): 
 const devinDiscovery = once(() => import("../discovery/devin"));
 
 // ---------------------------------------------------------------------------
+// Factory Droid
+// ---------------------------------------------------------------------------
+
+export function factoryDroidModelManagerOptions(
+	config: FactoryDroidModelDiscoveryOptions = {},
+): ModelManagerOptions<"factory-droid-agent"> {
+	return {
+		providerId: "factory-droid",
+		cacheProviderId: resolveModelCacheProviderId("factory-droid", config),
+		// No model-listing endpoint exists; the registry narrowed offline is the seed.
+		staticModels: factoryDroidSeedModels(config),
+		dynamicModelsAuthoritative: true,
+		fetchDynamicModels: () => fetchFactoryDroidModels(config),
+		// Refresh current policy online; cached eligibility is not current entitlement.
+		alwaysRefetchDynamicModels: true,
+	};
+}
+
+// ---------------------------------------------------------------------------
 // Synthetic role providers
 // ---------------------------------------------------------------------------
 
@@ -371,6 +402,15 @@ export function webModelManagerOptions(): ModelManagerOptions<"web-search"> {
 		providerId: "web",
 		cacheProviderId: resolveModelCacheProviderId("web"),
 		staticModels: seedModels<"web-search">("web"),
+	};
+}
+
+/** Cloudflare Workers AI judges: the authored Clef rows; the account id resolves per request. */
+export function cloudflareWorkersAiModelManagerOptions(): ModelManagerOptions<"workers-ai-systemone"> {
+	return {
+		providerId: "cloudflare-workers-ai",
+		cacheProviderId: resolveModelCacheProviderId("cloudflare-workers-ai"),
+		staticModels: seedModels<"workers-ai-systemone">("cloudflare-workers-ai"),
 	};
 }
 
@@ -404,7 +444,6 @@ export function typesafeModelManagerOptions(config: TypeSafeModelManagerConfig =
 			: undefined),
 	};
 }
-
 // ---------------------------------------------------------------------------
 // Zai
 // ---------------------------------------------------------------------------

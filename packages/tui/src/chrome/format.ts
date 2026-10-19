@@ -1,6 +1,8 @@
 import { renderProgressBar } from "../components/progress-bar";
 import { shimmerText } from "../theme/shimmer";
 import { theme as currentTheme, type Theme } from "../theme/theme";
+import type { NativeNode } from "../native/node";
+import { node } from "../native/describe";
 
 /** Brand names for provider ids in user-facing usage displays. */
 export function formatProviderName(provider: string): string {
@@ -39,6 +41,16 @@ const unstyledProgressBarTheme: ProgressBarTheme = {
 
 function resolveProgressBarTheme(uiTheme: ProgressBarTheme | undefined): ProgressBarTheme {
 	return uiTheme ?? currentTheme ?? unstyledProgressBarTheme;
+}
+
+/**
+ * Native {@link renderAsciiBar}: a terminal-drawn progress bar with the same
+ * percent label; `undefined` is indeterminate.
+ */
+export function describeAsciiBar(fraction: number | undefined): NativeNode {
+	if (fraction === undefined) return node("progress", { value: null });
+	const value = Math.min(1, Math.max(0, fraction));
+	return node("progress", { value, label: `${Math.round(value * 100)}%` });
 }
 
 /**

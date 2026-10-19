@@ -21,6 +21,7 @@ import type {
 	ProviderSessionState,
 } from "@oh-my-pi/pi-ai/types";
 import { __resetProxyCache } from "@oh-my-pi/pi-ai/utils/proxy";
+import { validateToolArguments } from "@oh-my-pi/pi-ai/utils/validation";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import * as piUtils from "@oh-my-pi/pi-utils";
@@ -30,7 +31,6 @@ const { getAgentDir, setAgentDir, TempDir } = piUtils;
 
 const originalAgentDir = getAgentDir();
 const originalWebSocket = global.WebSocket;
-const originalCodexWebSocketV2 = Bun.env.PI_CODEX_WEBSOCKET_V2;
 const originalProxyEnv: Record<string, string | undefined> = {
 	PI_PROXY: Bun.env.PI_PROXY,
 	PI_PROXY_CODEX_PROXY_TEST: Bun.env.PI_PROXY_CODEX_PROXY_TEST,
@@ -60,7 +60,6 @@ beforeEach(() => {
 afterEach(() => {
 	global.WebSocket = originalWebSocket;
 	setAgentDir(originalAgentDir);
-	restoreEnv("PI_CODEX_WEBSOCKET_V2", originalCodexWebSocketV2);
 	vi.useRealTimers();
 	for (const key in originalProxyEnv) restoreEnv(key, originalProxyEnv[key]);
 	__resetProxyCache();
@@ -208,6 +207,38 @@ function createNoProgressCodexSse(signal: AbortSignal | undefined): Response {
 	return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
 }
 
+/**
+ * Non-2xx response whose error body is delivered partially and then stalls
+ * forever unless the request signal aborts. Mirrors a server (or proxy) that
+ * flushes error headers plus an incomplete JSON body and holds the socket open —
+ * the shape that used to bypass the Codex pre-response deadline (issue #12664).
+ * Wiring the body stream to the fetch signal lets the armed pre-response
+ * watchdog abort the read exactly as a real socket would.
+ */
+function createStalledErrorResponse(status: number, signal: AbortSignal | undefined): Response {
+	const encoder = new TextEncoder();
+	let abortListener: (() => void) | undefined;
+	const stream = new ReadableStream<Uint8Array>({
+		start(controller) {
+			controller.enqueue(encoder.encode('{"error":{"message":"synthetic incomplete'));
+			abortListener = () => {
+				if (abortListener) signal?.removeEventListener("abort", abortListener);
+				const reason = signal?.reason;
+				controller.error(reason instanceof Error ? reason : new Error("request aborted"));
+			};
+			if (signal?.aborted) {
+				queueMicrotask(() => abortListener?.());
+			} else {
+				signal?.addEventListener("abort", abortListener, { once: true });
+			}
+		},
+		cancel() {
+			if (abortListener) signal?.removeEventListener("abort", abortListener);
+		},
+	});
+	return new Response(stream, { status, headers: { "content-type": "application/json" } });
+}
+
 function encodeWebSocketMessage(value: Record<string, unknown>): Uint8Array {
 	return new TextEncoder().encode(JSON.stringify(value));
 }
@@ -334,6 +365,48 @@ class MockWebSocket {
 }
 
 describe("openai-codex streaming", () => {
+	it.each(["arguments.done", "output_item.done", "terminal"])(
+		"refuses truncated final JSON via %s",
+		async finalizer => {
+			const raw = '{"path":"repaired.txt","content":"hello';
+			const item = { type: "function_call", id: "fc_1", call_id: "call_1", name: "write", arguments: "" };
+			const events: unknown[] = [
+				{ type: "response.output_item.added", output_index: 0, item },
+				{ type: "response.function_call_arguments.delta", output_index: 0, item_id: "fc_1", delta: raw },
+			];
+			if (finalizer === "arguments.done") {
+				events.push({
+					type: "response.function_call_arguments.done",
+					output_index: 0,
+					item_id: "fc_1",
+					arguments: raw,
+				});
+			}
+			if (finalizer !== "terminal") {
+				events.push({ type: "response.output_item.done", output_index: 0, item: { ...item, arguments: raw } });
+			}
+			events.push({ type: "response.completed", response: { id: "resp_1", status: "completed" } });
+			const output = await streamOpenAICodexResponses(
+				{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+				createCodexTestContext(),
+				{
+					apiKey: createCodexTestToken(),
+					fetch: async () =>
+						new Response(events.map(event => "data: " + JSON.stringify(event) + "\n\n").join(""), {
+							headers: { "content-type": "text/event-stream" },
+						}),
+				},
+			).result();
+			expect(output.stopReason).toBe("toolUse");
+			const call = output.content.find(block => block.type === "toolCall");
+			if (!call) throw new Error("Expected tool call");
+			expect(call.arguments).toEqual({ __parseError: expect.any(String), __rawJson: raw });
+			expect(() =>
+				validateToolArguments({ name: "write", description: "", parameters: { type: "object" } }, call),
+			).toThrow("Tool call arguments are not valid JSON");
+		},
+	);
+
 	it("normalizes Codex response endpoint base URLs", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
@@ -1129,6 +1202,89 @@ describe("openai-codex streaming", () => {
 		expect(toolCall.arguments).toEqual({ path: "README.md" });
 		expect((toolCall as unknown as Record<string, unknown>).partialJson).toBeUndefined();
 		expect((toolCall as unknown as Record<string, unknown>).lastParseLen).toBeUndefined();
+	});
+
+	it.each([
+		{
+			name: "streamed deltas and an empty arguments done",
+			deltas: ['{"path": ', '"README.md"}'],
+			done: "",
+			late: [],
+		},
+		{
+			name: "streamed deltas and no arguments done",
+			deltas: ['{"path": ', '"README.md"}'],
+			done: undefined,
+			late: [],
+		},
+		{ name: "only a full arguments done", deltas: [], done: '{"path": "README.md"}', late: [] },
+		{
+			name: "a full arguments done and a late delta",
+			deltas: ['{"path": "README.md"}'],
+			done: '{"path": "README.md"}',
+			late: [" "],
+		},
+	])(
+		"keeps tool-call args from $name when output_item.done carries empty arguments",
+		async ({ deltas, done, late }) => {
+			const item = { type: "function_call", id: "fc_1", call_id: "call_1", name: "read_file", arguments: "" };
+			const delta = (text: string) => ({
+				type: "response.function_call_arguments.delta",
+				item_id: "fc_1",
+				delta: text,
+			});
+			const events: unknown[] = [{ type: "response.output_item.added", item }, ...deltas.map(delta)];
+			if (done !== undefined)
+				events.push({ type: "response.function_call_arguments.done", item_id: "fc_1", arguments: done });
+			events.push(
+				...late.map(delta),
+				{ type: "response.output_item.done", item },
+				{ type: "response.completed", response: { id: "resp_1", status: "completed" } },
+			);
+			const output = await streamOpenAICodexResponses(
+				{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+				createCodexTestContext(),
+				{
+					apiKey: createCodexTestToken(),
+					fetch: async () =>
+						new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+							headers: { "content-type": "text/event-stream" },
+						}),
+				},
+			).result();
+			const toolCall = output.content.find(block => block.type === "toolCall");
+			if (toolCall?.type !== "toolCall") throw new Error("expected a finalized toolCall block");
+			expect(toolCall.arguments).toEqual({ path: "README.md" });
+		},
+	);
+
+	it("persists lenient-repaired tool-call args on the native history item (#14155)", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const context = createCodexTestContext();
+		const brokenArgs = '{"command": "pwd", "name": , "ready": null}';
+		const sse = `${[
+			`data: ${JSON.stringify({ type: "response.output_item.added", item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "bash", arguments: "" } })}`,
+			`data: ${JSON.stringify({ type: "response.output_item.done", item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "bash", arguments: brokenArgs } })}`,
+			`data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8, input_tokens_details: { cached_tokens: 0 } } } })}`,
+		].join("\n\n")}\n\n`;
+		const fetchMock = vi.fn(
+			async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		);
+
+		const model = { ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false };
+		const result = await streamOpenAICodexResponses(model, context, {
+			apiKey: token,
+			fetch: fetchMock as FetchImpl,
+		}).result();
+
+		const toolCall = result.content.find(c => c.type === "toolCall");
+		if (toolCall?.type !== "toolCall") throw new Error("expected a finalized toolCall block");
+		const payload = result.providerPayload;
+		if (payload?.type !== "openaiResponsesHistory") throw new Error("expected native Responses history");
+		const nativeCall = payload.items.find(item => item.type === "function_call");
+		expect(JSON.parse(String(nativeCall?.arguments))).toEqual(toolCall.arguments);
 	});
 
 	it("routes interleaved function-call argument deltas to the matching open item", async () => {
@@ -2034,7 +2190,7 @@ describe("openai-codex streaming", () => {
 		expect(result.usage.cost.output).toBeCloseTo(0.000012);
 		expect(result.usage.cost.total).toBeCloseTo(0.000022);
 	});
-	it("bills priority turns at the model's baked serviceTierCost multiplier (gpt-5.5 = 2.5x)", async () => {
+	it("bills priority turns at the Codex provider's baked 2.5x serviceTierCost multiplier", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
 
@@ -2067,28 +2223,188 @@ describe("openai-codex streaming", () => {
 			maxTokens: 128000,
 		};
 
-		// gpt-5.5: the exact `service-tier-cost` rule bakes { flex: 0.5, priority: 2.5 }.
-		const tiered = buildModel({ ...spec, id: "gpt-5.5" });
-		expect(tiered.serviceTierCost).toEqual({ flex: 0.5, priority: 2.5 });
-		const tieredResult = await streamOpenAICodexResponses(tiered, context, {
-			fetch: fetchMock,
-			apiKey: token,
-			serviceTier: "priority",
-		}).result();
-		// 5 input tokens at $1/MTok * 2.5, 3 output at $2/MTok * 2.5.
-		expect(tieredResult.usage.cost.input).toBeCloseTo(0.0000125);
-		expect(tieredResult.usage.cost.output).toBeCloseTo(0.000015);
-
-		// Other Codex models inherit the provider-root { flex: 0.5, priority: 2 } rule.
+		// Every Codex model without its own table, gpt-5.5 included, bakes the
+		// provider-root { flex: 0.5, priority: 2.5 } rule: Fast draws included usage at
+		// 2.5x Standard. gpt-5.1-codex priced Fast at 2x before that rule changed.
 		const generic = buildModel({ ...spec, id: "gpt-5.1-codex" });
-		expect(generic.serviceTierCost).toEqual({ flex: 0.5, priority: 2 });
+		expect(generic.serviceTierCost).toEqual({ flex: 0.5, priority: 2.5 });
 		const genericResult = await streamOpenAICodexResponses(generic, context, {
 			fetch: fetchMock,
 			apiKey: token,
 			serviceTier: "priority",
 		}).result();
-		expect(genericResult.usage.cost.input).toBeCloseTo(0.00001);
-		expect(genericResult.usage.cost.output).toBeCloseTo(0.000012);
+		// 5 input tokens at $1/MTok * 2.5, 3 output at $2/MTok * 2.5.
+		expect(genericResult.usage.cost.input).toBeCloseTo(0.0000125, 12);
+		expect(genericResult.usage.cost.output).toBeCloseTo(0.000015, 12);
+	});
+
+	it("records a served scale tier without pricing it", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+
+		const payload = Buffer.from(
+			JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "acc_test" } }),
+			"utf8",
+		).toBase64();
+		const token = `aaa.${payload}.bbb`;
+
+		const sse = `${[
+			`data: ${JSON.stringify({ type: "response.output_item.added", item: { type: "message", id: "msg_1", role: "assistant", status: "completed", content: [{ type: "output_text", text: "Hello" }] } })}`,
+			`data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", service_tier: "scale", usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8, input_tokens_details: { cached_tokens: 0 } } } })}`,
+		].join("\n\n")}\n\n`;
+		const fetchMock: FetchImpl = async () =>
+			new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+
+		const context: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
+		};
+		const model = buildModel({
+			id: "gpt-5.5",
+			name: "Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		});
+
+		const result = await streamOpenAICodexResponses(model, context, {
+			fetch: fetchMock,
+			apiKey: token,
+			serviceTier: "scale",
+		}).result();
+		// Scale has no Codex pricing entry, so the cost stays standard — but the tier
+		// identity is preserved for premium-request and speed accounting.
+		expect(result.serviceTier).toBe("scale");
+		expect(result.usage.cost.input).toBeCloseTo(0.00001);
+		expect(result.usage.cost.output).toBeCloseTo(0.000012);
+	});
+
+	it("bills ultrafast turns at the model's baked 8x multiplier (gpt-6-astra)", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+
+		const sse = `${[
+			`data: ${JSON.stringify({ type: "response.output_item.added", item: { type: "message", id: "msg_1", role: "assistant", status: "completed", content: [{ type: "output_text", text: "Hello" }] } })}`,
+			`data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", service_tier: "ultrafast", usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8, input_tokens_details: { cached_tokens: 0 } } } })}`,
+		].join("\n\n")}\n\n`;
+		const fetchMock: FetchImpl = async () =>
+			new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+
+		// Astra carries a published ultrafast rate. The Codex table uses OpenAI's
+		// included-usage multipliers: Ultrafast 8x, Fast 2.5x.
+		const astra = buildModel({
+			id: "gpt-6-astra",
+			name: "Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		});
+		expect(astra.serviceTierCost).toEqual({ flex: 0.5, priority: 2.5, ultrafast: 8 });
+		// The catalog bakes Astra's $10/$50 card over the spec's placeholder cost.
+		expect(astra.cost).toMatchObject({ input: 10, output: 50 });
+
+		const result = await streamOpenAICodexResponses(
+			astra,
+			{
+				systemPrompt: ["You are a helpful assistant."],
+				messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
+			},
+			{ fetch: fetchMock, apiKey: createCodexTestToken(), serviceTier: "ultrafast" },
+		).result();
+		// 5 input tokens at $10/MTok * 8, 3 output at $50/MTok * 8.
+		expect(result.usage.cost.input).toBeCloseTo(0.0004, 12);
+		expect(result.usage.cost.output).toBeCloseTo(0.0012, 12);
+	});
+
+	it.each(["default", "auto"] as const)(
+		"bills a requested priority turn at the priority rate when the response echoes %s",
+		async echo => {
+			const tempDir = TempDir.createSync("@pi-codex-stream-");
+			setAgentDir(tempDir.path());
+			const sse = `${[
+				`data: ${JSON.stringify({ type: "response.output_item.added", item: { type: "message", id: "msg_1", role: "assistant", status: "completed", content: [{ type: "output_text", text: "Hello" }] } })}`,
+				`data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", service_tier: echo, usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8, input_tokens_details: { cached_tokens: 0 } } } })}`,
+			].join("\n\n")}\n\n`;
+			const model = buildModel({
+				id: "gpt-5.5",
+				name: "Codex",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				baseUrl: "https://chatgpt.com/backend-api",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0 },
+				contextWindow: 400000,
+				maxTokens: 128000,
+			});
+			expect(model.serviceTierCost?.priority).toBe(2.5);
+			const result = await streamOpenAICodexResponses(
+				model,
+				{
+					systemPrompt: ["You are a helpful assistant."],
+					messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
+				},
+				{
+					fetch: async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+					apiKey: createCodexTestToken(),
+					serviceTier: "priority",
+				},
+			).result();
+			// The Codex backend echoes `default` on turns it serves Fast, so neither
+			// that echo nor `auto` overrides the sent tier: 5 input tokens at $1/MTok
+			// and 3 output at $2/MTok, times 2.5, counted as one premium request.
+			expect(result.serviceTier).toBe("priority");
+			expect(result.usage.cost.input).toBeCloseTo(0.0000125, 12);
+			expect(result.usage.cost.output).toBeCloseTo(0.000015, 12);
+			expect(result.usage.premiumRequests).toBe(1);
+		},
+	);
+
+	it("records an unrequested turn as default at standard rates when the response echoes default", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const sse = `${[
+			`data: ${JSON.stringify({ type: "response.output_item.added", item: { type: "message", id: "msg_1", role: "assistant", status: "completed", content: [{ type: "output_text", text: "Hello" }] } })}`,
+			`data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", service_tier: "default", usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8, input_tokens_details: { cached_tokens: 0 } } } })}`,
+		].join("\n\n")}\n\n`;
+		const model = buildModel({
+			id: "gpt-5.5",
+			name: "Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		});
+		const result = await streamOpenAICodexResponses(
+			model,
+			{
+				systemPrompt: ["You are a helpful assistant."],
+				messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
+			},
+			{
+				fetch: async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+				apiKey: createCodexTestToken(),
+			},
+		).result();
+		// 5 input tokens at $1/MTok and 3 output at $2/MTok, no multiplier.
+		expect(result.serviceTier).toBe("default");
+		expect(result.usage.cost.input).toBeCloseTo(0.000005, 12);
+		expect(result.usage.cost.output).toBeCloseTo(0.000006, 12);
+		expect(result.usage.premiumRequests).toBe(0);
 	});
 
 	it("fails truncated SSE streams that never emit a terminal response event", async () => {
@@ -2193,6 +2509,75 @@ describe("openai-codex streaming", () => {
 		expect(fetchMock).toHaveBeenCalledTimes(2);
 		expect(result.stopReason).toBe("stop");
 		expect(result.content.find(block => block.type === "text")?.text).toBe("Hello after retry");
+	});
+
+	it("reports its provider-error retry sleep through providerRetryWait", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		const payload = Buffer.from(
+			JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "acc_test" } }),
+			"utf8",
+		).toBase64();
+		const token = `aaa.${payload}.bbb`;
+		let requestCount = 0;
+
+		const successSse = `${[
+			`data: ${JSON.stringify({ type: "response.output_item.added", item: { type: "message", id: "msg_retry", role: "assistant", status: "in_progress", content: [] } })}`,
+			`data: ${JSON.stringify({ type: "response.content_part.added", part: { type: "output_text", text: "" } })}`,
+			`data: ${JSON.stringify({ type: "response.output_text.delta", delta: "Hello after retry" })}`,
+			`data: ${JSON.stringify({ type: "response.output_item.done", item: { type: "message", id: "msg_retry", role: "assistant", status: "completed", content: [{ type: "output_text", text: "Hello after retry" }] } })}`,
+			`data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8, input_tokens_details: { cached_tokens: 0 } } } })}`,
+		].join("\n\n")}\n\n`;
+		const errorSse = `data: ${JSON.stringify({ type: "error", code: "model_error", message: "An error occurred while processing your request. You can retry your request." })}\n\n`;
+
+		const fetchMock = vi.fn(async (input: string | URL) => {
+			const url = typeof input === "string" ? input : input.toString();
+			if (url === "https://chatgpt.com/backend-api/codex/responses") {
+				requestCount += 1;
+				return new Response(requestCount === 1 ? errorSse : successSse, {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				});
+			}
+			return new Response("not found", { status: 404 });
+		});
+
+		const model: Model<"openai-codex-responses"> = buildModel({
+			id: "gpt-5.1-codex",
+			name: "GPT-5.1 Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			preferWebsockets: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		});
+
+		const context: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
+		};
+
+		const waits: Array<{ delayMs: number; attempt?: number; maxAttempts?: number }> = [];
+		const result = await completeSimple(model, context, {
+			apiKey: token,
+			fetch: fetchMock as FetchImpl,
+			providerRetryWait: async (delayMs, _signal, info) => {
+				waits.push({ delayMs, attempt: info?.attempt, maxAttempts: info?.maxAttempts });
+			},
+		});
+
+		expect(result.stopReason).toBe("stop");
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+		// The 500ms provider-error backoff must reach the caller instead of being
+		// slept silently inside the stream loop.
+		expect(waits).toEqual([{ delayMs: 500, attempt: 1, maxAttempts: 5 }]);
+		expect(waitSpy).not.toHaveBeenCalledWith(500, expect.anything());
 	});
 
 	it("stops reading SSE responses after a terminal response event", async () => {
@@ -2516,6 +2901,51 @@ describe("openai-codex streaming", () => {
 		expect(result.content.find(block => block.type === "text")?.text).toBe("Recovered after watchdog timeout");
 	});
 
+	it.each([
+		["non-retryable 403 parsed by CodexApiError.fromResponse", 403],
+		["retryable 503 inspected by fetchWithRetry", 503],
+	] as const)("bounds a stalled error body with the pre-response deadline (%s)", async (_label, status) => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const callerAbort = new AbortController();
+		const { promise: requestStarted, resolve: markRequestStarted } = Promise.withResolvers<void>();
+		let requestCount = 0;
+		const fetchMock: FetchImpl = async (input, init) => {
+			requestCount += 1;
+			const requestSignal = getRequestSignal(input, init);
+			markRequestStarted();
+			return createStalledErrorResponse(status, requestSignal);
+		};
+		const model = { ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false };
+
+		const resultPromise = streamOpenAICodexResponses(model, createCodexTestContext(), {
+			apiKey: token,
+			fetch: fetchMock,
+			signal: callerAbort.signal,
+			streamFirstEventTimeoutMs: 10,
+		}).result();
+		await requestStarted;
+		const backstop = Promise.withResolvers<never>();
+		// Bun fake timers incorrectly fire this production watchdog after clearTimeout,
+		// so use the platform clock to ensure the test fails if the body remains stuck.
+		const backstopTimer = setTimeout(() => {
+			callerAbort.abort();
+			backstop.reject(new Error("stalled error body exceeded the test backstop"));
+		}, 1_000);
+		let result;
+		try {
+			result = await Promise.race([resultPromise, backstop.promise]);
+		} finally {
+			clearTimeout(backstopTimer);
+		}
+
+		expect(requestCount).toBe(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("timed out");
+	});
+
 	it("bounds Codex SSE socket-close attempts and preserves the default when omitted", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
@@ -2748,6 +3178,35 @@ describe("openai-codex streaming", () => {
 		expect(capturedHeaders?.get("session_id")).toBe(sessionId);
 		expect(capturedHeaders?.get("x-client-request-id")).toBe(sessionId);
 		expect(capturedBody?.prompt_cache_key).toBeUndefined();
+	});
+	it("routes a side request with its parent's cache affinity while keeping its own identity", async () => {
+		// The backend derives prompt-cache affinity from the session headers, so a side
+		// request reads its parent's cached prefix only when it sends the parent's id.
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		let capturedHeaders: Headers | undefined;
+		let capturedBody: { client_metadata?: Record<string, string> } | undefined;
+		const fetchMock = vi.fn(async (_input: string | URL, init?: RequestInit) => {
+			capturedHeaders = init?.headers instanceof Headers ? init.headers : new Headers(init?.headers);
+			capturedBody = JSON.parse(decodeCodexRequestBody(init?.body));
+			return new Response(createCompletedCodexSse("Hello"), {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			});
+		});
+
+		await streamOpenAICodexResponses(model, createCodexTestContext(), {
+			fetch: fetchMock as FetchImpl,
+			apiKey: createCodexTestToken(),
+			sessionId: "main-session:side:1",
+			parentSessionId: "main-session",
+			preferWebsockets: false,
+		}).result();
+
+		for (const header of ["conversation_id", "session_id", "session-id"]) {
+			expect(capturedHeaders?.get(header)).toBe("main-session");
+		}
+		expect(capturedHeaders?.get("x-client-request-id")).toBe("main-session:side:1");
+		expect(capturedBody?.client_metadata?.session_id).toBe("main-session:side:1");
 	});
 	it("applies cache retention resolution to direct Codex request body construction", async () => {
 		const model = createCodexTestModel();
@@ -3692,7 +4151,90 @@ describe("openai-codex streaming", () => {
 		expect(fetchMock).not.toHaveBeenCalled();
 		expect(sentRequests[0]?.type).toBe("response.create");
 		expect(sentRequests[0]?.service_tier).toBe("priority");
-		expect(result.usage.premiumRequests).toBeUndefined();
+		// The served tier is recorded on the message and counted as a premium
+		// request, so live sessions and the stats backfill agree.
+		expect(result.serviceTier).toBe("priority");
+		expect(result.usage.premiumRequests).toBe(1);
+	});
+
+	it("records the websocket tier onPayload sent when the response echoes default", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const sentRequests: Array<Record<string, unknown>> = [];
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+
+		class DefaultEchoWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+
+			override send(data: string): void {
+				sentRequests.push(JSON.parse(data) as Record<string, unknown>);
+				this.sendJson({
+					type: "response.output_item.added",
+					item: { type: "message", id: "msg_ws", role: "assistant", status: "in_progress", content: [] },
+				});
+				this.sendJson({ type: "response.content_part.added", part: { type: "output_text", text: "" } });
+				this.sendJson({ type: "response.output_text.delta", delta: "Hello WS" });
+				this.sendJson({
+					type: "response.output_item.done",
+					item: {
+						type: "message",
+						id: "msg_ws",
+						role: "assistant",
+						status: "completed",
+						content: [{ type: "output_text", text: "Hello WS" }],
+					},
+				});
+				this.sendJson({
+					type: "response.done",
+					response: { id: "resp_ws", status: "completed", service_tier: "default", usage: DEFAULT_USAGE },
+				});
+			}
+		}
+
+		global.WebSocket = DefaultEchoWebSocket as unknown as typeof WebSocket;
+
+		const model: Model<"openai-codex-responses"> = buildModel({
+			id: "gpt-5.5",
+			name: "Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			preferWebsockets: true,
+			input: ["text"],
+			cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		});
+		const result = await streamOpenAICodexResponses(
+			model,
+			{
+				systemPrompt: ["You are a helpful assistant."],
+				messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
+			},
+			{
+				fetch: fetchMock as FetchImpl,
+				apiKey: createCodexTestToken(),
+				serviceTier: "priority",
+				sessionId: "ws-payload-tier-session",
+				providerSessionState: new Map<string, ProviderSessionState>(),
+				onPayload: async payload => ({ ...(payload as Record<string, unknown>), service_tier: "flex" }),
+			},
+		).result();
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(sentRequests[0]?.service_tier).toBe("flex");
+		// The hook sent flex instead of the requested priority, so the `default`
+		// echo resolves to flex: 5 input tokens at $1/MTok and 3 output at $2/MTok,
+		// times 0.5, with no premium request.
+		expect(result.serviceTier).toBe("flex");
+		expect(result.usage.cost.input).toBeCloseTo(0.0000025, 12);
+		expect(result.usage.cost.output).toBeCloseTo(0.000003, 12);
+		expect(result.usage.premiumRequests).toBe(0);
 	});
 
 	it("continues websocket chains across Standard → Fast → Standard service tiers", async () => {
@@ -3794,6 +4336,101 @@ describe("openai-codex streaming", () => {
 		expect(stats?.lastInputItems).toBe(1);
 		expect(stats?.lastDeltaInputItems).toBe(1);
 		expect(stats?.lastPreviousResponseId).toBe("resp_2");
+	});
+
+	it("sends a full websocket create when entering or leaving the advertised Ultrafast tier", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const sentRequests: Array<Record<string, unknown>> = [];
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+
+		class UltrafastWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+
+			override send(data: string): void {
+				sentRequests.push(JSON.parse(data) as Record<string, unknown>);
+				const responseIndex = sentRequests.length;
+				this.emitCodexResponse({
+					messageId: `msg_${responseIndex}`,
+					responseId: `resp_${responseIndex}`,
+					text: `Answer ${responseIndex}`,
+					terminalType: "response.completed",
+					includeCreated: true,
+				});
+			}
+		}
+
+		global.WebSocket = UltrafastWebSocket as unknown as typeof WebSocket;
+		const spec: ModelSpec<"openai-codex-responses"> = {
+			id: "gpt-6.1-sol",
+			name: "GPT-6.1 Sol",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			preferWebsockets: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 272000,
+			maxTokens: 128000,
+		};
+		const model: Model<"openai-codex-responses"> = buildModel({ ...spec, serviceTiers: ["priority", "ultrafast"] });
+		const baseOptions = {
+			fetch: fetchMock as FetchImpl,
+			apiKey: createCodexTestToken(),
+			sessionId: "ws-ultrafast-session",
+			providerSessionState: new Map<string, ProviderSessionState>(),
+		};
+		const startedAt = Date.now();
+		let context: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [{ role: "user", content: "Question 1", timestamp: startedAt }],
+		};
+		for (const [turn, serviceTier] of [undefined, "ultrafast", "ultrafast", undefined].entries()) {
+			if (turn > 0) {
+				context = {
+					systemPrompt: context.systemPrompt,
+					messages: [
+						...context.messages,
+						{ role: "user", content: `Question ${turn + 1}`, timestamp: startedAt + turn },
+					],
+				};
+			}
+			const response = await streamOpenAICodexResponses(model, context, {
+				...baseOptions,
+				...(serviceTier ? { serviceTier } : {}),
+			}).result();
+			context = { systemPrompt: context.systemPrompt, messages: [...context.messages, response] };
+		}
+
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(sentRequests.map(request => [request.service_tier, request.previous_response_id])).toEqual([
+			[undefined, undefined],
+			// Standard → Ultrafast: full create, the whole transcript replayed.
+			["ultrafast", undefined],
+			// Ultrafast → Ultrafast: chained delta.
+			["ultrafast", "resp_2"],
+			// Ultrafast → Standard: full create again.
+			[undefined, undefined],
+		]);
+		expect(JSON.stringify(sentRequests[1]?.input)).toContain("Question 1");
+		expect(JSON.stringify(sentRequests[2]?.input)).not.toContain("Question 2");
+		expect(JSON.stringify(sentRequests[3]?.input)).toContain("Question 1");
+
+		// A Codex model that does not advertise the tier never receives it.
+		sentRequests.length = 0;
+		await streamOpenAICodexResponses(buildModel({ ...spec, serviceTiers: ["priority"] }), context, {
+			...baseOptions,
+			sessionId: "ws-ultrafast-unadvertised",
+			serviceTier: "ultrafast",
+		}).result();
+		expect(sentRequests).toHaveLength(1);
+		expect(sentRequests[0]?.service_tier).toBeUndefined();
 	});
 
 	it("records websocket delta request and usage diagnostics", async () => {
@@ -5028,64 +5665,6 @@ describe("openai-codex streaming", () => {
 			lastDeltaInputItems: undefined,
 			lastPreviousResponseId: undefined,
 		});
-	});
-
-	it("uses websocket v2 beta header when v2 mode is enabled", async () => {
-		const tempDir = TempDir.createSync("@pi-codex-stream-");
-		setAgentDir(tempDir.path());
-		Bun.env.PI_CODEX_WEBSOCKET_V2 = "1";
-
-		const payload = Buffer.from(
-			JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "acc_test" } }),
-			"utf8",
-		).toBase64();
-		const token = `aaa.${payload}.bbb`;
-
-		const fetchMock = vi.fn(async () => {
-			throw new Error("SSE fallback should not be called");
-		});
-
-		class WebSocketV2HeaderProbe extends MockWebSocket {
-			constructor(url: string, options?: { headers?: WsHeaders }) {
-				super(url, options);
-				expect(options?.headers?.["OpenAI-Beta"] ?? options?.headers?.["openai-beta"]).toBe(
-					"responses_websockets=2026-02-06",
-				);
-				this.scheduleOpen();
-			}
-
-			override send(): void {
-				this.emitCodexResponse({ messageId: "msg_v2", responseId: "resp_v2", text: "Hello v2" });
-			}
-		}
-
-		global.WebSocket = WebSocketV2HeaderProbe as unknown as typeof WebSocket;
-
-		const model: Model<"openai-codex-responses"> = buildModel({
-			id: "gpt-5.3-codex-spark",
-			name: "GPT-5.3 Codex Spark",
-			api: "openai-codex-responses",
-			provider: "openai-codex",
-			baseUrl: "https://chatgpt.com/backend-api",
-			reasoning: true,
-			preferWebsockets: true,
-			input: ["text"],
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: 128000,
-			maxTokens: 128000,
-		});
-		const context: Context = {
-			systemPrompt: ["You are a helpful assistant."],
-			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
-		};
-		const providerSessionState = new Map<string, ProviderSessionState>();
-		await streamOpenAICodexResponses(model, context, {
-			fetch: fetchMock as FetchImpl,
-			apiKey: token,
-			sessionId: "ws-v2-session",
-			providerSessionState,
-		}).result();
-		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
 	it("waits for caller abort when a prewarmed websocket is silent before its first event", async () => {
@@ -6735,6 +7314,35 @@ describe("openai-codex streaming", () => {
 			.join("");
 		expect(text).toBe("Second");
 	});
+
+	it("passes explicit service tier routing through websocket prewarm", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-prewarm-tier-");
+		setAgentDir(tempDir.path());
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const constructorHints: Array<string | undefined> = [];
+
+		class PrewarmTierWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				constructorHints.push(options?.headers?.["x-codex-routing-hint"]);
+				this.scheduleOpen();
+			}
+		}
+		global.WebSocket = PrewarmTierWebSocket as unknown as typeof WebSocket;
+
+		try {
+			await prewarmOpenAICodexResponses(model, {
+				apiKey: createCodexTestToken(),
+				sessionId: "ws-prewarm-tier-session",
+				providerSessionState,
+				serviceTier: "priority",
+			});
+			expect(constructorHints).toEqual([`model=${model.requestModelId ?? model.id};tier=priority`]);
+		} finally {
+			for (const state of providerSessionState.values()) state.close();
+		}
+	});
 });
 
 describe("openai-codex SSE statelessness", () => {
@@ -6809,5 +7417,647 @@ describe("openai-codex SSE statelessness", () => {
 			providerSessionState,
 		});
 		expect(stats).toMatchObject({ fullContextRequests: 2, deltaRequests: 0 });
+	});
+});
+
+describe("openai-codex recovery attempt gate", () => {
+	const BUDGET_EXHAUSTED = "Provider operation budget exhausted";
+	const ACCESS_PROGRAM_REJECTION = {
+		code: "access_program_not_enabled",
+		message: "The requested Cyber access program is not authorized for this workspace.",
+	};
+	const SSE_HEADERS = { "content-type": "text/event-stream" };
+
+	/** Live budget the test spends at the moment it chooses. */
+	function createBudget(): { operationTimeoutMs: number; operationDeadlineAt: number } {
+		return { operationTimeoutMs: 60_000, operationDeadlineAt: Date.now() + 60_000 };
+	}
+
+	function spendBudget(options: { operationDeadlineAt?: number }): void {
+		options.operationDeadlineAt = Date.now() - 1;
+	}
+
+	function accessProgramModel(accountId: string, preferWebsockets: boolean): Model<"openai-codex-responses"> {
+		return {
+			...createCodexTestModel("https://chatgpt.com/backend-api"),
+			preferWebsockets,
+			accountAccess: { [accountId]: { cyberPrograms: ["standard", "daybreak_blue"] } },
+		};
+	}
+
+	/** SSE response that delivers `events`, then stalls until the request signal aborts. */
+	function createStalledCodexSse(signal: AbortSignal | undefined, events: Array<Record<string, unknown>>): Response {
+		const encoder = new TextEncoder();
+		let abortListener: (() => void) | undefined;
+		const stream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				for (const event of events) controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+				abortListener = () => {
+					const reason = signal?.reason;
+					controller.error(reason instanceof Error ? reason : new Error("request aborted"));
+				};
+				if (signal?.aborted) queueMicrotask(abortListener);
+				else signal?.addEventListener("abort", abortListener, { once: true });
+			},
+			cancel() {
+				if (abortListener) signal?.removeEventListener("abort", abortListener);
+			},
+		});
+		return new Response(stream, { status: 200, headers: SSE_HEADERS });
+	}
+
+	beforeEach(() => {
+		setAgentDir(TempDir.createSync("@pi-codex-attempt-gate-").path());
+	});
+
+	it("still sends the initial HTTP request when payload preparation spends the operation budget", async () => {
+		const fetchMock = vi.fn<FetchImpl>(
+			async () =>
+				new Response(createStatefulCodexSse("Initial response", "resp_initial_budget"), { headers: SSE_HEADERS }),
+		);
+		const options = {
+			apiKey: createCodexTestToken(),
+			fetch: fetchMock,
+			...createBudget(),
+			onPayload: async () => {
+				spendBudget(options);
+				return undefined;
+			},
+		};
+
+		await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			options,
+		).result();
+
+		// The operation budget gates retries/recovery, not the first send.
+		// Its eventual result may still be bounded by the existing watchdog.
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("refuses the SSE fallback of a failed initial websocket open once the budget is spent", async () => {
+		const fetchMock = vi.fn<FetchImpl>(
+			async () => new Response(createCompletedCodexSse("late"), { headers: SSE_HEADERS }),
+		);
+		const options = {
+			fetch: fetchMock,
+			apiKey: createCodexTestToken(),
+			sessionId: "gate-initial-ws-fallback",
+			providerSessionState: new Map<string, ProviderSessionState>(),
+			...createBudget(),
+		};
+		class SpentHandshakeWebSocket extends MockWebSocket {
+			constructor(url: string, wsOptions?: WsOptions) {
+				super(url, wsOptions);
+				spendBudget(options);
+				setTimeout(() => {
+					this.readyState = MockWebSocket.CLOSED;
+					this.emit("error", new Event("error"));
+					this.emit("close", new Event("close"));
+				}, 0);
+			}
+		}
+		global.WebSocket = SpentHandshakeWebSocket as unknown as typeof WebSocket;
+
+		const result = await streamOpenAICodexResponses(
+			createCodexTestModel("https://chatgpt.com/backend-api"),
+			createCodexTestContext(),
+			options,
+		).result();
+
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain(BUDGET_EXHAUSTED);
+	});
+
+	it("refuses the initial SSE access-program replay once the budget is spent", async () => {
+		const accountId = "acct-gate-initial-sse";
+		const options = {
+			apiKey: createCodexTestToken(accountId),
+			fetch: undefined as FetchImpl | undefined,
+			...createBudget(),
+		};
+		const fetchMock = vi.fn<FetchImpl>(async () => {
+			spendBudget(options);
+			return new Response(JSON.stringify({ error: ACCESS_PROGRAM_REJECTION }), {
+				status: 403,
+				headers: { "content-type": "application/json" },
+			});
+		});
+		options.fetch = fetchMock;
+
+		const result = await streamOpenAICodexResponses(
+			accessProgramModel(accountId, false),
+			createCodexTestContext(),
+			options,
+		).result();
+
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain(BUDGET_EXHAUSTED);
+	});
+
+	it("refuses the SSE access-program replay when its payload preparation spends the budget", async () => {
+		const accountId = "acct-gate-replay-payload";
+		let payloads = 0;
+		const options = {
+			apiKey: createCodexTestToken(accountId),
+			fetch: undefined as FetchImpl | undefined,
+			...createBudget(),
+			onPayload: async () => {
+				payloads += 1;
+				// The replay's outer gate already passed against a live budget;
+				// spend it while the replay prepares its payload, before any send.
+				if (payloads === 2) spendBudget(options);
+				return undefined;
+			},
+		};
+		const fetchMock = vi.fn<FetchImpl>(async () => {
+			if (fetchMock.mock.calls.length > 1) {
+				return new Response(createStatefulCodexSse("late", "resp_replay_payload"), { headers: SSE_HEADERS });
+			}
+			return new Response(JSON.stringify({ error: ACCESS_PROGRAM_REJECTION }), {
+				status: 403,
+				headers: { "content-type": "application/json" },
+			});
+		});
+		options.fetch = fetchMock;
+
+		const result = await streamOpenAICodexResponses(
+			accessProgramModel(accountId, false),
+			createCodexTestContext(),
+			options,
+		).result();
+
+		expect(payloads).toBe(2);
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain(BUDGET_EXHAUSTED);
+	});
+
+	it("refuses the compaction websocket-to-SSE fallback once the budget is spent", async () => {
+		const fetchMock = vi.fn<FetchImpl>(
+			async () => new Response(createCompletedCodexSse("late"), { headers: SSE_HEADERS }),
+		);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const options = {
+			apiKey: createCodexTestToken(),
+			fetch: fetchMock,
+			sessionId: "gate-compaction-ws-fallback",
+			providerSessionState,
+			...createBudget(),
+		};
+		class DroppedCompactionWebSocket extends MockWebSocket {
+			constructor(url: string, wsOptions?: WsOptions) {
+				super(url, wsOptions);
+				this.scheduleOpen();
+			}
+
+			override send(): void {
+				spendBudget(options);
+				this.readyState = MockWebSocket.CLOSED;
+				this.emit("close", { code: 1011 } as CloseEvent);
+			}
+		}
+		global.WebSocket = DroppedCompactionWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		try {
+			const events = await openCodexCompactionEventStream(
+				model,
+				{ model: model.id, input: [{ type: "compaction_trigger" }] },
+				options,
+			);
+			const error = await events.next().then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(error).toBeInstanceOf(AIError.ProviderOperationDeadlineError);
+			expect(fetchMock).not.toHaveBeenCalled();
+		} finally {
+			for (const state of providerSessionState.values()) state.close();
+		}
+	});
+
+	it("refuses the compaction access-program replay once the budget is spent", async () => {
+		const accountId = "acct-gate-compaction";
+		const fetchMock = vi.fn<FetchImpl>(
+			async () => new Response(createCompletedCodexSse("late"), { headers: SSE_HEADERS }),
+		);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const options = {
+			apiKey: createCodexTestToken(accountId),
+			fetch: fetchMock,
+			sessionId: "gate-compaction-access-program",
+			providerSessionState,
+			...createBudget(),
+		};
+		class RejectingCompactionWebSocket extends MockWebSocket {
+			constructor(url: string, wsOptions?: WsOptions) {
+				super(url, wsOptions);
+				this.scheduleOpen();
+			}
+
+			override send(): void {
+				spendBudget(options);
+				this.sendJson({ type: "response.failed", response: { error: ACCESS_PROGRAM_REJECTION } });
+			}
+		}
+		global.WebSocket = RejectingCompactionWebSocket as unknown as typeof WebSocket;
+		const model = accessProgramModel(accountId, true);
+		try {
+			const events = await openCodexCompactionEventStream(
+				model,
+				{ model: model.id, input: [{ type: "compaction_trigger" }] },
+				options,
+			);
+			const error = await events.next().then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(error).toBeInstanceOf(AIError.ProviderOperationDeadlineError);
+			expect(fetchMock).not.toHaveBeenCalled();
+		} finally {
+			for (const state of providerSessionState.values()) state.close();
+		}
+	});
+
+	it.each([
+		[
+			"access-program rejection",
+			"acct-gate-ws-access",
+			{ type: "response.failed", response: { error: ACCESS_PROGRAM_REJECTION } },
+		],
+		[
+			"stale previous_response_id",
+			"acc_test",
+			{
+				type: "error",
+				code: "previous_response_not_found",
+				message: "Previous response with id 'resp_1' not found.",
+			},
+		],
+	] as const)(
+		"refuses the websocket reopen after a %s once the budget is spent",
+		async (_label, accountId, failure) => {
+			const fetchMock = vi.fn<FetchImpl>(
+				async () => new Response(createCompletedCodexSse("late"), { headers: SSE_HEADERS }),
+			);
+			const providerSessionState = new Map<string, ProviderSessionState>();
+			const options = {
+				fetch: fetchMock,
+				apiKey: createCodexTestToken(accountId),
+				sessionId: `gate-ws-reopen-${accountId}`,
+				providerSessionState,
+				...createBudget(),
+			};
+			let sendCount = 0;
+			class RejectingWebSocket extends MockWebSocket {
+				constructor(url: string, wsOptions?: WsOptions) {
+					super(url, wsOptions);
+					this.scheduleOpen();
+				}
+
+				override send(): void {
+					sendCount += 1;
+					spendBudget(options);
+					this.sendJson(failure);
+				}
+			}
+			global.WebSocket = RejectingWebSocket as unknown as typeof WebSocket;
+			try {
+				const result = await streamOpenAICodexResponses(
+					accessProgramModel(accountId, true),
+					createCodexTestContext(),
+					options,
+				).result();
+
+				expect(sendCount).toBe(1);
+				expect(fetchMock).not.toHaveBeenCalled();
+				expect(result.stopReason).toBe("error");
+				expect(result.errorMessage).toContain(BUDGET_EXHAUSTED);
+			} finally {
+				for (const state of providerSessionState.values()) state.close();
+			}
+		},
+	);
+
+	it("refuses the websocket access-program replay when its payload preparation spends the budget", async () => {
+		const accountId = "acct-gate-ws-replay-payload";
+		const fetchMock = vi.fn<FetchImpl>(
+			async () => new Response(createCompletedCodexSse("late"), { headers: SSE_HEADERS }),
+		);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		let payloads = 0;
+		const options = {
+			fetch: fetchMock,
+			apiKey: createCodexTestToken(accountId),
+			sessionId: "gate-ws-replay-payload",
+			providerSessionState,
+			...createBudget(),
+			onPayload: async () => {
+				payloads += 1;
+				// The replay's outer gate already passed against a live budget;
+				// spend it while the replay prepares its frame, before any send.
+				if (payloads === 2) spendBudget(options);
+				return undefined;
+			},
+		};
+		let responseCreates = 0;
+		class RejectThenCompleteWebSocket extends MockWebSocket {
+			constructor(url: string, wsOptions?: WsOptions) {
+				super(url, wsOptions);
+				this.scheduleOpen();
+			}
+
+			override send(data: string): void {
+				const frame: unknown = JSON.parse(data);
+				if (!frame || typeof frame !== "object" || !("type" in frame) || frame.type !== "response.create") return;
+				responseCreates += 1;
+				if (responseCreates === 1) {
+					this.sendJson({ type: "response.failed", response: { error: ACCESS_PROGRAM_REJECTION } });
+					return;
+				}
+				this.emitCodexResponse({
+					messageId: "msg_ws_replay_payload",
+					responseId: "resp_ws_replay_payload",
+					text: "late",
+				});
+			}
+		}
+		global.WebSocket = RejectThenCompleteWebSocket as unknown as typeof WebSocket;
+		try {
+			const result = await streamOpenAICodexResponses(
+				accessProgramModel(accountId, true),
+				createCodexTestContext(),
+				options,
+			).result();
+
+			expect(payloads).toBe(2);
+			expect(responseCreates).toBe(1);
+			expect(fetchMock).not.toHaveBeenCalled();
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain(BUDGET_EXHAUSTED);
+		} finally {
+			for (const state of providerSessionState.values()) state.close();
+		}
+	});
+
+	it("refuses the SSE replay of a websocket failure with buffered output once the budget is spent", async () => {
+		const fetchMock = vi.fn<FetchImpl>(
+			async () => new Response(createCompletedCodexSse("late"), { headers: SSE_HEADERS }),
+		);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const options = {
+			fetch: fetchMock,
+			apiKey: createCodexTestToken(),
+			sessionId: "gate-ws-replay-over-sse",
+			providerSessionState,
+			...createBudget(),
+		};
+		class PartialThenDroppedWebSocket extends MockWebSocket {
+			constructor(url: string, wsOptions?: WsOptions) {
+				super(url, wsOptions);
+				this.scheduleOpen();
+			}
+
+			override send(): void {
+				this.sendJson({
+					type: "response.output_item.added",
+					item: { type: "message", id: "msg_partial", role: "assistant", status: "in_progress", content: [] },
+				});
+				this.sendJson({ type: "response.content_part.added", part: { type: "output_text", text: "" } });
+				this.sendJson({ type: "response.output_text.delta", delta: "partial" });
+				// Spend the budget on the next macrotask, once the consumer drained
+				// (and re-based the budget on) the delta, then drop the socket.
+				setTimeout(() => {
+					spendBudget(options);
+					this.readyState = MockWebSocket.CLOSED;
+					this.emit("close", { code: 1011 } as CloseEvent);
+				}, 0);
+			}
+		}
+		global.WebSocket = PartialThenDroppedWebSocket as unknown as typeof WebSocket;
+		try {
+			const result = await streamOpenAICodexResponses(
+				createCodexTestModel("https://chatgpt.com/backend-api"),
+				createCodexTestContext(),
+				options,
+			).result();
+
+			expect(fetchMock).not.toHaveBeenCalled();
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain(BUDGET_EXHAUSTED);
+		} finally {
+			for (const state of providerSessionState.values()) state.close();
+		}
+	});
+
+	it("refuses the SSE fallback of a failed websocket reopen once the budget is spent", async () => {
+		const fetchMock = vi.fn<FetchImpl>(
+			async () => new Response(createCompletedCodexSse("late"), { headers: SSE_HEADERS }),
+		);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const options = {
+			fetch: fetchMock,
+			apiKey: createCodexTestToken(),
+			sessionId: "gate-ws-reopen-sse-fallback",
+			providerSessionState,
+			providerRetryWait: async () => {},
+			...createBudget(),
+		};
+		let constructorCount = 0;
+		class LimitThenRefusedWebSocket extends MockWebSocket {
+			constructor(url: string, wsOptions?: WsOptions) {
+				super(url, wsOptions);
+				constructorCount += 1;
+				if (constructorCount === 1) {
+					this.scheduleOpen();
+					return;
+				}
+				// The reconnect handshake fails after the budget ran out.
+				spendBudget(options);
+				setTimeout(() => {
+					this.readyState = MockWebSocket.CLOSED;
+					this.emit("error", new Event("error"));
+					this.emit("close", new Event("close"));
+				}, 0);
+			}
+
+			override send(): void {
+				this.sendJson({
+					type: "error",
+					code: "websocket_connection_limit_reached",
+					message: "connection limit reached",
+				});
+			}
+		}
+		global.WebSocket = LimitThenRefusedWebSocket as unknown as typeof WebSocket;
+		try {
+			const result = await streamOpenAICodexResponses(
+				createCodexTestModel("https://chatgpt.com/backend-api"),
+				createCodexTestContext(),
+				options,
+			).result();
+
+			expect(constructorCount).toBe(2);
+			expect(fetchMock).not.toHaveBeenCalled();
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain(BUDGET_EXHAUSTED);
+		} finally {
+			for (const state of providerSessionState.values()) state.close();
+		}
+	});
+
+	const NESTED_HTTP_FAILURES = [
+		["network failure", undefined],
+		["HTTP 408", 408],
+		["HTTP 429", 429],
+		["HTTP 500", 500],
+		["HTTP 503", 503],
+	] as const;
+
+	for (const [label, status] of NESTED_HTTP_FAILURES) {
+		it.each(["before wait", "during wait", "live budget", "caller abort"] as const)(
+			"gates nested " + label + " retries (%s)",
+			async mode => {
+				const caller = new AbortController();
+				const options = {
+					apiKey: createCodexTestToken(),
+					signal: caller.signal,
+					codexSseMaxAttempts: 2,
+					...createBudget(),
+				};
+				// Advance the live operation deadline deterministically, without
+				// racing watchdog timers or replacing the HTTP retry implementation.
+				vi.spyOn(scheduler, "wait").mockImplementation(async () => {
+					if (mode === "during wait" || mode === "caller abort") spendBudget(options);
+					if (mode === "caller abort") caller.abort();
+				});
+				let requests = 0;
+				const fetchMock: FetchImpl = async () => {
+					requests += 1;
+					if (requests === 1) {
+						if (mode === "before wait") spendBudget(options);
+						if (status === undefined) throw new TypeError("fetch failed");
+						// Explicit zero delay covers the immediate retry path too.
+						return new Response("temporary failure", { status, headers: { "retry-after": "0" } });
+					}
+					return new Response(createStatefulCodexSse("Recovered", "resp_nested_retry"), { headers: SSE_HEADERS });
+				};
+				const result = await streamOpenAICodexResponses(
+					{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+					createCodexTestContext(),
+					Object.assign(options, { fetch: fetchMock }),
+				).result();
+
+				expect(requests).toBe(mode === "live budget" ? 2 : 1);
+				if (mode === "live budget") {
+					expect(result.stopReason).toBe("stop");
+					expect(result.content.find(block => block.type === "text")?.text).toBe("Recovered");
+				} else if (mode === "caller abort") {
+					expect(result.stopReason).toBe("aborted");
+					expect(result.errorMessage).toBe("Request was aborted");
+				} else {
+					expect(result.stopReason).toBe("error");
+					expect(result.errorMessage).toContain(BUDGET_EXHAUSTED);
+				}
+			},
+		);
+	}
+
+	for (const status of [400, 415]) {
+		it.each(["spent budget", "caller abort", "live budget"] as const)(
+			"gates the uncompressed replay after HTTP " + status + " (%s)",
+			async mode => {
+				await withEnv({ PI_CODEX_ZSTD: "1" }, async () => {
+					const caller = new AbortController();
+					const options = { apiKey: createCodexTestToken(), signal: caller.signal, ...createBudget() };
+					const encodings: Array<string | null> = [];
+					let cancelled = false;
+					const fetchMock: FetchImpl = async (_input, init) => {
+						encodings.push(new Headers(init?.headers).get("content-encoding"));
+						if (encodings.length === 1) {
+							return new Response(
+								new ReadableStream<Uint8Array>({
+									cancel() {
+										cancelled = true;
+										// Rejection cleanup is awaited before replay; spend the
+										// budget here to exercise that exact transport boundary.
+										if (mode !== "live budget") spendBudget(options);
+										if (mode === "caller abort") caller.abort();
+									},
+								}),
+								{ status },
+							);
+						}
+						return new Response(createStatefulCodexSse("Uncompressed", "resp_encoding_replay"), {
+							headers: SSE_HEADERS,
+						});
+					};
+					const result = await streamOpenAICodexResponses(
+						{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+						createCodexTestContext(),
+						Object.assign(options, { fetch: fetchMock }),
+					).result();
+
+					expect(cancelled).toBe(true);
+					expect(encodings).toEqual(mode === "live budget" ? ["zstd", null] : ["zstd"]);
+					if (mode === "live budget") {
+						expect(result.stopReason).toBe("stop");
+						expect(result.content.find(block => block.type === "text")?.text).toBe("Uncompressed");
+					} else if (mode === "caller abort") {
+						expect(result.stopReason).toBe("aborted");
+						expect(result.errorMessage).toBe("Request was aborted");
+					} else {
+						expect(result.stopReason).toBe("error");
+						expect(result.errorMessage).toContain(BUDGET_EXHAUSTED);
+					}
+				});
+			},
+		);
+	}
+
+	const IDLE_TIMEOUT = {
+		timeouts: { streamIdleTimeoutMs: 20, streamFirstEventTimeoutMs: 60_000 },
+		events: [{ type: "response.created", response: { id: "resp_idle" } }],
+		message: "OpenAI Codex SSE stream stalled while waiting for the next event",
+	};
+	const FIRST_EVENT_TIMEOUT = {
+		timeouts: { streamIdleTimeoutMs: 60_000, streamFirstEventTimeoutMs: 20 },
+		events: [],
+		message: "OpenAI Codex SSE stream timed out while waiting for the first event",
+	};
+	it.each([
+		["idle", "", IDLE_TIMEOUT, false],
+		["idle", " past the operation deadline", IDLE_TIMEOUT, true],
+		["first-event", "", FIRST_EVENT_TIMEOUT, false],
+		["first-event", " past the operation deadline", FIRST_EVENT_TIMEOUT, true],
+	] as const)("surfaces an SSE %s timeout%s as StreamTimeoutError", async (_label, _suffix, scenario, withBudget) => {
+		// Real 20 ms watchdogs: Bun fake timers misfire the production idle
+		// watchdog (see the pre-response deadline test above). The budgeted
+		// cases let the timed-out gap outlive a 10 ms operation budget.
+		const budget = withBudget ? { operationTimeoutMs: 10, operationDeadlineAt: Date.now() + 10 } : {};
+		let fetchCount = 0;
+		const fetchMock: FetchImpl = async (input, init) => {
+			fetchCount += 1;
+			return createStalledCodexSse(getRequestSignal(input, init), [...scenario.events]);
+		};
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{
+				apiKey: createCodexTestToken(),
+				fetch: fetchMock,
+				providerRetryWait: async () => {},
+				...scenario.timeouts,
+				...budget,
+			},
+		).result();
+
+		expect(fetchCount).toBe(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe(scenario.message);
+		expect(AIError.is(result.errorId, AIError.Flag.Timeout)).toBe(true);
 	});
 });

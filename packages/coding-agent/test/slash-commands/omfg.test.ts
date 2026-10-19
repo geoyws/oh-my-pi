@@ -14,22 +14,14 @@ function createRuntime() {
 			ctx: {
 				editor: { setText, addToHistory } as unknown as InteractiveModeContext["editor"],
 				handleOmfgCommand,
+				// Admitting `before_user_message` gate: refusal is covered in user-message-refusal.test.ts.
+				session: { gateUserMessage: async () => {} },
 			} as unknown as InteractiveModeContext,
 		},
 	};
 }
 
 describe("/omfg slash command", () => {
-	it("routes the full complaint through the interactive omfg handler", async () => {
-		const harness = createRuntime();
-
-		const handled = await executeBuiltinSlashCommand("/omfg This guy used any again....", harness.runtime);
-
-		expect(handled).toBe(true);
-		expect(harness.setText).toHaveBeenCalledWith("");
-		expect(harness.handleOmfgCommand).toHaveBeenCalledWith("This guy used any again....");
-	});
-
 	it("preserves the raw multi-word suffix after /omfg", async () => {
 		const harness = createRuntime();
 

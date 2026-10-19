@@ -7,7 +7,7 @@
  * — about one {@link JudgmentState}. Every question in a request sees the same
  * state and is answered independently, so callers batch independent questions
  * into one call. The shape mirrors TypeSafe's System One API so the native
- * backend ({@link TypeSafeJudge}) forwards requests verbatim, while the text
+ * backend ({@link NativeJudge}) forwards requests verbatim, while the text
  * bridge ({@link TextJudge}) renders the same questions into keyword prompts
  * for an ordinary chat model.
  */
@@ -83,7 +83,7 @@ export interface JudgmentRequest<Q extends Questions = Questions> {
 }
 
 export interface JudgmentResult<Q extends Questions = Questions> {
-	/** Transport that produced the answers (`typesafe`, or the chat model's api). */
+	/** Transport that produced the answers (a judgment api such as `typesafe`, or the chat model's api). */
 	api: string;
 	provider: string;
 	model: string;
@@ -117,15 +117,19 @@ export class JudgmentParseError extends Error {
 
 /**
  * Usage from a backend that reports token counts and, optionally, one billed
- * USD amount. Judgment pricing is input-only, so the amount lands on `input`.
+ * USD amount. Missing or non-finite amounts contribute zero to session totals.
+ * Judgment pricing is input-only, so the amount lands on `input`.
  */
-export function tokenUsage(input: number, output: number, cost = 0): Usage {
+export function tokenUsage(input: number | undefined, output: number | undefined, cost = 0): Usage {
+	const inputTokens = typeof input === "number" && Number.isFinite(input) ? input : 0;
+	const outputTokens = typeof output === "number" && Number.isFinite(output) ? output : 0;
+	const billedCost = Number.isFinite(cost) ? cost : 0;
 	return {
-		input,
-		output,
+		input: inputTokens,
+		output: outputTokens,
 		cacheRead: 0,
 		cacheWrite: 0,
-		totalTokens: input + output,
-		cost: { input: cost, output: 0, cacheRead: 0, cacheWrite: 0, total: cost },
+		totalTokens: inputTokens + outputTokens,
+		cost: { input: billedCost, output: 0, cacheRead: 0, cacheWrite: 0, total: billedCost },
 	};
 }

@@ -3,11 +3,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { Snowflake, untilAborted } from "@oh-my-pi/pi-utils";
-import type { ElementHandle, ElementScreenshotOptions, Frame, KeyInput, Page } from "puppeteer-core";
+import type { ElementHandle, ElementScreenshotOptions, Frame, Page } from "puppeteer-core";
 import { formatScreenshot, resizeImage } from "../../utils/image-resize";
 import { throwIfAborted } from "../tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { type AriaSnapshotOptions, buildAriaSnapshotScript } from "./aria/aria-snapshot";
+import { clickElement, fillViaHandle, focusTextEntryTarget, pressKey } from "./interactions";
+import { readPageViewport } from "./launch";
 import { RunOutput } from "./run-output";
 import type { ScreenshotResult, SessionSnapshot } from "./tab-protocol";
 
@@ -50,7 +52,7 @@ export interface BrowserFrameApi {
 	/** Type text into a matching element. */
 	type(selector: string, text: string): Promise<void>;
 	/** Press a keyboard key, optionally after focusing an element. */
-	press(key: KeyInput, options?: FramePressOptions): Promise<void>;
+	press(key: string, options?: FramePressOptions): Promise<void>;
 	/** Return a matching element's text content. */
 	text(selector: string): Promise<string>;
 	/** Return a matching element's inner HTML. */
@@ -101,18 +103,23 @@ export interface FrameApiHooks {
 	captureScreenshot(frame: Frame, selector: string, signal: AbortSignal): Promise<string>;
 }
 
+/** A frame's DevTools identifier, the id CDP events name it by. */
+export function devtoolsFrameId(frame: Frame): string {
+	// Puppeteer keeps the DevTools id on an internal field its public types omit.
+	const internal = frame as unknown as { _id: string };
+	return internal._id;
+}
+
 /** List the page's current main and child frames with stable DevTools identifiers. */
 export async function listFrames(page: Page, signal?: AbortSignal): Promise<BrowserFrameInfo[]> {
 	const result: BrowserFrameInfo[] = [];
 	for (const frame of page.frames()) {
 		const parent = frame.parentFrame();
-		const internalFrame = frame as unknown as { _id: string };
-		const internalParent = parent as unknown as { _id: string } | null;
 		const info: BrowserFrameInfo = {
-			id: internalFrame._id,
+			id: devtoolsFrameId(frame),
 			name: frame.name(),
 			url: frame.url(),
-			parentId: internalParent?._id ?? null,
+			parentId: parent ? devtoolsFrameId(parent) : null,
 		};
 		if (parent) {
 			let element: ElementHandle | null = null;
@@ -204,25 +211,50 @@ export function createFrameApi(frame: Frame, hooks: FrameApiHooks): BrowserFrame
 			},
 		);
 	};
+	/**
+	 * Wait for an actionable match without Puppeteer's `Locator` preconditions:
+	 * those wait on animation-frame and IntersectionObserver callbacks a
+	 * backgrounded headless tab never delivers (#12892).
+	 */
+	const actionHandle = async (label: string, selector: string, signal: AbortSignal): Promise<ElementHandle> => {
+		const handle = await untilAborted(signal, () =>
+			frame.waitForSelector(hooks.normalizeSelector(selector), {
+				timeout: hooks.actionOpMs,
+				visible: true,
+				signal,
+			}),
+		);
+		if (!handle) throw new ToolError(`${label} matched no visible element`);
+		return handle;
+	};
 	return {
 		click: selector =>
 			hooks.op(
 				`frame.click(${JSON.stringify(selector)})`,
 				hooks.actionOpMs,
-				signal =>
-					untilAborted(signal, () =>
-						frame.locator(hooks.normalizeSelector(selector)).setTimeout(hooks.actionOpMs).click({ signal }),
-					),
+				async signal => {
+					const label = `frame.click(${JSON.stringify(selector)})`;
+					const handle = await actionHandle(label, selector, signal);
+					try {
+						await clickElement(handle, label, signal);
+					} finally {
+						await handle.dispose().catch(() => undefined);
+					}
+				},
 				selectorOptions(selector),
 			),
 		fill: (selector, value) =>
 			hooks.op(
 				`frame.fill(${JSON.stringify(selector)})`,
 				hooks.actionOpMs,
-				signal =>
-					untilAborted(signal, () =>
-						frame.locator(hooks.normalizeSelector(selector)).setTimeout(hooks.actionOpMs).fill(value, { signal }),
-					),
+				async signal => {
+					const handle = await actionHandle(`frame.fill(${JSON.stringify(selector)})`, selector, signal);
+					try {
+						await fillViaHandle(handle, value, signal);
+					} finally {
+						await handle.dispose().catch(() => undefined);
+					}
+				},
 				selectorOptions(selector),
 			),
 		type: (selector, text) =>
@@ -233,6 +265,7 @@ export function createFrameApi(frame: Frame, hooks: FrameApiHooks): BrowserFrame
 					const handle = await untilAborted(signal, () => frame.$(hooks.normalizeSelector(selector)));
 					if (!handle) throw new ToolError(`frame.type(${JSON.stringify(selector)}) matched no element`);
 					try {
+						await focusTextEntryTarget(handle, "type into", signal);
 						await untilAborted(signal, () => handle.type(text, { delay: 0 }));
 					} finally {
 						await handle.dispose().catch(() => undefined);
@@ -244,7 +277,7 @@ export function createFrameApi(frame: Frame, hooks: FrameApiHooks): BrowserFrame
 			hooks.op(`frame.press(${JSON.stringify(key)})`, hooks.actionOpMs, async signal => {
 				if (options?.selector)
 					await untilAborted(signal, () => frame.focus(hooks.normalizeSelector(options.selector!)));
-				await untilAborted(signal, () => frame.page().keyboard.press(key));
+				await untilAborted(signal, () => pressKey(frame.page(), key));
 			}),
 		text: selector =>
 			hooks.op(
@@ -340,6 +373,7 @@ export async function captureFrameScreenshot(
 	const handle = await untilAborted(signal, () => frame.$(normalizeSelector(selector)));
 	if (!handle) throw new ToolError(`frame.screenshot(${JSON.stringify(selector)}) matched no element`);
 	let buffer: Buffer;
+	let captureScale: number;
 	try {
 		await untilAborted(signal, () =>
 			handle.evaluate(element => {
@@ -349,6 +383,7 @@ export async function captureFrameScreenshot(
 				target.scrollIntoView({ behavior: "instant", block: "center", inline: "center" });
 			}),
 		).catch(() => undefined);
+		captureScale = (await readPageViewport(frame.page(), signal)).deviceScaleFactor ?? 1;
 		const screenshotOptions: ElementScreenshotOptions = { type: "png", scrollIntoView: false };
 		buffer = (await untilAborted(signal, () => handle.screenshot(screenshotOptions))) as Buffer;
 	} finally {
@@ -385,6 +420,7 @@ export async function captureFrameScreenshot(
 			savedByteLength: savedBuffer.length,
 			dest,
 			resized,
+			capture: { area: "element", scale: captureScale },
 		}).join("\n"),
 	});
 	output.push({ type: "image", data: resized.data, mimeType: resized.mimeType });

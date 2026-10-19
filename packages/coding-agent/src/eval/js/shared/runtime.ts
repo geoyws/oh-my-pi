@@ -5,15 +5,20 @@ import { createRequire } from "node:module";
 import * as path from "node:path";
 import { Writable } from "node:stream";
 import * as util from "node:util";
+import * as vm from "node:vm";
 
+// Subpath imports only: the computer worker's readiness graph includes this runtime and must not
+// load pi_natives (verified under `--no-addons`); the `@oh-my-pi/pi-utils` barrel loads it eagerly.
 import * as logger from "@oh-my-pi/pi-utils/logger";
+import { isRecord } from "@oh-my-pi/pi-utils/type-guards";
 
+import { evalImageMetadata } from "../../types";
 import type { EvalPreludeSource } from "../worker-protocol";
 import { createHelpers, type HelperBundle } from "./helpers";
 import { awaitMaybePromise, indirectEval } from "./indirect-eval";
 import { LocalModuleLoader } from "./local-module-loader";
 import { JAVASCRIPT_PRELUDE_SOURCE } from "./prelude";
-import { wrapCode } from "./rewrite-imports";
+import { diagnoseCellSyntaxError, wrapCode } from "./rewrite-imports";
 import type { JsDisplayOutput, JsStatusEvent } from "./types";
 
 export interface RuntimeCallIdentity {
@@ -39,15 +44,15 @@ export interface RuntimeHooks {
  * with base64.
  */
 function surfaceBridgedToolImages(value: unknown, hooks: RuntimeHooks): unknown {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return value;
-	const { images, ...rest } = value as { images?: unknown } & Record<string, unknown>;
+	if (!isRecord(value)) return value;
+	const { images, ...rest } = value;
 	if (!Array.isArray(images) || images.length === 0) return value;
 	let displayed = 0;
 	for (const image of images) {
-		if (!image || typeof image !== "object") continue;
-		const { data, mimeType } = image as { data?: unknown; mimeType?: unknown };
+		if (!isRecord(image)) continue;
+		const { data, mimeType } = image;
 		if (typeof data !== "string" || typeof mimeType !== "string") continue;
-		hooks.onDisplay({ type: "image", data, mimeType });
+		hooks.onDisplay({ type: "image", data, mimeType, ...evalImageMetadata(image) });
 		displayed++;
 	}
 	if (displayed === 0) return value;
@@ -58,6 +63,7 @@ export interface RunContext {
 	runId: string;
 	hooks: RuntimeHooks;
 	cwd: string;
+	filename?: string;
 	callOccurrences: Map<string, number>;
 	finalExpressionSet: boolean;
 	finalExpressionValue: unknown;
@@ -77,6 +83,8 @@ export interface RuntimeOptions {
 	 * `{ local: "/…/artifacts/local" }`). Stable for the worker's lifetime.
 	 */
 	localRoots?: Record<string, string>;
+	/** Selected package directory consulted after the importing file's project. */
+	packageRoot?: string;
 }
 
 // Strict base64: characters from the standard alphabet plus optional `=` padding, and a
@@ -271,6 +279,16 @@ function describeDataType(data: unknown): string {
 	return typeof data;
 }
 
+/** Compiles `source` as a global script without running it (matches indirect eval semantics). */
+function compiles(source: string): boolean {
+	try {
+		new vm.Script(source);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 /**
  * Shared JS runtime for the eval worker and the browser tab worker. Owns the prelude,
  * helper bag, console bridge, and indirect-eval execution. Emits text/display/tool-call
@@ -373,6 +391,7 @@ export class JsRuntime {
 		this.sessionId = opts.sessionId;
 		this.#env = new Map();
 		this.#moduleLoader = new LocalModuleLoader(this.sessionId);
+		this.#moduleLoader.setPackageRoot(opts.packageRoot);
 		this.#localRoots = opts.localRoots ?? {};
 		this.helpers = createHelpers({
 			cwd: () => this.#activeCwd(),
@@ -402,6 +421,16 @@ export class JsRuntime {
 		if (activeGlobalRunOwner === null || activeGlobalRunOwner === this.#globalOwner) {
 			this.#activateGlobals("set cwd");
 		}
+	}
+
+	setPackageRoot(packageRoot: string | undefined): void {
+		if (this.#disposed) throw new Error("Cannot set package root on a disposed JS runtime");
+		this.#moduleLoader.setPackageRoot(packageRoot);
+	}
+
+	/** The session's internal-URL roots move with it (a re-adopted session has a new artifacts dir). */
+	setLocalRoots(localRoots: Record<string, string> | undefined): void {
+		this.#localRoots = localRoots ?? {};
 	}
 
 	/**
@@ -512,6 +541,7 @@ export class JsRuntime {
 			runId: options.runId ?? crypto.randomUUID(),
 			hooks,
 			cwd: options.cwd ?? this.#cwd,
+			filename,
 			finalExpressionSet: false,
 			finalExpressionValue: undefined,
 			callOccurrences: new Map(),
@@ -519,7 +549,18 @@ export class JsRuntime {
 		try {
 			return await this.#als.run(context, async () => {
 				const wrapped = await wrapCode(code);
-				const value = indirectEval(wrapped.source, filename);
+				let value: unknown;
+				try {
+					value = indirectEval(wrapped.source, filename);
+				} catch (error) {
+					// The engine's own compile SyntaxError has no usable cell position; surface Babel's.
+					// Sync cells run inside indirectEval, so a SyntaxError may also be a runtime one
+					// (e.g. JSON.parse); only diagnose when the source itself fails to compile as a script.
+					if (error instanceof SyntaxError && !compiles(wrapped.source)) {
+						throw (await diagnoseCellSyntaxError(code)) ?? error;
+					}
+					throw error;
+				}
 				if (wrapped.finalExpressionReturned) {
 					const awaited = await awaitMaybePromise(value);
 					if (context.finalExpressionSet) {
@@ -545,11 +586,11 @@ export class JsRuntime {
 			return;
 		}
 		if (value && typeof value === "object") {
-			const record = value as Record<string, unknown>;
+			const record = isRecord(value) ? value : {};
 			if (record.type === "image" && typeof record.mimeType === "string") {
 				const data = coerceImageBase64(record.data);
 				if (data !== null) {
-					hooks.onDisplay({ type: "image", data, mimeType: record.mimeType });
+					hooks.onDisplay({ type: "image", data, mimeType: record.mimeType, ...evalImageMetadata(record) });
 					return;
 				}
 				logger.warn("js displayValue: dropping image with unrecognized data shape", {
@@ -578,6 +619,11 @@ export class JsRuntime {
 		return this.#als.getStore()?.cwd ?? this.#cwd;
 	}
 
+	#activeFilename(): string | undefined {
+		const filename = this.#als.getStore()?.filename;
+		return filename && path.isAbsolute(filename) ? filename : undefined;
+	}
+
 	#activeHooks(action: string): RuntimeHooks | undefined {
 		const hooks = this.#als.getStore()?.hooks;
 		if (!hooks) {
@@ -587,15 +633,18 @@ export class JsRuntime {
 	}
 
 	#activeRequire(moduleUrlOrPath?: string): NodeJS.Require {
-		return this.#moduleLoader.requireForFile(moduleUrlOrPath, this.#activeCwd());
+		return this.#moduleLoader.requireForFile(moduleUrlOrPath ?? this.#activeFilename(), this.#activeCwd());
 	}
 
 	#moduleFilename(moduleUrlOrPath?: string): string {
-		return this.#moduleLoader.filenameForUrl(moduleUrlOrPath) ?? path.join(this.#activeCwd(), "[eval]");
+		return (
+			this.#moduleLoader.filenameForUrl(moduleUrlOrPath ?? this.#activeFilename()) ??
+			path.join(this.#activeCwd(), "[eval]")
+		);
 	}
 
 	#moduleDirname(moduleUrlOrPath?: string): string {
-		return this.#moduleLoader.dirnameForUrl(moduleUrlOrPath, this.#activeCwd());
+		return this.#moduleLoader.dirnameForUrl(moduleUrlOrPath ?? this.#activeFilename(), this.#activeCwd());
 	}
 
 	#buildDynamicRequire(): NodeJS.Require {
@@ -642,7 +691,9 @@ export class JsRuntime {
 				return surfaceBridgedToolImages(await hooks.callTool("__prelude__", payload), hooks);
 			},
 			__omp_import__: async (source: string, options?: ImportCallOptions) => {
-				const resolved = await this.#moduleLoader.resolveForRun(this.#activeCwd(), source);
+				const filename = this.#activeFilename();
+				const baseDir = filename ? path.dirname(filename) : this.#activeCwd();
+				const resolved = await this.#moduleLoader.resolveForRun(baseDir, source);
 				if (resolved.mode === "local") return resolved.value;
 				const target = resolved.target;
 				return options !== undefined ? await import(target, options) : await import(target);

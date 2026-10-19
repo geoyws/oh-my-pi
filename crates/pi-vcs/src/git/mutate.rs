@@ -1,9 +1,11 @@
 //! In-process local Git mutations.
 
 use std::{
+	borrow::Cow,
 	collections::{BTreeMap, BTreeSet},
 	ffi::OsStr,
 	fs,
+	io::Write,
 	path::{Path, PathBuf},
 	process::{Command, Stdio},
 };
@@ -11,14 +13,16 @@ use std::{
 use gix::bstr::{BString, ByteSlice};
 
 use super::{
-	GitRepo, normalize_path,
+	GitRepo,
+	filter::WorktreeFilter,
+	normalize_path,
 	open::{load_index_or_empty, load_index_or_head, status_with_fresh_index, status_with_index},
 	read::literal_pathspec,
 };
 use crate::{
 	error::{Error, Result},
 	types::{
-		CleanOptions, CommitOptions, DetachGitDirResult, ResetMode, RestoreOptions,
+		CleanOptions, CommitAuthor, CommitOptions, DetachGitDirResult, ResetMode, RestoreOptions,
 		WorktreeAddOptions, WorktreeAddResult, WorktreeClone,
 	},
 };
@@ -68,11 +72,7 @@ pub(crate) fn update_reference(
 				.duration_since(std::time::UNIX_EPOCH)
 				.map_or(0, |elapsed| elapsed.as_secs())
 		);
-		gix::actor::SignatureRef {
-			name:  "oh-my-pi".into(),
-			email: "omp@localhost".into(),
-			time:  &now,
-		}
+		gix::actor::SignatureRef { name: "omp".into(), email: "omp@localhost".into(), time: &now }
 	};
 	repo
 		.edit_references_as(Some(edit), Some(committer))
@@ -97,6 +97,11 @@ impl GitRepo {
 	pub fn stage_files(&self, files: &[String]) -> Result<()> {
 		let repo = self.gix()?;
 		let mut index = load_index_or_head(&repo, "git add")?;
+		// Whole seconds since the epoch before any file is stat'ed (see
+		// `stage_one`).
+		let staging_started = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map_or(0, |elapsed| elapsed.as_secs());
 		let all = files.is_empty();
 		let mut requested: BTreeSet<String> = files
 			.iter()
@@ -128,8 +133,41 @@ impl GitRepo {
 		let (mut filter, filter_index) = repo
 			.filter_pipeline(None)
 			.map_err(|err| Error::backend("git add", err))?;
+		// Hash every selected path first, then rewrite the index in one pass:
+		// removing entries path by path rescans the whole index each time.
+		let mut replaced = std::collections::HashSet::<BString>::new();
+		let mut staged = Vec::new();
 		for path in selected {
-			stage_one(&mut filter, &filter_index, &mut index, &path)?;
+			match stage_one(self.root(), &mut filter, &filter_index, &path, staging_started)? {
+				Staged::Entry(entry) => {
+					replaced.insert(path.into());
+					staged.push(entry);
+				},
+				Staged::Removed => {
+					replaced.insert(path.into());
+				},
+				Staged::Kept => {},
+			}
+		}
+		index.remove_entries(|_, path, _| replaced.contains(path));
+		// A kept entry's stat as new as the old index is racy: only that
+		// index's timestamp makes git re-check the file's content, and the
+		// index written here is newer, so the stat is dropped to keep the
+		// check (git smudges such entries when it writes an index).
+		let racy_from = index.timestamp();
+		for entry in index.entries_mut() {
+			if entry.stat.is_racy(racy_from, Default::default()) {
+				entry.stat = gix::index::entry::Stat::default();
+			}
+		}
+		for entry in staged {
+			index.dangerously_push_entry(
+				entry.stat,
+				entry.id,
+				gix::index::entry::Flags::empty(),
+				entry.mode,
+				entry.path.as_bstr(),
+			);
 		}
 		index.sort_entries();
 		index
@@ -152,7 +190,7 @@ impl GitRepo {
 	/// Create a commit and return its object id.
 	pub fn commit_create(&self, message: &str, options: &CommitOptions) -> Result<String> {
 		let repo = self.gix()?;
-		run_commit_hook(self, &repo, "pre-commit", &[])?;
+		run_commit_hook(self, "pre-commit", &[])?;
 		let mut head = repo
 			.head()
 			.map_err(|err| Error::backend("git commit", err))?;
@@ -206,21 +244,10 @@ impl GitRepo {
 			.committer()
 			.ok_or_else(|| Error::backend("git commit", "committer identity is not configured"))?
 			.map_err(|err| Error::backend("git commit", err))?;
-		let override_author;
+		let override_author = options.author.as_ref().map(signature_for).transpose()?;
 		let mut author_time = gix::date::parse::TimeBuf::default();
-		let author = if let Some(author) = &options.author {
-			let time = match &author.date {
-				Some(date) => {
-					gix::date::parse(date, None).map_err(|err| Error::backend("git commit", err))?
-				},
-				None => gix::date::Time::now_local_or_utc(),
-			};
-			override_author = gix::actor::Signature {
-				name: author.name.clone().into(),
-				email: author.email.clone().into(),
-				time,
-			};
-			override_author.to_ref(&mut author_time)
+		let author = if let Some(author) = override_author.as_ref() {
+			author.to_ref(&mut author_time)
 		} else if let Some(author) = inherited_author.as_ref() {
 			author.to_ref(&mut author_time)
 		} else {
@@ -231,7 +258,7 @@ impl GitRepo {
 		};
 		let message_path = self.info().git_dir.join("COMMIT_EDITMSG");
 		fs::write(&message_path, message)?;
-		run_commit_hook(self, &repo, "commit-msg", &[message_path.as_os_str()])?;
+		run_commit_hook(self, "commit-msg", &[message_path.as_os_str()])?;
 		let message = fs::read_to_string(&message_path)
 			.map_err(|err| Error::backend("git commit read commit-msg result", err))?;
 		let commit = repo
@@ -264,8 +291,44 @@ impl GitRepo {
 				deref:  true,
 			})
 			.map_err(|err| Error::backend("git commit", err))?;
-		let _ = run_commit_hook(self, &repo, "post-commit", &[]);
+		let _ = run_commit_hook(self, "post-commit", &[]);
 		Ok(id.to_hex().to_string())
+	}
+
+	/// Write a commit object for `tree` on top of `parents` without touching
+	/// HEAD, the index, any ref, or the worktree (`git commit-tree`). No hooks
+	/// run. Returns the new commit id.
+	pub fn commit_tree(
+		&self,
+		tree: &str,
+		parents: &[String],
+		message: &str,
+		author: Option<&CommitAuthor>,
+	) -> Result<String> {
+		let repo = self.gix()?;
+		let tree = resolve_tree(&repo, tree)?;
+		let parents = parents
+			.iter()
+			.map(|parent| resolve_commit(&repo, parent))
+			.collect::<Result<Vec<_>>>()?;
+		let committer = repo
+			.committer()
+			.ok_or_else(|| Error::backend("git commit-tree", "committer identity is not configured"))?
+			.map_err(|err| Error::backend("git commit-tree", err))?;
+		let override_author = author.map(signature_for).transpose()?;
+		let mut author_time = gix::date::parse::TimeBuf::default();
+		let author = if let Some(author) = override_author.as_ref() {
+			author.to_ref(&mut author_time)
+		} else {
+			repo
+				.author()
+				.ok_or_else(|| Error::backend("git commit-tree", "author identity is not configured"))?
+				.map_err(|err| Error::backend("git commit-tree", err))?
+		};
+		let commit = repo
+			.new_commit_as(committer, author, message, tree, parents)
+			.map_err(|err| Error::backend("git commit-tree", err))?;
+		Ok(commit.id.to_hex().to_string())
 	}
 
 	/// Checkout a branch or detached revision without overwriting local changes.
@@ -296,15 +359,18 @@ impl GitRepo {
 		} else {
 			gix::refs::transaction::PreviousValue::MustNotExist
 		};
-		update_reference(
-			&repo,
-			"git branch",
-			&full,
-			id,
-			constraint,
-			&format!("branch: Created from {start}"),
-			false,
-		)?;
+		// git's reflog tells a `-f` move apart from a creation.
+		let exists = force
+			&& repo
+				.try_find_reference(&full)
+				.map_err(|e| Error::backend("git branch", e))?
+				.is_some();
+		let message = if exists {
+			format!("branch: Reset to {start}")
+		} else {
+			format!("branch: Created from {start}")
+		};
+		update_reference(&repo, "git branch", &full, id, constraint, &message, false)?;
 		Ok(())
 	}
 
@@ -601,19 +667,46 @@ impl GitRepo {
 		let linked_repo = linked.gix()?;
 		checkout_tree(&linked, &linked_repo, id, true)?;
 		if options.keep_changes {
-			self.seed_worktree_changes(path, &admin)?;
+			self.seed_worktree_changes(path, &admin, id)?;
 		}
 		Ok(WorktreeAddResult { cloned_with: None, clone_error })
 	}
 
-	/// Replicate the source checkout's uncommitted state onto a freshly
-	/// materialized worktree at `path`: copy every dirty tracked and
-	/// untracked file (deleting what the source deleted), then install the
-	/// source index so staged hunks stay staged.
-	fn seed_worktree_changes(&self, path: &Path, admin: &Path) -> Result<()> {
+	/// Replicate the source checkout's uncommitted state onto a worktree at
+	/// `path` freshly checked out at the source `HEAD` (`head_commit`): copy
+	/// every staged, dirty tracked, and untracked file (deleting what the
+	/// source deleted), then install the source index so staged hunks stay
+	/// staged, with its stat cache rebased onto the files now on disk.
+	fn seed_worktree_changes(
+		&self,
+		path: &Path,
+		admin: &Path,
+		head_commit: gix::hash::ObjectId,
+	) -> Result<()> {
 		let repo = self.gix()?;
 		let (dirty_tracked, untracked) = collect_clone_reconciliation_paths(&repo)?;
-		for relative in dirty_tracked.iter().chain(untracked.iter()) {
+		// One snapshot of the source index decides which paths to copy and is
+		// what gets installed, so a concurrent `git add` in the source cannot
+		// split the two.
+		let source_index = if self.info().git_dir.join("index").is_file() {
+			Some(load_index_or_empty(&repo, "git worktree add")?)
+		} else {
+			None
+		};
+		// The checkout wrote `HEAD` content, so paths whose index entry differs
+		// from `HEAD` (staged edits, additions, and deletions) need the source
+		// bytes too, even when the source worktree matches its index.
+		let staged = match &source_index {
+			Some(source_index) => {
+				let head_index = repo
+					.index_from_tree(&commit_tree(&repo, &head_commit)?)
+					.map_err(|err| Error::backend("git worktree add", err))?;
+				index_diff_paths(source_index, &head_index)
+			},
+			None => BTreeSet::new(),
+		};
+
+		for relative in dirty_tracked.iter().chain(&untracked).chain(&staged) {
 			let relative = relative.to_path_lossy();
 			let src = self.root().join(&relative);
 			let dst = path.join(&relative);
@@ -640,11 +733,17 @@ impl GitRepo {
 				Err(err) => return Err(err.into()),
 			}
 		}
-		let source_index = self.info().git_dir.join("index");
-		if source_index.is_file() {
-			fs::copy(source_index, admin.join("index"))?;
-		}
-		Ok(())
+		let Some(mut index) = source_index else {
+			return Ok(());
+		};
+		// The source stat cache describes the source files. Checkout filters
+		// (e.g. `core.autocrlf`) can write clean files at a different size, and
+		// git reports a size mismatch as modified without hashing the content.
+		refresh_clean_index_stats(&mut index, path, &dirty_tracked)?;
+		index.set_path(admin.join("index"));
+		index
+			.write(INDEX_WRITE)
+			.map_err(|err| Error::backend("git worktree add", err))
 	}
 
 	fn worktree_add_cloned(
@@ -683,18 +782,7 @@ impl GitRepo {
 			// index carries its staged state. Only the stat cache is stale
 			// (new inodes); refresh it for entries the source reports clean so
 			// dirty files still hash on the next status.
-			for (entry, entry_path) in current.entries_mut_with_paths() {
-				if dirty_tracked.contains(entry_path) {
-					continue;
-				}
-				let Ok(metadata) = gix::index::fs::Metadata::from_path_no_follow(
-					&path.join(entry_path.to_path_lossy()),
-				) else {
-					continue;
-				};
-				entry.stat = gix::index::entry::Stat::from_fs(&metadata)
-					.map_err(|err| Error::backend("git worktree add", err))?;
-			}
+			refresh_clean_index_stats(&mut current, path, &dirty_tracked)?;
 			return current
 				.write(INDEX_WRITE)
 				.map_err(|err| Error::backend("git worktree add", err));
@@ -704,34 +792,26 @@ impl GitRepo {
 			.index_from_tree(&tree)
 			.map_err(|err| Error::backend("git worktree add", err))?;
 
-		let current_paths: BTreeSet<BString> = current
-			.entries()
-			.iter()
-			.map(|entry| entry.path(&current).to_owned())
-			.collect();
-		let target_paths: BTreeSet<BString> = target
-			.entries()
-			.iter()
-			.map(|entry| entry.path(&target).to_owned())
-			.collect();
-		let mut delete = current_paths
-			.difference(&target_paths)
-			.cloned()
-			.collect::<BTreeSet<_>>();
+		let differing = index_diff_paths(&current, &target);
+		let (write_paths, removed): (BTreeSet<BString>, BTreeSet<BString>) = differing
+			.into_iter()
+			.partition(|entry_path| target.entry_by_path(entry_path.as_bstr()).is_some());
+		let mut delete = removed;
 		delete.extend(untracked);
-		delete.extend(dirty_tracked.difference(&target_paths).cloned());
+		delete.extend(
+			dirty_tracked
+				.iter()
+				.filter(|entry_path| target.entry_by_path(entry_path.as_bstr()).is_none())
+				.cloned(),
+		);
 
-		let mut write = BTreeSet::new();
-		for entry in target.entries() {
-			let path = entry.path(&target);
-			if current
-				.entry_by_path(path)
-				.is_none_or(|old| old.id != entry.id || old.mode != entry.mode)
-				|| dirty_tracked.contains(path)
-			{
-				write.insert(path.to_owned());
-			}
-		}
+		let mut write = write_paths;
+		write.extend(
+			dirty_tracked
+				.iter()
+				.filter(|entry_path| target.entry_by_path(entry_path.as_bstr()).is_some())
+				.cloned(),
+		);
 
 		for relative in &delete {
 			let full = path.join(relative.to_path_lossy());
@@ -801,6 +881,23 @@ impl GitRepo {
 			.map_err(|err| Error::backend("git worktree add", err))
 	}
 
+	/// Resolve the executable hook `name` as git's `find_hook` does: under
+	/// `core.hooksPath` (a relative value resolves against the checkout root)
+	/// or else the shared `hooks` directory, which linked worktrees read from
+	/// the common dir. `None` when the hook is missing or not executable.
+	pub fn hook_path(&self, name: &str) -> Result<Option<PathBuf>> {
+		let dir = self
+			.gix()?
+			.config_snapshot()
+			.string("core.hooksPath")
+			.map_or_else(
+				|| self.info().common_dir.join("hooks"),
+				|value| self.root().join(value.to_str_lossy().as_ref()),
+			);
+		let hook = dir.join(name);
+		Ok(hook_is_executable(&hook).then_some(hook))
+	}
+
 	/// Remove a linked worktree, returning false when dirty and not forced.
 	pub fn worktree_remove(&self, path: &Path, force: bool) -> Result<bool> {
 		let Some(linked) = Self::discover(path)? else {
@@ -835,31 +932,22 @@ impl GitRepo {
 	}
 }
 
-fn run_commit_hook(
-	repository: &GitRepo,
-	repo: &gix::Repository,
-	name: &str,
-	args: &[&OsStr],
-) -> Result<()> {
-	let hooks_dir = repo
-		.config_snapshot()
-		.string("core.hooksPath")
-		.map(|value| PathBuf::from(value.to_str_lossy().into_owned()))
-		.map_or_else(
-			|| repository.info().git_dir.join("hooks"),
-			|path| {
-				if path.is_absolute() {
-					path
-				} else {
-					repository.root().join(path)
-				}
-			},
-		);
-	let hook = hooks_dir.join(name);
-	if !hook_is_executable(&hook) {
+fn run_commit_hook(repository: &GitRepo, name: &str, args: &[&OsStr]) -> Result<()> {
+	let Some(hook) = repository.hook_path(name)? else {
 		return Ok(());
-	}
-	let output = Command::new(&hook)
+	};
+	// Windows CreateProcess cannot execute a shebang script directly. Let Git
+	// invoke the hook through its own shell, as `git commit` does.
+	#[cfg(windows)]
+	let mut command = {
+		let _ = hook;
+		let mut command = Command::new("git");
+		command.args(["hook", "run", "--ignore-missing", name, "--"]);
+		command
+	};
+	#[cfg(not(windows))]
+	let mut command = Command::new(&hook);
+	let output = command
 		.args(args)
 		.current_dir(repository.root())
 		.env("GIT_DIR", &repository.info().git_dir)
@@ -891,17 +979,14 @@ fn hook_is_executable(path: &Path) -> bool {
 	let Ok(metadata) = fs::metadata(path) else {
 		return false;
 	};
-	if !metadata.is_file() {
-		return false;
-	}
 	#[cfg(unix)]
 	{
 		use std::os::unix::fs::PermissionsExt;
-		metadata.permissions().mode() & 0o111 != 0
+		metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
 	}
 	#[cfg(not(unix))]
 	{
-		true
+		metadata.is_file()
 	}
 }
 
@@ -913,8 +998,174 @@ fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>> {
 	}
 }
 
+/// Metadata needed to turn a copied checkout into a private repository. All
+/// reads happen before changing an isolation, so source worktree administration
+/// is never opened through a copied (and potentially stale) .git pointer.
+struct PrivateGitSnapshot {
+	head:          Option<Vec<u8>>,
+	index:         Option<Vec<u8>>,
+	refs:          Vec<(String, gix::hash::ObjectId)>,
+	config_values: Vec<(String, String)>,
+	shared:        Vec<(String, Vec<u8>)>,
+	sparse:        Option<Vec<u8>>,
+	shallow:       Option<Vec<u8>>,
+	object_dirs:   Vec<PathBuf>,
+	git_crypt:     Vec<(PathBuf, Vec<u8>)>,
+}
+
+fn snapshot_private_git(original: &GitRepo, source_common: &Path) -> Result<PrivateGitSnapshot> {
+	let repo = original.gix()?;
+	let common = fs::canonicalize(source_common)?;
+	let head = read_optional_file(&original.info().head_path)?;
+	let index = read_optional_file(&original.info().git_dir.join("index"))?;
+	let refs = snapshot_refs(&repo)?;
+	let config = repo.config_snapshot();
+	let mut config_values: Vec<(String, String)> = [
+		"user.name",
+		"user.email",
+		"core.fileMode",
+		"core.splitIndex",
+		"core.sparseCheckout",
+		"core.sparseCheckoutCone",
+	]
+	.into_iter()
+	.filter_map(|key| {
+		config
+			.string(key)
+			.map(|value| (key.to_owned(), value.to_str_lossy().into_owned()))
+	})
+	.collect();
+	// `git submodule` treats a gitlink as initialized only when the repository
+	// config registers it; keep the repo-local registrations so the private
+	// admin reports the same initialized pins as its source.
+	for section in config.sections_by_name("submodule").into_iter().flatten() {
+		if section.meta().source != gix::config::Source::Local {
+			continue;
+		}
+		let Some(name) = section.header().subsection_name() else {
+			continue;
+		};
+		let name = name.to_str_lossy();
+		for key in ["url", "active"] {
+			if let Some(value) = section.value(key) {
+				config_values
+					.push((format!("submodule.{name}.{key}"), value.to_str_lossy().into_owned()));
+			}
+		}
+	}
+	// Filter and diff drivers configured only in the repository (git-crypt's
+	// clean/smudge/textconv are the usual case) must follow the admin: without
+	// them every filtered file reads as modified, and its smudged worktree bytes
+	// would be staged and captured as they are.
+	for name in ["filter", "diff"] {
+		for section in config.sections_by_name(name).into_iter().flatten() {
+			if section.meta().source != gix::config::Source::Local {
+				continue;
+			}
+			let Some(driver) = section.header().subsection_name() else {
+				continue;
+			};
+			let driver = driver.to_str_lossy();
+			for key in section.value_names() {
+				let key: &str = key.as_ref();
+				if let Some(value) = section.value(key) {
+					config_values
+						.push((format!("{name}.{driver}.{key}"), value.to_str_lossy().into_owned()));
+				}
+			}
+		}
+	}
+	let shared = copy_named_files(&original.info().git_dir, "sharedindex.")?;
+	let sparse = read_optional_file(&original.info().git_dir.join("info/sparse-checkout"))?;
+	let shallow = read_optional_file(&common.join("shallow"))?;
+	let mut object_dirs = vec![common.join("objects")];
+	if let Ok(chained) = fs::read_to_string(common.join("objects/info/alternates")) {
+		for line in chained
+			.lines()
+			.map(str::trim)
+			.filter(|line| !line.is_empty())
+		{
+			let path = Path::new(line);
+			object_dirs.push(if path.is_absolute() {
+				path.to_owned()
+			} else {
+				common.join("objects").join(path)
+			});
+		}
+	}
+	// git-crypt keeps its keys in `<git dir>/git-crypt`. The private admin gets
+	// its own copy, owner-only: a link would let `git-crypt lock` run in the
+	// isolation delete the source's keys.
+	let git_crypt = match [original.info().git_dir.join("git-crypt"), common.join("git-crypt")]
+		.into_iter()
+		.find(|dir| fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir()))
+	{
+		Some(dir) => read_tree_files(&dir)?,
+		None => Vec::new(),
+	};
+	Ok(PrivateGitSnapshot {
+		head,
+		index,
+		refs,
+		config_values,
+		shared,
+		sparse,
+		shallow,
+		object_dirs,
+		git_crypt,
+	})
+}
+
+fn materialize_private_git(worktree_root: &Path, snapshot: PrivateGitSnapshot) -> Result<()> {
+	gix::init(worktree_root).map_err(|error| Error::backend("git init", error))?;
+	let git_entry = worktree_root.join(".git");
+	let objects_info = git_entry.join("objects/info");
+	fs::create_dir_all(&objects_info)?;
+	let alternate_text = snapshot
+		.object_dirs
+		.iter()
+		.map(|path| path.to_string_lossy())
+		.collect::<Vec<_>>()
+		.join("\n")
+		+ "\n";
+	fs::write(objects_info.join("alternates"), alternate_text)?;
+	for (name, id) in snapshot.refs {
+		write_loose_ref(&git_entry, &name, id)?;
+	}
+	if let Some(head) = snapshot.head {
+		fs::write(git_entry.join("HEAD"), head)?;
+	}
+	for (key, value) in snapshot.config_values {
+		set_config_file(&git_entry.join("config"), &key, &value)?;
+	}
+	if let Some(bytes) = snapshot.shallow {
+		fs::write(git_entry.join("shallow"), bytes)?;
+	}
+	if let Some(bytes) = snapshot.sparse {
+		fs::create_dir_all(git_entry.join("info"))?;
+		fs::write(git_entry.join("info/sparse-checkout"), bytes)?;
+	}
+	for (name, bytes) in snapshot.shared {
+		fs::write(git_entry.join(name), bytes)?;
+	}
+	if !snapshot.git_crypt.is_empty() {
+		write_private_tree(&git_entry.join("git-crypt"), snapshot.git_crypt)?;
+	}
+	if let Some(bytes) = snapshot.index {
+		fs::write(git_entry.join("index"), bytes)?;
+	} else if let Ok(detached) = GitRepo::require(worktree_root)
+		&& resolve_commit(&detached.gix()?, "HEAD").is_ok()
+	{
+		detached.read_tree("HEAD", None)?;
+	}
+	Ok(())
+}
+
 /// Sever a copied linked worktree from its source metadata without copying
 /// objects.
+///
+/// This root operation keeps its registered-admin cleanup; submodule repair
+/// below must never remove a source admin directory.
 pub fn detach_git_dir(
 	worktree_root: &Path,
 	source_common_dir: &Path,
@@ -933,29 +1184,7 @@ pub fn detach_git_dir(
 	if iso_common != source_common {
 		return Ok(DetachGitDirResult::Independent);
 	}
-	let repo = original.gix()?;
-	let head = read_optional_file(&original.info().head_path)?;
-	let index = read_optional_file(&original.info().git_dir.join("index"))?;
-	let refs = snapshot_refs(&repo)?;
-	let config_values = [
-		"user.name",
-		"user.email",
-		"core.fileMode",
-		"core.splitIndex",
-		"core.sparseCheckout",
-		"core.sparseCheckoutCone",
-	]
-	.into_iter()
-	.filter_map(|key| {
-		repo
-			.config_snapshot()
-			.string(key)
-			.map(|v| (key, v.to_str_lossy().into_owned()))
-	})
-	.collect::<Vec<_>>();
-	let shared = copy_named_files(&original.info().git_dir, "sharedindex.")?;
-	let sparse = read_optional_file(&original.info().git_dir.join("info/sparse-checkout"))?;
-	let shallow = read_optional_file(&source_common.join("shallow"))?;
+	let snapshot = snapshot_private_git(&original, &source_common)?;
 	let own_admin = if meta.is_file() {
 		registered_admin(&git_entry)?
 	} else {
@@ -969,58 +1198,193 @@ pub fn detach_git_dir(
 	if let Some(admin) = own_admin {
 		fs::remove_dir_all(admin)?;
 	}
-	gix::init(worktree_root).map_err(|e| Error::backend("git init", e))?;
-	let objects_info = git_entry.join("objects/info");
-	fs::create_dir_all(&objects_info)?;
-	let mut alternates = vec![source_common.join("objects")];
-	if let Ok(chained) = fs::read_to_string(source_common.join("objects/info/alternates")) {
-		for line in chained
-			.lines()
-			.map(str::trim)
-			.filter(|line| !line.is_empty())
-		{
-			let path = Path::new(line);
-			alternates.push(if path.is_absolute() {
-				path.to_owned()
-			} else {
-				source_common.join("objects").join(path)
-			});
-		}
-	}
-	let alternate_text = alternates
-		.iter()
-		.map(|p| p.to_string_lossy())
-		.collect::<Vec<_>>()
-		.join("\n")
-		+ "\n";
-	fs::write(objects_info.join("alternates"), alternate_text)?;
-	for (name, id) in refs {
-		write_loose_ref(&git_entry, &name, id)?;
-	}
-	if let Some(head) = head {
-		fs::write(git_entry.join("HEAD"), head)?;
-	}
-	for (key, value) in config_values {
-		set_config_file(&git_entry.join("config"), key, &value)?;
-	}
-	if let Some(bytes) = shallow {
-		fs::write(git_entry.join("shallow"), bytes)?;
-	}
-	if let Some(bytes) = sparse {
-		fs::create_dir_all(git_entry.join("info"))?;
-		fs::write(git_entry.join("info/sparse-checkout"), bytes)?;
-	}
-	for (name, bytes) in shared {
-		fs::write(git_entry.join(name), bytes)?;
-	}
-	if let Some(bytes) = index {
-		fs::write(git_entry.join("index"), bytes)?;
-	} else if let Ok(detached) = GitRepo::require(worktree_root)
-		&& resolve_commit(&detached.gix()?, "HEAD").is_ok()
-	{
-		detached.read_tree("HEAD", None)?;
-	}
+	materialize_private_git(worktree_root, snapshot)?;
 	Ok(DetachGitDirResult::Detached)
+}
+
+struct CopiedSubmodule {
+	relative: PathBuf,
+	metadata: PrivateGitSnapshot,
+}
+
+fn collect_copied_submodules(
+	source_root: &Path,
+	isolated_root: &Path,
+	relative: &Path,
+	snapshots: &mut Vec<CopiedSubmodule>,
+) -> Result<()> {
+	let source_parent = source_root.join(relative);
+	let repo = GitRepo::require(&source_parent)?;
+	if fs::canonicalize(repo.root())? != source_parent {
+		return Err(Error::backend(
+			"git rebind copied submodules",
+			format!("source {} is not an independent repository", source_parent.display()),
+		));
+	}
+	let gix = repo.gix()?;
+	let index = load_index_or_head(&gix, "git rebind copied submodules")?;
+	for entry in index.entries() {
+		if !entry.mode.is_submodule() {
+			continue;
+		}
+		if entry.stage() != gix::index::entry::Stage::Unconflicted {
+			return Err(Error::backend(
+				"git rebind copied submodules",
+				"unmerged gitlink in source index",
+			));
+		}
+		let path = entry
+			.path(&index)
+			.to_str()
+			.map_err(|error| Error::backend("git rebind copied submodules", error))?;
+		let child = Path::new(path);
+		if path.is_empty()
+			|| path
+				.split('/')
+				.any(|part| part.is_empty() || part == "." || part == "..")
+			|| child.is_absolute()
+			|| !child
+				.components()
+				.all(|part| matches!(part, std::path::Component::Normal(_)))
+		{
+			return Err(Error::backend(
+				"git rebind copied submodules",
+				format!("invalid gitlink path {path}"),
+			));
+		}
+		let child_relative = relative.join(child);
+		let source_child = source_root.join(&child_relative);
+		let isolated_child = isolated_root.join(&child_relative);
+		let optional_meta = |path: &Path| match fs::symlink_metadata(path) {
+			Ok(meta) => Ok(Some(meta)),
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+			Err(error) => Err(error),
+		};
+		// A gitlink outside the sparse cone, or whose directory is deleted as a
+		// pending change, has nothing in the isolation to rebind.
+		match (optional_meta(&source_child)?, optional_meta(&isolated_child)?) {
+			(_, None) => continue,
+			(None, Some(_)) => {
+				return Err(Error::backend(
+					"git rebind copied submodules",
+					format!("copied submodule {} has no source directory", child_relative.display()),
+				));
+			},
+			(Some(_), Some(_)) => {},
+		}
+		if fs::canonicalize(&source_child)? != source_child
+			|| fs::canonicalize(&isolated_child)? != isolated_child
+		{
+			return Err(Error::backend(
+				"git rebind copied submodules",
+				format!("symlinked submodule path {}", child_relative.display()),
+			));
+		}
+		let source_git = source_child.join(".git");
+		let isolated_git = isolated_child.join(".git");
+		let (source_meta, isolated_meta) =
+			match (optional_meta(&source_git)?, optional_meta(&isolated_git)?) {
+				(Some(source), Some(isolated)) => (source, isolated),
+				// Nothing in the isolation can reach a source admin: the gitlink was
+				// never initialized, or the backend (rcopy's `git worktree add`)
+				// checked it out empty.
+				(_, None) => continue,
+				(None, Some(_)) => {
+					return Err(Error::backend(
+						"git rebind copied submodules",
+						format!(
+							"copied Git admin for uninitialized submodule {}",
+							child_relative.display()
+						),
+					));
+				},
+			};
+		if source_meta.file_type().is_symlink()
+			|| isolated_meta.file_type().is_symlink()
+			|| !(source_meta.is_file() || source_meta.is_dir())
+			|| !(isolated_meta.is_file() || isolated_meta.is_dir())
+		{
+			return Err(Error::backend(
+				"git rebind copied submodules",
+				format!("invalid submodule Git admin {}", child_relative.display()),
+			));
+		}
+		let subrepo = GitRepo::require(&source_child)?;
+		if fs::canonicalize(subrepo.root())? != source_child {
+			return Err(Error::backend(
+				"git rebind copied submodules",
+				format!("uninitialized submodule {}", child_relative.display()),
+			));
+		}
+		let expected = entry.id.to_string();
+		if subrepo.head_sha()?.as_deref() != Some(expected.as_str()) {
+			return Err(Error::backend(
+				"git rebind copied submodules",
+				format!("off-pin submodule {}", child_relative.display()),
+			));
+		}
+		let metadata = snapshot_private_git(&subrepo, &subrepo.info().common_dir)?;
+		if metadata.head.is_none() {
+			return Err(Error::backend(
+				"git rebind copied submodules",
+				format!("missing submodule HEAD {}", child_relative.display()),
+			));
+		}
+		// Depth-first: an initialized grandchild must be private before its
+		// parent.
+		collect_copied_submodules(source_root, isolated_root, &child_relative, snapshots)?;
+		snapshots.push(CopiedSubmodule { relative: child_relative, metadata });
+	}
+	Ok(())
+}
+
+/// Give every initialized gitlink in a copied isolation its own Git admin.
+///
+/// Each gets HEAD, refs, index and object store alternates. Source
+/// administration is only read; destination gitfiles are never followed
+/// through their stale pointers.
+pub fn rebind_copied_submodules(source_root: &Path, isolated_root: &Path) -> Result<usize> {
+	let source = fs::canonicalize(source_root)?;
+	let isolated = fs::canonicalize(isolated_root)?;
+	if source == isolated
+		|| source.starts_with(&isolated)
+		|| isolated.starts_with(&source)
+		|| !fs::symlink_metadata(isolated_root)?.is_dir()
+	{
+		return Err(Error::backend(
+			"git rebind copied submodules",
+			"source and isolation overlap or are symlinks",
+		));
+	}
+	let mut snapshots = Vec::new();
+	collect_copied_submodules(&source, &isolated, Path::new(""), &mut snapshots)?;
+	let count = snapshots.len();
+	for snapshot in snapshots {
+		let destination = isolated.join(&snapshot.relative);
+		let git_entry = destination.join(".git");
+		if fs::symlink_metadata(&git_entry)?.is_dir() {
+			fs::remove_dir_all(&git_entry)?;
+		} else {
+			fs::remove_file(&git_entry)?;
+		}
+		materialize_private_git(&destination, snapshot.metadata)?;
+	}
+	Ok(count)
+}
+
+/// Author signature for an explicit [`CommitAuthor`]; a missing date means now.
+fn signature_for(author: &CommitAuthor) -> Result<gix::actor::Signature> {
+	let time = match &author.date {
+		Some(date) => {
+			gix::date::parse(date, None).map_err(|err| Error::backend("git commit", err))?
+		},
+		None => gix::date::Time::now_local_or_utc(),
+	};
+	Ok(gix::actor::Signature {
+		name: author.name.clone().into(),
+		email: author.email.clone().into(),
+		time,
+	})
 }
 
 fn resolve_commit(repo: &gix::Repository, spec: &str) -> Result<gix::hash::ObjectId> {
@@ -1212,40 +1576,59 @@ fn same_worktree_file(_: &fs::Metadata, _: &fs::Metadata) -> bool {
 	false
 }
 
-/// Write the filtered worktree content at `path` into the object database and
-/// replace its index entry. A path that vanished or is untrackable (socket,
-/// plain directory) is left out of the index, as `git add` would.
+/// The new index entry for a staged path.
+struct StagedEntry {
+	path: BString,
+	stat: gix::index::entry::Stat,
+	id:   gix::ObjectId,
+	mode: gix::index::entry::Mode,
+}
+
+/// What staging a path does to its index entries.
+enum Staged {
+	/// Replace them with this entry.
+	Entry(StagedEntry),
+	/// Drop them: the path vanished or is untrackable (socket), as `git add`
+	/// would.
+	Removed,
+	/// Leave them: a plain directory.
+	Kept,
+}
+
+/// Write the filtered worktree content at `path` into the object database.
 fn stage_one(
+	root: &Path,
 	filter: &mut gix::filter::Pipeline<'_>,
 	filter_index: &gix::index::State,
-	index: &mut gix::index::File,
 	path: &str,
-) -> Result<()> {
+	staging_started: u64,
+) -> Result<Staged> {
 	use gix::objs::tree::EntryKind;
 	let rela_path = path.as_bytes().as_bstr();
+	// Stat before reading, as `git add` does, so the entry keeps a valid stat
+	// cache: a write landing after the stat changes the file's stat and later
+	// status calls re-hash it. A file last changed in the second staging
+	// began could change again within that second and keep its stat, so its
+	// stat is not recorded and the next status compares contents instead.
+	let stat = gix::index::fs::Metadata::from_path_no_follow(&root.join(path))
+		.ok()
+		.and_then(|metadata| gix::index::entry::Stat::from_fs(&metadata).ok())
+		.filter(|stat| u64::from(stat.mtime.secs) < staging_started)
+		.unwrap_or_default();
 	let Some((id, kind, _)) = filter
 		.worktree_file_to_object(rela_path, filter_index)
 		.map_err(|err| Error::backend("git add", err))?
 	else {
-		index.remove_entries(|_, p, _| p == rela_path);
-		return Ok(());
+		return Ok(Staged::Removed);
 	};
 	let mode = match kind {
 		EntryKind::Blob => gix::index::entry::Mode::FILE,
 		EntryKind::BlobExecutable => gix::index::entry::Mode::FILE_EXECUTABLE,
 		EntryKind::Link => gix::index::entry::Mode::SYMLINK,
 		EntryKind::Commit => gix::index::entry::Mode::COMMIT,
-		EntryKind::Tree => return Ok(()),
+		EntryKind::Tree => return Ok(Staged::Kept),
 	};
-	index.remove_entries(|_, p, _| p == rela_path);
-	index.dangerously_push_entry(
-		Default::default(),
-		id,
-		gix::index::entry::Flags::empty(),
-		mode,
-		rela_path,
-	);
-	Ok(())
+	Ok(Staged::Entry(StagedEntry { path: rela_path.to_owned(), stat, id, mode }))
 }
 
 fn copy_index_paths(dest: &mut gix::index::File, source: &gix::index::File, files: &[String]) {
@@ -1408,13 +1791,14 @@ fn checkout_conflicts(
 	target: &gix::index::File,
 ) -> Result<Vec<String>> {
 	let mut conflicts = Vec::new();
+	let mut filter = WorktreeFilter::staging(repo, "git checkout")?;
 	for entry in current.entries() {
 		let path = entry.path(current).to_str_lossy().into_owned();
 		let target_entry = target.entry_by_path(path.as_bytes().as_bstr());
 		if target_entry.is_some_and(|e| e.id == entry.id && e.mode == entry.mode) {
 			continue;
 		}
-		if worktree_id(repo, &root.join(&path), entry.mode)? != Some(entry.id) {
+		if worktree_id(repo, &mut filter, root, &path, entry.mode)? != Some(entry.id) {
 			conflicts.push(path);
 		}
 	}
@@ -1423,21 +1807,27 @@ fn checkout_conflicts(
 	Ok(conflicts)
 }
 
+/// Blob id the worktree entry at repo-relative `path` would be staged as —
+/// regular files pass through the clean filters, so a CRLF checkout under
+/// `core.autocrlf` matches its LF blob — or `None` when it is missing.
 fn worktree_id(
 	repo: &gix::Repository,
-	path: &Path,
+	filter: &mut WorktreeFilter<'_>,
+	root: &Path,
+	path: &str,
 	mode: gix::index::entry::Mode,
 ) -> Result<Option<gix::hash::ObjectId>> {
-	if !path.exists() && fs::symlink_metadata(path).is_err() {
+	let absolute = root.join(path);
+	if !absolute.exists() && fs::symlink_metadata(&absolute).is_err() {
 		return Ok(None);
 	}
 	let data = if mode == gix::index::entry::Mode::SYMLINK {
-		fs::read_link(path)?
+		fs::read_link(&absolute)?
 			.to_string_lossy()
 			.into_owned()
 			.into_bytes()
 	} else {
-		fs::read(path)?
+		filter.worktree_to_git(path, fs::read(&absolute)?)?
 	};
 	Ok(Some(
 		gix::objs::compute_hash(repo.object_hash(), gix::objs::Kind::Blob, &data)
@@ -1477,20 +1867,21 @@ fn restore_index_paths(
 	index: &gix::index::File,
 	files: &[String],
 ) -> Result<()> {
+	let mut filter = WorktreeFilter::staging(repo, "git restore")?;
 	for entry in index.entries() {
 		let path = entry.path(index).to_str_lossy();
 		if files.is_empty() || files.iter().any(|wanted| path_matches(&path, wanted)) {
 			let object = repo
 				.find_object(entry.id)
 				.map_err(|e| Error::backend("git restore", e))?;
-			let blob = object
+			let mut blob = object
 				.try_into_blob()
 				.map_err(|e| Error::backend("git restore", e))?;
 			let full = root.join(path.as_ref());
 			if let Some(parent) = full.parent() {
 				fs::create_dir_all(parent)?;
 			}
-			fs::write(full, &blob.data)?;
+			fs::write(full, filter.git_to_worktree(&path, blob.take_data())?)?;
 		}
 	}
 	Ok(())
@@ -1502,6 +1893,53 @@ fn path_matches(path: &str, wanted: &str) -> bool {
 		|| path
 			.strip_prefix(wanted)
 			.is_some_and(|r| r.starts_with('/'))
+}
+
+/// Every regular file under `dir`, relative to it, read up front. Symlinks are
+/// refused rather than followed.
+fn read_tree_files(dir: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>> {
+	let mut files = Vec::new();
+	let mut pending = vec![PathBuf::new()];
+	while let Some(relative) = pending.pop() {
+		for entry in fs::read_dir(dir.join(&relative))? {
+			let entry = entry?;
+			let child = relative.join(entry.file_name());
+			let kind = entry.file_type()?;
+			if kind.is_dir() {
+				pending.push(child);
+			} else if kind.is_file() {
+				files.push((child.clone(), fs::read(dir.join(&child))?));
+			} else {
+				return Err(Error::backend(
+					"git private admin",
+					format!("unsupported entry {}", dir.join(child).display()),
+				));
+			}
+		}
+	}
+	Ok(files)
+}
+
+/// Write `files` under a new owner-only directory `root`.
+fn write_private_tree(root: &Path, files: Vec<(PathBuf, Vec<u8>)>) -> Result<()> {
+	#[cfg(unix)]
+	use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+	for (relative, bytes) in files {
+		let path = root.join(relative);
+		if let Some(parent) = path.parent() {
+			let mut builder = fs::DirBuilder::new();
+			builder.recursive(true);
+			#[cfg(unix)]
+			builder.mode(0o700);
+			builder.create(parent)?;
+		}
+		let mut options = fs::OpenOptions::new();
+		options.write(true).create_new(true);
+		#[cfg(unix)]
+		options.mode(0o600);
+		options.open(&path)?.write_all(&bytes)?;
+	}
+	Ok(())
 }
 
 fn set_config_file(path: &Path, key: &str, value: &str) -> Result<()> {
@@ -1517,6 +1955,50 @@ fn set_config_file(path: &Path, key: &str, value: &str) -> Result<()> {
 	let mut bytes = Vec::new();
 	config.write_to(&mut bytes)?;
 	fs::write(path, bytes)?;
+	Ok(())
+}
+
+/// Paths whose entry differs between `left` and `right` (blob id or mode), or
+/// that exist on only one side.
+fn index_diff_paths(left: &gix::index::File, right: &gix::index::File) -> BTreeSet<BString> {
+	let mut paths = BTreeSet::new();
+	for entry in left.entries() {
+		let entry_path = entry.path(left);
+		if right
+			.entry_by_path(entry_path)
+			.is_none_or(|other| other.id != entry.id || other.mode != entry.mode)
+		{
+			paths.insert(entry_path.to_owned());
+		}
+	}
+	for entry in right.entries() {
+		let entry_path = entry.path(right);
+		if left.entry_by_path(entry_path).is_none() {
+			paths.insert(entry_path.to_owned());
+		}
+	}
+	paths
+}
+
+/// Point the stat cache of every index entry outside `dirty` at the file now
+/// under `root`, so entries whose content matches the index read as clean.
+fn refresh_clean_index_stats(
+	index: &mut gix::index::File,
+	root: &Path,
+	dirty: &BTreeSet<BString>,
+) -> Result<()> {
+	for (entry, entry_path) in index.entries_mut_with_paths() {
+		if dirty.contains(entry_path) {
+			continue;
+		}
+		let Ok(metadata) =
+			gix::index::fs::Metadata::from_path_no_follow(&root.join(entry_path.to_path_lossy()))
+		else {
+			continue;
+		};
+		entry.stat = gix::index::entry::Stat::from_fs(&metadata)
+			.map_err(|err| Error::backend("git worktree add", err))?;
+	}
 	Ok(())
 }
 
@@ -1570,13 +2052,22 @@ fn collect_clone_reconciliation_paths(
 	Ok((dirty_tracked, untracked))
 }
 
+fn git_metadata_path(path: &Path) -> Cow<'_, str> {
+	let display = path.to_string_lossy();
+	if cfg!(windows) {
+		Cow::Owned(display.replace('\\', "/"))
+	} else {
+		display
+	}
+}
+
 fn register_worktree(path: &Path, common: &Path, head: &str) -> Result<PathBuf> {
 	fs::create_dir_all(path)?;
 	let name = worktree_admin_name(common, path);
 	let admin = common.join("worktrees").join(name);
 	fs::create_dir_all(&admin)?;
-	fs::write(path.join(".git"), format!("gitdir: {}\n", admin.display()))?;
-	fs::write(admin.join("gitdir"), format!("{}\n", path.join(".git").display()))?;
+	fs::write(path.join(".git"), format!("gitdir: {}\n", git_metadata_path(&admin)))?;
+	fs::write(admin.join("gitdir"), format!("{}\n", git_metadata_path(&path.join(".git"))))?;
 	fs::write(admin.join("commondir"), "../..\n")?;
 	fs::write(admin.join("HEAD"), format!("{head}\n"))?;
 	Ok(admin)
@@ -1686,13 +2177,10 @@ fn branch_is_checked_out(common: &Path, full_ref: &str) -> bool {
 fn tracked_worktree_dirty(repo: &GitRepo) -> Result<bool> {
 	let gix = repo.gix()?;
 	let index = load_index_or_head(&gix, "git worktree remove")?;
+	let mut filter = WorktreeFilter::staging(&gix, "git worktree remove")?;
 	for entry in index.entries() {
-		if worktree_id(
-			&gix,
-			&repo.root().join(entry.path(&index).to_str_lossy().as_ref()),
-			entry.mode,
-		)? != Some(entry.id)
-		{
+		let path = entry.path(&index).to_str_lossy();
+		if worktree_id(&gix, &mut filter, repo.root(), &path, entry.mode)? != Some(entry.id) {
 			return Ok(true);
 		}
 	}
@@ -1786,6 +2274,13 @@ mod tests {
 		git(temp.path(), &["init", "-q", "-b", "main"]);
 		git(temp.path(), &["config", "user.name", "Test"]);
 		git(temp.path(), &["config", "user.email", "test@example.com"]);
+		// gix reads the developer's `~/.gitconfig`, where a global
+		// `core.hooksPath` would redirect hook lookup away from this fixture.
+		git(temp.path(), &["config", "core.hooksPath", ".git/hooks"]);
+		// Assertions compare exact worktree bytes; Git for Windows' system
+		// `core.autocrlf=true` would check them out as CRLF. Tests covering
+		// line-ending conversion opt back in explicitly.
+		git(temp.path(), &["config", "core.autocrlf", "false"]);
 		fs::write(temp.path().join("a"), "one\n").unwrap();
 		fs::write(temp.path().join("b"), "two\n").unwrap();
 		git(temp.path(), &["add", "."]);
@@ -1832,6 +2327,34 @@ mod tests {
 		assert_eq!(git(temp.path(), &["status", "--porcelain"]), "A  new");
 		repo.unstage(&[]).unwrap();
 		assert_eq!(git(temp.path(), &["status", "--porcelain"]), "?? new");
+	}
+
+	/// Staged entries record the file's stat so later status calls can skip
+	/// re-hashing them; a zeroed stat would force a content check every time.
+	/// A file changed in the second staging began could change again within
+	/// that second without its stat changing, so it records none.
+	#[test]
+	fn stage_files_records_the_stat_cache_unless_racy() {
+		let (temp, repo) = fixture();
+		let set_mtime = |path: &str, when: std::time::SystemTime| {
+			fs::OpenOptions::new()
+				.write(true)
+				.open(temp.path().join(path))
+				.and_then(|file| file.set_modified(when))
+				.unwrap();
+		};
+		let now = std::time::SystemTime::now();
+		fs::write(temp.path().join("a"), "changed content\n").unwrap();
+		set_mtime("a", now - std::time::Duration::from_secs(30));
+		set_mtime("b", now + std::time::Duration::from_secs(60));
+		repo.stage_files(&[]).unwrap();
+		let index = gix::open(temp.path()).unwrap().open_index().unwrap();
+		let stat = |path: &str| index.entry_by_path(path.into()).unwrap().stat;
+		let size = fs::metadata(temp.path().join("a")).unwrap().len();
+		assert_eq!(u64::from(stat("a").size), size, "a records its size");
+		assert_ne!(stat("a").mtime, gix::index::entry::stat::Time::default(), "a records its mtime");
+		assert_eq!(stat("b"), gix::index::entry::Stat::default(), "a racy stat is not recorded");
+		assert_eq!(git(temp.path(), &["status", "--porcelain"]), "M  a");
 	}
 
 	#[test]
@@ -2034,6 +2557,11 @@ mod tests {
 		fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 	}
 
+	#[cfg(windows)]
+	fn write_hook(path: &Path, body: &str, _executable: bool) {
+		fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+	}
+
 	#[test]
 	fn stage_commit_survives_unadvanced_index_mtime() {
 		// Regression: a commit right after staging on the same cached handle used
@@ -2059,7 +2587,6 @@ mod tests {
 		assert_eq!(git(temp.path(), &["show", "HEAD:a"]), "changed");
 	}
 
-	#[cfg(unix)]
 	#[test]
 	fn commit_hooks_match_git_commit_behavior() {
 		let (temp, repo) = fixture();
@@ -2099,12 +2626,16 @@ mod tests {
 			.commit_create("missing hook is skipped", &CommitOptions::default())
 			.unwrap();
 
-		fs::write(temp.path().join("b"), "one more\n").unwrap();
-		repo.stage_files(&["b".into()]).unwrap();
-		write_hook(&pre_commit, "echo should-not-run >&2\nexit 1", false);
-		repo
-			.commit_create("non-executable hook is skipped", &CommitOptions::default())
-			.unwrap();
+		#[cfg(unix)]
+		{
+			fs::write(temp.path().join("b"), "one more\n").unwrap();
+			repo.stage_files(&["b".into()]).unwrap();
+			write_hook(&pre_commit, "echo should-not-run >&2\nexit 1", false);
+			repo
+				.commit_create("non-executable hook is skipped", &CommitOptions::default())
+				.unwrap();
+		}
+		#[cfg(unix)]
 		fs::remove_file(&pre_commit).unwrap();
 		repo
 			.commit_create("subject\n\nbody\n\n", &CommitOptions {
@@ -2141,6 +2672,47 @@ mod tests {
 		repo.reset(ResetMode::Hard, Some(&main)).unwrap();
 		assert!(repo.delete_branch("other", true).unwrap());
 		assert!(!repo.delete_branch("missing", true).unwrap());
+	}
+
+	#[test]
+	fn checkout_restore_and_worktree_remove_honor_autocrlf() {
+		// Regression: conflict and dirty checks hashed raw worktree bytes, so a
+		// CRLF checkout under `core.autocrlf=true` (the Git for Windows default)
+		// read as modified and blocked the next checkout or a non-forced
+		// worktree removal, and restore wrote LF where git writes CRLF.
+		let (temp, repo) = fixture();
+		git(temp.path(), &["config", "core.autocrlf", "true"]);
+		repo.create_branch("other", "HEAD", false).unwrap();
+		fs::write(temp.path().join("a"), "main\n").unwrap();
+		repo.stage_files(&["a".into()]).unwrap();
+		repo
+			.commit_create("main", &CommitOptions::default())
+			.unwrap();
+		repo.checkout("other").unwrap();
+		assert_eq!(fs::read_to_string(temp.path().join("a")).unwrap(), "one\r\n");
+		repo.checkout("main").unwrap();
+		assert_eq!(fs::read_to_string(temp.path().join("a")).unwrap(), "main\r\n");
+		assert_eq!(git(temp.path(), &["status", "--porcelain"]), "");
+
+		fs::write(temp.path().join("a"), "dirty\r\n").unwrap();
+		assert!(matches!(repo.checkout("other"), Err(Error::Conflict { .. })));
+		repo
+			.restore(&RestoreOptions { files: vec!["a".into()], ..Default::default() })
+			.unwrap();
+		assert_eq!(fs::read_to_string(temp.path().join("a")).unwrap(), "main\r\n");
+		assert_eq!(git(temp.path(), &["status", "--porcelain"]), "");
+
+		let linked = temp.path().join("../linked-autocrlf");
+		let _ = fs::remove_dir_all(&linked);
+		repo
+			.worktree_add(&linked, "main", WorktreeAddOptions {
+				detach:       true,
+				clone:        WorktreeClone::Off,
+				keep_changes: false,
+			})
+			.unwrap();
+		assert_eq!(fs::read_to_string(linked.join("a")).unwrap(), "main\r\n");
+		assert!(repo.worktree_remove(&linked, false).unwrap(), "clean CRLF checkout is not dirty");
 	}
 
 	#[test]
@@ -2219,8 +2791,8 @@ mod tests {
 		fs::write(temp.path().join("parent-untracked.txt"), "delete\n").unwrap();
 
 		// 4. Global excludesfile (core.excludesFile), configured *after* `repo`'s
-		//    cached gix handle was opened by the staging calls above. The clean below
-		//    must observe it or `global.env` is deleted.
+		//    cached gix handle was opened by the staging calls above. The clean
+		//    below must observe it or `global.env` is deleted.
 		let global_exclude = outside.path().join("global-excludes");
 		fs::write(&global_exclude, "global.env\n").unwrap();
 		git(temp.path(), &["config", "core.excludesFile", global_exclude.to_str().unwrap()]);
@@ -2285,8 +2857,8 @@ mod tests {
 			initially_empty.exists(),
 			"pathspec-scoped clean leaves directories outside the pathspec"
 		);
-		// 10. Pathspec scoping: cleaning with a pathspec prunes empty dirs inside the
-		//     pathspec but preserves the parent
+		// 10. Pathspec scoping: cleaning with a pathspec prunes empty dirs inside
+		//     the pathspec but preserves the parent
 		let pathspec_dir = temp.path().join("pathspec-parent/child/grandchild");
 		fs::create_dir_all(&pathspec_dir).unwrap();
 		fs::write(pathspec_dir.join("leaf.txt"), "leaf\n").unwrap();
@@ -2405,6 +2977,35 @@ mod tests {
 		assert_eq!(fs::read(linked.join(".git")).unwrap(), pointer_before);
 		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), git(&linked, &["rev-parse", "HEAD"]));
 		let _ = fs::remove_dir_all(linked);
+	}
+
+	#[test]
+	fn worktree_registration_paths_are_accepted_by_git() {
+		let (temp, repo) = fixture();
+		let linked_dir = tempfile::tempdir().unwrap();
+		let linked = linked_dir.path().to_path_buf();
+		repo
+			.worktree_add(&linked, "main", WorktreeAddOptions {
+				detach:       true,
+				clone:        WorktreeClone::Off,
+				keep_changes: false,
+			})
+			.unwrap();
+
+		let admin = registered_admin(&linked.join(".git")).unwrap().unwrap();
+		assert_eq!(
+			fs::read_to_string(linked.join(".git")).unwrap(),
+			format!("gitdir: {}\n", git_metadata_path(&admin))
+		);
+		assert_eq!(
+			fs::read_to_string(admin.join("gitdir")).unwrap(),
+			format!("{}\n", git_metadata_path(&linked.join(".git")))
+		);
+
+		let listed = git(temp.path(), &["worktree", "list", "--porcelain"]);
+		let expected = format!("worktree {}", git_metadata_path(&linked));
+		assert!(listed.lines().any(|line| line == expected), "{listed}");
+		git(temp.path(), &["worktree", "repair", linked.to_str().unwrap()]);
 	}
 
 	#[test]
@@ -2579,6 +3180,50 @@ mod tests {
 	}
 
 	#[test]
+	fn worktree_add_keep_changes_carries_staged_only_state_without_phantom_edits() {
+		for clone in [WorktreeClone::Auto, WorktreeClone::Off] {
+			let (temp, repo) = fixture();
+			fs::write(temp.path().join("c"), "three\n").unwrap();
+			git(temp.path(), &["add", "c"]);
+			git(temp.path(), &["commit", "-qm", "add c"]);
+			// The source keeps its LF files; a plain checkout under autocrlf
+			// writes CRLF, so clean files land at a different size.
+			git(temp.path(), &["config", "core.autocrlf", "true"]);
+			fs::write(temp.path().join("a"), "staged only\n").unwrap();
+			git(temp.path(), &["add", "a"]);
+			git(temp.path(), &["rm", "-q", "b"]);
+			fs::write(temp.path().join("added"), "staged add\n").unwrap();
+			git(temp.path(), &["add", "added"]);
+			let source_status = git(temp.path(), &["status", "--porcelain"]);
+			assert_eq!(source_status, "M  a\nA  added\nD  b");
+			git(temp.path(), &["branch", "kept-staged"]);
+
+			let linked = temp.path().join(format!("../linked-keep-staged-{clone:?}"));
+			let _ = fs::remove_dir_all(&linked);
+			let result = repo
+				.worktree_add(&linked, "kept-staged", WorktreeAddOptions {
+					detach: false,
+					clone,
+					keep_changes: true,
+				})
+				.unwrap();
+			if clone == WorktreeClone::Off {
+				assert!(result.cloned_with.is_none());
+			}
+
+			assert_eq!(fs::read_to_string(linked.join("a")).unwrap(), "staged only\n");
+			assert_eq!(fs::read_to_string(linked.join("added")).unwrap(), "staged add\n");
+			assert!(!linked.join("b").exists());
+			assert_eq!(
+				git(&linked, &["status", "--porcelain"]),
+				source_status,
+				"clean and staged-only files must not read as unstaged edits"
+			);
+			let _ = repo.worktree_remove(&linked, true);
+		}
+	}
+
+	#[test]
 	fn mutate_worktree_and_detach() {
 		let (temp, repo) = fixture();
 		let linked = temp.path().join("../linked-mut");
@@ -2592,7 +3237,7 @@ mod tests {
 			.unwrap();
 		assert!(
 			git(temp.path(), &["worktree", "list", "--porcelain"])
-				.contains(linked.to_string_lossy().as_ref())
+				.contains(git_metadata_path(&linked).as_ref())
 		);
 		assert!(repo.worktree_remove(&linked, true).unwrap());
 
@@ -2614,9 +3259,272 @@ mod tests {
 		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), source_head);
 		assert!(
 			!git(temp.path(), &["worktree", "list", "--porcelain"])
-				.contains(linked.to_string_lossy().as_ref())
+				.contains(git_metadata_path(&linked).as_ref())
 		);
 		assert!(repo.worktree_prune().is_ok());
 		let _ = fs::remove_dir_all(linked);
+	}
+
+	/// Linked worktree of `parent -> packages/aix-root -> nested/grand`, the
+	/// pai-root shape; gitlinks are recursively initialized when `init`.
+	fn nested_linked_fixture(root: &Path, init: bool) -> PathBuf {
+		let grand = root.join("grand");
+		let child = root.join("child");
+		let parent = root.join("parent");
+		for repo in [&grand, &child, &parent] {
+			fs::create_dir_all(repo).unwrap();
+			git(repo, &["init", "-q", "-b", "main"]);
+			git(repo, &["config", "user.name", "Proof"]);
+			git(repo, &["config", "user.email", "proof.invalid"]);
+			git(repo, &["config", "core.hooksPath", "/dev/null"]);
+			fs::write(repo.join("tracked"), "unchanged\n").unwrap();
+			git(repo, &["add", "tracked"]);
+			git(repo, &["commit", "-qm", "seed"]);
+		}
+		let allow = ["-c", "protocol.file.allow=always", "submodule", "add"];
+		git(&child, &[&allow[..], &[grand.to_str().unwrap(), "nested/grand"]].concat());
+		git(&child, &["commit", "-qam", "pin grandchild"]);
+		git(&parent, &[&allow[..], &[child.to_str().unwrap(), "packages/aix-root"]].concat());
+		git(&parent, &["commit", "-qam", "pin child"]);
+		let linked = root.join("linked");
+		git(&parent, &["worktree", "add", "--detach", linked.to_str().unwrap(), "HEAD"]);
+		if init {
+			git(&linked, &[
+				"-c",
+				"protocol.file.allow=always",
+				"submodule",
+				"update",
+				"--init",
+				"--recursive",
+			]);
+		}
+		linked
+	}
+
+	/// Copy `linked` verbatim to a different depth, as a copy backend does, and
+	/// detach its top-level metadata.
+	fn copied_detached_isolation(root: &Path, linked: &Path) -> PathBuf {
+		// Real isolations live at a different depth than the source, so the
+		// copied relative child gitfiles resolve to no admin at all.
+		let isolated_parent = root.join("omp/wt/task");
+		fs::create_dir_all(&isolated_parent).unwrap();
+		let isolated = isolated_parent.join("m");
+		assert!(
+			Command::new("cp")
+				.args(["-Rp", linked.to_str().unwrap(), isolated.to_str().unwrap()])
+				.status()
+				.unwrap()
+				.success()
+		);
+		let common = GitRepo::require(linked).unwrap().info().common_dir.clone();
+		assert_eq!(detach_git_dir(&isolated, &common).unwrap(), DetachGitDirResult::Detached);
+		isolated
+	}
+
+	fn rebind_error(source: &Path, isolated: &Path) -> String {
+		match rebind_copied_submodules(source, isolated) {
+			Err(Error::Backend { message, .. }) => message,
+			other => panic!("expected a backend refusal, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn rebind_refuses_an_off_pin_submodule_before_writing_anything() {
+		let tmp = tempfile::tempdir().unwrap();
+		let linked = nested_linked_fixture(tmp.path(), true);
+		let source_grand = linked.join("packages/aix-root/nested/grand");
+		fs::write(source_grand.join("tracked"), "moved\n").unwrap();
+		git(&source_grand, &["commit", "-qam", "move grandchild off its pin"]);
+		let isolated = copied_detached_isolation(tmp.path(), &linked);
+		let child_pointer = fs::read(isolated.join("packages/aix-root/.git")).unwrap();
+		let grand_pointer = fs::read(isolated.join("packages/aix-root/nested/grand/.git")).unwrap();
+
+		let error = rebind_error(&linked, &isolated);
+		assert!(error.contains("off-pin submodule packages/aix-root/nested/grand"), "{error}");
+		// The parent child is on-pin and was snapshotted first, but every write
+		// waits until all gitlinks validate: both copied gitfiles are untouched.
+		assert_eq!(fs::read(isolated.join("packages/aix-root/.git")).unwrap(), child_pointer);
+		assert_eq!(
+			fs::read(isolated.join("packages/aix-root/nested/grand/.git")).unwrap(),
+			grand_pointer
+		);
+	}
+
+	#[test]
+	fn rebind_skips_uninitialized_gitlinks_but_refuses_a_copy_that_gained_an_admin() {
+		let tmp = tempfile::tempdir().unwrap();
+		let linked = nested_linked_fixture(tmp.path(), false);
+		let isolated = copied_detached_isolation(tmp.path(), &linked);
+		assert_eq!(rebind_copied_submodules(&linked, &isolated).unwrap(), 0);
+		assert!(git(&isolated, &["status", "--porcelain"]).is_empty());
+
+		fs::write(isolated.join("packages/aix-root/.git"), "gitdir: /elsewhere\n").unwrap();
+		let error = rebind_error(&linked, &isolated);
+		assert!(
+			error.contains("copied Git admin for uninitialized submodule packages/aix-root"),
+			"{error}"
+		);
+	}
+
+	#[test]
+	fn rebind_skips_a_gitlink_whose_directory_is_absent() {
+		// Sparse checkouts and a deleted-submodule pending change leave a
+		// gitlink in the index with no directory on disk.
+		let tmp = tempfile::tempdir().unwrap();
+		let linked = nested_linked_fixture(tmp.path(), false);
+		fs::remove_dir(linked.join("packages/aix-root")).unwrap();
+		let isolated = copied_detached_isolation(tmp.path(), &linked);
+		assert_eq!(rebind_copied_submodules(&linked, &isolated).unwrap(), 0);
+
+		// A directory only the copy has is not something the source can vouch
+		// for.
+		fs::create_dir_all(isolated.join("packages/aix-root")).unwrap();
+		let error = rebind_error(&linked, &isolated);
+		assert!(
+			error.contains("copied submodule packages/aix-root has no source directory"),
+			"{error}"
+		);
+	}
+
+	#[test]
+	fn rebind_refuses_overlapping_source_and_isolation() {
+		let tmp = tempfile::tempdir().unwrap();
+		let linked = nested_linked_fixture(tmp.path(), true);
+		let inner = linked.join("packages");
+		assert!(rebind_error(&linked, &inner).contains("overlap"));
+		assert!(rebind_error(&inner, &linked).contains("overlap"));
+		assert!(rebind_error(&linked, &linked).contains("overlap"));
+	}
+
+	#[test]
+	fn copied_recursive_submodules_get_private_git_metadata_without_touching_source() {
+		let tmp = tempfile::tempdir().unwrap();
+		let linked = nested_linked_fixture(tmp.path(), true);
+		let source_child = linked.join("packages/aix-root");
+		let source_grand = source_child.join("nested/grand");
+		let source_admin = GitRepo::require(&source_child)
+			.unwrap()
+			.info()
+			.git_dir
+			.clone();
+		let parent_head = git(&linked, &["rev-parse", "HEAD"]);
+		let source_pins = git(&linked, &["submodule", "status", "--recursive"]);
+		let source_index = fs::read(source_admin.join("index")).unwrap();
+		let source_pointer = fs::read(source_child.join(".git")).unwrap();
+		let isolated = copied_detached_isolation(tmp.path(), &linked);
+		assert!(
+			GitRepo::require(&isolated)
+				.unwrap()
+				.diff_text(&crate::types::DiffOptions::default())
+				.is_err(),
+			"a stale copied child gitfile must fail native preflight before repair"
+		);
+		assert_eq!(rebind_copied_submodules(&linked, &isolated).unwrap(), 2);
+		let private_child = isolated.join("packages/aix-root");
+		let private_grand = private_child.join("nested/grand");
+		for directory in [&private_child, &private_grand] {
+			assert!(
+				directory.join(".git").is_dir(),
+				"private Git admin missing in {}",
+				directory.display()
+			);
+			assert!(git(directory, &["status", "--porcelain"]).is_empty());
+		}
+		assert!(
+			GitRepo::require(&isolated)
+				.unwrap()
+				.diff_text(&crate::types::DiffOptions::default())
+				.unwrap()
+				.is_empty()
+		);
+		assert!(git(&isolated, &["status", "--porcelain"]).is_empty());
+		// Same initialized pins as the source, not `-` (uninitialized) rows.
+		assert_eq!(git(&isolated, &["submodule", "status", "--recursive"]), source_pins);
+		fs::write(private_grand.join("tracked"), "isolated edit\n").unwrap();
+		// Task capture diffs each nested repository separately; the edit must
+		// be visible through the grandchild's own private metadata.
+		let grand_diff = GitRepo::require(&private_grand)
+			.unwrap()
+			.diff_text(&crate::types::DiffOptions::default())
+			.unwrap();
+		assert!(grand_diff.contains("+isolated edit"), "{grand_diff}");
+		assert_eq!(git(&isolated, &["status", "--porcelain"]), " M packages/aix-root");
+		assert_eq!(fs::read_to_string(source_grand.join("tracked")).unwrap(), "unchanged\n");
+		assert_eq!(git(&linked, &["rev-parse", "HEAD"]), parent_head);
+		assert_eq!(fs::read(source_admin.join("index")).unwrap(), source_index);
+		assert_eq!(fs::read(source_child.join(".git")).unwrap(), source_pointer);
+		assert_eq!(
+			git(&source_grand, &["rev-parse", "HEAD"]),
+			git(&private_grand, &["rev-parse", "HEAD"])
+		);
+	}
+
+	/// A repo-local clean/smudge driver (git-crypt's shape, here a rot13 `tr`)
+	/// and git-crypt's key dir must follow a detached copy: without them every
+	/// filtered file reads as modified.
+	#[cfg(unix)]
+	#[test]
+	fn detach_git_dir_keeps_repo_local_filter_drivers_and_git_crypt_keys() {
+		let temp = TempDir::new().unwrap();
+		let source = temp.path().join("source");
+		fs::create_dir_all(&source).unwrap();
+		git(&source, &["init", "-q", "-b", "main"]);
+		git(&source, &["config", "user.name", "Proof"]);
+		git(&source, &["config", "user.email", "proof.invalid"]);
+		git(&source, &["config", "core.hooksPath", "/dev/null"]);
+		git(&source, &["config", "filter.rot.clean", "tr a-z n-za-m"]);
+		git(&source, &["config", "filter.rot.smudge", "tr a-z n-za-m"]);
+		git(&source, &["config", "filter.rot.required", "true"]);
+		git(&source, &["config", "diff.rot.textconv", "\"tr\" a-z n-za-m # textconv"]);
+		fs::write(source.join(".gitattributes"), "*.sec filter=rot diff=rot\n").unwrap();
+		fs::write(source.join("plain.sec"), "hello\n").unwrap();
+		git(&source, &["add", ".gitattributes", "plain.sec"]);
+		git(&source, &["commit", "-q", "-m", "filtered"]);
+		let common = fs::canonicalize(source.join(".git")).unwrap();
+		fs::create_dir_all(common.join("git-crypt/keys")).unwrap();
+		fs::write(common.join("git-crypt/keys/default"), "not a real key\n").unwrap();
+		let linked = temp.path().join("linked");
+		git(&source, &["worktree", "add", "-q", "--detach", linked.to_str().unwrap()]);
+		assert_eq!(git(&source, &["cat-file", "-p", "HEAD:plain.sec"]), "uryyb");
+
+		assert_eq!(detach_git_dir(&linked, &common).unwrap(), DetachGitDirResult::Detached);
+
+		for (key, value) in [
+			("filter.rot.clean", "tr a-z n-za-m"),
+			("filter.rot.smudge", "tr a-z n-za-m"),
+			("filter.rot.required", "true"),
+			("diff.rot.textconv", "\"tr\" a-z n-za-m # textconv"),
+		] {
+			assert_eq!(git(&linked, &["config", "--local", key]), value);
+		}
+		// The key dir is the copy's own, owner-only: deleting it there (what
+		// `git-crypt lock` does) leaves the source's keys in place.
+		let keys = linked.join(".git/git-crypt");
+		assert!(fs::symlink_metadata(&keys).unwrap().is_dir());
+		assert_eq!(fs::read_to_string(keys.join("keys/default")).unwrap(), "not a real key\n");
+		{
+			use std::os::unix::fs::PermissionsExt;
+			let mode = fs::metadata(keys.join("keys/default"))
+				.unwrap()
+				.permissions()
+				.mode();
+			assert_eq!(mode & 0o077, 0);
+		}
+		fs::remove_dir_all(&keys).unwrap();
+		assert_eq!(
+			fs::read_to_string(common.join("git-crypt/keys/default")).unwrap(),
+			"not a real key\n"
+		);
+		// Force a content comparison: the clean filter must turn the smudged
+		// worktree bytes back into the committed blob.
+		let file = fs::File::options()
+			.write(true)
+			.open(linked.join("plain.sec"))
+			.unwrap();
+		file
+			.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+			.unwrap();
+		assert_eq!(git(&linked, &["status", "--porcelain"]), "");
+		assert_eq!(fs::read_to_string(linked.join("plain.sec")).unwrap(), "hello\n");
 	}
 }

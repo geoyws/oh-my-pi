@@ -3,8 +3,10 @@ import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-ag
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { Loader } from "@oh-my-pi/pi-tui";
+import { Loader, TERMINAL, Text } from "@oh-my-pi/pi-tui";
 import { createInteractiveModeContext } from "../../helpers/interactive-mode-context";
+
+import { cfgErrorNotify, cfgTerminalShowProgress } from "@oh-my-pi/pi-coding-agent/modes/settings";
 
 /**
  * Faithful model of the shared `statusContainer` + working-loader invariant that
@@ -21,14 +23,24 @@ import { createInteractiveModeContext } from "../../helpers/interactive-mode-con
  * the next `agent_start` recreates and re-attaches it.
  */
 function createContext(options: { terminalProgress?: boolean } = {}) {
-	const streamState = { isStreaming: false };
-	if (options.terminalProgress) settings.set("terminal.showProgress", true);
-	const setProgress = vi.fn((_active: boolean) => {});
+	// `continuation`: a scheduled retry/continuation the session still owes.
+	const streamState: { isStreaming: boolean; continuation?: PromiseWithResolvers<void> } = { isStreaming: false };
+	if (options.terminalProgress) cfgTerminalShowProgress.set(settings, true);
+	const progressCleared = Promise.withResolvers<void>();
+	const setProgress = vi.fn((active: boolean) => {
+		if (!active) progressCleared.resolve();
+	});
 	const ctx = createInteractiveModeContext({
 		ui: { terminal: { setProgress } },
 		session: {
 			get isStreaming() {
 				return streamState.isStreaming;
+			},
+			get hasPostPromptWork() {
+				return streamState.continuation !== undefined;
+			},
+			waitForIdle: async () => {
+				await streamState.continuation?.promise;
 			},
 		},
 	});
@@ -48,11 +60,12 @@ function createContext(options: { terminalProgress?: boolean } = {}) {
 		ctx.loadingAnimation = working;
 		statusContainer.addChild(working);
 	});
-	return { ctx, streamState, statusContainer, workingLoaders, setProgress };
+	return { ctx, streamState, statusContainer, workingLoaders, setProgress, progressCleared: progressCleared.promise };
 }
 
 const AGENT_START = { type: "agent_start" } as unknown as AgentSessionEvent;
 const AGENT_END = { type: "agent_end", messages: [] } as unknown as AgentSessionEvent;
+const NON_TERMINAL_AGENT_END = { type: "agent_end", messages: [], isTerminal: false } as unknown as AgentSessionEvent;
 const COMPACTION_START = {
 	type: "auto_compaction_start",
 	reason: "overflow",
@@ -64,12 +77,34 @@ const COMPACTION_END = {
 	result: { summary: "s", shortSummary: "s", tokensBefore: 10, details: {}, firstKeptEntryId: undefined },
 	willRetry: true,
 } as unknown as AgentSessionEvent;
+
+/** One macrotask hop: every microtask continuation queued so far has run. */
+async function nextMacrotask(): Promise<void> {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	setImmediate(resolve);
+	await promise;
+}
+
 const RETRY_START = {
 	type: "auto_retry_start",
 	attempt: 1,
 	maxAttempts: 3,
 	delayMs: 1000,
 	errorMessage: "overloaded",
+} as unknown as AgentSessionEvent;
+const PROVIDER_RETRY_WAIT_START = {
+	type: "provider_retry_wait_start",
+	waitId: 1,
+	role: "main",
+	delayMs: 2000,
+	model: "claude-sonnet-4-5",
+	provider: "anthropic",
+	api: "anthropic-messages",
+} as unknown as AgentSessionEvent;
+const PROVIDER_RETRY_WAIT_END = {
+	type: "provider_retry_wait_end",
+	aborted: false,
+	waitId: 1,
 } as unknown as AgentSessionEvent;
 const TASK_TOOL_EXECUTION_END = {
 	type: "tool_execution_end",
@@ -220,23 +255,304 @@ describe("EventController loader recovery after overflow maintenance", () => {
 		expect(statusContainer.children).toHaveLength(0);
 	});
 
-	it("mirrors agent and auto-compaction activity to OSC 9;4 when enabled", async () => {
+	it("keeps OSC 9;4 progress on through auto-compaction inside a live turn", async () => {
 		const { ctx, setProgress } = createContext({ terminalProgress: true });
 		const controller = new EventController(ctx);
 
 		await controller.handleEvent(AGENT_START);
-		expect(setProgress).toHaveBeenCalledTimes(1);
-		expect(setProgress).toHaveBeenLastCalledWith(true);
-
 		await controller.handleEvent(COMPACTION_START);
-		expect(setProgress).toHaveBeenCalledTimes(1);
-
 		await controller.handleEvent(COMPACTION_END);
-		expect(setProgress).toHaveBeenCalledTimes(2);
-		expect(setProgress).toHaveBeenLastCalledWith(false);
+		// Clearing here would tell Tern the agent finished while it keeps working.
+		expect(setProgress.mock.calls.map(call => call[0])).toEqual([true]);
 
+		// The overflow retry's own agent_start/agent_end bracket ends the busy state once.
 		await controller.handleEvent(AGENT_START);
 		await controller.handleEvent(AGENT_END);
-		expect(setProgress.mock.calls.map(call => call[0])).toEqual([true, false, true, false]);
+		expect(setProgress.mock.calls.map(call => call[0])).toEqual([true, false]);
+	});
+
+	it("brackets OSC 9;4 progress around auto-compaction outside a turn", async () => {
+		const { ctx, setProgress } = createContext({ terminalProgress: true });
+		const controller = new EventController(ctx);
+
+		await controller.handleEvent(COMPACTION_START);
+		await controller.handleEvent(COMPACTION_END);
+		expect(setProgress.mock.calls.map(call => call[0])).toEqual([true, false]);
+	});
+
+	it("leaves OSC 9;4 progress to a turn that starts during auto-compaction", async () => {
+		const { ctx, setProgress } = createContext({ terminalProgress: true });
+		const controller = new EventController(ctx);
+
+		await controller.handleEvent(COMPACTION_START);
+		await controller.handleEvent(AGENT_START);
+		await controller.handleEvent(COMPACTION_END);
+		expect(setProgress.mock.calls.map(call => call[0])).toEqual([true]);
+
+		await controller.handleEvent(AGENT_END);
+		expect(setProgress.mock.calls.map(call => call[0])).toEqual([true, false]);
+	});
+
+	it("ends OSC 9;4 progress when an abort cancels the overflow retry before it starts", async () => {
+		const { ctx, streamState, setProgress, progressCleared } = createContext({ terminalProgress: true });
+		const controller = new EventController(ctx);
+
+		await controller.handleEvent(AGENT_START);
+		await controller.handleEvent(COMPACTION_START);
+		await controller.handleEvent(COMPACTION_END);
+		// Recovery scheduled the retry, so the overflowed turn settles non-terminally.
+		const retry = Promise.withResolvers<void>();
+		streamState.continuation = retry;
+		await controller.handleEvent(NON_TERMINAL_AGENT_END);
+		await nextMacrotask();
+		expect(setProgress.mock.calls.map(call => call[0])).toEqual([true]);
+
+		// Esc cancels the scheduled retry: no agent_start or terminal agent_end follows.
+		streamState.continuation = undefined;
+		retry.resolve();
+		await progressCleared;
+		expect(setProgress.mock.calls.map(call => call[0])).toEqual([true, false]);
+	});
+
+	it("leaves OSC 9;4 progress to a scheduled continuation that does start", async () => {
+		const { ctx, streamState, setProgress } = createContext({ terminalProgress: true });
+		const controller = new EventController(ctx);
+
+		await controller.handleEvent(AGENT_START);
+		const retry = Promise.withResolvers<void>();
+		streamState.continuation = retry;
+		await controller.handleEvent(NON_TERMINAL_AGENT_END);
+
+		// The retry runs: its agent_start supersedes the settle watch.
+		await controller.handleEvent(AGENT_START);
+		streamState.continuation = undefined;
+		retry.resolve();
+		await nextMacrotask();
+		expect(setProgress.mock.calls.map(call => call[0])).toEqual([true]);
+
+		await controller.handleEvent(AGENT_END);
+		expect(setProgress.mock.calls.map(call => call[0])).toEqual([true, false]);
+	});
+
+	it("reports OSC 9;4 activity to Tern even when the setting is off", async () => {
+		const program = Bun.env.TERM_PROGRAM;
+		try {
+			Bun.env.TERM_PROGRAM = "vscode";
+			const outside = createContext();
+			await new EventController(outside.ctx).handleEvent(AGENT_START);
+			expect(outside.setProgress).not.toHaveBeenCalled();
+
+			Bun.env.TERM_PROGRAM = "tern";
+			const { ctx, setProgress } = createContext();
+			const controller = new EventController(ctx);
+			await controller.handleEvent(AGENT_START);
+			await controller.handleEvent(AGENT_END);
+			expect(setProgress.mock.calls.map(call => call[0])).toEqual([true, false]);
+		} finally {
+			if (program === undefined) delete Bun.env.TERM_PROGRAM;
+			else Bun.env.TERM_PROGRAM = program;
+		}
+	});
+
+	it("shows a Provider retrying countdown while a provider-internal retry wait sleeps", async () => {
+		const { ctx, streamState, statusContainer } = createContext();
+		const controller = new EventController(ctx);
+		const visible = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+
+		await controller.handleEvent(AGENT_START);
+		streamState.isStreaming = true;
+
+		await controller.handleEvent(PROVIDER_RETRY_WAIT_START);
+		const loader = statusContainer.children[0] as Loader;
+		expect(loader).toBeDefined();
+		expect(visible(loader.render(80).join("\n"))).toContain("Provider retrying in 2.0s");
+
+		// The countdown is a live closure like the auto-retry one: a static banner
+		// would still read 2.0s here.
+		vi.advanceTimersByTime(500);
+		expect(visible(loader.render(80).join("\n"))).toContain("in 1.5s");
+
+		await controller.handleEvent(PROVIDER_RETRY_WAIT_END);
+
+		// The wait ended inside the same turn, so the working loader comes back
+		// instead of the UI going blank.
+		expect(statusContainer.children).not.toContain(loader);
+		expect(ctx.loadingAnimation).toBeDefined();
+		expect(statusContainer.children).toContain(ctx.loadingAnimation!);
+	});
+
+	it("never clobbers an active session-level retry overlay", async () => {
+		const { ctx, streamState, statusContainer } = createContext();
+		const controller = new EventController(ctx);
+
+		await controller.handleEvent(AGENT_START);
+		streamState.isStreaming = true;
+		await controller.handleEvent(RETRY_START);
+		const sessionRetryLoader = ctx.retryLoader;
+		expect(sessionRetryLoader).toBeDefined();
+
+		await controller.handleEvent(PROVIDER_RETRY_WAIT_START);
+		expect(ctx.retryLoader).toBe(sessionRetryLoader);
+		expect(statusContainer.children).toEqual([sessionRetryLoader!]);
+
+		await controller.handleEvent(PROVIDER_RETRY_WAIT_END);
+		expect(ctx.retryLoader).toBe(sessionRetryLoader);
+		expect(statusContainer.children).toEqual([sessionRetryLoader!]);
+	});
+
+	it("does not arm the retry-pending gate, so a failing turn still notifies", async () => {
+		const previousWarpProtocol = process.env.WARP_CLI_AGENT_PROTOCOL_VERSION;
+		delete process.env.WARP_CLI_AGENT_PROTOCOL_VERSION;
+		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		cfgErrorNotify.override(settings, "on");
+		const { ctx } = createContext();
+		const controller = new EventController(ctx);
+		try {
+			// `auto_retry_start` suppresses the error toast (the turn will be retried);
+			// a provider-internal wait must not, because nothing was superseded.
+			await controller.handleEvent(PROVIDER_RETRY_WAIT_START);
+			controller.sendErrorNotification({
+				type: "agent_end",
+				messages: [
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "boom" }],
+						stopReason: "error",
+						usage: { inputTokens: 0, outputTokens: 0 },
+						timestamp: Date.now(),
+					},
+				],
+			} as unknown as Extract<AgentSessionEvent, { type: "agent_end" }>);
+			expect(spy).toHaveBeenCalledTimes(1);
+		} finally {
+			if (previousWarpProtocol !== undefined) process.env.WARP_CLI_AGENT_PROTOCOL_VERSION = previousWarpProtocol;
+		}
+	});
+
+	it("keeps the newest countdown until its own end arrives", async () => {
+		const { ctx, streamState, statusContainer } = createContext();
+		const controller = new EventController(ctx);
+
+		await controller.handleEvent(AGENT_START);
+		streamState.isStreaming = true;
+
+		await controller.handleEvent(PROVIDER_RETRY_WAIT_START);
+		const first = statusContainer.children[0];
+		expect(first).toBeDefined();
+
+		// A second wait supersedes the first while it still sleeps.
+		await controller.handleEvent({
+			...(PROVIDER_RETRY_WAIT_START as unknown as Record<string, unknown>),
+			waitId: 2,
+			delayMs: 9000,
+		} as unknown as AgentSessionEvent);
+		const second = statusContainer.children[0];
+		expect(second).toBeDefined();
+		expect(second).not.toBe(first);
+
+		// The stale end for the superseded wait must not take the countdown down.
+		await controller.handleEvent(PROVIDER_RETRY_WAIT_END);
+		expect(statusContainer.children).toEqual([second]);
+		expect(ctx.loadingAnimation).toBeUndefined();
+
+		// The mounted wait's own end restores Working….
+		await controller.handleEvent({
+			...(PROVIDER_RETRY_WAIT_END as unknown as Record<string, unknown>),
+			waitId: 2,
+		} as unknown as AgentSessionEvent);
+		expect(statusContainer.children).not.toContain(second);
+		expect(ctx.loadingAnimation).toBeDefined();
+		expect(statusContainer.children).toContain(ctx.loadingAnimation!);
+	});
+
+	it("never unmounts a session-level retry overlay on a provider wait end", async () => {
+		const { ctx, streamState, statusContainer } = createContext();
+		const controller = new EventController(ctx);
+
+		await controller.handleEvent(AGENT_START);
+		streamState.isStreaming = true;
+		await controller.handleEvent(PROVIDER_RETRY_WAIT_START);
+		expect(statusContainer.children).toHaveLength(1);
+
+		// The main turn fails mid-wait: the session-level retry takes over the row.
+		await controller.handleEvent(RETRY_START);
+		const sessionRetryLoader = ctx.retryLoader;
+		expect(sessionRetryLoader).toBeDefined();
+		expect(statusContainer.children).toEqual([sessionRetryLoader!]);
+
+		// The provider wait's own end must only drop its reference, never the row.
+		await controller.handleEvent(PROVIDER_RETRY_WAIT_END);
+		expect(ctx.retryLoader).toBe(sessionRetryLoader);
+		expect(statusContainer.children).toEqual([sessionRetryLoader!]);
+	});
+
+	it("leaves a session-level retry overlay alone across an advisor wait lifecycle", async () => {
+		const { ctx, streamState, statusContainer } = createContext();
+		const controller = new EventController(ctx);
+
+		await controller.handleEvent(AGENT_START);
+		streamState.isStreaming = true;
+
+		// Advisor backoff while the main turn runs: background role, never mounted.
+		await controller.handleEvent({
+			...(PROVIDER_RETRY_WAIT_START as unknown as Record<string, unknown>),
+			role: "advisor",
+			waitId: 7,
+		} as unknown as AgentSessionEvent);
+		await controller.handleEvent(RETRY_START);
+		const sessionRetryLoader = ctx.retryLoader;
+		expect(sessionRetryLoader).toBeDefined();
+
+		await controller.handleEvent({
+			...(PROVIDER_RETRY_WAIT_END as unknown as Record<string, unknown>),
+			waitId: 7,
+		} as unknown as AgentSessionEvent);
+		expect(ctx.retryLoader).toBe(sessionRetryLoader);
+		expect(statusContainer.children).toEqual([sessionRetryLoader!]);
+	});
+
+	it("leaves the idle status row alone for background waits", async () => {
+		const { ctx, streamState, statusContainer } = createContext();
+		const controller = new EventController(ctx);
+
+		// Idle prompt: the row holds the retry hint, no turn is streaming.
+		const hint = new Text("F5 to Retry", 0, 0);
+		statusContainer.addChild(hint);
+		expect(streamState.isStreaming).toBe(false);
+
+		await controller.handleEvent({
+			...(PROVIDER_RETRY_WAIT_START as unknown as Record<string, unknown>),
+			role: "side",
+			waitId: 3,
+		} as unknown as AgentSessionEvent);
+		expect(statusContainer.children).toEqual([hint]);
+
+		// Even the main role never mounts while nothing is streaming.
+		await controller.handleEvent({
+			...(PROVIDER_RETRY_WAIT_START as unknown as Record<string, unknown>),
+			role: "main",
+			waitId: 5,
+		} as unknown as AgentSessionEvent);
+		expect(statusContainer.children).toEqual([hint]);
+
+		await controller.handleEvent({
+			...(PROVIDER_RETRY_WAIT_END as unknown as Record<string, unknown>),
+			waitId: 5,
+		} as unknown as AgentSessionEvent);
+		expect(statusContainer.children).toEqual([hint]);
+		await controller.handleEvent({
+			...(PROVIDER_RETRY_WAIT_END as unknown as Record<string, unknown>),
+			waitId: 3,
+		} as unknown as AgentSessionEvent);
+		expect(statusContainer.children).toEqual([hint]);
+
+		// Even while streaming, a non-main role never mounts.
+		streamState.isStreaming = true;
+		await controller.handleEvent({
+			...(PROVIDER_RETRY_WAIT_START as unknown as Record<string, unknown>),
+			role: "advisor",
+			waitId: 4,
+		} as unknown as AgentSessionEvent);
+		expect(statusContainer.children).toEqual([hint]);
 	});
 });

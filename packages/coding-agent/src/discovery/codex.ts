@@ -41,6 +41,8 @@ import {
 } from "./helpers";
 import { resolvePluginStdioPaths } from "./substitute-plugin-root";
 
+import { cfgSkillsEnableCodexUser } from "../extensibility/settings";
+
 const PROVIDER_ID = "codex";
 const DISPLAY_NAME = "OpenAI Codex";
 const PRIORITY = 70;
@@ -62,7 +64,7 @@ function getUserCodexDir(ctx: LoadContext, capabilityToggle = false): string | n
 /** Legacy `skills.enableCodexUser` toggle; off by default and without initialized settings. */
 function readCodexUserSkillsToggle(): boolean {
 	try {
-		return activeSettings.get("skills.enableCodexUser") === true;
+		return cfgSkillsEnableCodexUser.get(activeSettings) === true;
 	} catch {
 		return false;
 	}
@@ -505,15 +507,19 @@ async function loadSettings(ctx: LoadContext): Promise<LoadResult<Settings>> {
 	const items: Settings[] = [];
 	if (userConfig && userConfigPath) {
 		items.push({
-			...userConfig,
+			path: userConfigPath,
+			data: userConfig,
+			level: "user",
 			_source: createSourceMeta(PROVIDER_ID, userConfigPath, "user"),
-		} as Settings);
+		});
 	}
 	if (projectConfig) {
 		items.push({
-			...projectConfig,
+			path: projectConfigPath,
+			data: projectConfig,
+			level: "project",
 			_source: createSourceMeta(PROVIDER_ID, projectConfigPath, "project"),
-		} as Settings);
+		});
 	}
 
 	return { items, warnings };

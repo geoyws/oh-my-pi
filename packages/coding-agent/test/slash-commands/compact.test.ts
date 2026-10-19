@@ -4,10 +4,7 @@ import type { CompactOptions } from "@oh-my-pi/pi-coding-agent/extensibility/ext
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import type { CompactMode } from "@oh-my-pi/pi-coding-agent/session/compact-modes";
 import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
-import {
-	ACP_BUILTIN_SLASH_COMMANDS,
-	executeAcpBuiltinSlashCommand,
-} from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
+import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
 import { executeBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
 import type { SlashCommandRuntime } from "@oh-my-pi/pi-coding-agent/slash-commands/types";
 
@@ -15,7 +12,9 @@ function acpRuntime() {
 	const compact = vi.fn(async (_instructions?: string, _options?: CompactOptions) => {});
 	const getContextUsage = vi.fn(() => undefined);
 	const output = vi.fn();
-	const runtime = { session: { compact, getContextUsage }, output } as unknown as SlashCommandRuntime;
+	// Admitting `before_user_message` gate: refusal is covered in user-message-refusal.test.ts.
+	const gateUserMessage = vi.fn(async () => {});
+	const runtime = { session: { compact, getContextUsage, gateUserMessage }, output } as unknown as SlashCommandRuntime;
 	return { compact, output, runtime };
 }
 
@@ -127,12 +126,6 @@ describe("/compact dispatch (ACP)", () => {
 
 		await executeAcpBuiltinSlashCommand("/compact", h.runtime);
 		expect(h.output).toHaveBeenCalledWith("Compaction failed: no model selected");
-	});
-
-	it("advertises the mode subcommands and input hint to ACP clients", () => {
-		const advertised = ACP_BUILTIN_SLASH_COMMANDS.find(c => c.name === "compact");
-		expect(advertised).toBeDefined();
-		expect(advertised?.input?.hint).toBe("[soft|remote|snapcompact] [focus]");
 	});
 });
 

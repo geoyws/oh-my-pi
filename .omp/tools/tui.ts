@@ -20,9 +20,9 @@
  */
 
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import * as net from "node:net";
 import { inflateSync } from "node:zlib";
 import type * as CanvasModule from "@napi-rs/canvas";
+import { IpcConnection } from "@oh-my-pi/pi-natives";
 import type * as KittyVt from "kitty-vt-wasm";
 import type { Color, KittyEvent, KittyTerminal } from "kitty-vt-wasm";
 import { tmpdir } from "node:os";
@@ -667,8 +667,7 @@ interface Session {
 	rows: number;
 	dir: string;
 	screen: Screen;
-	sock: net.Socket | null;
-	sockBuf: string;
+	sock: IpcConnection | null;
 	waiters: Waiter[];
 	raw: Buffer[];
 	rawBytes: number;
@@ -697,41 +696,37 @@ function connectSocket(
 ): Promise<boolean> {
 	const deadline = Date.now() + timeoutMs;
 	const { promise, resolve } = Promise.withResolvers<boolean>();
-	const attempt = () => {
-		const sock = net.createConnection(path);
-		sock.on("connect", () => {
-			sock.setEncoding("utf8");
-			sock.on("data", (data: string) => {
-				session.sockBuf += data;
-				for (;;) {
-					const index = session.sockBuf.indexOf("\n");
-					if (index < 0) return;
-					const line = session.sockBuf.slice(0, index);
-					session.sockBuf = session.sockBuf.slice(index + 1);
-					const waiter = session.waiters.shift();
-					if (!waiter) continue;
-					clearTimeout(waiter.timer);
-					try {
-						waiter.resolve(JSON.parse(line));
-					} catch (error) {
-						waiter.reject(new Error(`bad response line: ${error}`));
-					}
-				}
+	const attempt = async () => {
+		let conn: IpcConnection;
+		try {
+			conn = await IpcConnection.connect(path, {
+				framing: "lines",
+				timeoutMs: Math.max(1, Math.min(1_000, deadline - Date.now())),
 			});
-			sock.on("close", () => {
-				if (session.sock === sock) session.sock = null;
-			});
-			sock.on("error", () => {});
-			session.sock = sock;
-			resolve(true);
-		});
-		sock.on("error", () => {
-			sock.destroy();
+		} catch {
 			if (Date.now() >= deadline || session.exit !== null) resolve(false);
 			else setTimeout(attempt, 150);
-		});
+			return;
+		}
+		conn.start(
+			(frame) => {
+				const waiter = session.waiters.shift();
+				if (!waiter) return;
+				clearTimeout(waiter.timer);
+				try {
+					waiter.resolve(JSON.parse(frame));
+				} catch (error) {
+					waiter.reject(new Error(`bad response line: ${error}`));
+				}
+			},
+			() => {
+				if (session.sock === conn) session.sock = null;
+			},
+		);
+		session.sock = conn;
+		resolve(true);
 	};
-	attempt();
+	void attempt();
 	return promise;
 }
 
@@ -758,7 +753,7 @@ function request(
 		reject(new Error(`debug request timed out: ${JSON.stringify(body)}`));
 	}, timeoutMs);
 	session.waiters.push({ resolve, reject, timer });
-	sock.write(`${JSON.stringify(body)}\n`);
+	sock.send(JSON.stringify(body));
 	return promise;
 }
 
@@ -946,6 +941,22 @@ function unescapeBytes(text: string): Buffer {
 	return Buffer.from(out);
 }
 
+/**
+ * Wraps `command` so the PTY child blocks until `gate` exists, then execs the
+ * real command in place (same pid, still the session leader).
+ *
+ * Bun (1.4.2, macOS) arms its exit watch inside `Bun.spawn`; a child already
+ * exiting by then makes it fall back to a blocking `wait4` on the JS thread. A
+ * PTY session leader cannot finish exiting until its unread output drains, and
+ * the only reader is that same blocked thread — so a fast command (`git grep`)
+ * deadlocked the whole agent. Creating `gate` only after `Bun.spawn` returns
+ * guarantees the watch is armed before the child can exit.
+ */
+function gated(gate: string, command: string[]): string[] {
+	const script = 'gate=$1; shift; while [ ! -e "$gate" ]; do sleep 0.01; done; exec "$@"';
+	return ["/bin/sh", "-c", script, "sh", gate, ...command];
+}
+
 // ─── Tool ────────────────────────────────────────────────────────────────────
 
 const factory = (omp: ToolHost) => {
@@ -968,6 +979,7 @@ const factory = (omp: ToolHost) => {
 		const cols = params.cols ?? 100;
 		const dir = mkdtempSync(join(tmpdir(), `omp-tui-${name}-`));
 		const sockPath = join(dir, "debug.sock");
+		const gatePath = join(dir, "spawn.gate");
 		const screen = await Screen.create(cols, rows);
 		// The PTY data callback closes over `session`; Bun.spawn returns
 		// synchronously and the callback fires on the event loop, so the
@@ -975,7 +987,7 @@ const factory = (omp: ToolHost) => {
 		let session: Session;
 		let proc: Child;
 		try {
-			const spawned = Bun.spawn(command, {
+			const spawned = Bun.spawn(gated(gatePath, command), {
 				cwd: omp.cwd,
 				env: {
 					...process.env,
@@ -993,6 +1005,7 @@ const factory = (omp: ToolHost) => {
 			});
 			const terminal = spawned.terminal;
 			if (!terminal) throw new Error("Bun.spawn did not create a PTY");
+			writeFileSync(gatePath, "");
 			proc = {
 				pid: spawned.pid,
 				exited: spawned.exited,
@@ -1018,7 +1031,6 @@ const factory = (omp: ToolHost) => {
 			dir,
 			screen,
 			sock: null,
-			sockBuf: "",
 			waiters: [],
 			raw: [],
 			rawBytes: 0,

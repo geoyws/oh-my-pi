@@ -1,39 +1,37 @@
-import * as fs from "node:fs";
-import * as net from "node:net";
 import * as readline from "node:readline";
+import { IpcConnection, IpcServer } from "@oh-my-pi/pi-natives";
 import {
 	STREAM_CHAT_TEXT_MAX,
 	STREAM_CLOSE_HOST_CONFLICT,
-	STREAM_HISTORY_LIMIT,
 	STREAM_PROTO,
 	STREAM_ROUTES,
 	STREAM_TITLE_MAX,
 	type StreamChatMessage,
 	type StreamPaneFrame,
-	type StreamRow,
 	type StreamServerToHost,
 } from "@oh-my-pi/pi-wire";
-import { encodeStreamFrame, STREAM_LOCAL_PROTO, type StreamSessionFrame, type StreamStreamerFrame } from "./protocol";
+import {
+	applyScreenFrame,
+	isSessionFrame,
+	MAX_LOCAL_LINE_BYTES,
+	STREAM_LOCAL_PROTO,
+	type StreamScreen,
+	type StreamSessionFrame,
+	type StreamStreamerFrame,
+} from "./protocol";
 import { streamSocketEndpoint } from "./paths";
 import { runStreamTui, type StreamTuiInfo } from "./console-tui";
 import { StreamServerClient, type StreamServerFatalError } from "./server-client";
 
-const MAX_LOCAL_LINE_BYTES = 4 * 1024 * 1024;
-
-interface PaneState {
+interface PaneState extends StreamScreen {
 	id: number;
 	title: string;
-	cols: number;
-	rows: number;
-	history: StreamRow[];
-	viewport: StreamRow[];
 	paused: boolean;
 }
 
 interface LocalConnection {
-	socket: net.Socket;
+	conn: IpcConnection;
 	pane?: PaneState;
-	buffer: Buffer;
 }
 
 export interface StreamUrls {
@@ -59,7 +57,7 @@ interface StreamConnectionOptions {
 	projectDir: string;
 	title: string;
 	hostUrl: string;
-	/** Bearer token resolver for the host socket (see `StreamCredential`). */
+	/** Bearer token resolver for the host socket (see `StencilCredential`). */
 	token: () => Promise<string | null>;
 	/** Test seam; production uses the server client's normal retry policy. */
 	reconnectDelay?: (attempt: number) => number;
@@ -102,8 +100,7 @@ export class StreamMuxHost {
 	readonly #connections = new Set<LocalConnection>();
 	readonly #panes = new Map<number, PaneState>();
 	readonly #finished = Promise.withResolvers<number>();
-	#server?: net.Server;
-	#endpoint?: string;
+	#server?: IpcServer;
 	#nextPaneId = 1;
 	#viewerCount?: number;
 	#channel = "";
@@ -136,28 +133,19 @@ export class StreamMuxHost {
 	async start(): Promise<string> {
 		if (this.#started) throw new Error("stream host is already started");
 		this.#started = true;
-		const endpoint = await streamSocketEndpoint(this.#options.projectDir, { create: true });
-		this.#endpoint = endpoint;
-		if (process.platform !== "win32") await clearStaleSocket(endpoint);
-
-		const server = net.createServer(socket => this.#accept(socket));
-		this.#server = server;
-		const listening = Promise.withResolvers<void>();
-		const onError = (error: Error): void => listening.reject(error);
-		server.once("error", onError);
-		server.listen(endpoint, () => {
-			server.off("error", onError);
-			listening.resolve();
-		});
+		const endpoint = await streamSocketEndpoint(this.#options.projectDir);
 		try {
-			await listening.promise;
-			if (process.platform !== "win32") await fs.promises.chmod(endpoint, 0o600);
+			this.#server = await IpcServer.listen(
+				endpoint,
+				{ framing: "lines", maxFrameBytes: MAX_LOCAL_LINE_BYTES },
+				conn => this.#accept(conn),
+			);
 		} catch (error) {
-			server.close();
-			if (process.platform !== "win32") fs.rmSync(endpoint, { force: true });
+			if (error instanceof Error && "code" in error && error.code === "EADDRINUSE") {
+				throw new Error(`another omp stream process is already running for this directory (${endpoint})`);
+			}
 			throw error;
 		}
-		process.once("exit", this.#removeSocketSync);
 		this.#onEvent({ t: "notice", message: "connecting your stencil.so channel" });
 		this.#onEvent({ t: "title", title: this.#title });
 		this.#onEvent({ t: "link", state: "connecting" });
@@ -196,11 +184,10 @@ export class StreamMuxHost {
 	async close(reason = "stream ended", exitCode = 0): Promise<void> {
 		if (this.#closing) return;
 		this.#closing = true;
-		process.off("exit", this.#removeSocketSync);
 		const bye: StreamStreamerFrame = { t: "bye", reason };
 		for (const connection of this.#connections) {
-			connection.socket.end(encodeStreamFrame(bye));
-			connection.socket.destroySoon();
+			connection.conn.send(JSON.stringify(bye));
+			connection.conn.end();
 		}
 		this.#connections.clear();
 		this.#panes.clear();
@@ -209,61 +196,24 @@ export class StreamMuxHost {
 
 		const server = this.#server;
 		this.#server = undefined;
-		if (server) {
-			const closed = Promise.withResolvers<void>();
-			server.close(() => closed.resolve());
-			await closed.promise;
-		}
-		if (process.platform !== "win32" && this.#endpoint) {
-			await fs.promises.rm(this.#endpoint, { force: true });
-		}
+		if (server) await server.close();
 		this.#finished.resolve(exitCode);
 	}
 
-	readonly #removeSocketSync = (): void => {
-		if (process.platform !== "win32" && this.#endpoint) fs.rmSync(this.#endpoint, { force: true });
-	};
-
-	#accept(socket: net.Socket): void {
+	#accept(conn: IpcConnection): void {
 		if (this.#closing) {
-			socket.destroy();
+			conn.destroy();
 			return;
 		}
-		const connection: LocalConnection = { socket, buffer: Buffer.alloc(0) };
+		const connection: LocalConnection = { conn };
 		this.#connections.add(connection);
-		socket.setNoDelay(true);
-		socket.on("data", chunk => this.#consume(connection, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
-		socket.on("error", () => {
-			// The paired close event performs pane cleanup.
-		});
-		socket.once("close", () => this.#detach(connection));
-	}
-
-	#consume(connection: LocalConnection, chunk: Buffer): void {
-		if (connection.socket.destroyed) return;
-		const input = connection.buffer.length === 0 ? chunk : Buffer.concat([connection.buffer, chunk]);
-		let offset = 0;
-		while (offset < input.length) {
-			const newline = input.indexOf(0x0a, offset);
-			if (newline === -1) break;
-			if (newline - offset > MAX_LOCAL_LINE_BYTES) {
-				connection.socket.destroy();
-				return;
-			}
-			const end = newline > offset && input[newline - 1] === 0x0d ? newline - 1 : newline;
-			const line = input.toString("utf8", offset, end);
-			offset = newline + 1;
-			if (!this.#handleLocalLine(connection, line)) {
-				connection.socket.destroy();
-				return;
-			}
-		}
-		const remaining = input.length - offset;
-		if (remaining > MAX_LOCAL_LINE_BYTES) {
-			connection.socket.destroy();
-			return;
-		}
-		connection.buffer = remaining === 0 ? Buffer.alloc(0) : Buffer.from(input.subarray(offset));
+		conn.start(
+			frame => {
+				if (conn.closed) return;
+				if (!this.#handleLocalLine(connection, frame)) conn.destroy();
+			},
+			() => this.#detach(connection),
+		);
 	}
 
 	#handleLocalLine(connection: LocalConnection, line: string): boolean {
@@ -293,9 +243,9 @@ export class StreamMuxHost {
 		};
 		connection.pane = pane;
 		this.#panes.set(pane.id, pane);
-		connection.socket.write(encodeStreamFrame(this.#sessionWelcome()));
+		connection.conn.send(JSON.stringify(this.#sessionWelcome()));
 		if (this.#viewerCount !== undefined) {
-			connection.socket.write(encodeStreamFrame({ t: "viewers", n: this.#viewerCount }));
+			connection.conn.send(JSON.stringify({ t: "viewers", n: this.#viewerCount }));
 		}
 		this.#client.send({ t: "pane-open", pane: pane.id, title: pane.title, cols: pane.cols, rows: pane.rows });
 		this.#onEvent({
@@ -310,49 +260,9 @@ export class StreamMuxHost {
 	}
 
 	#applyFrame(pane: PaneState, frame: Exclude<StreamSessionFrame, { t: "hello" }>): void {
-		let wire: StreamPaneFrame;
-		switch (frame.t) {
-			case "resize":
-				pane.cols = frame.cols;
-				pane.rows = frame.rows;
-				if (pane.viewport.length > frame.rows) pane.viewport.length = frame.rows;
-				while (pane.viewport.length < frame.rows) pane.viewport.push("");
-				wire = { ...frame, pane: pane.id };
-				break;
-			case "history": {
-				const overflow = pane.history.length + frame.rows.length - STREAM_HISTORY_LIMIT;
-				if (overflow >= pane.history.length) {
-					pane.history = frame.rows.slice(-STREAM_HISTORY_LIMIT);
-				} else {
-					if (overflow > 0) pane.history.splice(0, overflow);
-					pane.history.push(...frame.rows);
-				}
-				wire = { ...frame, pane: pane.id };
-				break;
-			}
-			case "viewport":
-				pane.viewport = frame.rows.slice();
-				wire = { ...frame, pane: pane.id };
-				break;
-			case "patch":
-				pane.rows = frame.rows;
-				if (pane.viewport.length > frame.rows) pane.viewport.length = frame.rows;
-				while (pane.viewport.length < frame.rows) pane.viewport.push("");
-				for (const [index, row] of frame.ops) {
-					if (index >= 0 && index < frame.rows) pane.viewport[index] = row;
-				}
-				wire = { ...frame, pane: pane.id };
-				break;
-			case "reset":
-				pane.history = [];
-				pane.viewport = [];
-				wire = { ...frame, pane: pane.id };
-				break;
-			case "paused":
-				pane.paused = frame.paused;
-				wire = { ...frame, pane: pane.id };
-				break;
-		}
+		if (frame.t === "paused") pane.paused = frame.paused;
+		else applyScreenFrame(pane, frame);
+		const wire: StreamPaneFrame = { ...frame, pane: pane.id };
 		this.#client.send(wire);
 	}
 
@@ -424,9 +334,9 @@ export class StreamMuxHost {
 	}
 
 	#broadcast(frame: StreamStreamerFrame): void {
-		const line = encodeStreamFrame(frame);
+		const line = JSON.stringify(frame);
 		for (const connection of this.#connections) {
-			if (connection.pane) connection.socket.write(line);
+			if (connection.pane) connection.conn.send(line);
 		}
 	}
 
@@ -517,74 +427,6 @@ export async function runStreamConsole(options: StreamConsoleOptions): Promise<n
 		process.off("SIGINT", stop);
 		process.off("SIGTERM", stop);
 	}
-}
-
-async function clearStaleSocket(endpoint: string): Promise<void> {
-	const status = await probeSocket(endpoint);
-	if (status === "live")
-		throw new Error(`another omp stream process is already running for this directory (${endpoint})`);
-	if (status === "stale") await fs.promises.unlink(endpoint);
-}
-
-function probeSocket(endpoint: string): Promise<"missing" | "stale" | "live"> {
-	const result = Promise.withResolvers<"missing" | "stale" | "live">();
-	const socket = net.createConnection({ path: endpoint });
-	socket.once("connect", () => {
-		socket.destroy();
-		result.resolve("live");
-	});
-	socket.once("error", error => {
-		socket.destroy();
-		const code = (error as NodeJS.ErrnoException).code;
-		if (code === "ENOENT") result.resolve("missing");
-		else if (code === "ECONNREFUSED") result.resolve("stale");
-		else result.reject(error);
-	});
-	return result.promise;
-}
-
-function isSessionFrame(value: unknown): value is StreamSessionFrame {
-	if (!value || typeof value !== "object" || !("t" in value) || typeof value.t !== "string") return false;
-	const frame = value as Record<string, unknown>;
-	switch (frame.t) {
-		case "hello":
-			return (
-				typeof frame.proto === "number" &&
-				Number.isInteger(frame.proto) &&
-				typeof frame.sessionId === "string" &&
-				typeof frame.title === "string" &&
-				isDimension(frame.cols) &&
-				isDimension(frame.rows)
-			);
-		case "resize":
-			return isDimension(frame.cols) && isDimension(frame.rows);
-		case "history":
-		case "viewport":
-			return Array.isArray(frame.rows) && frame.rows.every(row => typeof row === "string");
-		case "patch":
-			return (
-				isDimension(frame.rows) &&
-				Array.isArray(frame.ops) &&
-				frame.ops.every(
-					op =>
-						Array.isArray(op) &&
-						op.length === 2 &&
-						typeof op[0] === "number" &&
-						Number.isInteger(op[0]) &&
-						typeof op[1] === "string",
-				)
-			);
-		case "reset":
-			return true;
-		case "paused":
-			return typeof frame.paused === "boolean";
-		default:
-			return false;
-	}
-}
-
-function isDimension(value: unknown): value is number {
-	return typeof value === "number" && Number.isInteger(value) && value >= 0;
 }
 
 function formatChat(message: StreamChatMessage): string {
