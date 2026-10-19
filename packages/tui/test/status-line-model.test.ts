@@ -172,4 +172,20 @@ describe("status line model segment compact thinking level", () => {
 		expect(Bun.stripANSI(rendered.content)).toBe(`${glyph} Test Model`);
 		expect(Bun.stripANSI(rendered.content)).not.toContain(theme.sep.dot);
 	});
+
+	it("labels resolved auto as `auto (<level>)` and keeps the resolved glyph when compact", () => {
+		const autoResolved = (compact: boolean): SegmentContext => {
+			const ctx = createThinkingContext(compact);
+			return {
+				...ctx,
+				session: { ...ctx.session, isAutoThinking: true, autoResolvedThinkingLevel: () => ThinkingLevel.High },
+			} as SegmentContext;
+		};
+		const glyph = theme.thinking.high.split(" ")[0];
+		const modelPrefix = theme.icon.model ? `${theme.icon.model} ` : "";
+		expect(Bun.stripANSI(renderSegment("model", autoResolved(false)).content)).toBe(
+			`${modelPrefix}Test Model${theme.sep.dot}${glyph} auto (high)`,
+		);
+		expect(Bun.stripANSI(renderSegment("model", autoResolved(true)).content)).toBe(`${glyph} Test Model`);
+	});
 });

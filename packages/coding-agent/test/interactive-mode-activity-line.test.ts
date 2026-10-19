@@ -1,10 +1,13 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
-import { cfgComposerTokenRate } from "@oh-my-pi/pi-coding-agent/modes/settings";
+import { cfgComposerTokenRate, cfgStatusLineCompactThinkingLevel } from "@oh-my-pi/pi-coding-agent/modes/settings";
+import { Effort } from "@oh-my-pi/pi-ai";
+import * as autoThinkingClassifier from "@oh-my-pi/pi-coding-agent/auto-thinking/classifier";
+import { AUTO_THINKING } from "@oh-my-pi/pi-tui/thinking";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -126,5 +129,42 @@ describe("InteractiveMode native dock activity line", () => {
 
 		session.tokenRate.reset();
 		expect(rate()).toBeUndefined();
+	});
+
+	it("labels the composer effort chip as requested auto, also when only the resolution changes", async () => {
+		cfgStatusLineCompactThinkingLevel.override(settings, false);
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		const classifierSpy = vi.spyOn(autoThinkingClassifier, "classifyDifficulty");
+		try {
+			const chip = () => {
+				const effort = nodes(mode.editor.describe(cx)).find(n => role(n) === "omp.composer.effort")!;
+				const parts = nodes(effort);
+				return {
+					text: (parts.find(n => n.k === "text")?.p as { text?: string } | undefined)?.text,
+					level: (parts.find(n => n.k === "effort")?.p as { level?: string } | undefined)?.level,
+				};
+			};
+			session.setThinkingLevel(Effort.High);
+			expect(chip()).toEqual({ text: "high", level: "high" });
+
+			session.setThinkingLevel(AUTO_THINKING);
+			const provisional = session.thinkingLevel;
+			expect(chip()).toEqual({ text: "auto", level: "auto" });
+
+			classifierSpy.mockResolvedValue(provisional as Effort);
+			await session.prompt("Implement a focused parser fix");
+			expect(chip()).toEqual({ text: `auto (${provisional})`, level: provisional });
+
+			// Re-selecting auto at the same concrete effort returns it to pending.
+			session.setThinkingLevel(AUTO_THINKING);
+			expect(session.thinkingLevel).toBe(provisional);
+			expect(chip()).toEqual({ text: "auto", level: "auto" });
+		} finally {
+			promptSpy.mockRestore();
+			classifierSpy.mockRestore();
+			session.setThinkingLevel(Effort.High);
+			cfgStatusLineCompactThinkingLevel.clearOverride(settings);
+		}
 	});
 });
