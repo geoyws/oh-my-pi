@@ -81,6 +81,12 @@ export const cfgDisabledProviders = register({
 	pathScoped: { valuesKey: "providers" },
 });
 
+/**
+ * Global read-only policy (also `PI_CONFIG_READONLY=1`): read at startup; refuses global config
+ * writes and routes model roles to project storage. No settings-panel UI — hand-edit config.yml.
+ */
+export const cfgConfigReadOnly = register({ id: "config.readOnly", type: "boolean", default: false });
+
 export const cfgModelRoleStorage = register({
 	id: "modelRoleStorage",
 	type: "enum",

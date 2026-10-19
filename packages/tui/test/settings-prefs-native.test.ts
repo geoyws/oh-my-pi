@@ -86,6 +86,7 @@ function harness(initial: Record<string, unknown> = {}): Harness {
 		get: path => values.get(path),
 		set: (path, value) => void values.set(path, value),
 		unset: path => void values.set(path, ENTRIES.find(entry => entry.path === path)?.defaultValue),
+		readOnlyReason: () => undefined,
 		normalizeProviderLimits: () => ({}),
 		validateProviderLimits: () => ({}),
 	};
