@@ -377,6 +377,24 @@ describe("StatusLineComponent auto thinking label", () => {
 		expect(ansi()).not.toContain("auto (high)");
 		expect(nativeLevel()).toEqual({ t: "auto", s: "thinkingOff" });
 	});
+
+	it("renders a session without autoResolvedThinkingLevel, treating its resolution as pending", () => {
+		const base = makeSession();
+		const session = base as unknown as ThinkingSession;
+		session.state.model.thinking = true;
+		session.state.thinkingLevel = "high";
+		delete (session as Partial<ThinkingSession>).autoResolvedThinkingLevel;
+		const component = statusLines.track(new StatusLineComponent(base, statusLineHost));
+		component.updateSettings({ preset: "custom", leftSegments: ["model"], rightSegments: [], sessionAccent: false });
+
+		expect(stripVTControlCharacters(component.getTopBorder(120).content)).toContain(
+			`Test Model${theme.sep.dot}${theme.thinking.high}`,
+		);
+		expect(nativeSpans(component.describePreview()).find(part => part.t === "high")).toEqual({
+			t: "high",
+			s: "thinkingHigh",
+		});
+	});
 });
 
 describe("StatusLineComponent hook statuses", () => {

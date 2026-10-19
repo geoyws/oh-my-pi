@@ -2722,7 +2722,10 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		target.sessionId = this.session.sessionManager?.getSessionId?.();
 		target.isStreaming = this.session.isStreaming;
 		target.isAutoThinking = this.session.isAutoThinking;
-		target.autoResolvedThinkingLevel = this.session.autoResolvedThinkingLevel();
+		target.autoResolvedThinkingLevel =
+			typeof this.session.autoResolvedThinkingLevel === "function"
+				? this.session.autoResolvedThinkingLevel()
+				: undefined;
 		target.isFastModeActive =
 			typeof this.session.isFastModeActive === "function" ? this.session.isFastModeActive() : false;
 		target.anthropicSlowModeLabel =
