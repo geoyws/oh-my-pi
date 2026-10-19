@@ -11,6 +11,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { AUTO_THINKING, clampAutoThinkingEffort, resolveProvisionalAutoLevel } from "@oh-my-pi/pi-tui/thinking";
+import { thinkingLevelLabel } from "@oh-my-pi/pi-tui/status-line/segments";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
@@ -398,6 +399,87 @@ describe("AgentSession role model thinking behavior", () => {
 		expect(session.thinkingLevel).toBe(Effort.Medium);
 		expect(session.autoResolvedThinkingLevel()).toBe(Effort.Medium);
 		expect(session.agent.state.thinkingLevel).toBe(Effort.Medium);
+	});
+
+	it("returns resolved auto to pending on re-selection and shows renderers the change even at the same effort", async () => {
+		const model = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const provisional = resolveProvisionalAutoLevel(model)!;
+		await createSession({
+			initialModelId: model.id,
+			initialThinkingLevel: provisional,
+			modelRoles: { default: `${model.provider}/${model.id}` },
+		});
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		vi.spyOn(autoThinkingClassifier, "classifyDifficulty").mockResolvedValue(provisional);
+		// What a renderer refreshing on the change notification would show.
+		const rendered: (string | undefined)[] = [];
+		session.subscribe(event => {
+			if (event.type === "thinking_level_changed") rendered.push(thinkingLevelLabel(session));
+		});
+		const receipts = () =>
+			session.sessionManager.getEntries().filter(entry => entry.type === "thinking_level_change").length;
+
+		// Explicit pin -> auto whose provisional effort equals the pin.
+		session.setThinkingLevel(AUTO_THINKING);
+		expect(session.configuredThinkingLevel()).toBe(AUTO_THINKING);
+		expect(session.thinkingLevel).toBe(provisional);
+		expect(rendered.at(-1)).toBe("auto");
+
+		// Re-selecting a pending auto changes nothing and persists nothing.
+		const pendingReceipts = receipts();
+		session.setThinkingLevel(AUTO_THINKING);
+		expect(session.autoResolvedThinkingLevel()).toBeUndefined();
+		expect(thinkingLevelLabel(session)).toBe("auto");
+		expect(receipts()).toBe(pendingReceipts);
+
+		await session.prompt("Implement a focused parser fix");
+		expect(session.autoResolvedThinkingLevel()).toBe(provisional);
+		expect(rendered.at(-1)).toBe(`auto (${provisional})`);
+
+		// Re-selecting auto after it resolved to the provisional effort: the
+		// resolution clears, the effective effort and transcript stay put, and
+		// renderers must not keep showing the stale resolution.
+		const resolvedReceipts = receipts();
+		session.setThinkingLevel(AUTO_THINKING);
+		expect(session.configuredThinkingLevel()).toBe(AUTO_THINKING);
+		expect(session.autoResolvedThinkingLevel()).toBeUndefined();
+		expect(session.thinkingLevel).toBe(provisional);
+		expect(session.agent.state.thinkingLevel).toBe(provisional);
+		expect(rendered.at(-1)).toBe("auto");
+		expect(receipts()).toBe(resolvedReceipts);
+
+		// Auto -> explicit pin at the same effort reads as the pin.
+		session.setThinkingLevel(provisional);
+		expect(session.isAutoThinking).toBe(false);
+		expect(rendered.at(-1)).toBe(provisional);
+	});
+
+	it("drops a resolved auto back to pending when the model changes, keeping auto requested", async () => {
+		const model = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const nextModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+		const provisional = resolveProvisionalAutoLevel(model)!;
+		await createSession({
+			initialModelId: model.id,
+			initialThinkingLevel: provisional,
+			modelRoles: { default: `${model.provider}/${model.id}` },
+		});
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		vi.spyOn(autoThinkingClassifier, "classifyDifficulty").mockResolvedValue(provisional);
+		const rendered: (string | undefined)[] = [];
+		session.subscribe(event => {
+			if (event.type === "thinking_level_changed") rendered.push(thinkingLevelLabel(session));
+		});
+
+		session.setThinkingLevel(AUTO_THINKING);
+		await session.prompt("Implement a focused parser fix");
+		expect(rendered.at(-1)).toBe(`auto (${provisional})`);
+
+		await session.setModelTemporary(nextModel);
+		expect(session.model?.id).toBe(nextModel.id);
+		expect(session.configuredThinkingLevel()).toBe(AUTO_THINKING);
+		expect(session.autoResolvedThinkingLevel()).toBeUndefined();
+		expect(session.thinkingLevel).toBe(resolveProvisionalAutoLevel(nextModel));
+		expect(rendered.at(-1)).toBe("auto");
 	});
 
 	it("does not record late classifier usage in a replacement session after abort", async () => {

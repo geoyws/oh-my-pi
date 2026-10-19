@@ -438,6 +438,7 @@ class StatusLineExternalInputs {
 	sessionId: string | undefined = undefined;
 	isStreaming: boolean | undefined = undefined;
 	isAutoThinking: boolean | undefined = undefined;
+	autoResolvedThinkingLevel: string | undefined = undefined;
 	isFastModeActive = false;
 	anthropicSlowModeLabel: string | undefined = undefined;
 	compactionSpeculation: unknown = undefined;
@@ -2721,6 +2722,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		target.sessionId = this.session.sessionManager?.getSessionId?.();
 		target.isStreaming = this.session.isStreaming;
 		target.isAutoThinking = this.session.isAutoThinking;
+		target.autoResolvedThinkingLevel = this.session.autoResolvedThinkingLevel();
 		target.isFastModeActive =
 			typeof this.session.isFastModeActive === "function" ? this.session.isFastModeActive() : false;
 		target.anthropicSlowModeLabel =
@@ -2779,6 +2781,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			left.sessionId === right.sessionId &&
 			left.isStreaming === right.isStreaming &&
 			left.isAutoThinking === right.isAutoThinking &&
+			left.autoResolvedThinkingLevel === right.autoResolvedThinkingLevel &&
 			left.isFastModeActive === right.isFastModeActive &&
 			left.anthropicSlowModeLabel === right.anthropicSlowModeLabel &&
 			left.compactionSpeculation === right.compactionSpeculation

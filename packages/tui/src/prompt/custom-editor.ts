@@ -56,8 +56,10 @@ const NATIVE_COMPOSER_PLACEHOLDER = "What are we cooking?";
 export interface ComposerNativeState {
 	/** The draft runs as a shell command (`!`, `!!`) or Python (`$`, `$$`); `excluded` keeps it from the model. */
 	readonly shell?: { readonly kind: "bash" | "python"; readonly excluded: boolean };
-	/** Thinking effort word (`high`, `off`, `auto`); undefined when the model has no thinking. */
+	/** Effective thinking effort word (`high`, `off`, `auto` while pending) driving the effort glyph; undefined when the model has no thinking. */
 	readonly thinking?: string;
+	/** The effort chip's text and tooltip (`high`, `auto`, `auto (high)`); defaults to {@link thinking}. */
+	readonly thinkingLabel?: string;
 	/** The thinking level draws as the model chip's icon instead of its own chip (where the terminal has `effort`). */
 	readonly thinkingInModel?: boolean;
 	/** Generation tok/s after the thinking level (live while running, else the last reading); undefined hides it. */
@@ -1094,6 +1096,7 @@ export class CustomEditor extends Editor {
 			shell?.kind,
 			shell?.excluded,
 			state.thinking,
+			state.thinkingLabel,
 			state.running,
 			thinkingKey,
 			modelKey,
@@ -1228,6 +1231,7 @@ export class CustomEditor extends Editor {
 		const shell = state.shell;
 		const focus = state.viewing && this.#describeViewing(state.viewing, interruptKey);
 		const thinking = state.thinking;
+		const thinkingLabel = state.thinkingLabel ?? thinking;
 		const thinkingHint = thinkingKey ? `  ${formatTooltipKey(thinkingKey)}` : "";
 		// The level collapses into the model chip's icon; its own tooltip and click stay.
 		const modelIcon =
@@ -1237,7 +1241,7 @@ export class CustomEditor extends Editor {
 						{
 							level: thinking,
 							role: "omp.composer.model.effort",
-							title: `Thinking effort: ${thinking}${thinkingHint}`,
+							title: `Thinking effort: ${thinkingLabel}${thinkingHint}`,
 							actions: { click: "thinking.cycle" },
 						},
 						undefined,
@@ -1284,7 +1288,7 @@ export class CustomEditor extends Editor {
 										undefined,
 										"meter",
 									),
-							node("text", { text: thinking, wrap: "none" }, undefined, "level"),
+							node("text", { text: thinkingLabel, wrap: "none" }, undefined, "level"),
 						],
 						"effort",
 					)

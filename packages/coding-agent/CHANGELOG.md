@@ -2,8 +2,13 @@
 
 ## [Unreleased]
 
+### Changed
+
+- The status line, footer and composer effort chip now show a requested `auto` thinking level as `auto` until a turn classifies it and as `auto (high)` (the resolved level) afterwards, so an auto-resolved effort no longer reads like an explicit `high` pin; the chip keeps the resolved level's colour and glyph
+
 ### Fixed
 
+- Fixed re-selecting `auto` thinking while it held a resolved level leaving the status line and listeners on the stale resolution when the provisional effort matched it: the resolution now returns to pending, `thinking_level_changed` (`configured: "auto"`) is emitted, and no duplicate transcript entry is written
 - Fixed a subagent whose `task.agentModelOverrides` entry is an explicit multi-entry list (e.g. scout) escaping its list on retry: the installed `subagent:<id>` chain used to lose to the current model's model-keyed chain, spending expensive models on readers. The list is now the session's complete retry chain — recovery walks it alone and stops with the normal exhausted-retry error when it runs out.
 
 ## [18.10.1] - 2026-10-12

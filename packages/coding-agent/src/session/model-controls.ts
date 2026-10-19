@@ -511,7 +511,10 @@ export class ModelControls {
 	 * Set the thinking level. `auto` enables per-turn classification. Entering
 	 * auto writes its provisional level plus `configured: "auto"` immediately,
 	 * giving external readers an authoritative selection receipt before the next
-	 * user turn. Later classifications persist only changed concrete resolutions.
+	 * user turn. Re-selecting auto while it holds a resolved level drops that
+	 * resolution back to pending and emits the change even when the provisional
+	 * effort equals the resolved one, without a duplicate transcript entry.
+	 * Later classifications persist only changed concrete resolutions.
 	 */
 	setThinkingLevel(level: ConfiguredThinkingLevel | undefined, persist: boolean = false): void {
 		if (level === AUTO_THINKING) {
@@ -522,6 +525,7 @@ export class ModelControls {
 			);
 			const wasAuto = this.#autoThinking;
 			const previousLevel = this.#thinkingLevel;
+			const previousResolved = this.#autoResolvedLevel;
 			this.#autoThinking = true;
 			this.#autoResolvedLevel = undefined;
 			this.#thinkingLevel = provisional;
@@ -535,6 +539,8 @@ export class ModelControls {
 			const isChanging = !wasAuto || previousLevel !== provisional;
 			if (isChanging) {
 				this.#host.sessionManager.appendThinkingLevelChange(provisional, AUTO_THINKING);
+			}
+			if (isChanging || previousResolved !== undefined) {
 				this.#host.emit({ type: "thinking_level_changed", thinkingLevel: provisional, configured: AUTO_THINKING });
 			}
 			return;

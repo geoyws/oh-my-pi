@@ -332,6 +332,53 @@ describe("StatusLineComponent effective settings cache", () => {
 	});
 });
 
+describe("StatusLineComponent auto thinking label", () => {
+	type ThinkingSession = {
+		state: { model: { thinking?: boolean }; thinkingLevel?: string };
+		isAutoThinking: boolean;
+		autoResolvedThinkingLevel: () => string | undefined;
+	};
+
+	function nativeSpans(node: unknown): { t: string; s?: string }[] {
+		if (!node || typeof node !== "object") return [];
+		const n = node as { p?: { spans?: { t: string; s?: string }[] }; c?: unknown[] };
+		return [...(n.p?.spans ?? []), ...(n.c ?? []).flatMap(nativeSpans)];
+	}
+
+	it("tells requested auto from an explicit pin and refreshes when only the resolution changes", () => {
+		const base = makeSession();
+		const session = base as unknown as ThinkingSession;
+		let resolved: string | undefined;
+		session.state.model.thinking = true;
+		session.state.thinkingLevel = "high";
+		session.autoResolvedThinkingLevel = () => resolved;
+		const component = statusLines.track(new StatusLineComponent(base, statusLineHost));
+		component.updateSettings({ preset: "custom", leftSegments: ["model"], rightSegments: [], sessionAccent: false });
+		const ansi = () => stripVTControlCharacters(component.getTopBorder(120).content);
+		const nativeLevel = () =>
+			nativeSpans(component.describePreview()).find(part => part.t === "high" || part.t.startsWith("auto"));
+		const highGlyph = theme.thinking.high.split(" ")[0];
+
+		// Explicit high pin.
+		expect(ansi()).toContain(`Test Model${theme.sep.dot}${theme.thinking.high}`);
+		expect(ansi()).not.toContain("auto");
+		expect(nativeLevel()).toEqual({ t: "high", s: "thinkingHigh" });
+
+		// Auto requested and resolved to the same effective effort.
+		session.isAutoThinking = true;
+		resolved = "high";
+		expect(ansi()).toContain(`Test Model${theme.sep.dot}${highGlyph} auto (high)`);
+		expect(nativeLevel()).toEqual({ t: "auto (high)", s: "thinkingHigh" });
+
+		// Re-selecting auto drops the resolution back to pending while the
+		// effective effort stays high: the cached bar must not keep `auto (high)`.
+		resolved = undefined;
+		expect(ansi()).toContain(`Test Model${theme.sep.dot}${theme.thinking.autoPending} auto`);
+		expect(ansi()).not.toContain("auto (high)");
+		expect(nativeLevel()).toEqual({ t: "auto", s: "thinkingOff" });
+	});
+});
+
 describe("StatusLineComponent hook statuses", () => {
 	it("renders every keyed status on a deterministic line", () => {
 		const component = makeComponent({ showHookStatus: true });
