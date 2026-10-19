@@ -1,3 +1,4 @@
+import type { Usage } from "@oh-my-pi/pi-ai";
 import type { Component } from "../tui";
 import { Text } from "../components/text";
 import { visibleWidth } from "../utils";
@@ -71,6 +72,13 @@ export interface JobSnapshot {
 	artifactError?: OutputMeta["artifactError"];
 	structured?: StructuredSubagentOutput;
 	/**
+	 * Child model usage for a task job (input/output/cacheRead/cacheWrite/
+	 * totalTokens and billed cost): live while running, final or partial once
+	 * settled. Status data — repeated on every snapshot of the job; consumers
+	 * summing spend use {@link CoordinationDetails.usage}.
+	 */
+	usage?: Usage;
+	/**
 	 * `agent://<id>` handle backing this job's artifacts — the job-row's
 	 * registry `agentId` when the manager disambiguated a requested job id
 	 * on collision, else the job id itself. See {@link AsyncJob.agentId}.
@@ -131,6 +139,14 @@ export interface CoordinationDetails {
 	agents?: AgentActivitySnapshot[];
 	/** `wait` was cut short by steering, a peer message, or a completion notice that injects next. */
 	interrupted?: boolean;
+	/**
+	 * Summed child usage of the settled jobs whose results THIS call consumed
+	 * (recovered for the first time). A job counts once across all consuming
+	 * surfaces: a result already auto-delivered or returned by an earlier
+	 * `wait`/`cancel` is excluded, and `jobs` listings never consume. Omitted
+	 * when no consumed job reported usage.
+	 */
+	usage?: Usage;
 }
 
 // =============================================================================

@@ -1233,6 +1233,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						? "completed"
 						: "failed";
 				spawn.progress.durationMs = result.durationMs;
+				if (result.usage) spawn.progress.usage = result.usage;
 			} else {
 				spawn.progress.status = payloads[position] ? "failed" : "aborted";
 			}
@@ -1325,6 +1326,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						progress.contextTokens = nextProgress.contextTokens;
 						progress.contextWindow = nextProgress.contextWindow;
 						progress.cost = nextProgress.cost;
+						progress.usage = nextProgress.usage ?? progress.usage;
 						progress.toolCount = nextProgress.toolCount;
 						progress.currentTool = nextProgress.currentTool;
 						progress.currentToolArgs = nextProgress.currentToolArgs;
@@ -1402,6 +1404,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					progress.contextTokens = singleResult?.contextTokens;
 					progress.contextWindow = singleResult?.contextWindow;
 					progress.cost = singleResult?.usage?.cost.total ?? 0;
+					// The final result is authoritative; a run that produced no
+					// result keeps the last live (partial) usage its stream reported.
+					if (singleResult?.usage) {
+						progress.usage = { ...singleResult.usage, cost: { ...singleResult.usage.cost } };
+					}
 					progress.extractedToolData = singleResult?.extractedToolData;
 					progress.retryFailure = singleResult?.retryFailure;
 					progress.retryState = undefined;

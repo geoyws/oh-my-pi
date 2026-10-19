@@ -2070,6 +2070,9 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 							accumulatedUsage.cost.total += getNumberField(costRecord, "total") ?? 0;
 							progress.cost = accumulatedUsage.cost.total;
 						}
+						// Fresh copy per turn: progress snapshots are shallow-copied
+						// downstream and must not alias the live accumulator.
+						progress.usage = { ...accumulatedUsage, cost: { ...accumulatedUsage.cost } };
 					}
 					// Accumulate tokens for progress display
 					progress.tokens += getUsageTokens(messageUsage);

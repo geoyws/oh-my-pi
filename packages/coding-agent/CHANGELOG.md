@@ -5,6 +5,7 @@
 ### Fixed
 
 - Fixed a subagent whose `task.agentModelOverrides` entry is an explicit multi-entry list (e.g. scout) escaping its list on retry: the installed `subagent:<id>` chain used to lose to the current model's model-keyed chain, spending expensive models on readers. The list is now the session's complete retry chain — recovery walks it alone and stops with the normal exhausted-retry error when it runs out.
+- Fixed background subagents' model usage being invisible to rpc/SDK consumers: `wait`, `cancel` and `jobs` job rows and `async-result` deliveries now carry each task job's own `usage` (input, output, cache read/write, total tokens and billed cost; live while running, partial after a failure or cancellation), and `wait`/`cancel` results and deliveries add a `details.usage` total that counts each job once — a result already delivered or returned by an earlier `wait` is not billed again.
 
 ## [18.10.1] - 2026-10-12
 

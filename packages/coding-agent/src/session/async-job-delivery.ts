@@ -8,8 +8,9 @@
  * This replaces the old single hardwired `onJobComplete` closure that routed
  * every completion — regardless of owner — into the first top-level session.
  */
+import type { Usage } from "@oh-my-pi/pi-ai";
 import { prompt } from "@oh-my-pi/pi-utils";
-import type { AsyncJob, AsyncJobType } from "../async";
+import { type AsyncJob, type AsyncJobType, asyncJobUsage, sumJobUsage } from "../async";
 import asyncResultTemplate from "../prompts/tools/async-result.md" with { type: "text" };
 import type { StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import { escapeHarnessTags } from "./harness-tags";
@@ -59,11 +60,18 @@ type AsyncResultJobDetails = {
 	meta?: OutputMeta;
 	/** Full structured payload (source/mode/status/data/error), when the job used an output schema. */
 	schema?: StructuredSubagentOutput;
+	/** Child model usage (tokens and billed cost) of a delivered task job. */
+	usage?: Usage;
 };
 
 export type AsyncResultDetails = {
 	jobs: AsyncResultJobDetails[];
 	meta?: OutputMeta;
+	/**
+	 * Summed child usage of the delivered jobs. Delivery consumes each result,
+	 * so a later `wait` never sums these jobs again.
+	 */
+	usage?: Usage;
 };
 
 /**
@@ -96,6 +104,7 @@ export function structuredStatusLabel(status: StructuredSubagentOutput["status"]
 export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): CustomMessage<AsyncResultDetails> | null {
 	if (entries.length === 0) return null;
 	const jobs = entries.map(entry => {
+		const usage = entry.job ? asyncJobUsage(entry.job) : undefined;
 		const structured = entry.job?.structured;
 		const hasStructuredData = structured ? Object.hasOwn(structured, "data") : false;
 		const structuredJson = structured && structured.status !== "valid" ? renderStructuredJson(structured) : undefined;
@@ -126,6 +135,7 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 			schemaStatusLabel: structured ? structuredStatusLabel(structured.status) : undefined,
 			schemaError: structured?.error === undefined ? undefined : escapeHarnessTags(structured.error),
 			schemaValid: structured?.status === "valid",
+			usage,
 		};
 	});
 	const details: AsyncResultDetails = {
@@ -139,8 +149,11 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 			durationMs: job.durationMs,
 			...(job.meta ? { meta: job.meta } : {}),
 			...(job.structured ? { schema: job.structured } : {}),
+			...(job.usage ? { usage: job.usage } : {}),
 		})),
 	};
+	const usage = sumJobUsage(jobs.flatMap(job => (job.usage ? [job.usage] : [])));
+	if (usage) details.usage = usage;
 	const text = prompt.render(asyncResultTemplate, {
 		multiple: jobs.length > 1,
 		jobs,

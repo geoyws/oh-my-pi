@@ -7,6 +7,7 @@
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 
 import type { AsyncJob, AsyncJobDetails, AsyncJobManager, AsyncJobType } from "./job-manager";
+import { asyncJobUsage, sumJobUsage } from "./job-manager";
 
 import { renderStructuredJson, structuredStatusLabel } from "../session/async-job-delivery";
 import { USER_INTERRUPT_LABEL } from "../session/messages";
@@ -152,6 +153,7 @@ interface TrackedJobLike {
 	label: string;
 	startTime: number;
 	endTime?: number;
+	agentId?: string;
 	latestDetails?: AsyncJobDetails;
 	resultText?: string;
 	errorText?: string;
@@ -208,6 +210,7 @@ export function snapshotJobs(
 				}
 			}
 		}
+		const usage = asyncJobUsage(latest);
 		return {
 			id: latest.id,
 			type: latest.type,
@@ -232,6 +235,7 @@ export function snapshotJobs(
 			...(!resultConsumed && options.includeResults !== false && latest.structured
 				? { structured: latest.structured }
 				: {}),
+			...(usage ? { usage } : {}),
 			...(latest.type === "task" ? { agentUrlId: current?.agentId ?? latest.id } : {}),
 		};
 	});
@@ -255,8 +259,16 @@ export function buildJobResult(
 	const jobResults = snapshotJobs(session, uniqueJobs, { includeResults: op !== "jobs" });
 	const alreadyConsumed = new Set(jobResults.filter(job => manager.isJobResultConsumed(job.id)).map(job => job.id));
 
+	let usage: CoordinationDetails["usage"];
 	if (op !== "jobs") {
 		manager.consumeJobResults(jobResults.filter(j => j.status !== "running").map(j => j.id));
+		// Bill only results this call recovered for the first time, so a job's
+		// usage is never summed twice across repeated waits or after delivery.
+		usage = sumJobUsage(
+			jobResults.flatMap(j =>
+				j.usage && !alreadyConsumed.has(j.id) && manager.isJobResultConsumed(j.id) ? [j.usage] : [],
+			),
+		);
 	}
 
 	const completed = jobResults.filter(j => j.status !== "running");
@@ -350,6 +362,7 @@ export function buildJobResult(
 		jobs: jobResults,
 		...(cancelOutcomes.length ? { cancelled: cancelOutcomes.map(({ id, status }) => ({ id, status })) } : {}),
 		...(agents.length ? { agents } : {}),
+		...(usage ? { usage } : {}),
 	};
 	return {
 		content: [{ type: "text", text: lines.join("\n").trimEnd() }],
