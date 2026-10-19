@@ -363,7 +363,12 @@ describe("libkitty end-to-end", () => {
 			};
 
 			session.setThinkingLevel(Effort.High);
+			// A fresh session paints no model segment until a turn has run; warm
+			// up with one turn under the explicit pin (no classification, since
+			// auto is off; agent.prompt is mocked).
+			await session.prompt("Warm up the status line");
 			await settle(() => rowWith(theme.thinking.high) !== "");
+			expect(classifierSpy).not.toHaveBeenCalled();
 			expect(rowWith(theme.thinking.high)).toContain(theme.thinking.high);
 			expect(rowWith(theme.thinking.high)).not.toContain("auto");
 
