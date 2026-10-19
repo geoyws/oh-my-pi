@@ -46,15 +46,18 @@ export function visibleJobs(manager: AsyncJobManager, ids: string[], ownerId: st
 /**
  * Settled jobs owned by `ownerId` whose completion was accepted but has not
  * reached the owner yet: delivery queued or awaiting yield-queue injection,
- * dead-lettered, or skipped while a `wait` watched it. Consumed, acknowledged,
- * and currently watched results are excluded.
+ * dead-lettered, or skipped while a `wait` watched it. A cancelled job is a
+ * settled result too: without it a `wait` after a kill throws "nothing to
+ * wait for" and the job's partial usage (which `buildJobResult` bills on
+ * first `wait`-consume) is unreachable in a live session. Consumed,
+ * acknowledged, and currently watched results are excluded.
  */
 export function undeliveredJobs(manager: AsyncJobManager, ownerId: string | undefined): AsyncJob[] {
 	return manager
 		.getAllJobs({ ownerId })
 		.filter(
 			job =>
-				(job.status === "completed" || job.status === "failed") &&
+				(job.status === "completed" || job.status === "failed" || job.status === "cancelled") &&
 				!manager.isJobResultConsumed(job.id) &&
 				!manager.isDeliverySuppressed(job.id),
 		);

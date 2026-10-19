@@ -20,7 +20,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { Usage } from "@oh-my-pi/pi-ai";
-import { buildJobResult } from "@oh-my-pi/pi-coding-agent/async/job-control";
+import { buildJobResult, undeliveredJobs } from "@oh-my-pi/pi-coding-agent/async/job-control";
 import { type AsyncJobDeliverySink, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
@@ -299,7 +299,11 @@ describe("async task child usage", () => {
 		expect(running.details?.usage).toBeUndefined();
 
 		expect(manager.cancel("WorkerC")).toBe(true);
-		await job.promise;
+	await job.promise;
+	// A cancelled settlement waits for its owner: a live `wait` must recover
+	// it (billing partial usage on first consume) instead of throwing
+	// "nothing to wait for".
+	expect(undeliveredJobs(manager, undefined).map(j => j.id)).toContain("WorkerC");
 
 		const cancelled = buildJobResult(session, manager, "wait", [job], []);
 		expect(cancelled.details?.jobs?.[0]?.status).toBe("cancelled");
@@ -308,6 +312,7 @@ describe("async task child usage", () => {
 
 		const repeat = buildJobResult(session, manager, "wait", [job], []);
 		expect(repeat.details?.usage).toBeUndefined();
+		expect(undeliveredJobs(manager, undefined).map(j => j.id)).not.toContain("WorkerC");
 	});
 
 	it("bills a failed child's partial usage from its result", async () => {
