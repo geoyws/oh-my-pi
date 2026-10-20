@@ -140,11 +140,12 @@ export interface CoordinationDetails {
 	/** `wait` was cut short by steering, a peer message, or a completion notice that injects next. */
 	interrupted?: boolean;
 	/**
-	 * Summed child usage of the settled jobs whose results THIS call consumed
-	 * (recovered for the first time). A job counts once across all consuming
-	 * surfaces: a result already auto-delivered or returned by an earlier
-	 * `wait`/`cancel` is excluded, and `jobs` listings never consume. Omitted
-	 * when no consumed job reported usage.
+	 * Summed child usage of the settled jobs whose results THIS `wait`
+	 * consumed (recovered for the first time). A job counts once across all
+	 * consuming surfaces: a result already auto-delivered or returned by an
+	 * earlier `wait` is excluded. `cancel` never consumes, so a cancelled job's
+	 * partial usage is billed by the next `wait`; `jobs` listings never consume.
+	 * Omitted when no consumed job reported usage.
 	 */
 	usage?: Usage;
 }
