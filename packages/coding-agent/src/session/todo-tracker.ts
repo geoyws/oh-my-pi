@@ -21,8 +21,15 @@ const MUTATING_TOOLS: Record<string, true> = {
 	eval: true,
 	edit: true,
 	write: true,
-	ast: true,
 };
+
+/** `ast` counts only its edit mode (its details carry `totalReplacements`); search results are reads. */
+function isMutatingResult(toolName: string, details: unknown): boolean {
+	if (toolName === "ast") {
+		return typeof details === "object" && details !== null && "totalReplacements" in details;
+	}
+	return MUTATING_TOOLS[toolName] === true;
+}
 const MID_RUN_NUDGE_MESSAGE_TYPE = "mid-run-todo-nudge";
 /** Message type of the hidden first-turn reminder {@link TodoTracker.createEagerTodoPrelude} builds. */
 export const EAGER_TODO_PRELUDE_MESSAGE_TYPE = "eager-todo-prelude";
@@ -129,10 +136,10 @@ export class TodoTracker {
 	}
 
 	/** Records a completed tool result before asynchronous event processing begins. */
-	onToolResult(toolName: string, isError: boolean): void {
+	onToolResult(toolName: string, isError: boolean, details?: unknown): void {
 		if (toolName === "todo") {
 			this.#mutationsSinceLastTouch = 0;
-		} else if (!isError && MUTATING_TOOLS[toolName]) {
+		} else if (!isError && isMutatingResult(toolName, details)) {
 			this.#mutationsSinceLastTouch++;
 		}
 		this.#reminderAwaitingProgress = false;

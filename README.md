@@ -244,7 +244,7 @@ _[Watch the capture ↗](https://omp.sh/clips/conflict.mp4)_
 
 ### 19 · Preview, then accept.
 
-`ast_edit` returns a _(proposed)_ card with the replacement count. The change is staged. The agent writes a one-line reason to `xd://resolve`; the TUI turns it into an **Accept** card and the disk move happens — atomic, all or nothing.
+`ast` in `mode: "edit"` returns a _(proposed)_ card with the replacement count. The change is staged. The agent writes a one-line reason to `xd://resolve`; the TUI turns it into an **Accept** card and the disk move happens — atomic, all or nothing.
 
 ![omp TUI: ✓ AST Edit: console.log($X) (proposed) 3 replacements · 1 file, then ✓ Accept: 3 replacements in 1 file (AST Edit), followed by 'Applied 3 replacements in src/auth.ts.'](https://omp.sh/clips/codemod-poster.webp)
 
@@ -267,8 +267,7 @@ Core tools live in the same namespace as `read` and `bash`. Pin the active set w
 - `read` — files, dirs, archives, SQLite, PDFs, notebooks, URLs, remote `ssh://` paths, and internal `://` schemes through one path.
 - `write` — create or overwrite a file, archive entry, or SQLite row.
 - `edit` — hashline patches with content-hash anchors and stale-anchor recovery.
-- `ast_edit` — structural rewrites previewed before apply, via ast-grep.
-- `ast_grep` — structural code queries over 50+ tree-sitter grammars.
+- `ast` — structural code queries (`mode: "search"`) and structural rewrites previewed before apply (`mode: "edit"`), via ast-grep over 50+ tree-sitter grammars.
 - `grep` — regex over files, globs, and internal URLs.
 - `glob` — glob-based path lookup; reach for `grep` when you need content matches.
 

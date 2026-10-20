@@ -306,6 +306,20 @@ export function resolveToolTier(tool: ApprovalSubject, args: unknown): ToolTier 
 	return getToolDecision(tool, args).tier;
 }
 
+/**
+ * The tool's own approval decision as `{ tier, policyKey? }`, before any user
+ * policy is consulted. Dispatcher layers (the `xd://` device gate) use it so a
+ * mounted tool's per-call policy key survives the dispatch instead of being
+ * replaced by the device name.
+ */
+export function resolveToolApprovalDecision(
+	tool: ApprovalSubject,
+	args: unknown,
+): { tier: ToolTier; policyKey?: string } {
+	const decision = getToolDecision(tool, args);
+	return { tier: decision.tier, ...(decision.policyKey ? { policyKey: decision.policyKey } : {}) };
+}
+
 function modeApprovesTier(mode: ApprovalMode, tier: ToolTier): boolean {
 	return TIER_RANK[tier] <= TIER_RANK[APPROVAL_MODE_MAX_TIER[mode]];
 }

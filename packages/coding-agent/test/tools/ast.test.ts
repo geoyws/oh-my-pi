@@ -6,6 +6,7 @@ import { adaptSchemaForStrict, toolWireSchema } from "@oh-my-pi/pi-ai/utils/sche
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ToolChoiceQueue } from "@oh-my-pi/pi-coding-agent/session/tool-choice-queue";
 import { createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { resolveApproval } from "@oh-my-pi/pi-coding-agent/tools/approval";
 import { AstTool, astCallMode } from "@oh-my-pi/pi-coding-agent/tools/ast";
 import { normalizeToolName } from "@oh-my-pi/pi-coding-agent/tools/builtin-names";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
@@ -144,6 +145,35 @@ describe("ast tool modes", () => {
 		expect(properties).not.toContain("ops");
 		expect(properties).not.toContain("mode");
 		expect(tool.description).not.toContain("STAGED");
+	});
+	it("refuses edit and queues nothing in an advisor-shaped session (no edit grant of its own)", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-advisor-"));
+		try {
+			const filePath = path.join(tempDir, "legacy.ts");
+			await Bun.write(filePath, "legacyWrap(x, value)\n");
+			const queue = new ToolChoiceQueue();
+			// Advisor sessions delegate isToolActive to the primary (which has
+			// `edit`), but sdk.ts answers `edit` false for advisors; this session
+			// mirrors that post-fix shape.
+			const session = createTestSession(tempDir, {
+				isToolActive: name => name !== "edit",
+				getToolChoiceQueue: () => queue,
+				buildToolChoice: () => ({ type: "tool" as const, name: "resolve" }),
+				steer: () => {},
+			});
+			const tool = new AstTool(session);
+			await expect(
+				tool.execute("ast-advisor-edit", {
+					mode: "edit",
+					ops: [{ pat: "legacyWrap($A, $B)", out: "modernWrap($A, $B)" }],
+					path: filePath,
+				}),
+			).rejects.toThrow("`ast` edit mode is unavailable in this session; available: search.");
+			expect(queue.hasPendingInvoker).toBe(false);
+			expect(await Bun.file(filePath).text()).toBe("legacyWrap(x, value)\n");
+		} finally {
+			await removeWithRetries(tempDir);
+		}
 	});
 
 	it("keeps only search mode when createTools omits edit", async () => {
@@ -299,28 +329,69 @@ describe("ast tool approval", () => {
 	const tool = new AstTool(createTestSession());
 	const ops = [{ pat: "a", out: "b" }];
 
-	it("treats search as read-tier", () => {
-		expect(tool.approval({ mode: "search", pat: "x" })).toBe("read");
-		expect(tool.approval({ mode: "search", pat: "x", path: "src/x.ts" })).toBe("read");
+	it("treats search as read-tier under the legacy ast_grep policy key", () => {
+		expect(tool.approval({ mode: "search", pat: "x" })).toEqual({ tier: "read", policyKey: "ast_grep" });
+		expect(tool.approval({ mode: "search", pat: "x", path: "src/x.ts" })).toEqual({
+			tier: "read",
+			policyKey: "ast_grep",
+		});
 	});
 
-	it("treats edit over internal URLs only as read-tier", () => {
-		expect(tool.approval({ mode: "edit", ops, path: "local://a.md" })).toBe("read");
-		expect(tool.approval({ mode: "edit", ops, path: "local://a.md; local://b.md" })).toBe("read");
+	it("treats edit over internal URLs only as read-tier under the legacy ast_edit policy key", () => {
+		expect(tool.approval({ mode: "edit", ops, path: "local://a.md" })).toEqual({
+			tier: "read",
+			policyKey: "ast_edit",
+		});
+		expect(tool.approval({ mode: "edit", ops, path: "local://a.md; local://b.md" })).toEqual({
+			tier: "read",
+			policyKey: "ast_edit",
+		});
 	});
 
 	it("treats edit touching any filesystem path as write-tier", () => {
-		expect(tool.approval({ mode: "edit", ops, path: "src/x.ts" })).toBe("write");
-		expect(tool.approval({ mode: "edit", ops, path: "local://a.md src/x.ts" })).toBe("write");
-		expect(tool.approval({ mode: "edit", ops, path: "local://a.md; src/x.ts" })).toBe("write");
-		expect(tool.approval({ mode: "edit", ops })).toBe("write");
+		expect(tool.approval({ mode: "edit", ops, path: "src/x.ts" })).toEqual({ tier: "write", policyKey: "ast_edit" });
+		expect(tool.approval({ mode: "edit", ops, path: "local://a.md src/x.ts" })).toEqual({
+			tier: "write",
+			policyKey: "ast_edit",
+		});
+		expect(tool.approval({ mode: "edit", ops, path: "local://a.md; src/x.ts" })).toEqual({
+			tier: "write",
+			policyKey: "ast_edit",
+		});
+		expect(tool.approval({ mode: "edit", ops })).toEqual({ tier: "write", policyKey: "ast_edit" });
 	});
 
 	it("classifies modeless calls by their fields", () => {
-		expect(tool.approval({ pat: "x", path: "src/x.ts" })).toBe("read");
-		expect(tool.approval({ ops, path: "src/x.ts" })).toBe("write");
-		expect(tool.approval({ ops, path: "local://a.md" })).toBe("read");
-		expect(tool.approval({ ops, path: "local://a.md src/x.ts" })).toBe("write");
+		expect(tool.approval({ pat: "x", path: "src/x.ts" })).toEqual({ tier: "read", policyKey: "ast_grep" });
+		expect(tool.approval({ ops, path: "src/x.ts" })).toEqual({ tier: "write", policyKey: "ast_edit" });
+		expect(tool.approval({ ops, path: "local://a.md" })).toEqual({ tier: "read", policyKey: "ast_edit" });
+		expect(tool.approval({ ops, path: "local://a.md src/x.ts" })).toEqual({ tier: "write", policyKey: "ast_edit" });
+	});
+});
+
+describe("ast legacy approval policies", () => {
+	const tool = new AstTool(createTestSession());
+	const ops = [{ pat: "a", out: "b" }];
+
+	it("keeps a pre-merge tools.approval.ast_edit deny applying to edit mode under yolo", () => {
+		expect(resolveApproval(tool, { mode: "edit", ops, path: "src/x.ts" }, "yolo", { ast_edit: "deny" }).policy).toBe(
+			"deny",
+		);
+		expect(resolveApproval(tool, { mode: "search", pat: "x" }, "yolo", { ast_edit: "deny" }).policy).not.toBe("deny");
+	});
+
+	it("keeps a pre-merge tools.approval.ast_grep deny applying to search mode under yolo", () => {
+		expect(resolveApproval(tool, { mode: "search", pat: "x" }, "yolo", { ast_grep: "deny" }).policy).toBe("deny");
+		expect(
+			resolveApproval(tool, { mode: "edit", ops, path: "src/x.ts" }, "yolo", { ast_grep: "deny" }).policy,
+		).not.toBe("deny");
+	});
+
+	it("applies a merged-name tools.approval.ast policy to both modes", () => {
+		expect(resolveApproval(tool, { mode: "search", pat: "x" }, "yolo", { ast: "deny" }).policy).toBe("deny");
+		expect(resolveApproval(tool, { mode: "edit", ops, path: "src/x.ts" }, "yolo", { ast: "deny" }).policy).toBe(
+			"deny",
+		);
 	});
 });
 
@@ -459,6 +530,34 @@ describe("ast search", () => {
 			expect(details?.limitReached).toBe(false);
 			expect(text).toContain("z.ts");
 			expect(text).not.toContain("a.ts");
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+	it("skips unknown and extensionless files unless a language is explicitly selected", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-search-file-filter-"));
+		try {
+			for (const name of ["source.ts", "notes.unsupported", "extensionless"]) {
+				await Bun.write(path.join(tempDir, name), "console.log(1);\n");
+			}
+			const tool = await getAstTool(createTestSession(tempDir), ["ast"]);
+
+			const inferred = await tool.execute("ast-search-inferred", {
+				mode: "search",
+				pat: "console.log($X)",
+				path: tempDir,
+			});
+			expect(inferred.details).toMatchObject({ matchCount: 1, files: ["source.ts"] });
+
+			const explicit = await tool.execute("ast-search-explicit", {
+				mode: "search",
+				pat: "console.log($X)",
+				path: tempDir,
+				lang: "ts",
+			});
+			expect(explicit.details).toMatchObject({ matchCount: 3 });
+			const details = explicit.details as { files: string[] };
+			expect([...details.files].sort()).toEqual(["extensionless", "notes.unsupported", "source.ts"]);
 		} finally {
 			await removeWithRetries(tempDir);
 		}

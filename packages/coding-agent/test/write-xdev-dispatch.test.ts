@@ -110,7 +110,7 @@ describe("read and write route xd:// device URLs", () => {
 			const approval = write!.approval;
 			expect(typeof approval).toBe("function");
 			if (typeof approval === "function") {
-				expect(approval({ path: "xd://ast", content })).toEqual({ tier: "write", policyKey: "ast" });
+				expect(approval({ path: "xd://ast", content })).toEqual({ tier: "write", policyKey: "ast_edit" });
 			}
 
 			// Execute dispatches through the xdev registry to the mounted ast,
@@ -293,8 +293,8 @@ describe("read and write route xd:// device URLs", () => {
 				ops: [{ pat: "a", out: "b" }],
 				path: "local://notes.ts",
 			});
-			expect(tier("xd://ast", astFsPath)).toEqual({ tier: "write", policyKey: "ast" });
-			expect(tier("xd://ast", astInternalPath)).toEqual({ tier: "read", policyKey: "ast" });
+			expect(tier("xd://ast", astFsPath)).toEqual({ tier: "write", policyKey: "ast_edit" });
+			expect(tier("xd://ast", astInternalPath)).toEqual({ tier: "read", policyKey: "ast_edit" });
 
 			// debug: inspection action → read; a real launch → exec (control).
 			expect(tier("xd://debug", JSON.stringify({ action: "sessions" }))).toEqual({
@@ -315,7 +315,7 @@ describe("read and write route xd:// device URLs", () => {
 			// ast's own approval fails a malformed path entry closed at exec.
 			expect(tier("xd://ast", JSON.stringify({ mode: "edit", ops: [{ pat: "a", out: "b" }], path: null }))).toEqual({
 				tier: "exec",
-				policyKey: "ast",
+				policyKey: "ast_edit",
 			});
 			expect(approval({ path: "xd://ast" })).toBe("exec");
 			expect(tier("xd://no_such_device", "{}")).toBe("exec");

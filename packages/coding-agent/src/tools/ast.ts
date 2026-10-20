@@ -1,6 +1,12 @@
 import type { AstToolDetails } from "@oh-my-pi/pi-tui/tools/ast";
 import { type } from "@oh-my-pi/omptype";
-import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
+import type {
+	AgentTool,
+	AgentToolContext,
+	AgentToolResult,
+	AgentToolUpdateCallback,
+	ToolApprovalDecision,
+} from "@oh-my-pi/pi-agent-core";
 import type { ToolExample } from "@oh-my-pi/pi-ai";
 import { prompt } from "@oh-my-pi/pi-utils";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
@@ -152,8 +158,14 @@ export class AstTool implements AgentTool<typeof astSchema, AstToolDetails> {
 		return resolveAstModes(this.session).includes("edit");
 	}
 
-	readonly approval = (args: unknown) => {
-		return astCallMode(args) === "edit" ? astEditApproval(args) : astSearchApproval(args);
+	readonly approval = (args: unknown): ToolApprovalDecision => {
+		const mode = astCallMode(args);
+		const decision = mode === "edit" ? astEditApproval(args) : astSearchApproval(args);
+		// Per-mode policy key: `tools.approval.ast_edit` / `tools.approval.ast_grep`
+		// user policies from before the merge keep applying to the matching mode.
+		const policyKey = mode === "edit" ? "ast_edit" : "ast_grep";
+		if (typeof decision === "string") return { tier: decision, policyKey };
+		return decision.policyKey ? decision : { ...decision, policyKey };
 	};
 
 	readonly approvalCacheTargets = (args: unknown): readonly string[] | undefined => {
