@@ -143,8 +143,11 @@ export class IdaDatabase {
 	readonly name: string;
 	readonly #conn: HostConnection;
 	#status: IdaHostStatus;
-	/** Project broker lease keeping the host alive while this process stays attached. */
-	#broker: DaemonBrokerLease | undefined;
+	/**
+	 * One project broker lease per session using this database (see {@link holdFor}). The shared
+	 * host connection holds none of its own, so it keeps no broker alive past its sessions.
+	 */
+	readonly #owners = new Map<ToolSession, { lease: DaemonBrokerLease; unregister: (() => void) | undefined }>();
 
 	private constructor(name: string, conn: HostConnection, status: IdaHostStatus) {
 		this.name = name;
@@ -163,7 +166,7 @@ export class IdaDatabase {
 		const conn = new HostConnection(name, socket, () => {
 			if (!db) return;
 			if (handles.get(name) === db) handles.delete(name);
-			db.#broker?.release();
+			db.#releaseOwners();
 		});
 		try {
 			const status = parseIdaHostStatus(await conn.call({ id: conn.nextId(), op }));
@@ -245,17 +248,36 @@ export class IdaDatabase {
 		await this.#conn.call({ id: this.#conn.nextId(), op: "close", save: options.save });
 	}
 
-	/** Drop this process's connection and broker lease; the host keeps running. */
+	/** Drop this process's connection and every session's broker lease; the host keeps running. */
 	disconnect(): void {
 		this.#conn.close();
-		this.#broker?.release();
+		this.#releaseOwners();
 	}
 
-	/** Hold `broker` until this connection closes; released at once when it already has. */
-	holdBroker(broker: DaemonBrokerLease): void {
-		this.#broker?.release();
-		this.#broker = broker;
-		if (!this.#conn.open) broker.release();
+	/**
+	 * Keep `broker`'s project broker (and with it the host) alive while `owner` uses this database:
+	 * one retained lease per session, released when that session is disposed or this connection
+	 * closes. A session without a dispose hook keeps it until {@link disconnect}
+	 * (`releaseIdaDatabases` at exit).
+	 */
+	holdFor(owner: ToolSession, broker: DaemonBrokerLease): void {
+		if (!this.#conn.open || this.#owners.has(owner)) return;
+		const entry = { lease: broker.retain(), unregister: undefined as (() => void) | undefined };
+		this.#owners.set(owner, entry);
+		const unregister = owner.registerDisposeCallback?.(() => {
+			if (this.#owners.get(owner) !== entry) return;
+			this.#owners.delete(owner);
+			entry.lease.release();
+		});
+		if (unregister) entry.unregister = unregister;
+	}
+
+	#releaseOwners(): void {
+		for (const entry of this.#owners.values()) {
+			entry.unregister?.();
+			entry.lease.release();
+		}
+		this.#owners.clear();
 	}
 }
 
@@ -271,7 +293,7 @@ function hostEndpoint(broker: DaemonBrokerClient, name: string): string {
 
 /** Attach to the host `name`, reusing this process's live connection; undefined when none listens. */
 async function attachHost(
-	broker: DaemonBrokerLease,
+	broker: DaemonBrokerClient,
 	name: string,
 	op: "open" | "status",
 ): Promise<IdaDatabase | undefined> {
@@ -289,8 +311,6 @@ async function attachHost(
 		return winner;
 	}
 	handles.set(name, db);
-	// The cached connection outlives the caller's lease, so it keeps its own.
-	db.holdBroker(broker.retain());
 	if (!cleanupRegistered) {
 		cleanupRegistered = true;
 		postmortem.register("ida-release", releaseIdaDatabases);
@@ -299,7 +319,7 @@ async function attachHost(
 }
 
 /** Attach to every host in `names` that answers; unreachable ones are skipped. */
-async function attachAll(broker: DaemonBrokerLease, names: string[]): Promise<IdaDatabase[]> {
+async function attachAll(broker: DaemonBrokerClient, names: string[]): Promise<IdaDatabase[]> {
 	const dbs = await Promise.all(names.map(name => attachHost(broker, name, "status").catch(() => undefined)));
 	return dbs.filter(db => db !== undefined);
 }
@@ -314,7 +334,7 @@ async function liveHostNames(broker: DaemonBrokerClient): Promise<string[]> {
 }
 
 /** Save and close least recently used idle hosts until starting one more stays within `ida.maxOpen`. */
-async function makeRoom(session: ToolSession, broker: DaemonBrokerLease, name: string): Promise<void> {
+async function makeRoom(session: ToolSession, broker: DaemonBrokerClient, name: string): Promise<void> {
 	const maxOpen = Math.max(1, cfgIdaMaxOpen.get(session.settings));
 	for (;;) {
 		const others = (await liveHostNames(broker)).filter(other => other !== name);
@@ -381,7 +401,8 @@ async function startHost(
 
 /** Attach to the host for `loc`, starting it (and waiting for the open) when none runs. */
 async function openIdaDatabase(session: ToolSession, loc: IdbLocation): Promise<IdaDatabase> {
-	// Held through the open; the attached handle then keeps its own lease (see `attachHost`).
+	// Held through the open, which may outlive the caller that started it; each caller then holds
+	// the database for its own session (see `acquireIdaDatabase`).
 	using broker = await daemonClientForProject(session.cwd);
 	await broker.request({ op: "ping" });
 	const name = idaDaemonName(loc.id);
@@ -427,8 +448,12 @@ export async function acquireIdaDatabase(
 ): Promise<IdaDatabase> {
 	const { signal, arch } = options;
 	const loc = await locateIdb(sourcePath, { arch });
+	using broker = await daemonClientForProject(session.cwd);
 	const cached = handles.get(idaDaemonName(loc.id));
-	if (cached?.connected && cached.status.state === "open") return cached;
+	if (cached?.connected && cached.status.state === "open") {
+		cached.holdFor(session, broker);
+		return cached;
+	}
 	let opening = pending.get(loc.id);
 	if (!opening) {
 		opening = openIdaDatabase(session, loc).finally(() => pending.delete(loc.id));
@@ -438,7 +463,9 @@ export async function acquireIdaDatabase(
 	}
 	const deadline = AbortSignal.timeout(OPEN_WAIT_MS);
 	try {
-		return await untilAborted(signal ? AbortSignal.any([signal, deadline]) : deadline, opening);
+		const db = await untilAborted(signal ? AbortSignal.any([signal, deadline]) : deadline, opening);
+		db.holdFor(session, broker);
+		return db;
 	} catch (error) {
 		if (signal?.aborted || !deadline.aborted) throw error;
 		const name = idaDaemonName(loc.id);
@@ -469,13 +496,17 @@ export async function findOpenIdaDatabase(session: ToolSession, ref: string): Pr
 	using broker = await daemonClientForProject(session.cwd);
 	const name = ref.startsWith(IDA_DAEMON_PREFIX) ? ref : idaDaemonName(ref);
 	const db = await attachHost(broker, name, "status").catch(() => undefined);
-	return db?.status.state === "open" ? db : undefined;
+	if (db?.status.state !== "open") return undefined;
+	db.holdFor(session, broker);
+	return db;
 }
 
 /** Every database hosted in this project, including ones other omp processes opened. */
 export async function listIdaDatabases(session: ToolSession): Promise<IdaDatabase[]> {
 	using broker = await daemonClientForProject(session.cwd);
-	return await attachAll(broker, await liveHostNames(broker));
+	const dbs = await attachAll(broker, await liveHostNames(broker));
+	for (const db of dbs) db.holdFor(session, broker);
+	return dbs;
 }
 
 /**
