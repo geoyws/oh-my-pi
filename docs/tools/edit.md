@@ -116,6 +116,59 @@ MV lib/welcome.py
 *** End Patch
 ```
 
+Markdown bullets — the file receives `- task`, so each body row still starts with `+`:
+
+```text
+[PLAN.md#A1B2]
+PUT >2:
++- task
++  - nested task
+```
+
+A block op anchored on `def` (line 2 above) resolves only the function node and orphans `@cache`; anchor the first decorator (line 1) to replace both.
+
+### Anti-patterns
+
+The tool prompt lists these as one-liners; the full WRONG/RIGHT forms (line numbers refer to a `greet.py` whose line 2 is `msg = "Hello, " + name` and line 3 is `print(msg)`):
+
+```text
+# WRONG — empty `PUT` to delete. RIGHT: `CUT 4.=4`
+PUT 4.=4:
+
+# WRONG — range sized to the post-edit content. RIGHT: `PUT 1.=1:` (body length irrelevant)
+PUT 1.=2:
++def greet(name):
+
+# WRONG — `-` rows / bare context lines do not exist; the range deletes, the body is only new content.
+PUT 3.=3:
+    msg = "Hello, " + name
+-   print(msg)
++   return msg
+# RIGHT
+PUT 3.=3:
++   return msg
+
+# WRONG — pure insertion as a widened `PUT`: retyped keepers get dropped (here line 4).
+PUT 2.=4:
++    msg = "Hello, " + name
++    extra = compute(name)
++    print(msg)
+# RIGHT — touch nothing you keep.
+PUT >2:
++    extra = compute(name)
+
+# WRONG — `PUT >N*:` anchored on the closing delimiter / last visible line. RIGHT: plain `PUT >M:`
+PUT >3*:
++after()
+# RIGHT
+PUT >3:
++after()
+
+# WRONG — body rows under register PUT; register pastes take no body. RIGHT: bodyless `PUT >20 @fn`.
+PUT >20 @fn:
++function f() {}
+```
+
 ## Output and side effects
 
 Hashline applies in one tool call; it does not use the staged `xd://resolve` / `xd://reject` flow used by `ast_edit`.

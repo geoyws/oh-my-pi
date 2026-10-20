@@ -13,6 +13,7 @@
 ### Changed
 
 - Enhanced browser resilience with configurable HTTPS error ignoring, domain allow-listing, and automatic tab recycling for security-sensitive state changes
+- Slimmed the `task`, `eval`, and hashline `edit` tool descriptions (~34% fewer schema tokens across the three, prose only: no parameter or constraint changed); hashline worked examples/anti-pattern forms and `judge`/`judge_batch`/DAG detail moved to `omp://tools/edit.md` and `omp://tools/eval.md`.
 
 ### Fixed
 

@@ -166,6 +166,31 @@ Registers one background subagent job and returns an `AgentHandle` immediately:
 - Completely blocked? Leave eval and call `hub` with `{ op: "wait", ids: [pool.name] }`; re-issue until settled. There is no `pool.wait()`, so the kernel remains free to serve `@tool` calls.
 - `.status()` reports worker/item counts and context usage; `.peek()` returns a non-consuming `{ batches, pending }` snapshot; `.close()` drops still-queued items. Pools are process-local; after a restart their workers remain parked keep-alive agents reachable through `hub`.
 
+### `judge()` / `judge_batch()`
+
+`await judge(state, questions)` → `{id: answer}`: typed judgment over one `state` (str, JSON object, or JSON array). Every question sees the same state and is answered independently, so batch independent questions into one call. It is cheap and fast (TypeSafe when credentialed, else the tiny/smol chat model); prefer it over `completion()` for classification, yes/no, and ranking. `questions` is `{id: q}` where `q` is one of:
+
+- `{type: "choice", instructions, criteria: {label: rubric | None, …}}` → `{choice, probabilities: {label: p}, confidence}` (≥2 labels)
+- `{type: "bool", instructions, criteria?: {true?: str, false?: str}}` → `{bool: P(yes)}`
+- `{type: "score", instructions, criteria: [lowest, …, highest]}` → `{score, probabilities: {"0": p, …}, confidence}` (≥2 levels; `score` is the probability-weighted level index)
+
+Two or more states → `judge_batch(states, questions, concurrency=32, retries=1, min_ok=1)` (JS: `judgeBatch(states, questions, { concurrency?, retries?, minOk? })`), never a loop of `judge()`. It runs the same `questions` over every state (`{key: state}` or a list keyed by index) as a host-owned job that outlives the cell and returns a `JudgmentBatch` at once. Pull settled items in bounded slices across cells:
+
+- `await b.drain(timeout?)` → `[(key, item)]` settled since the last drain (`[]` on timeout; `item.answers` on success, else `item.error`, never raised). `drain()` raises only when the run died wholesale (no judge, or fewer than `min_ok` answered).
+- Python `async for k, item in b.drain_iter(timeout)` / JS `for await (const [k, item] of b.drainIter({ timeout }))` until timeout or completion.
+- `b.status()` → `{done, total, failed, running, model}`; `b.results()` → `{key: answers}` so far; `b.failed()` → `{key: error}`; `b.cancel()`; `b.close()` releases it.
+- `b.id` is an async job id: completion auto-delivers a summary, `hub wait ids:[b.id]` works, and `judge_batch.attach(id)` (JS `judgeBatch.attach(id)`) re-creates the ref after a reset.
+
+### Delegation DAGs
+
+Compose `agent()` handles into acyclic waves:
+
+- **Name nodes.** `h = agent(…)` returns at once; `h.handle` is `agent://<id>`.
+- **Wire edges.** Put an upstream `.wait()` result or `.handle` in the downstream prompt. Bulk: `write("local://<name>.md", …)`.
+- **`wait(hs)`** is the wave barrier. Open-ended item streams → `workpool()`.
+- **Isolate failure.** `wait(hs, raise_errors=False)` keeps a failure in its slot; only that subtree degrades.
+- **Acyclic only.** No node waits on its own descendant.
+
 ### Kernel-defined tools (`@tool` / `tool(fn)`)
 
 With `eval.tools.enabled` (default on), a cell can turn a function into a tool other agents may call:

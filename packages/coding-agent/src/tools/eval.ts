@@ -91,9 +91,9 @@ function enabledEvalLanguages(backends: EvalBackendsAllowance): EvalLanguageToke
 }
 
 const evalCellCommonFields = {
-	"title?": type("string").describe('short label shown in transcript (e.g. "imports", "load config")'),
+	"title?": type("string").describe("short transcript label"),
 	"timeout?": type("number").describe("timeout for this eval call in seconds; 0 disables the cell timeout"),
-	"reset?": type("boolean").describe("wipe this language's kernel before running. Other languages are untouched."),
+	"reset?": type("boolean").describe("wipe this language's kernel first; other languages untouched"),
 };
 
 /**

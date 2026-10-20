@@ -1,95 +1,51 @@
-{{#if asyncEnabled}}{{#if batchEnabled}}Delegate work to background subagents by passing multiple items in a single `tasks[]` batch.
-Execution does not block — you receive IDs immediately.{{else}}Delegate work to ONE background subagent per call.
-Execution does not block — you receive an ID immediately.{{/if}}{{#if hasBlockingAgents}}
-Agents marked BLOCKING run inline — results return in this call; non-blocking items in the same batch still spawn as background jobs.{{/if}}{{else}}{{#if batchEnabled}}Run subagents synchronously by passing items in a `tasks[]` batch. Execution blocks until all work finishes.{{else}}Run ONE subagent synchronously. Execution blocks until work finishes.{{/if}}{{/if}}
+{{#if asyncEnabled}}{{#if batchEnabled}}Spawn background subagents from one `tasks[]` batch; IDs return immediately.{{else}}Spawn ONE background subagent per call; its ID returns immediately.{{/if}}{{#if hasBlockingAgents}} BLOCKING agents run inline and return in this call; other batch items still run in background.{{/if}}{{else}}{{#if batchEnabled}}Run a `tasks[]` batch of subagents synchronously; blocks until all finish.{{else}}Run ONE subagent synchronously; blocks until it finishes.{{/if}}{{/if}}
 {{#if asyncEnabled}}
 
-# Async Job Contract
-- Results auto-deliver. A settled `hub jobs`/`hub wait` snapshot is the delivery; no duplicate `async-result` follows.
-- Job IDs are process-local. An ID whose result was delivered or recovered by a snapshot expires shortly (~30s) after; unconsumed rows stay inspectable for up to five minutes after settlement. Afterward, use the agent ID with `hub send`, `agent://<id>`, or `history://<id>`.
-- With `outputSchema`, a result's parsed payload — when present — is served at `agent://<id>` (fields via `agent://<id>?q=.<field>`) regardless of validity; a schema-violating (invalid) result also previews the payload inline in the auto-delivered follow-up.
-- `completed` means successful yield/job exit, not artifact acceptance. Verify claimed changes.
+# Results
+- Results auto-deliver; a settled `hub jobs`/`hub wait` snapshot counts as delivery.
+- Job IDs are process-local, expiring ~30s after delivery (unconsumed: 5 min); later use `hub send`, `agent://<id>`, `history://<id>`.
+- `outputSchema` payload, even invalid, at `agent://<id>` (fields `?q=.<field>`); invalid also previews inline.
+- `completed` ≠ accepted; verify claimed changes.
 {{/if}}
 
-# Task Design
-- **Agent typing:** Pick each item's most specific available agent.{{#if scoutAvailable}} Read-only research MUST run on `scout` (faster model).{{/if}} Omit `agent` when the spawn-policy default is the best fit; otherwise pass the specialist explicitly.
-- **No overhead:** Each `task` MUST instruct its agent to skip formatters, linters, and project-wide test suites. Run those once at the end.
-- **One-pass:** Prefer agents that investigate AND edit in one pass;{{#if scoutAvailable}} spin a read-only scout only when affected files are genuinely unknown.{{/if}}
-- **Overlap:** Parallelize independent ownership. Same-file edits are not guaranteed to merge.{{#if ircEnabled}} Have siblings coordinate through `hub` before editing shared files.{{/if}} Name one integration owner and serialize only the irreducibly shared mutation boundary. Every concurrent batch has two prerequisites:
-  1. Every task MUST skip validation (build/lint/tests) — validating mid-flight blocks agents on each other's edits.
-  2. Decide cross-task contracts up front (e.g. the interface A implements and B consumes) and state them in the {{#if batchEnabled}}batch `context`{{else}}task{{/if}}, not left for agents to negotiate.
+# Delegation
+- Pick each item's most specific agent.{{#if scoutAvailable}} Read-only research MUST use `scout`, only when affected files are unknown.{{/if}} Omit `agent` when the spawn-policy default is the best fit; otherwise pass the specialist. Prefer one agent that investigates AND edits.
+- Same-file edits are not guaranteed to merge.{{#if ircEnabled}} Siblings coordinate through `hub` before editing shared files.{{/if}} Name one integration owner; decide shared contracts up front in {{#if batchEnabled}}`context`{{else}}the task{{/if}}.
+- Every task MUST skip build/lint/tests/formatters; run them once at the end.
+- Subagents start blank.{{#if ircEnabled}} Parent IRC steers immediately.{{/if}} Pass large payloads as `local://<path>`, NEVER inline.
 
 # Inputs
 {{#if batchEnabled}}
-- `context`: Shared project state, constraints, and contracts. Applies to the entire batch; do not duplicate this background into individual tasks.
-- `tasks[]`: Array of subagents to spawn.
-  - `name`: A stable CamelCase identifier (≤32 chars), used to address the agent (IRC, job ids). Generated automatically if omitted.
-  - `agent`: The agent type to spawn (e.g. {{#if scoutAvailable}}`scout`, {{/if}}`reviewer`).
-    Omitting `agent` selects the spawn-policy default (`{{defaultAgent}}`). Use it only when that agent fits the task.{{#if allowedAgentsText}} Current spawn policy allows: {{allowedAgentsText}}.{{/if}}
-    NEVER pass the spawn-policy default explicitly. Only omit it after checking the available agents below.
-  - `task`: Complete, self-contained instructions. One-liners or missing acceptance criteria are PROHIBITED.
-{{#if evalToolsEnabled}}  - `tools`: Names of eval-defined tools (`@tool` in Python, `tool(fn, {…})` in JS) to expose to this subagent; each runs inside your kernel when the subagent calls it.
+`context`: shared state, constraints, contracts; never repeat per task. Each `tasks[]` item:
 {{/if}}
-{{#if effortEnabled}}  - `effort`: Scale w/ complexity of this task: `"lo"`|`"med"`|`"hi"`
+- `name`: CamelCase ≤32, addresses the agent; auto-generated if omitted.
+- `agent`: agent type. Omitting it selects the spawn-policy default (`{{defaultAgent}}`); NEVER pass that default explicitly.{{#if allowedAgentsText}} Spawn policy allows: {{allowedAgentsText}}.{{/if}}
+- `task`: complete, self-contained, with acceptance criteria; one-liners PROHIBITED.
+{{#if evalToolsEnabled}}- `tools`: eval-defined tool names (`@tool` / `tool(fn)`); calls run in your kernel.
 {{/if}}
-  - `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.
-  - `schemaMode`: `"permissive"` (default) accepts a retry-exhausted invalid result with a warning; `"strict"` fails it.
+{{#if effortEnabled}}- `effort`: `"lo"`|`"med"`|`"hi"`, by task complexity.
+{{/if}}
+- `outputSchema`: per-spawn JSON Schema; overrides agent/session schemas.
+- `schemaMode`: `"permissive"` (default) accepts retry-exhausted invalid output with a warning; `"strict"` fails it.
 {{#if isolationEnabled}}
-{{#if applyIsolatedChanges}}
-  - `isolated`: Run in a dedicated worktree; successful changes are automatically applied to the parent checkout.
-{{else}}
-  - `isolated`: Run in a dedicated worktree; changes are retained as patch or branch artifacts without modifying the parent checkout.
-{{/if}}
-{{/if}}
-{{else}}
-- `name`: A stable CamelCase identifier (≤32 chars), used to address the agent (IRC, job ids). Generated automatically if omitted.
-- `agent`: The agent type to spawn (e.g. {{#if scoutAvailable}}`scout`, {{/if}}`reviewer`).
-  Omitting `agent` selects the spawn-policy default (`{{defaultAgent}}`). Use it only when that agent fits the task.{{#if allowedAgentsText}} Current spawn policy allows: {{allowedAgentsText}}.{{/if}}
-  NEVER pass the spawn-policy default explicitly. Only omit it after checking the available agents below.
-- `task`: Complete, self-contained instructions. One-liners or missing acceptance criteria are PROHIBITED.
-{{#if evalToolsEnabled}}- `tools`: Names of eval-defined tools (`@tool` in Python, `tool(fn, {…})` in JS) to expose to this subagent; each runs inside your kernel when the subagent calls it.
-{{/if}}
-{{#if effortEnabled}}- `effort`: Scale w/ complexity of this task: `"lo"`|`"med"`|`"hi"`
-{{/if}}
-- `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.
-- `schemaMode`: `"permissive"` (default) accepts a retry-exhausted invalid result with a warning; `"strict"` fails it.
-{{#if isolationEnabled}}
-{{#if applyIsolatedChanges}}
-- `isolated`: Run in a dedicated worktree; successful changes are automatically applied to the parent checkout.
-{{else}}
-- `isolated`: Run in a dedicated worktree; changes are retained as patch or branch artifacts without modifying the parent checkout.
-{{/if}}
-{{/if}}
+- `isolated`: run in a worktree; {{#if applyIsolatedChanges}}successful changes auto-apply to the parent checkout{{else}}changes kept as patch/branch artifacts, parent untouched{{/if}}.
 {{/if}}
 
-# Communication
-Subagents start blank — no conversation history.{{#if ircEnabled}} Parent-to-subagent IRC delivered immediately as steering.{{/if}}
-Pass large payloads via `local://<path>` URIs, NEVER inline text.
-
-# Format Contracts
-{{#if batchEnabled}}
-`context` format:
-# Goal         ← what the batch accomplishes
-# Constraints  ← rules and session decisions
-# Contract     ← shared interfaces
+# Format
+{{#if batchEnabled}}`context`: `# Goal`, `# Constraints`, `# Contract`.
 {{/if}}
-
-`task` format:
-# Target       ← exact files and symbols; explicit non-goals
-# Change       ← step-by-step add/remove/rename; APIs and patterns
-# Acceptance   ← observable result; no project-wide commands
+`task`: `# Target` (files, symbols, non-goals), `# Change` (steps, APIs), `# Acceptance` (observable result; no project-wide commands).
 
 # Available Agents
 {{#if spawningDisabled}}
 Agent spawning is currently disabled.
 {{else}}
-Pick the most specific agent. Omit `agent` only when the spawn-policy default is that agent.
 {{#if hasModelMentions}}
-Agents named `m<N>` are models the user tagged in this conversation (`<model agent="m<N>" name="…"/>` in their message): the general-purpose task agent pinned to that model. Spawn one only when the user's request names it; never substitute it for a specialist on your own.
+`m<N>` agents are models the user tagged (`<model agent="m<N>" name="…"/>`): the task agent pinned to that model. Spawn one only when the user's request names it; never in place of a specialist.
 {{/if}}
 {{#list agents join="\n"}}
 ### {{name}}{{#if readOnly}} (READ-ONLY){{/if}}{{#if blocking}} (BLOCKING: inline result){{/if}}
 {{description}}
-{{#if readOnly}}Use ONLY for investigation; do edits yourself or assign to a writing agent.{{/if}}
+{{#if readOnly}}Investigation only; edits go to you or a writing agent.{{/if}}
 {{/list}}
 {{/if}}
