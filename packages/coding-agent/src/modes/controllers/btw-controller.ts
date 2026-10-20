@@ -8,7 +8,7 @@ import {
 	getBtwCopyText,
 	getBtwLatestTurn,
 } from "../../session/btw-history";
-import { UserMessageRefusedError } from "../../session/agent-session";
+import { UserMessageRefusedError } from "../../session/user-message-refused-error";
 import { restoreDetachedDraft } from "../../slash-commands/helpers/draft";
 import { beginBtwTurn, patchLatestBtwTurn, runBtwTurn } from "../../session/btw-turn";
 import { TRUNCATE_LENGTHS } from "@oh-my-pi/pi-tui/render/render-utils";

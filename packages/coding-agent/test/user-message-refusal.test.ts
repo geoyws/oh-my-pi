@@ -22,11 +22,8 @@ import type {
 	ExtensionFactory,
 	UserMessageSource,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
-import {
-	AgentSession,
-	UserMessageRefusedError,
-	type AgentSessionEvent,
-} from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { UserMessageRefusedError } from "@oh-my-pi/pi-coding-agent/session/user-message-refused-error";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm, SKILL_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { COLLAB_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/collab/protocol";

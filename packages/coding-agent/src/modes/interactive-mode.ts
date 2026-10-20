@@ -142,8 +142,8 @@ import {
 	type DroppedPrompt,
 	type ResolvedRoleModel,
 	SHUTDOWN_CONSOLIDATE_BUDGET_MS,
-	UserMessageRefusedError,
 } from "../session/agent-session";
+import { UserMessageRefusedError } from "../session/user-message-refused-error";
 import type { CompactMode } from "../session/compact-modes";
 import type { ForeignSessionSource } from "../session/foreign-session-store";
 import { HistoryStorage } from "../session/history-storage";

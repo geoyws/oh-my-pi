@@ -44,7 +44,7 @@ import type { InteractiveModeContext, SubmittedUserInput } from "../../modes/typ
 import manualContinuePrompt from "../../prompts/system/manual-continue.md" with { type: "text" };
 import { AgentRegistry } from "../../registry/agent-registry";
 import type { RestoredQueuedMessage } from "../../session/agent-session-types";
-import { UserMessageRefusedError } from "../../session/agent-session";
+import { UserMessageRefusedError } from "../../session/user-message-refused-error";
 import { USER_INTERRUPT_LABEL } from "../../session/messages";
 import { PINNED_HUD_TOGGLE_ID } from "@oh-my-pi/pi-tui/prompt/composer";
 import { pickRecentFocusableAgentId } from "./session-focus-controller";

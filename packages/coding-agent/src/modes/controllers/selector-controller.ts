@@ -59,7 +59,7 @@ import type {
 	SelectOnlyModelSelectorOptions,
 	SessionPickHandler,
 } from "../../modes/types";
-import { UserMessageRefusedError } from "../../session/agent-session";
+import { UserMessageRefusedError } from "../../session/user-message-refused-error";
 import type { SessionOAuthAccountList } from "../../session/agent-session-types";
 import type { ResetCreditAccountStatus, ResetCreditRedeemOutcome } from "../../session/auth-storage";
 import {

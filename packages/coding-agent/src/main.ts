@@ -104,7 +104,7 @@ import {
 	resolvePrewalkTarget,
 } from "./sdk";
 import type { AgentSession } from "./session/agent-session";
-import { UserMessageRefusedError } from "./session/agent-session";
+import { UserMessageRefusedError } from "./session/user-message-refused-error";
 import { createAuthStorageSettingsSync, describeAuthBrokerStartupError } from "./session/auth-broker-config";
 import type { AuthStorage } from "./session/auth-storage";
 import { describePendingToolCalls } from "./session/exit-diagnostics";

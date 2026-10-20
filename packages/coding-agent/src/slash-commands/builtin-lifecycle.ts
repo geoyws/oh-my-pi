@@ -1,6 +1,6 @@
 import { SEANCE_SLASH_COMMAND } from "./seance";
 import { admitTuiSlashText, clearSubmittedText, restoreRefusedLine } from "./helpers/draft";
-import { UserMessageRefusedError } from "../session/agent-session";
+import { UserMessageRefusedError } from "../session/user-message-refused-error";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { CompactionCancelledError } from "@oh-my-pi/pi-agent-core/compaction";

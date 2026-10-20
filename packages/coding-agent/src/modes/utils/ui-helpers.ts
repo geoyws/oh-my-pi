@@ -77,7 +77,7 @@ import {
 	type SkillPromptDetails,
 } from "../../session/messages";
 import type { SessionContext, StrippedToolCallsMarker } from "../../session/session-context";
-import { UserMessageRefusedError } from "../../session/agent-session";
+import { UserMessageRefusedError } from "../../session/user-message-refused-error";
 import { executeBuiltinSlashCommand, lookupBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
 import { parseSlashCommand } from "../../slash-commands/helpers/parse";
 import { restoreRefusedDraft } from "../../slash-commands/helpers/draft";

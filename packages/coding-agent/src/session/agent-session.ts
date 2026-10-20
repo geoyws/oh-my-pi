@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { UserMessageRefusedError } from "./user-message-refused-error";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -603,23 +604,6 @@ export class PromptDroppedError extends Error {
 	constructor() {
 		super("Prompt dropped before provider dispatch.");
 		this.name = "PromptDroppedError";
-	}
-}
-
-/**
- * Rejection when a `before_user_message` extension handler refuses a user
- * message. The message was NOT sent to the provider, NOT persisted, and NOT
- * queued. {@link notice} (== {@link Error.message}) is the handler's safe
- * notice verbatim — the only text any UI may display for the refusal. It
- * never contains the message text.
- */
-export class UserMessageRefusedError extends Error {
-	readonly notice: string;
-	constructor(notice?: string) {
-		const safe = notice?.trim() ? notice : "An extension refused to send this message.";
-		super(safe);
-		this.name = "UserMessageRefusedError";
-		this.notice = safe;
 	}
 }
 
