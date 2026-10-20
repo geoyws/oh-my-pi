@@ -11,6 +11,7 @@
 
 ### Fixed
 
+- Fixed `find` reporting `no hits` when its judge backend failed every request, and losing the HTTP status once the judge account was rejected: an all-failed result now leads with `find failed for "query": all N judge requests failed`, and calls made during the five-minute rejection cooldown repeat the original error (for example `402 Insufficient credits`) instead of only "rejected the account recently"
 - Preserve authored global and project settings YAML when changing a setting or model role, including comments, quotes, whitespace, line endings, external edits, and symlink targets; alias values survive anchor edits/deletion, `<<` merge keys survive unrelated edits and gain explicit overrides when an inherited value changes, trailing-comma flow maps stay writable, nested migrations retain valid key ordering, duplicate keys stay writable with the last occurrence winning, filling an empty value keeps the blanks before its trailing comment, a byte order mark or `?` explicit keys no longer misindent added keys, and documents holding only a `---` marker, its comments or an anchor gain valid settings below those authored lines.
 - Fixed global read-only protection for missing config targets reached through directory aliases or dangling symlink chains, while retaining writes to distinct project configs.
 - Fixed the global read-only policy silently disabling runtime `agent.db` storage (model MRU, performance, MCP, fetch and task caches); only global config migration, quarantine and marker writes are skipped now.

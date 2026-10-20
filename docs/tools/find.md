@@ -41,7 +41,7 @@ Use `find` first when the implementing location is unknown. Use `grep` for known
   - footer with `listed`, `judged`, files read and bytes sent, request count, input tokens, cost, and wall/API time
   - when requests failed: `E of R requests failed:` followed by up to five distinct phase-prefixed failure messages
 - No hits: `no hits for "query" (τ 0.20)` plus the footer; the result is marked `useless`.
-- Every request failed (for example no judge configured): the result is an error carrying the failure messages.
+- Every request failed (for example no judge configured, or the judge account was rejected): the header reads `find failed for "query": all R judge requests failed, so no results were judged`, the failure lines name the judge model and its error (an account rejected within the last five minutes repeats its original error, HTTP status included), and the result is an error.
 - When `path` narrows the search, the header reads `N hit(s) for "query" in <dir>/ …` and the renderer shows `in <dir>/`.
 - `details`: `query`, `keywords` (lexical keywords used), `threshold`, `hits` (`rel` as a readable host path or URL, `nameScore`, `contentScore`, merged `ranges` with `start`/`end`/`p`/`snippet`, `linesSeen`, `truncated`), `stats`, `elapsedMs`, `cwd` (hyperlink base), and `scopePath` (display form of `path`, absent when searching the cwd).
 - Streaming: phase progress (`lexical scan`, `filename ranking 64/128`, `verifying 8 passages in 5 files`, …) is emitted through `onUpdate` and shown in the transcript header while the call runs.
