@@ -39,7 +39,9 @@ import {
 import type { InputItem as CodexInputItem } from "@oh-my-pi/pi-ai/providers/openai-codex/request-transformer";
 import { convertTools } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import { buildResponsesInput, resolveOpenAICompatPolicy } from "@oh-my-pi/pi-ai/providers/openai-shared";
+import { isSurvivingAssistant } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { stripOpenAIResponsesOutputOnlyStatusesForReplay } from "@oh-my-pi/pi-ai/utils";
+import { resolveCatalogPolicy } from "@oh-my-pi/pi-catalog/compat/catalog-policy";
 import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import { clampThinkingLevelForModel } from "@oh-my-pi/pi-catalog/model-thinking";
 import { isRecord, logger, prompt } from "@oh-my-pi/pi-utils";
@@ -160,6 +162,12 @@ export interface CompactionResult<T = unknown> {
 	details?: T;
 	/** Hook-provided data to persist alongside compaction entry. */
 	preserveData?: Record<string, unknown>;
+	/**
+	 * Last entry the provider-native replay history covers. Set when a remote
+	 * compaction could only fit the history before the kept tail; later entries
+	 * replay normally after the native history.
+	 */
+	providerReplayThroughEntryId?: string;
 }
 
 // ============================================================================
@@ -377,9 +385,11 @@ export function compactionContextTokens(providerContextTokens: number, storedCon
 /**
  * The prompt budget below `contextWindow`: the window less
  * {@link resolveBudgetReserveTokens}, capped at `contextWindow - 1` so it never
- * reaches the whole window even when the reserve resolves to 0.
+ * reaches the whole window even when the reserve resolves to 0. Independent of
+ * any configured trigger; the default {@link resolveThresholdTokens} and
+ * length-stop recovery's "did the window run out" check both use it.
  */
-function promptBudgetTokens(contextWindow: number, settings: CompactionSettings): number {
+export function promptBudgetTokens(contextWindow: number, settings: CompactionSettings): number {
 	return Math.max(0, Math.min(contextWindow - 1, contextWindow - resolveBudgetReserveTokens(contextWindow, settings)));
 }
 
@@ -537,13 +547,23 @@ export function findCutPoint(
 	// belonging to an assistant. Checking individual messages can either retain
 	// the oversized older assistant or miss its boundary and retain all history.
 	let accumulatedTokens = 0;
+	// The latest surviving assistant turn replays byte-for-byte, signatures of
+	// abandoned tool calls included, so it is counted as the latest.
+	let latestTurnIndex = -1;
+	for (let i = entries.length - 1; i >= 0 && latestTurnIndex < 0; i--) {
+		const message = getMessageFromEntry(entries[i]);
+		if (message?.role === "assistant" && isSurvivingAssistant(message)) latestTurnIndex = i;
+	}
 	let cutPointIndex = cutPoints.length - 1;
 	let cutIndex = cutPoints[cutPointIndex];
 
 	for (let i = endIndex - 1; i >= startIndex; i--) {
 		const entry = entries[i];
 		const message = getMessageFromEntry(entry);
-		if (message) accumulatedTokens += tokenizer.countMessage(message);
+		if (message) {
+			accumulatedTokens +=
+				i === latestTurnIndex ? tokenizer.countLatestTurn(message) : tokenizer.countMessage(message);
+		}
 		if (i !== cutPoints[cutPointIndex]) continue;
 		if (accumulatedTokens > keepRecentTokens) break;
 		cutIndex = i;
@@ -681,14 +701,15 @@ export interface SummaryOptions {
 	convertToLlm?: ConvertToLlm;
 	/**
 	 * The provider context a live turn sends for `summarized` + `retained`, cut to
-	 * `summarized`. Anthropic on-demand compaction sends it so retained signed
-	 * thinking keeps its prefix; without it the request uses `remoteSystemPrompt`,
-	 * `tools` and `convertToLlm`.
+	 * `summarized`, as read by the summarizer `model`. Anthropic on-demand
+	 * compaction sends it so retained signed thinking keeps its prefix; without
+	 * it the request uses `remoteSystemPrompt`, `tools` and `convertToLlm`.
 	 */
 	buildProviderContext?: (
 		summarized: AgentMessage[],
 		retained: AgentMessage[],
-		signal?: AbortSignal,
+		signal: AbortSignal | undefined,
+		model: Model,
 	) => Promise<Context>;
 	/**
 	 * Whether a message is a turn the user wrote. Remote Compaction V2 keeps these
@@ -858,13 +879,14 @@ function planSummaryWindows(
 	messages: Message[],
 	tokenizer: Tokenizer,
 	dialect: Dialect | undefined,
+	dropThinking: boolean,
 	budgetTokens: number,
 ): Message[][] {
 	const windows: Message[][] = [];
 	let current: Message[] = [];
 	let currentTokens = 0;
 	for (const message of messages) {
-		const tokens = tokenizer.countTokens(serializeConversationForSummary([message], dialect));
+		const tokens = tokenizer.countTokens(serializeConversationForSummary([message], dialect, dropThinking));
 		if (currentTokens > 0 && currentTokens + tokens > budgetTokens) {
 			windows.push(current);
 			current = [];
@@ -893,8 +915,9 @@ export async function generateSummary(
 	// Convert to LLM messages first (handles custom app messages when caller provides a transformer).
 	const llmMessages = (options?.convertToLlm ?? defaultConvertToLlm)(currentMessages);
 	const dialect = preferredDialect(model.id);
+	const dropThinking = resolveCatalogPolicy(model).classifierCotExtraction === true;
 	const tokenizer = new Tokenizer(model);
-	const wholeConversation = serializeConversationForSummary(llmMessages, dialect);
+	const wholeConversation = serializeConversationForSummary(llmMessages, dialect, dropThinking);
 	const budgetTokens = summaryInputBudgetTokens(model, maxTokens);
 	// A span that outgrew the summarizer's window is summarized as a fold: each
 	// window updates the summary carried out of the previous one, which is the
@@ -905,12 +928,15 @@ export async function generateSummary(
 	// common case and costs exactly the one call it always did.
 	const pending: SummaryWindow[] = tokenizer.checkTokenBudget(wholeConversation, budgetTokens).fits
 		? [{ messages: llmMessages, budgetTokens, text: wholeConversation }]
-		: planSummaryWindows(llmMessages, tokenizer, dialect, budgetTokens).map(messages => ({ messages, budgetTokens }));
+		: planSummaryWindows(llmMessages, tokenizer, dialect, dropThinking, budgetTokens).map(messages => ({
+				messages,
+				budgetTokens,
+			}));
 
 	let carriedSummary = previousSummary;
 	while (pending.length > 0) {
 		const window = pending[0];
-		const text = window.text ?? serializeConversationForSummary(window.messages, dialect);
+		const text = window.text ?? serializeConversationForSummary(window.messages, dialect, dropThinking);
 		// A budget probe, not a raw count: a window whose bytes already fit needs
 		// neither an exact count nor the clamp, and the bust path hands back the
 		// exact count the proportional clamp needs as its denominator.
@@ -948,7 +974,7 @@ export async function generateSummary(
 			pending.splice(
 				0,
 				1,
-				...planSummaryWindows(window.messages, tokenizer, dialect, halved).map(messages => ({
+				...planSummaryWindows(window.messages, tokenizer, dialect, dropThinking, halved).map(messages => ({
 					messages,
 					budgetTokens: halved,
 				})),
@@ -1198,7 +1224,11 @@ async function generateShortSummary(
 ): Promise<string> {
 	const maxTokens = Math.min(512, Math.floor(0.2 * reserveTokens));
 	const llmMessages = (options?.convertToLlm ?? defaultConvertToLlm)(recentMessages);
-	const conversationText = serializeConversationForSummary(llmMessages, preferredDialect(model.id));
+	const conversationText = serializeConversationForSummary(
+		llmMessages,
+		preferredDialect(model.id),
+		resolveCatalogPolicy(model).classifierCotExtraction === true,
+	);
 
 	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
 	if (historySummary) {
@@ -1275,6 +1305,8 @@ export interface CompactionPreparation {
 	recentMessages: AgentMessage[];
 	/** Entry IDs parallel to recentMessages, for an Anthropic-safe keep-tail boundary. */
 	recentEntryIds?: string[];
+	/** Last entry before the kept tail; a remote compaction that cannot fit the tail covers history through it. */
+	lastSummarizedEntryId?: string;
 	/** Whether this is a split turn (cut point in middle of turn) */
 	isSplitTurn: boolean;
 	tokensBefore: number;
@@ -1487,6 +1519,7 @@ export function prepareCompaction(
 		turnPrefixMessages,
 		recentMessages,
 		recentEntryIds,
+		lastSummarizedEntryId: compactionEntries[cutPoint.firstKeptEntryIndex - 1]?.id,
 		isSplitTurn: cutPoint.isSplitTurn,
 		tokensBefore,
 		previousSummary: previousCompaction?.summary,
@@ -1641,6 +1674,13 @@ function formatRemoteCompactionSummary(inputTokens: number): string {
 	);
 }
 
+/** A V2 remote-compaction request's history and the user items its replacement history retains. */
+interface RemoteCompactionV2Input {
+	codexBody: OpenAICodexCompactionBody | undefined;
+	remoteHistory: Array<Record<string, unknown>>;
+	retainedUserItems: unknown[];
+}
+
 /**
  * Generate summaries for compaction using prepared data.
  * Returns CompactionResult - SessionManager adds id/parentId when saving.
@@ -1662,6 +1702,7 @@ export async function compact(
 		turnPrefixMessages,
 		recentMessages,
 		recentEntryIds,
+		lastSummarizedEntryId,
 		isSplitTurn,
 		tokensBefore,
 		previousSummary,
@@ -1702,12 +1743,28 @@ export async function compact(
 		oneshotRetry: options?.oneshotRetry,
 	};
 
-	const previousSnapcompactArchive = snapcompact.getPreservedArchive(previousPreserveData);
+	// An archive keeps the reasoning policy of the model it was rendered for;
+	// Claude refuses inputs that reproduce reasoning (issue #6093), so a
+	// summarizer whose classifier refuses quoted reasoning (the
+	// `classifier-cot-extraction` catalog axis) reads the archive's no-reasoning view (scrubbed
+	// while its tool-output spans are still marked), and a summary with no
+	// archive behind it is scrubbed of `¶think:` sections.
+	const withoutThinking = !snapcompact.readerIncludesThinking(model);
+	const storedSnapcompactArchive = snapcompact.getPreservedArchive(previousPreserveData);
+	const snapcompactView =
+		storedSnapcompactArchive && withoutThinking
+			? snapcompact.viewWithoutThinking(previousSummary ?? "", storedSnapcompactArchive)
+			: undefined;
+	const previousSnapcompactArchive = snapcompactView?.archive ?? storedSnapcompactArchive;
+	const previousSummaryForReader =
+		withoutThinking && previousSummary !== undefined
+			? (snapcompactView?.summary ?? snapcompact.textWithoutThinking(previousSummary))
+			: previousSummary;
 	const previousSnapcompactArchiveText = previousSnapcompactArchive
 		? snapcompact.archiveSourceText(previousSnapcompactArchive)
 		: undefined;
 	const previousSummaryForCompaction = mergePreviousSummaryWithSnapcompactArchive(
-		previousSummary,
+		previousSummaryForReader,
 		previousSnapcompactArchiveText,
 	);
 	const snapcompactArchiveMigrationMessage = previousSnapcompactArchiveText
@@ -1718,23 +1775,58 @@ export async function compact(
 	// A local summary has no native payload to carry it into the first remote
 	// request. Encode it as history; do not resend opaque native placeholders.
 	const previousSummaryMigrationMessage =
-		settings.remoteEnabled !== false && previousSummary && !previousNativeHistory
-			? createCompactionSummaryMessage(previousSummary, tokensBefore, new Date().toISOString())
+		settings.remoteEnabled !== false && previousSummaryForReader && !previousNativeHistory
+			? createCompactionSummaryMessage(previousSummaryForReader, tokensBefore, new Date().toISOString())
 			: undefined;
 
 	let preserveData = withAnthropicCompactionPreserveData(
 		withOpenAiRemoteCompactionPreserveData(previousPreserveData, undefined),
 		undefined,
 	);
-	const remoteMessages: AgentMessage[] = [
+	const remotePrefixMessages: AgentMessage[] = [
 		...(previousSummaryMigrationMessage ? [previousSummaryMigrationMessage] : []),
 		...(snapcompactArchiveMigrationMessage ? [snapcompactArchiveMigrationMessage] : []),
 		...messagesToSummarize,
 		...turnPrefixMessages,
-		...recentMessages,
 	];
+	const remoteMessages: AgentMessage[] = [...remotePrefixMessages, ...recentMessages];
 	let usedRemoteCompaction = false;
+	let remoteReplayThroughEntryId: string | undefined;
 	let nativeCompactionError: unknown;
+	/**
+	 * Remote compaction replaces the whole history, so its request carries the
+	 * kept tail too. A turn can leave that history over the window (a large
+	 * response or tool output after the last check), which no request can
+	 * send. Then compact the history before the tail instead; the tail replays
+	 * normally after the native history, as a speculative snapshot's later
+	 * turns do. While that fallback exists, the whole-history attempt must not
+	 * rewrite the tail's trailing tool outputs: the prefix keeps them intact.
+	 */
+	const canCompactBeforeTail = lastSummarizedEntryId !== undefined && recentMessages.length > 0;
+	const sendRemoteCompaction = async (
+		sendWhole: () => Promise<void>,
+		sendPrefix: () => Promise<boolean>,
+	): Promise<void> => {
+		try {
+			await sendWhole();
+		} catch (err) {
+			if (
+				signal?.aborted ||
+				!canCompactBeforeTail ||
+				!AIError.is(AIError.classify(err), AIError.Flag.ContextOverflow)
+			) {
+				throw err;
+			}
+			logger.info("Remote compaction history overflows the context window; compacting before the kept tail", {
+				model: model.id,
+				provider: model.provider,
+				keptMessages: recentMessages.length,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			if (!(await sendPrefix())) throw err;
+			remoteReplayThroughEntryId = lastSummarizedEntryId;
+		}
+	};
 	if (
 		settings.remoteEnabled !== false &&
 		settings.remoteStreamingV2Enabled !== false &&
@@ -1746,52 +1838,58 @@ export async function compact(
 				? previousRemoteCompaction.replacementHistory
 				: undefined;
 		const convertToLlm = summaryOptions.convertToLlm ?? defaultConvertToLlm;
-		const messages = convertToLlm(remoteMessages);
 		// Replacement history keeps what the user wrote. Summaries, archive
 		// migrations, and custom/hook messages can serialize as user-role items
 		// too, so pick the user's own messages before serialization erases that,
 		// then serialize each one exactly as the request does.
 		const isUserAuthored = summaryOptions.isUserAuthored ?? ((message: AgentMessage) => message.role === "user");
-		const userMessages = convertToLlm(
-			[...messagesToSummarize, ...turnPrefixMessages, ...recentMessages].filter(isUserAuthored),
-		);
 		const remoteSystemPrompt = summaryOptions.remoteSystemPrompt ?? [SUMMARIZATION_SYSTEM_PROMPT];
 		const isCodexCompaction = isCodexResponsesModel(model);
 		// Retained user items carry no credential-bound blobs, so they are
-		// serialized once; the preserved prefix (filtered per attempt below)
-		// joins them when the request is built.
-		const retainedUserItemsBase: unknown[] = [];
-		if (isCodexCompaction) {
-			for (const message of userMessages) {
-				const userBody = await buildTransformedCodexRequestBody(
-					model,
-					{ messages: [message] },
-					{ responsesLite: model.useResponsesLite },
-				);
-				retainedUserItemsBase.push(...(userBody.input ?? []));
+		// serialized once per history shape; the preserved prefix (filtered per
+		// attempt below) joins them when the request is built.
+		const retainedUserItemsByShape = new Map<boolean, unknown[]>();
+		const buildRetainedUserItems = async (includeTail: boolean): Promise<unknown[]> => {
+			const cached = retainedUserItemsByShape.get(includeTail);
+			if (cached) return cached;
+			const userMessages = convertToLlm(
+				[...messagesToSummarize, ...turnPrefixMessages, ...(includeTail ? recentMessages : [])].filter(
+					isUserAuthored,
+				),
+			);
+			const items: unknown[] = [];
+			if (isCodexCompaction) {
+				for (const message of userMessages) {
+					const userBody = await buildTransformedCodexRequestBody(
+						model,
+						{ messages: [message] },
+						{ responsesLite: model.useResponsesLite },
+					);
+					items.push(...(userBody.input ?? []));
+				}
+			} else {
+				for (const message of userMessages) {
+					items.push(...buildOpenAiResponsesCompactionInput([message], model, undefined));
+				}
 			}
-		} else {
-			for (const message of userMessages) {
-				retainedUserItemsBase.push(...buildOpenAiResponsesCompactionInput([message], model, undefined));
-			}
-		}
+			retainedUserItemsByShape.set(includeTail, items);
+			return items;
+		};
 		// The compaction request replays transcript history (and the
 		// preserved prefix) under one credential: build it from the row
 		// actually serving the attempt, so caller-bound encrypted_content
 		// from a previous credential is dropped instead of 400ing.
 		// withAuth may rotate to a sibling after a 401, so the build lives
-		// inside the attempt and is memoized per row. Static keys resolve
-		// to no row: a summary never needs another caller's blobs, so
-		// unknown-at-build-time strips everything.
+		// inside the attempt. Static keys resolve to no row: a summary never
+		// needs another caller's blobs, so unknown-at-build-time strips
+		// everything.
 		const credentialTracker = trackCompactionCredentialResolutions(apiKey);
 		const previousV2CredentialId = previousRemoteCompaction?.credentialId;
-		let servingV2CredentialId: number | undefined;
-		const v2Requests = new Map<number | undefined, CompactionV2Request>();
-		const buildV2RequestForCredential = async (
+		const buildV2Input = async (
+			includeTail: boolean,
 			credentialId: number | undefined,
-		): Promise<CompactionV2Request | undefined> => {
-			const cached = v2Requests.get(credentialId);
-			if (cached) return cached;
+		): Promise<RemoteCompactionV2Input> => {
+			const messages = convertToLlm(includeTail ? remoteMessages : remotePrefixMessages);
 			// The preserved prefix shares the stored transcript's
 			// provenance: strip its encrypted reasoning when the serving
 			// credential is unknown, or when the compaction that stored it
@@ -1801,7 +1899,10 @@ export async function compact(
 				credentialId,
 				previousV2CredentialId,
 			);
-			const retainedUserItems: unknown[] = [...(filteredPrefix ?? []), ...retainedUserItemsBase];
+			const retainedUserItems: unknown[] = [
+				...(filteredPrefix ?? []),
+				...(await buildRetainedUserItems(includeTail)),
+			];
 			let codexBody: OpenAICodexCompactionBody | undefined;
 			let remoteHistory: Array<Record<string, unknown>>;
 			if (isCodexCompaction) {
@@ -1848,12 +1949,12 @@ export async function compact(
 					prefixCredentialId: previousV2CredentialId,
 				});
 			}
-			// An empty converted transcript (or a preserved prefix emptied by
-			// the credential strip) carries nothing worth a remote round trip.
-			// Skip V2 silently like the V1 history check below so compaction
-			// falls through to local summarization instead of recording a
-			// native failure for sending nothing.
-			if (remoteHistory.length === 0) return undefined;
+			return { codexBody, remoteHistory, retainedUserItems };
+		};
+		const buildV2Request = (
+			{ codexBody, remoteHistory, retainedUserItems }: RemoteCompactionV2Input,
+			rewriteOutputs: boolean,
+		): CompactionV2Request => {
 			const instructions = codexBody
 				? typeof codexBody.instructions === "string"
 					? codexBody.instructions
@@ -1872,6 +1973,7 @@ export async function compact(
 				model.contextWindow,
 				instructions,
 				tools,
+				{ rewriteOutputs },
 			);
 			if (trimmed.rewrittenOutputs > 0) {
 				logger.info("Rewrote trailing tool outputs before OpenAI V2 remote compaction", {
@@ -1890,15 +1992,13 @@ export async function compact(
 				retainedMessageBudget: settings.v2RetainedMessageBudget,
 				retainedUserItems,
 			};
-			const request = codexBody
+			return codexBody
 				? buildCompactionV2RequestFromBody(model, { ...codexBody, input: trimmed.input }, requestOptions)
 				: buildCompactionV2Request(model, trimmed.input, instructions, {
 						...requestOptions,
 						tools,
 						reasoning: buildCompactionV2Reasoning(model, summaryOptions.thinkingLevel),
 					});
-			v2Requests.set(credentialId, request);
-			return request;
 		};
 		// Pre-resolve the likely serving row so the common single-attempt
 		// case builds once; a rotated sibling rebuilds inside the attempt.
@@ -1911,45 +2011,65 @@ export async function compact(
 			// Resolver failures surface properly at send time inside
 			// withAuth; build credential-blind (strip-all) instead.
 		}
-		let builtV2CredentialId = preResolvedV2CredentialId;
+		/**
+		 * Sends one history shape. Resolves `false` without a request when the
+		 * converted transcript (or a preserved prefix emptied by the credential
+		 * strip) carries nothing worth a remote round trip, so compaction falls
+		 * through to local summarization instead of recording a native failure.
+		 */
+		const sendV2 = async (includeTail: boolean, rewriteOutputs: boolean): Promise<boolean> => {
+			let builtCredentialId = preResolvedV2CredentialId;
+			const input = await buildV2Input(includeTail, builtCredentialId);
+			if (input.remoteHistory.length === 0) return false;
+			let request: CompactionV2Request | undefined = buildV2Request(input, rewriteOutputs);
+			let servingCredentialId: number | undefined;
+			const remote = await withAuth(
+				credentialTracker.key,
+				async key => {
+					// withAuth rotated to a sibling: the built request replays
+					// the old row's blobs, so rebuild for the row actually
+					// serving this attempt.
+					const attemptCredentialId = credentialTracker.credentialIdOf(key);
+					if (attemptCredentialId !== builtCredentialId) {
+						builtCredentialId = attemptCredentialId;
+						const rebuilt = await buildV2Input(includeTail, builtCredentialId);
+						// The sibling's strip emptied the input: nothing to
+						// send on this row either.
+						request = rebuilt.remoteHistory.length === 0 ? undefined : buildV2Request(rebuilt, rewriteOutputs);
+					}
+					if (request === undefined) return undefined;
+					servingCredentialId = attemptCredentialId;
+					return requestCompactionV2Streaming(model, key, request, signal, {
+						fetch: summaryOptions.fetch,
+						providerSessionState: summaryOptions.providerSessionState,
+						preferWebsockets: summaryOptions.preferWebsockets,
+						codexCompaction: summaryOptions.codexCompaction,
+					});
+				},
+				{ signal },
+			);
+			if (remote === undefined) return false;
+			preserveData = {
+				...preserveData,
+				...storeCompactionV2PreserveData(remote, model, servingCredentialId),
+			};
+			return true;
+		};
 		try {
-			const v2Request = await buildV2RequestForCredential(builtV2CredentialId);
-			if (v2Request !== undefined) {
-				const remote = await withAuth(
-					credentialTracker.key,
-					async key => {
-						// withAuth rotated to a sibling: the pre-built request
-						// replays the old row's blobs, so rebuild for the row
-						// actually serving this attempt.
-						const attemptCredentialId = credentialTracker.credentialIdOf(key);
-						let requestForAttempt = v2Request;
-						if (attemptCredentialId !== builtV2CredentialId) {
-							builtV2CredentialId = attemptCredentialId;
-							const rebuilt = await buildV2RequestForCredential(builtV2CredentialId);
-							// The sibling's strip emptied the input: nothing to
-							// send on this row either.
-							if (rebuilt === undefined) return undefined;
-							requestForAttempt = rebuilt;
-						}
-						servingV2CredentialId = attemptCredentialId;
-						return requestCompactionV2Streaming(model, key, requestForAttempt, signal, {
-							fetch: summaryOptions.fetch,
-							providerSessionState: summaryOptions.providerSessionState,
-							preferWebsockets: summaryOptions.preferWebsockets,
-							codexCompaction: summaryOptions.codexCompaction,
-						});
-					},
-					{ signal },
-				);
-				if (remote !== undefined) {
-					preserveData = {
-						...preserveData,
-						...storeCompactionV2PreserveData(remote, model, servingV2CredentialId),
-					};
-					usedRemoteCompaction = true;
-				}
-			}
+			let sent = false;
+			await sendRemoteCompaction(
+				async () => {
+					sent = await sendV2(true, !canCompactBeforeTail);
+				},
+				async () => {
+					if (!(await sendV2(false, true))) return false;
+					sent = true;
+					return true;
+				},
+			);
+			if (sent) usedRemoteCompaction = true;
 		} catch (err) {
+			// A user/session abort is a cancellation, not a remote failure —
 			// swallowing it here would downgrade Esc into "fall back to local
 			// summarization" and keep compaction running on an aborted signal.
 			if (signal?.aborted) throw err;
@@ -1979,25 +2099,21 @@ export async function compact(
 					: undefined;
 		const previousV1History = previousV1Source?.replacementHistory;
 		const previousV1CredentialId = previousV1Source?.credentialId;
-		const convertedV1Messages = (summaryOptions.convertToLlm ?? defaultConvertToLlm)(remoteMessages);
+		const convertToLlm = summaryOptions.convertToLlm ?? defaultConvertToLlm;
 		const v1Instructions = summaryOptions.remoteSystemPrompt?.join("\n\n") ?? SUMMARIZATION_SYSTEM_PROMPT;
 		const v1ImageDetail = openAiCompatSupportsImageDetailOriginal(model);
 		// Same credential binding as V2: the native history replays under
 		// the row actually serving the attempt, and the stored prefix is
 		// filtered by the row that wrote it.
 		const v1CredentialTracker = trackCompactionCredentialResolutions(apiKey);
-		let servingV1CredentialId: number | undefined;
-		const v1Histories = new Map<number | undefined, Array<Record<string, unknown>>>();
-		const buildV1HistoryForCredential = (credentialId: number | undefined): Array<Record<string, unknown>> => {
-			const cached = v1Histories.get(credentialId);
-			if (cached) return cached;
-			const history = buildOpenAiNativeHistory(convertedV1Messages, model, previousV1History, v1ImageDetail, {
-				currentCredentialId: credentialId,
-				prefixCredentialId: previousV1CredentialId,
-			});
-			v1Histories.set(credentialId, history);
-			return history;
-		};
+		const buildV1History = (includeTail: boolean, credentialId: number | undefined): Array<Record<string, unknown>> =>
+			buildOpenAiNativeHistory(
+				convertToLlm(includeTail ? remoteMessages : remotePrefixMessages),
+				model,
+				previousV1History,
+				v1ImageDetail,
+				{ currentCredentialId: credentialId, prefixCredentialId: previousV1CredentialId },
+			);
 		let preResolvedV1CredentialId: number | undefined;
 		try {
 			await resolveApiKeyOnce(v1CredentialTracker.key, signal, resolved => {
@@ -2007,48 +2123,64 @@ export async function compact(
 			// Resolver failures surface properly at send time inside
 			// withAuth; build credential-blind (strip-all) instead.
 		}
-		let builtV1CredentialId = preResolvedV1CredentialId;
-		let v1History = buildV1HistoryForCredential(builtV1CredentialId);
-		if (v1History.length > 0) {
-			try {
-				const remote = await withAuth(
-					v1CredentialTracker.key,
-					key => {
-						// withAuth rotated to a sibling: rebuild for the row
-						// actually serving this attempt instead of resending
-						// the old row's blobs.
-						const attemptCredentialId = v1CredentialTracker.credentialIdOf(key);
-						if (attemptCredentialId !== builtV1CredentialId) {
-							builtV1CredentialId = attemptCredentialId;
-							v1History = buildV1HistoryForCredential(builtV1CredentialId);
-						}
-						servingV1CredentialId = attemptCredentialId;
-						return requestOpenAiRemoteCompaction(model, key, v1History, v1Instructions, signal, {
-							fetch: summaryOptions.fetch,
-							sessionId: summaryOptions.sessionId,
-							providerSessionState: summaryOptions.providerSessionState,
-							codexCompaction: summaryOptions.codexCompaction,
-						});
-					},
-					{ signal },
-				);
-				preserveData = withOpenAiRemoteCompactionPreserveData(
-					preserveData,
-					servingV1CredentialId === undefined ? remote : { ...remote, credentialId: servingV1CredentialId },
-				);
-				usedRemoteCompaction = true;
-			} catch (err) {
-				// A user/session abort is a cancellation, not a remote failure —
-				// swallowing it here would downgrade Esc into "fall back to local
-				// summarization" and keep compaction running on an aborted signal.
-				if (signal?.aborted) throw err;
-				nativeCompactionError = selectNativeCompactionError(nativeCompactionError, err);
-				logger.warn("OpenAI remote compaction failed", {
-					error: err instanceof Error ? err.message : String(err),
-					model: model.id,
-					provider: model.provider,
-				});
-			}
+		/** Sends one history shape; resolves `false` without a request when it is empty. */
+		const sendV1 = async (includeTail: boolean, rewriteOutputs: boolean): Promise<boolean> => {
+			let builtCredentialId = preResolvedV1CredentialId;
+			let history = buildV1History(includeTail, builtCredentialId);
+			if (history.length === 0) return false;
+			let servingCredentialId: number | undefined;
+			const remote = await withAuth(
+				v1CredentialTracker.key,
+				key => {
+					// withAuth rotated to a sibling: rebuild for the row
+					// actually serving this attempt instead of resending
+					// the old row's blobs.
+					const attemptCredentialId = v1CredentialTracker.credentialIdOf(key);
+					if (attemptCredentialId !== builtCredentialId) {
+						builtCredentialId = attemptCredentialId;
+						history = buildV1History(includeTail, builtCredentialId);
+					}
+					servingCredentialId = attemptCredentialId;
+					return requestOpenAiRemoteCompaction(model, key, history, v1Instructions, signal, {
+						fetch: summaryOptions.fetch,
+						sessionId: summaryOptions.sessionId,
+						providerSessionState: summaryOptions.providerSessionState,
+						codexCompaction: summaryOptions.codexCompaction,
+						rewriteOutputs,
+					});
+				},
+				{ signal },
+			);
+			preserveData = withOpenAiRemoteCompactionPreserveData(
+				preserveData,
+				servingCredentialId === undefined ? remote : { ...remote, credentialId: servingCredentialId },
+			);
+			return true;
+		};
+		try {
+			let sent = false;
+			await sendRemoteCompaction(
+				async () => {
+					sent = await sendV1(true, !canCompactBeforeTail);
+				},
+				async () => {
+					if (!(await sendV1(false, true))) return false;
+					sent = true;
+					return true;
+				},
+			);
+			if (sent) usedRemoteCompaction = true;
+		} catch (err) {
+			// A user/session abort is a cancellation, not a remote failure —
+			// swallowing it here would downgrade Esc into "fall back to local
+			// summarization" and keep compaction running on an aborted signal.
+			if (signal?.aborted) throw err;
+			nativeCompactionError = selectNativeCompactionError(nativeCompactionError, err);
+			logger.warn("OpenAI remote compaction failed", {
+				error: err instanceof Error ? err.message : String(err),
+				model: model.id,
+				provider: model.provider,
+			});
 		}
 	}
 
@@ -2148,7 +2280,7 @@ export async function compact(
 			// history when the host can build them: kept thinking remains valid
 			// only when the summarized prefix matches what was sent byte for byte.
 			const context = summaryOptions.buildProviderContext
-				? await summaryOptions.buildProviderContext(summarizedMessages, allMessages.slice(safeCut), signal)
+				? await summaryOptions.buildProviderContext(summarizedMessages, allMessages.slice(safeCut), signal, model)
 				: {
 						systemPrompt: summaryOptions.remoteSystemPrompt ?? [],
 						messages: (summaryOptions.convertToLlm ?? defaultConvertToLlm)(summarizedMessages),
@@ -2307,6 +2439,7 @@ export async function compact(
 		tokensBefore,
 		details: { readFiles, modifiedFiles } as CompactionDetails,
 		preserveData: finalPreserveData,
+		...(remoteReplayThroughEntryId ? { providerReplayThroughEntryId: remoteReplayThroughEntryId } : {}),
 	};
 }
 
@@ -2324,7 +2457,11 @@ async function generateTurnPrefixSummary(
 	const maxTokens = Math.min(Math.floor(0.5 * reserveTokens), MAX_SUMMARY_TOKENS); // Smaller budget for turn prefix
 
 	const llmMessages = (options?.convertToLlm ?? defaultConvertToLlm)(messages);
-	const conversationText = serializeConversationForSummary(llmMessages, preferredDialect(model.id));
+	const conversationText = serializeConversationForSummary(
+		llmMessages,
+		preferredDialect(model.id),
+		resolveCatalogPolicy(model).classifierCotExtraction === true,
+	);
 	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
 	const summarizationMessages = [
 		{

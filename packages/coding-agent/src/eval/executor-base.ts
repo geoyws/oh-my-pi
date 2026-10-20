@@ -15,9 +15,9 @@ import {
 	rejectTimeoutControlCollision,
 } from "./bridge-timeout";
 import type { JsStatusEvent } from "./js/shared/types";
-import type { KernelDisplayOutput } from "./py/display";
 import { registerPyToolBridge } from "./py/tool-bridge";
 import { getActiveEvalShadowCell } from "./speculation/runtime-context";
+import type { EvalDisplayOutput } from "./types";
 
 /**
  * Constructor for a language executor's cancellation error. Each backend
@@ -42,13 +42,12 @@ export class EvalKernelNotRunningError extends Error {
  * over agents keeps one event per handle instead of one per poll tick. Shared
  * by the kernel (Python) and VM (JS) executors.
  */
-export class DisplayOutputCollector<T extends KernelDisplayOutput> {
-	readonly outputs: T[] = [];
+export class DisplayOutputCollector {
+	readonly outputs: EvalDisplayOutput[] = [];
 	readonly #snapshotIndex = new Map<string, number>();
 
-	push(output: T): void {
-		const display: KernelDisplayOutput = output;
-		const key = display.type === "status" ? statusEventKey(display.event) : undefined;
+	push(output: EvalDisplayOutput): void {
+		const key = output.type === "status" ? statusEventKey(output.event) : undefined;
 		if (key !== undefined) {
 			const index = this.#snapshotIndex.get(key);
 			if (index !== undefined) {
@@ -98,7 +97,7 @@ export interface KernelExecutionResult {
 	totalBytes: number;
 	outputLines: number;
 	outputBytes: number;
-	displayOutputs: KernelDisplayOutput[];
+	displayOutputs: EvalDisplayOutput[];
 	stdinRequested: boolean;
 }
 
@@ -113,7 +112,7 @@ export interface GenericKernel<TEnv> {
 			id: string;
 			signal?: AbortSignal;
 			onChunk: (text: string) => Promise<void> | void;
-			onDisplay: (output: KernelDisplayOutput) => Promise<void> | void;
+			onDisplay: (output: EvalDisplayOutput) => Promise<void> | void;
 		},
 	): Promise<{
 		status: "ok" | "error";
@@ -464,7 +463,7 @@ export async function executeWithKernelBase<
 		maxColumns: resolveOutputMaxColumns(settings),
 	});
 
-	const display = new DisplayOutputCollector<KernelDisplayOutput>();
+	const display = new DisplayOutputCollector();
 	const displayOutputs = display.outputs;
 	const deadlineMs = getExecutionDeadlineMs(options);
 	const remainingMs = getRemainingTimeoutMs(deadlineMs);
@@ -525,7 +524,7 @@ export async function executeWithKernelBase<
 	 * `application/x-omp-status` bundle, so a timeout pause/resume arriving here
 	 * is forged (or an echo) and is dropped: the deadline stays armed.
 	 */
-	const collectDisplay = (output: KernelDisplayOutput): void => {
+	const collectDisplay = (output: EvalDisplayOutput): void => {
 		if (output.type === "status") {
 			if (rejectRuntimeTimeoutControl(output.event, errorLogLabel)) return;
 			options?.onStatus?.(output.event);

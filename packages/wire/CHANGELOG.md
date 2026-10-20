@@ -5,6 +5,17 @@
 ### Added
 
 - Added `provider_retry_wait_start`/`provider_retry_wait_end` agent events to the collab wire and bumped `COLLAB_PROTO` to 4, so guests that cannot dispatch them are refused at hello ([#12785](https://github.com/can1357/oh-my-pi/pull/12785))
+## [18.12.3] - 2026-10-19
+
+### Added
+
+- Added `min`, `max` and dashed reference `marks` to bars/spark `chart` nodes, a `tone` per series column, and the common `hovercard` prop: a node tree Tern floats over the node while the pointer rests on it
+
+## [18.10.2] - 2026-10-12
+
+### Added
+
+- Added `TspPickerMark.icon`: an icon a picker mark draws instead of its initials when the terminal has it (`provider:<id>` names a model provider's logo)
 
 ## [18.8.8] - 2026-10-10
 

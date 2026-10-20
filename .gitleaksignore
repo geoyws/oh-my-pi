@@ -14,3 +14,7 @@ c4a2441d8f9195de810b3492be5bf5673cecf9c9:packages/coding-agent/test/acp-session-
 5060ac09dea7fad2eaaba2bfd7aac632353e97da:packages/ai/test/fixtures/factory-droid-responses-ws-frames.jsonl:generic-api-key:1
 5060ac09dea7fad2eaaba2bfd7aac632353e97da:packages/ai/test/fixtures/factory-droid-responses-ws-frames.jsonl:generic-api-key:2
 5060ac09dea7fad2eaaba2bfd7aac632353e97da:packages/ai/test/fixtures/factory-droid-responses-ws-frames.jsonl:generic-api-key:9
+# 2026-10-20 upstream v18.12.3 public test fixtures (model ids / advisor fixture), not credentials (omp t-e3fa50e5)
+packages/catalog/test/image-tokenization.test.ts:generic-api-key:145
+packages/coding-agent/test/advisor/advisor.test.ts:generic-api-key:2147
+packages/coding-agent/test/model-registry.test.ts:generic-api-key:2835

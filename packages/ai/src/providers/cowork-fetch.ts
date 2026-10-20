@@ -312,8 +312,10 @@ async function sendCoworkRequest(
 		const reason = signal?.reason;
 		const error = reason instanceof Error ? reason : new DOMException("The operation was aborted.", "AbortError");
 		// Order matters: the queue has to let go of the request before it is
-		// destroyed, and the caller is settled here because a queued request
-		// never reaches the `error` handler below.
+		// destroyed. The caller is settled here because a queued request never
+		// reaches the `error` handler below, and Bun before 1.4 emits 'close' but
+		// not 'error' for destroy(error), so that listener never settles a request
+		// still waiting for headers either.
 		if (request !== undefined) dropFromAgentQueue(directAgent, request);
 		request?.destroy(error);
 		result.reject(error);

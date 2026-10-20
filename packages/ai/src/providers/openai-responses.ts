@@ -40,6 +40,7 @@ import {
 import { OpenAIHttpError, postOpenAIStream } from "../utils/openai-http";
 import { markOperationProgress, operationDeadlineExceeded } from "../utils/operation-deadline";
 import { notifyProviderResponse } from "../utils/provider-response";
+import { wrapFetchForRequestCompression } from "../utils/request-compression";
 import { waitForRetry } from "../utils/retry-wait";
 import {
 	adaptSchemaForStrict,
@@ -105,6 +106,7 @@ import {
 	isForeignEncryptedReasoningError,
 	isOpenAIResponsesProgressEvent,
 	isStrictToolsDisabledForScope,
+	readOpenRouterRawMetadata,
 	type OpenAIPromptCacheOptions,
 	type OpenAIStrictToolsScope,
 	type OpenAIStrictToolsState,
@@ -508,6 +510,27 @@ function getOpenAIResponsesProviderSessionState(
 	return created;
 }
 
+/**
+ * Whether the next request for `model` replays native Responses history items
+ * (encrypted reasoning, item ids), as {@link buildParams} decides it. A session
+ * is cold, rebuilding turns from message content, from the first request on a
+ * connection-bound host (`compat.connectionBoundNativeHistory`, GitHub Copilot)
+ * and after `close()` on any host, until a response succeeds. Without session
+ * state every request replays.
+ */
+export function openAIResponsesReplaysNativeHistory(
+	model: Pick<Model, "api" | "provider" | "compat"> | null | undefined,
+	providerSessionState: Map<string, ProviderSessionState> | undefined,
+): boolean {
+	if (model?.api !== "openai-responses" || !providerSessionState) return true;
+	const state = providerSessionState.get(`${OPENAI_RESPONSES_PROVIDER_SESSION_STATE_PREFIX}${model.provider}`) as
+		| OpenAIResponsesProviderSessionState
+		| undefined;
+	if (state) return state.nativeHistoryReplayWarmed;
+	const compat = model.compat;
+	return !(compat && "connectionBoundNativeHistory" in compat && compat.connectionBoundNativeHistory);
+}
+
 /** Host per-provider storage defaults; see {@link configureProviderStoreResponses}. */
 let configuredProviderStoreResponses: Readonly<Record<string, boolean>> = {};
 
@@ -892,7 +915,7 @@ const streamOpenAIResponsesOnce = (
 						body: requestParams,
 						signal: requestSignal,
 						fetch: wrapFetchForCopilotFallback(
-							options?.fetch,
+							wrapFetchForRequestCompression(options?.fetch ?? fetch, model),
 							model.provider === "github-copilot",
 							resolveCopilotRequestIdentity(options?.headers),
 							copilotCacheKey,
@@ -1452,7 +1475,7 @@ const streamOpenAIResponsesOnce = (
 				output.requestBodyReadTimeoutFullReplay = true;
 			}
 			// Some providers via OpenRouter include extra details here.
-			const rawMetadata = (error as { error?: { metadata?: { raw?: string } } })?.error?.metadata?.raw;
+			const rawMetadata = readOpenRouterRawMetadata(capturedErrorResponse);
 			if (rawMetadata) output.errorMessage += `\n${rawMetadata}`;
 			output.duration = performance.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;

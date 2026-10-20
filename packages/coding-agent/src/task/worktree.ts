@@ -6,7 +6,7 @@ import * as path from "node:path";
 import type { VcsCommitAuthor, VcsGitRepo } from "@oh-my-pi/pi-natives";
 import * as natives from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
-import { formatBytes, getWorktreeDir, logger, Snowflake } from "@oh-my-pi/pi-utils";
+import { formatBytes, getWorktreeDir, isEnoent, logger, Snowflake } from "@oh-my-pi/pi-utils";
 import type { SettingValueOf } from "../config/registry";
 
 import { withRepoLock } from "../utils/repo-lock";
@@ -85,17 +85,45 @@ export function getGitNoIndexNullPath(): string {
 	return GIT_NO_INDEX_NULL_PATH;
 }
 
+/** Real path of the git common dir owning `dir`, or `undefined` outside any repo. */
+async function realCommonDir(dir: string): Promise<string | undefined> {
+	const commonDir = vcs.gitInfo(dir)?.commonDir;
+	if (!commonDir) return undefined;
+	// git writes realpath'd admin pointers; match them across symlinked
+	// prefixes (macOS /var -> /private/var).
+	return fs.realpath(commonDir).catch(() => path.resolve(commonDir));
+}
+
 /**
  * Find every repository under `repoRoot` whose edits the root diff cannot
- * carry: each initialized submodule at every depth (the root diff never
- * renders a gitlink, let alone the submodule's files) plus every
- * non-submodule nested repo. Paths are relative to `repoRoot`; a submodule
- * always precedes the repos nested inside it.
+ * carry: each initialized submodule at every depth plus every non-submodule
+ * nested repo. Paths are relative to `repoRoot`; a submodule always precedes
+ * the repos nested inside it.
+ *
+ * A directory whose common dir belongs to one of `ownRepos` is a linked
+ * worktree of the same repository, not a nested repo, and is skipped with
+ * everything under it. A copied isolation carries every in-tree linked
+ * worktree (e.g. gitignored `.claude/worktrees/*`); baselining each one
+ * re-hashes its whole tree and froze the host (#16068). Isolation setup
+ * detaches those copies onto private admins, so the same relative path under
+ * every other `ownRepos` root (the source checkout) is judged too.
  */
-async function discoverNestedRepos(repoRoot: string): Promise<string[]> {
+async function discoverNestedRepos(repoRoot: string, ownRepos: readonly string[]): Promise<string[]> {
 	// Initialized submodules, recursively; uninitialized ones have no edits.
 	const submodules = await vcs.requireGit(repoRoot).submodulePaths();
 	const submodulePaths = new Set(submodules);
+	const ownCommonDirs = new Set(
+		(await Promise.all(ownRepos.map(realCommonDir))).filter((dir): dir is string => dir !== undefined),
+	);
+	const counterpartRoots = ownRepos.filter(root => path.resolve(root) !== path.resolve(repoRoot));
+	const isOwnLinkedWorktree = async (full: string, rel: string): Promise<boolean> => {
+		if (ownCommonDirs.size === 0) return false;
+		for (const dir of [full, ...counterpartRoots.map(root => path.join(root, rel))]) {
+			const commonDir = await realCommonDir(dir);
+			if (commonDir && ownCommonDirs.has(commonDir)) return true;
+		}
+		return false;
+	};
 
 	// Find all .git dirs/files that aren't the root or known submodules
 	const result: string[] = [...submodules];
@@ -119,6 +147,7 @@ async function discoverNestedRepos(repoRoot: string): Promise<string[]> {
 				hasGit = true;
 			} catch {}
 			if (hasGit && !submodulePaths.has(rel)) {
+				if (await isOwnLinkedWorktree(full, rel)) continue;
 				result.push(rel);
 				// Don't recurse into nested repos — they manage their own tree
 				continue;
@@ -286,14 +315,17 @@ async function writeSyntheticTree(
  * Capture the baseline of `repoRoot` and every nested repo under it. Each repo
  * baseline may buffer at most `budgetBytes` of uncommitted content (the
  * isolation-snapshot budget, {@link ISOLATION_BASELINE_MAX_CONTENT_BYTES}).
+ * Linked worktrees of any repo in `ownRepos` are not nested repos (see
+ * {@link discoverNestedRepos}).
  */
 export async function captureBaseline(
 	repoRoot: string,
 	budgetBytes: number = ISOLATION_BASELINE_MAX_CONTENT_BYTES,
+	ownRepos: readonly string[] = [repoRoot],
 ): Promise<WorktreeBaseline> {
 	const [root, nestedPaths] = await Promise.all([
 		captureRepoBaseline(repoRoot, budgetBytes),
-		discoverNestedRepos(repoRoot),
+		discoverNestedRepos(repoRoot, ownRepos),
 	]);
 	const nested = await Promise.all(
 		nestedPaths.map(async relativePath => ({
@@ -312,13 +344,16 @@ export async function captureBaseline(
  * own state is the only exact baseline: a baseline read from the live parent
  * before or after the copy also absorbs whatever other agents or merges wrote
  * in between, and that drift would surface as this task's changes.
+ *
+ * Copied linked worktrees may point at either the isolation's or the parent's
+ * admin dir, so both count as the root repository.
  */
 export async function captureIsolationBaseline(
 	isolationDir: string,
 	repoRoot: string,
 	budgetBytes: number = ISOLATION_BASELINE_MAX_CONTENT_BYTES,
 ): Promise<WorktreeBaseline> {
-	const { root, nested } = await captureBaseline(isolationDir, budgetBytes);
+	const { root, nested } = await captureBaseline(isolationDir, budgetBytes, [isolationDir, repoRoot]);
 	return {
 		root: { ...root, repoRoot },
 		nested: nested.map(({ relativePath, baseline }) => ({
@@ -394,7 +429,34 @@ export interface DeltaPatchResult {
 	nestedPatches: NestedRepoPatch[];
 }
 
+async function hasGitEntry(dir: string): Promise<boolean> {
+	try {
+		await fs.lstat(path.join(dir, ".git"));
+		return true;
+	} catch (error) {
+		if (isEnoent(error)) return false;
+		throw error;
+	}
+}
+
 export async function captureDeltaPatch(isolationDir: string, baseline: WorktreeBaseline): Promise<DeltaPatchResult> {
+	// Synthetic tree construction may read a new gitlink commit before the
+	// root patch exists. Keep isolation-local objects in the source ODB first;
+	// this does not change its refs, HEAD, or index. Submodules added inside
+	// the isolation have no source checkout or `modules/<name>` admin dir (a
+	// patch apply never creates one), so their objects go to the source root
+	// ODB — the only store that survives isolation cleanup.
+	const sourceRoot = baseline.root.repoRoot;
+	const relativePaths = new Set([
+		...(await vcs.requireGit(sourceRoot).submodulePaths()),
+		...(await vcs.requireGit(isolationDir).submodulePaths()),
+	]);
+	for (const relativePath of relativePaths) {
+		const isolatedDir = path.join(isolationDir, relativePath);
+		const sourceDir = path.join(sourceRoot, relativePath);
+		if (!(await hasGitEntry(isolatedDir))) continue;
+		await vcs.copyGitObjects(isolatedDir, (await hasGitEntry(sourceDir)) ? sourceDir : sourceRoot);
+	}
 	const rootPatch = await captureRepoDeltaPatch(isolationDir, baseline.root, baseline.root.repoRoot);
 	const nestedPatches: NestedRepoPatch[] = [];
 
@@ -1331,7 +1393,9 @@ async function verifyCopiedSubmodulesDetached(
  */
 async function detachNestedGitfileRepos(repoRoot: string, mergedDir: string): Promise<void> {
 	const submodules = new Set(await vcs.requireGit(repoRoot).submodulePaths());
-	for (const relativePath of await discoverNestedRepos(repoRoot)) {
+	// Linked worktrees of the root repository are detached too: a copied
+	// pointer into the source admin would share its HEAD, index and refs.
+	for (const relativePath of await discoverNestedRepos(repoRoot, [])) {
 		if (submodules.has(relativePath)) continue;
 		const copyRoot = path.join(mergedDir, relativePath);
 		const stat = await fs.lstat(path.join(copyRoot, ".git")).catch((err: NodeJS.ErrnoException) => {
@@ -1341,6 +1405,20 @@ async function detachNestedGitfileRepos(repoRoot: string, mergedDir: string): Pr
 		if (!stat?.isFile()) continue;
 		const sourceRoot = path.join(repoRoot, relativePath);
 		await detachCopiedRepo(sourceRoot, copyRoot, vcs.requireGit(sourceRoot).info().commonDir);
+	}
+}
+
+/**
+ * Copy every initialized source submodule tree the isolation lacks, parents
+ * first. `git worktree add` (rcopy) checks out gitlinks but not their trees;
+ * the copied gitfiles are then privatized like any other copied submodule.
+ */
+async function materializeCopiedSubmodules(sourceRoot: string, isolationRoot: string): Promise<void> {
+	for (const relativePath of await vcs.requireGit(sourceRoot).submodulePaths()) {
+		const sourceDir = path.join(sourceRoot, relativePath);
+		const isolatedDir = path.join(isolationRoot, relativePath);
+		if (!(await hasGitEntry(sourceDir)) || (await hasGitEntry(isolatedDir))) continue;
+		await fs.cp(sourceDir, isolatedDir, { recursive: true });
 	}
 }
 
@@ -1368,6 +1446,9 @@ export async function ensureIsolation(
 		await writeIsolationOwner(baseDir, id);
 		try {
 			await natives.isoStart(candidate, repoRoot, mergedDir);
+			// `git worktree add` (rcopy) checks out gitlinks but not their
+			// trees; materialize them before the rebind and hand-out gates.
+			await materializeCopiedSubmodules(repoRoot, mergedDir);
 			await detachCopiedRepo(repoRoot, mergedDir, sourceCommonDir);
 			await detachNestedGitfileRepos(repoRoot, mergedDir);
 			// The fail-closed hand-out gates, on the final copy: the nested-repo
