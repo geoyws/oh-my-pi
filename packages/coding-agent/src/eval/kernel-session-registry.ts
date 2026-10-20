@@ -112,10 +112,12 @@ interface KernelSessionRegistry<
 	disposeAll(): Promise<void>;
 	disposeByOwner(ownerId: string): Promise<void>;
 	executeOnSession(code: string, cwd: string, options: TOptions): Promise<R>;
-	peekLiveKernel(cwd: string, options: TOptions): TKernel | undefined;
+	/**
+	 * The live retained kernel for a host-side request (e.g. an eval-defined tool call), held so the
+	 * idle reaper cannot shut it down until `release()`; releasing restarts the idle window.
+	 */
+	holdLiveKernel(cwd: string, options: TOptions): { kernel: TKernel; release(): void } | undefined;
 	getPresentSession(cwd: string, options: TOptions): TSession | undefined;
-	/** Restart the idle window after host work (e.g. an eval-defined tool call) used a retained kernel. */
-	noteSessionActivity(cwd: string, options: TOptions): void;
 }
 
 export function normalizeKernelSessionCwd(cwd: string): string {
@@ -183,6 +185,22 @@ export function createKernelSessionRegistry<
 	function forgetIdleState(session: TSession): void {
 		idleStates.get(session)?.timer.disarm();
 		idleStates.delete(session);
+	}
+
+	/** Marks `session` in use: never reaped until the returned (idempotent) release restarts its window. */
+	function holdSession(session: TSession): () => void {
+		const idle = idleStateFor(session);
+		idle.uses += 1;
+		idle.timer.disarm();
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			idle.uses -= 1;
+			if (idle.uses > 0 || idleStates.get(session) !== idle) return;
+			if (isCurrent(session)) idle.timer.arm(idle.idleMs);
+			else forgetIdleState(session);
+		};
 	}
 
 	function reapIdleSession(session: TSession, idleMs: number): void {
@@ -493,22 +511,15 @@ export function createKernelSessionRegistry<
 		}
 	}
 
-	function peekLiveKernel(cwd: string, options: TOptions): TKernel | undefined {
-		const sessionId = options.sessionId ?? `session:${cwd}`;
-		const sessionKey = descriptor.buildSessionKey(sessionId, cwd, options.interpreter);
-		const kernel = sessions.get(sessionKey)?.kernel;
-		return kernel?.isAlive() ? kernel : undefined;
+	function holdLiveKernel(cwd: string, options: TOptions): { kernel: TKernel; release(): void } | undefined {
+		const session = getPresentSession(cwd, options);
+		if (!session?.kernel.isAlive()) return undefined;
+		return { kernel: session.kernel, release: holdSession(session) };
 	}
 
 	function getPresentSession(cwd: string, options: TOptions): TSession | undefined {
 		const sessionId = options.sessionId ?? `session:${cwd}`;
 		return sessions.get(descriptor.buildSessionKey(sessionId, cwd, options.interpreter));
-	}
-
-	function noteSessionActivity(cwd: string, options: TOptions): void {
-		const session = getPresentSession(cwd, options);
-		const state = session && idleStates.get(session);
-		if (state && state.uses === 0) state.timer.arm(state.idleMs);
 	}
 
 	async function executeOnSession(code: string, cwd: string, options: TOptions): Promise<R> {
@@ -539,18 +550,12 @@ export function createKernelSessionRegistry<
 			if (inFlight) await inFlight.catch(() => undefined);
 		}
 		const session = await acquireSession(sessionKey, sessionId, cwd, options);
-		const idle = idleStateFor(session);
-		idle.uses += 1;
-		idle.idleMs = options.kernelIdleTimeoutMs;
-		idle.timer.disarm();
+		idleStateFor(session).idleMs = options.kernelIdleTimeoutMs;
+		const release = holdSession(session);
 		try {
 			return await executeHeldSession(session, code, cwd, options);
 		} finally {
-			idle.uses -= 1;
-			if (idle.uses === 0 && idleStates.get(session) === idle) {
-				if (isCurrent(session)) idle.timer.arm(idle.idleMs);
-				else forgetIdleState(session);
-			}
+			release();
 		}
 	}
 
@@ -559,16 +564,15 @@ export function createKernelSessionRegistry<
 		const kernel = await acquireLiveSessionKernel(session, cwd, options);
 		if (!isCurrent(session, kernel)) throw new descriptor.cancelledErrorClass(false);
 		throwIfCallerCancelled(options);
-		const runOptions = {
-			...options,
-			cwd,
-			// A reap removes the session, so a pending note means this cell runs on a fresh kernel.
-			kernelRestartNotice: reapedNotices.take(session.sessionKey),
-		};
+		// A reap removes the session, so a pending note means this cell runs on a fresh kernel.
+		const restartNotice = reapedNotices.take(session.sessionKey);
+		const runOptions = { ...options, cwd, kernelRestartNotice: restartNotice?.text };
 		let result: R;
 		try {
 			result = await descriptor.executeWithKernel(kernel, code, runOptions);
 		} catch (err) {
+			// Only a returned result carries the note; keep it for the next cell otherwise.
+			if (restartNotice) reapedNotices.restore(session.sessionKey, restartNotice);
 			if (
 				descriptor.isCancellation?.(err) ||
 				isCancellationError(err, descriptor.cancelledErrorClass) ||
@@ -584,5 +588,5 @@ export function createKernelSessionRegistry<
 		return result;
 	}
 
-	return { disposeAll, disposeByOwner, executeOnSession, peekLiveKernel, getPresentSession, noteSessionActivity };
+	return { disposeAll, disposeByOwner, executeOnSession, holdLiveKernel, getPresentSession };
 }

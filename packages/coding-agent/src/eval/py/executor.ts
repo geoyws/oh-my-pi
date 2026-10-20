@@ -506,36 +506,39 @@ async function invokePythonToolRequest(
 	options: PythonToolInvokeOptions,
 ): Promise<PythonToolRequestOutcome> {
 	const cwd = normalizeKernelSessionCwd(options.cwd);
-	const kernel = sessionRegistry.peekLiveKernel(cwd, {
+	// Held synchronously, before the first await: the idle reaper must not shut the kernel down while
+	// the bridge starts or the request runs.
+	const held = sessionRegistry.holdLiveKernel(cwd, {
 		cwd,
 		sessionId: options.sessionId,
 		interpreter: options.interpreter,
 		kernelOwnerId: options.kernelOwnerId,
 	});
-	if (!kernel) throw new EvalKernelNotRunningError("Python");
-
-	const bridgeOptions: PythonExecutorOptions = {
-		cwd,
-		sessionId: options.sessionId,
-		interpreter: options.interpreter,
-		kernelOwnerId: options.kernelOwnerId,
-		toolSession: options.toolSession,
-		signal: options.signal,
-	};
-	await ensureToolBridge(bridgeOptions);
-
-	const runId = Snowflake.next();
-	const unregister = registerPyToolBridge(options.sessionId, runId, {
-		toolSession: options.toolSession,
-		signal: options.signal,
-		emitStatus: undefined,
-	});
+	if (!held) throw new EvalKernelNotRunningError("Python");
 	try {
-		const execution = await kernel.invokeTool(request, { id: runId, signal: options.signal });
-		return { execution, envelope: execution.reply };
+		await ensureToolBridge({
+			cwd,
+			sessionId: options.sessionId,
+			interpreter: options.interpreter,
+			kernelOwnerId: options.kernelOwnerId,
+			toolSession: options.toolSession,
+			signal: options.signal,
+		});
+
+		const runId = Snowflake.next();
+		const unregister = registerPyToolBridge(options.sessionId, runId, {
+			toolSession: options.toolSession,
+			signal: options.signal,
+			emitStatus: undefined,
+		});
+		try {
+			const execution = await held.kernel.invokeTool(request, { id: runId, signal: options.signal });
+			return { execution, envelope: execution.reply };
+		} finally {
+			unregister();
+		}
 	} finally {
-		unregister();
-		sessionRegistry.noteSessionActivity(cwd, bridgeOptions);
+		held.release();
 	}
 }
 

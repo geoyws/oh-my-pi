@@ -1,9 +1,12 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import { $which, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../src/config/settings";
 import { disposeAllVmContexts } from "../../src/eval/js/context-manager";
-import { disposeAllKernelSessions } from "../../src/eval/py/executor";
+import { resolvePythonKernelIdentity } from "../../src/eval/py";
+import { callPythonTool, disposeAllKernelSessions, executePython, type PythonResult } from "../../src/eval/py/executor";
+import { PythonKernel } from "../../src/eval/py/kernel";
+import * as pyToolBridge from "../../src/eval/py/tool-bridge";
 import { disposePyToolBridge } from "../../src/eval/py/tool-bridge";
 import type { ToolSession } from "../../src/tools";
 import { EvalTool } from "../../src/tools/eval";
@@ -177,4 +180,87 @@ describe("eval.kernelIdleTimeoutSeconds", () => {
 			30_000,
 		);
 	}
+
+	it.skipIf(!PYTHON_INTEGRATION)(
+		"py: delivers the restart note when the cell after a reap is out of time before it runs",
+		async () => {
+			const options = {
+				cwd: tempDir.path(),
+				sessionId: `kernel-idle-deadline-${crypto.randomUUID()}`,
+				interpreter: Bun.env.PYTHON ?? $which("python3") ?? $which("python") ?? undefined,
+				kernelIdleTimeoutMs: 300,
+			};
+			const first = await executePython("import os\nprint(f'pid={os.getpid()}')", options);
+			expect(await waitForExit(pidFrom(first.output), 10_000)).toBe(true);
+
+			// Deterministic hook: the fresh kernel is real, but becomes ready only after this cell's
+			// deadline, so execution hits the already-expired-deadline exit.
+			const originalStart = PythonKernel.start;
+			PythonKernel.start = async startOptions => {
+				const kernel = await originalStart.call(PythonKernel, {
+					...startOptions,
+					signal: undefined,
+					deadlineMs: undefined,
+				});
+				const deadlineMs = startOptions.deadlineMs ?? Date.now();
+				while (Date.now() <= deadlineMs) await Bun.sleep(10);
+				return kernel;
+			};
+			let expired: PythonResult;
+			try {
+				expired = await executePython("print('never runs')", { ...options, timeoutMs: 1_000 });
+			} finally {
+				PythonKernel.start = originalStart;
+			}
+			expect(expired.cancelled).toBe(true);
+			expect(expired.output).toContain(
+				"[kernel] The previous Python kernel was shut down after 1s with no cell running",
+			);
+			expect(expired.output).toContain("timed out");
+			expect(expired.output).not.toContain("never runs");
+
+			const after = await executePython("print('fresh')", options);
+			expect(after.output).toContain("fresh");
+			expect(after.output).not.toContain("[kernel] The previous");
+		},
+		30_000,
+	);
+
+	it.skipIf(!PYTHON_INTEGRATION)(
+		"py: never reaps a kernel while an eval-defined tool call waits on a slow bridge start",
+		async () => {
+			const session = makeSession(0.5);
+			const evalTool = new EvalTool(session);
+			const defined = await runCell(
+				evalTool,
+				"py",
+				"import os\n@tool\ndef ping() -> dict:\n    '''Report the kernel pid.'''\n    return {'pid': os.getpid()}\nprint(f'pid={os.getpid()}')",
+			);
+			expect(defined.status).toBe("complete");
+			const pid = pidFrom(defined.output);
+
+			// Deterministic hook: hold the process-wide bridge start open across the idle window.
+			const ensureBridge = pyToolBridge.ensurePyToolBridge;
+			const bridgeEntered = Promise.withResolvers<void>();
+			const releaseBridge = Promise.withResolvers<void>();
+			const bridgeSpy = spyOn(pyToolBridge, "ensurePyToolBridge").mockImplementation(async () => {
+				bridgeEntered.resolve();
+				await releaseBridge.promise;
+				return await ensureBridge();
+			});
+			try {
+				const call = callPythonTool("ping", {}, { ...resolvePythonKernelIdentity(session), toolSession: session });
+				await bridgeEntered.promise;
+				// The idle timer is a real host timer racing a real kernel; wait out two windows.
+				await Bun.sleep(1_000);
+				releaseBridge.resolve();
+				expect(await call).toMatchObject({ ok: true, value: { pid } });
+			} finally {
+				releaseBridge.resolve();
+				bridgeSpy.mockRestore();
+			}
+			expect(isProcessAlive(pid)).toBe(true);
+		},
+		30_000,
+	);
 });

@@ -21,13 +21,19 @@ export function resolveKernelIdleTimeoutMs(settings: Settings | undefined): numb
 	return Math.max(1, Math.round(seconds * 1000));
 }
 
+/** Model-visible note owed to the next cell on a reaped session key. */
+export interface KernelRestartNotice {
+	text: string;
+	ownerIds: Set<string>;
+}
+
 /**
  * Session keys whose retained kernel was idle-reaped. The first cell that
  * starts a fresh kernel on such a key takes the note, so the model learns its
  * state was reset exactly once.
  */
 export class ReapedKernelNotices {
-	readonly #byKey = new Map<string, { idleMs: number; ownerIds: Set<string> }>();
+	readonly #byKey = new Map<string, KernelRestartNotice>();
 	readonly #languageLabel: string;
 
 	constructor(languageLabel: string) {
@@ -35,19 +41,25 @@ export class ReapedKernelNotices {
 	}
 
 	record(sessionKey: string, idleMs: number, ownerIds: Iterable<string>): void {
-		this.#byKey.set(sessionKey, { idleMs, ownerIds: new Set(ownerIds) });
+		const seconds = Math.max(1, Math.round(idleMs / 1000));
+		this.#byKey.set(sessionKey, {
+			text:
+				`[kernel] The previous ${this.#languageLabel} kernel was shut down after ${seconds}s with no cell running ` +
+				"(eval.kernelIdleTimeoutSeconds). This cell runs in a fresh kernel: variables, imports, and eval-defined tools from earlier cells are gone.\n",
+			ownerIds: new Set(ownerIds),
+		});
 	}
 
-	/** Removes and returns the model-visible restart note for `sessionKey`, if one is pending. */
-	take(sessionKey: string): string | undefined {
-		const entry = this.#byKey.get(sessionKey);
-		if (!entry) return undefined;
+	/** Removes and returns the note pending for `sessionKey`; {@link restore} it if it never reached the model. */
+	take(sessionKey: string): KernelRestartNotice | undefined {
+		const notice = this.#byKey.get(sessionKey);
 		this.#byKey.delete(sessionKey);
-		const seconds = Math.max(1, Math.round(entry.idleMs / 1000));
-		return (
-			`[kernel] The previous ${this.#languageLabel} kernel was shut down after ${seconds}s with no cell running ` +
-			"(eval.kernelIdleTimeoutSeconds). This cell runs in a fresh kernel: variables, imports, and eval-defined tools from earlier cells are gone.\n"
-		);
+		return notice;
+	}
+
+	/** Puts back an undelivered note unless a newer reap already recorded one. */
+	restore(sessionKey: string, notice: KernelRestartNotice): void {
+		if (!this.#byKey.has(sessionKey)) this.#byKey.set(sessionKey, notice);
 	}
 
 	forget(sessionKey: string): void {

@@ -562,10 +562,11 @@ export async function executeWithKernelBase<
 			: null;
 
 	try {
+		// Before any early exit: every result dumped from this sink, a timeout included, carries the note.
+		if (options?.kernelRestartNotice) sink.push(options.kernelRestartNotice);
 		if (remainingMs !== undefined && remainingMs <= 0) {
 			throw new cancelledErrorClass(true);
 		}
-		if (options?.kernelRestartNotice) sink.push(options.kernelRestartNotice);
 
 		const result = await kernel.execute(code, {
 			cwd: options?.cwd,

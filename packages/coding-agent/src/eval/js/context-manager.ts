@@ -222,9 +222,10 @@ export async function executeInVmContext(options: {
 		options.timeoutMs,
 		options.ownerId,
 	);
-	// A reap removes the session, so a pending note means this cell runs in a fresh runtime.
+	// A reap removes the session, so a pending note means this cell runs in a fresh runtime. The text
+	// lands in the cell's output sink, which every executeJs outcome (result, error, abort) dumps.
 	const restartNotice = reapedNotices.take(sessionKey);
-	if (restartNotice) options.runState.onText?.(restartNotice);
+	if (restartNotice) options.runState.onText?.(restartNotice.text);
 	const result = await runOnce(session, options);
 	if (session.state === "alive" && path.isAbsolute(options.filename)) {
 		updateEvalState(options.session, {
