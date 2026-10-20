@@ -112,6 +112,7 @@ import {
 	type OpenAIStrictToolsState,
 	processResponsesStream,
 	resolveOpenAICompatPolicy,
+	resolveOpenAIEffortFallbackConstraints,
 	resolveOpenAIOutputTokenParam,
 	resolveOpenAIRequestSetup,
 	resolveOpenAIResponsesOutputClamp,
@@ -974,6 +975,7 @@ const streamOpenAIResponsesOnce = (
 								? resolveOpenAIReasoningEffortFallback(error, capturedErrorResponse, activeRequestParams, {
 										explicitDisable:
 											options?.forceReasoningOff === true || options?.disableReasoning === true,
+										...resolveOpenAIEffortFallbackConstraints(model, model.compat),
 									})
 								: undefined;
 						if (reasoningEffortFallback !== undefined && activeReasoningEffortFallbackKey) {
