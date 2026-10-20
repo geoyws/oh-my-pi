@@ -44,7 +44,7 @@ Ordinary print mode has no interactive review surface and ignores `plan.defaultO
 
 Because previews and plan approval ride `write`, normal session assembly retains the transport:
 
-- `createTools(...)` auto-appends `write` when a deferrable tool such as `ast_edit` is active and `restrictToolNames` is not set.
+- `createTools(...)` auto-appends `write` when a deferrable tool such as `ast` (with edit mode available) is active and `restrictToolNames` is not set.
 - `createAgentSession(...)` ensures registration for deferrable tools, available plan mode, or deferred MCP discovery, subject to the same restriction.
 - Active-tool reconciliation retains `write` while mounted devices, deferrable tools, or active plan mode need it. This may be a device-only transport, not a general filesystem-write grant.
 

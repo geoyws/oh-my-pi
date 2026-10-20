@@ -1155,7 +1155,7 @@ export async function resolveExplicitFindPatterns(
  * Result of partitioning a list of user-supplied paths/globs into entries whose
  * base directory currently exists on disk versus those that do not.
  *
- * Used by multi-path tools (search, find, ast_grep, ast_edit) to tolerate one
+ * Used by multi-path tools (search, find, ast) to tolerate one
  * or more missing entries in a multi-path call: the surviving entries should
  * still be searched, with the missing entries surfaced as a non-fatal warning.
  */
@@ -1422,7 +1422,7 @@ export function searchPathTier(args: unknown): ToolTier {
 }
 
 /**
- * Shared path-input pipeline for `search`, `ast_grep`, and `ast_edit`:
+ * Shared path-input pipeline for `search` and `ast`:
  *  1. normalize + reject empty paths,
  *  2. materialize external URLs; internal URLs stay URLs for the native search's filesystem,
  *  3. partition existing vs missing when multiple paths are supplied,

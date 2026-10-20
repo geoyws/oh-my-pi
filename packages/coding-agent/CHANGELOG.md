@@ -26,6 +26,7 @@
 - Fixed a project daemon broker outliving an omp killed with `kill -9` when the kernel later handed that omp's pid to an unrelated long-lived process: the stale presence file the killed omp left behind kept passing the pid-only liveness check, so the orphaned broker (ppid 1) re-armed its idle check forever. Presence entries now record the process start time and the broker drops any entry whose pid is dead or now belongs to a different process, so it exits within its idle grace plus one presence check; brokers with a live persistent daemon still stay up.
 ### Changed
 
+- Merged the `ast_grep` and `ast_edit` tools into one `ast` tool with `mode: "search"` and `mode: "edit"`. The wire schema narrows to the modes a session may use (search follows `astGrep.enabled`; edit follows `astEdit.enabled` plus the `edit` grant), staged edit previews still resolve through `xd://resolve`/`xd://reject`, and the old names remain as aliases for existing agent definitions and sessions.
 - The status line, footer and composer effort chip now show a requested `auto` thinking level as `auto` until a turn classifies it and as `auto (high)` (the resolved level) afterwards, so an auto-resolved effort no longer reads like an explicit `high` pin; the chip keeps the resolved level's colour and glyph
 
 ### Fixed

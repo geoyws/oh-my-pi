@@ -21,7 +21,7 @@ const MUTATING_TOOLS: Record<string, true> = {
 	eval: true,
 	edit: true,
 	write: true,
-	ast_edit: true,
+	ast: true,
 };
 const MID_RUN_NUDGE_MESSAGE_TYPE = "mid-run-todo-nudge";
 /** Message type of the hidden first-turn reminder {@link TodoTracker.createEagerTodoPrelude} builds. */

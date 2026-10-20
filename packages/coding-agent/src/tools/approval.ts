@@ -133,7 +133,7 @@ export const TIER_RANK: Readonly<Record<ToolTier, number>> = {
 };
 
 /**
- * Fold the per-target decisions of a multi-target write tool (`edit`, `ast_edit`): the first
+ * Fold the per-target decisions of a multi-target write tool (`edit`, `ast` edit mode): the first
  * `policy: "deny"` decision wins with its reason (a read-only URL target); otherwise the highest
  * tier, starting from "read".
  */

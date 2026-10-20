@@ -1,4 +1,4 @@
-/** Gallery fixtures for the edit tools (edit, apply_patch, ast_edit). */
+/** Gallery fixtures for the edit tools (edit, apply_patch). The `ast` edit-mode preview lives with the search fixture. */
 import type { GalleryFixture } from "./types";
 
 export const editFixtures: Record<string, GalleryFixture> = {
@@ -183,72 +183,6 @@ export const editFixtures: Record<string, GalleryFixture> = {
 				errorText:
 					"Hunk @@ -177,4 +177,4 @@ failed to apply: the context line `function countEditFiles(edits: EditRenderEntry[]): number {` does not match the file. The file may have changed since it was read.",
 			},
-		},
-	},
-
-	ast_edit: {
-		label: "AST Edit",
-		streamingArgs: {
-			ops: [{ pat: "countEditFiles($$$ARGS)" }],
-			paths: ["packages/coding-agent/src/**/*.ts"],
-		},
-		args: {
-			ops: [{ pat: "countEditFiles($$$ARGS)", out: "countDistinctFiles($$$ARGS)" }],
-			paths: ["packages/coding-agent/src/**/*.ts"],
-		},
-		result: {
-			content: [
-				{
-					type: "text",
-					text: [
-						"# edit/renderer.ts (2 replacements)",
-						"-468:		fileCount = countEditFiles(editArgs.edits);",
-						"+468:		fileCount = countDistinctFiles(editArgs.edits);",
-						"-488:		const totalFiles = args?.edits ? countEditFiles(args.edits) : 0;",
-						"+488:		const totalFiles = args?.edits ? countDistinctFiles(args.edits) : 0;",
-						"",
-						"# tools/tool-result.ts (1 replacement)",
-						"-42:	return countEditFiles(files);",
-						"+42:	return countDistinctFiles(files);",
-					].join("\n"),
-				},
-			],
-			details: {
-				totalReplacements: 3,
-				filesTouched: 2,
-				filesSearched: 214,
-				applied: false,
-				limitReached: false,
-				scopePath: "packages/coding-agent/src",
-				searchPath: "/Users/dev/Projects/pi/packages/coding-agent/src",
-				files: ["edit/renderer.ts", "tools/tool-result.ts"],
-				fileReplacements: [
-					{ path: "edit/renderer.ts", count: 2 },
-					{ path: "tools/tool-result.ts", count: 1 },
-				],
-				displayContent: [
-					"# edit/",
-					"## renderer.ts (2 replacements)",
-					"-468│		fileCount = countEditFiles(editArgs.edits);",
-					"+468│		fileCount = countDistinctFiles(editArgs.edits);",
-					"-488│		const totalFiles = args?.edits ? countEditFiles(args.edits) : 0;",
-					"+488│		const totalFiles = args?.edits ? countDistinctFiles(args.edits) : 0;",
-					"",
-					"# tools/",
-					"## tool-result.ts (1 replacement)",
-					"-42│	return countEditFiles(files);",
-					"+42│	return countDistinctFiles(files);",
-				].join("\n"),
-			},
-		},
-		errorResult: {
-			content: [
-				{
-					type: "text",
-					text: "Pattern parse error in ops[0].pat: unbalanced parenthesis in `countEditFiles($$$ARGS`",
-				},
-			],
-			isError: true,
 		},
 	},
 };
