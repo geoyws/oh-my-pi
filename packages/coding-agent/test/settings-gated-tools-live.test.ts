@@ -10,6 +10,7 @@ import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
+import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 
 import { cfgBashEnabled } from "@oh-my-pi/pi-coding-agent/exec/settings";
 import { cfgGithubEnabled, cfgGrepEnabled } from "@oh-my-pi/pi-coding-agent/tools/settings";
@@ -69,36 +70,41 @@ describe("settings-gated tools in a live session", () => {
 
 	const GREP_POLICY = "NEVER shell `grep`/`rg`/`awk`";
 
-	it("removes and restores grep in the request tools and system prompt", async () => {
+	it("removes and restores regex mode in the request tools and system prompt", async () => {
 		const settings = Settings.isolated({});
 		const session = await startSession(settings);
-		expect(session.getActiveToolNames()).toContain("grep");
+		expect(session.getActiveToolNames()).toContain("search");
 		expect(session.systemPrompt.join("\n")).toContain(GREP_POLICY);
+		const searchBefore = session.getToolByName("search");
+		expect(searchBefore).toBeDefined();
+		expect(JSON.stringify(toolWireSchema(searchBefore as never))).toContain('"pattern"');
 
 		cfgGrepEnabled.set(settings, false);
 		await settle(session);
 		expect(session.getActiveToolNames()).not.toContain("grep");
 		expect(session.getToolByName("grep")).toBeUndefined();
-		expect(session.systemPrompt.join("\n")).not.toContain(GREP_POLICY);
+		// The merged tool stays (glob mode remains); only the regex mode leaves the schema.
+		const searchAfter = session.getToolByName("search");
+		expect(searchAfter).toBeDefined();
+		expect(JSON.stringify(toolWireSchema(searchAfter as never))).not.toContain('"pattern"');
 		expect(session.getActiveToolNames()).toContain("read");
 
 		cfgGrepEnabled.set(settings, true);
 		await settle(session);
-		expect(session.getActiveToolNames()).toContain("grep");
-		expect(session.systemPrompt.join("\n")).toContain(GREP_POLICY);
+		expect(JSON.stringify(toolWireSchema(session.getToolByName("search") as never))).toContain('"pattern"');
 	});
 
 	it("never widens an explicit tool list", async () => {
 		const settings = Settings.isolated({ "grep.enabled": false, "github.enabled": false });
 		const session = await startSession(settings, ["read", "bash"]);
 		const before = session.getActiveToolNames();
-		expect(before).not.toContain("grep");
+		expect(before).not.toContain("search");
 
 		cfgGrepEnabled.set(settings, true);
 		cfgGithubEnabled.set(settings, true);
 		await settle(session);
 		expect(session.getActiveToolNames()).toEqual(before);
-		expect(session.getToolByName("grep")).toBeUndefined();
+		expect(session.getToolByName("search")).toBeUndefined();
 
 		cfgBashEnabled.set(settings, false);
 		await settle(session);

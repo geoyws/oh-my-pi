@@ -1,0 +1,6 @@
+{{#if regex}}Search file contents (`mode: "regex"`){{#if glob}}, file names (`mode: "glob"`){{/if}}{{#if semantic}}, and behavior (`mode: "semantic"`){{/if}} from one tool.{{else}}{{#if glob}}Find files and directories by glob pattern (`mode: "glob"`){{#if semantic}} and behavior (`mode: "semantic"`){{/if}}.{{else}}Semantic search: describe behavior, get implementing files and line ranges.{{/if}}{{/if}}
+{{#if regex}}- regex: Rust regex, then PCRE2. `path`: `;`-separated file/dir/glob/URL; default `.`. Case-sensitive and gitignore-respected by default; `skip` paginates files. File-only selector: `src/foo.ts:50-100`. Literal `\n` enables cross-line. Bare glob `*.ts` matches any depth; `dir/*.ts` only direct children.
+{{/if}}{{#if glob}}- glob: glob files/dirs via `path` (`;`-separated paths or internal URLs); default workspace root. `gitignore`/`hidden` default true. Newest-first by directory; dirs end `/`.
+{{/if}}{{#if semantic}}- semantic: behavior/location unknown → semantic first; known strings/regex → regex, names → glob. `query` is plain language; `grep_keywords` likely verbatim terms (`[]` if unsure). Hits strongest first; below ~0.4 is weak — widen or switch modes before concluding absence.
+{{/if}}{{#if eagerDelegation}}- Multi-round search MUST use {{#if scoutAvailable}}Task + scout{{else}}Task{{/if}}, not chained calls.
+{{/if}}

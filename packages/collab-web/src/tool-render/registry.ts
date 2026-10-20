@@ -13,9 +13,7 @@ import { evalRenderer } from "./tools/eval";
 import { fetchRenderer } from "./tools/fetch";
 import { generateImageRenderer } from "./tools/generate-image";
 import { githubRenderer } from "./tools/github";
-import { globRenderer } from "./tools/glob";
-import { goalRenderer } from "./tools/goal";
-import { grepRenderer } from "./tools/grep";
+import { searchRenderer } from "./tools/search";
 import { waitRenderer } from "./tools/wait";
 import { lspRenderer } from "./tools/lsp";
 import { recallRenderer } from "./tools/memory-recall";
@@ -45,8 +43,6 @@ const RENDERERS: Record<string, ToolRenderer> = {
 	python: evalRenderer,
 	notebook: evalRenderer,
 	fetch: fetchRenderer,
-	glob: globRenderer,
-	find: globRenderer,
 	generate_image: generateImageRenderer,
 	github: githubRenderer,
 	goal: goalRenderer,
@@ -60,8 +56,7 @@ const RENDERERS: Record<string, ToolRenderer> = {
 	resolve: resolveRenderer,
 	reject: resolveRenderer,
 	propose: resolveRenderer,
-	grep: grepRenderer,
-	search: grepRenderer,
+	search: searchRenderer,
 	task: taskRenderer,
 	todo: todoRenderer,
 	web_search: webSearchRenderer,

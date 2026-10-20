@@ -612,9 +612,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			autoBackgroundSeconds: cfgBashAutoBackgroundThresholdMs.get(this.session.settings) / 1000,
 			hasAstGrep: isToolActive("ast", cfgAstGrepEnabled.get(this.session.settings)),
 			hasAstEdit: isToolActive("ast", cfgAstEditEnabled.get(this.session.settings)),
-			hasGrep: isToolActive("grep", cfgGrepEnabled.get(this.session.settings)),
-			hasGlob: isToolActive("glob", cfgGlobEnabled.get(this.session.settings)),
-			hasFind: this.session.isToolActive?.("find") ?? isFindEnabled(this.session),
+			hasGrep: isToolActive("search", cfgGrepEnabled.get(this.session.settings)),
+			hasGlob: isToolActive("search", cfgGlobEnabled.get(this.session.settings)),
+			hasFind: this.session.isToolActive?.("search") ?? isFindEnabled(this.session),
 			hasRead: isToolActive("read", true),
 			// Frozen at the last prompt rebuild (managed sessions). SDK consumers
 			// building a bare ToolSession lack the rebuild lifecycle, so fall back
