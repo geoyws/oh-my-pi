@@ -14,6 +14,7 @@ import {
 } from "../../src/launch/protocol";
 import { listServices, sendService, startService, waitForOwnedServiceCompletion } from "../../src/launch/services";
 import type { ToolSession } from "../../src/tools";
+import { unmanagedDaemonLease } from "../helpers/daemon-lease";
 
 interface EmbeddedBroker {
 	/** Settles once this in-process broker has shut down and flushed its metadata. */
@@ -76,7 +77,7 @@ describe("session-owned supervised services", () => {
 		const first = makeSession("first-session", firstCompletions);
 		const second = makeSession("second-session", secondCompletions);
 		try {
-			vi.spyOn(brokerClients, "daemonClientForProject").mockResolvedValue(client);
+			vi.spyOn(brokerClients, "daemonClientForProject").mockResolvedValue(unmanagedDaemonLease(client));
 			const started = await startService(first, {
 				name: "failing-service",
 				command: "echo service-ready; read answer; exit 3",
@@ -134,7 +135,7 @@ describe("session-owned supervised services", () => {
 			for (const callback of callbacks) callback();
 		};
 		try {
-			vi.spyOn(brokerClients, "daemonClientForProject").mockResolvedValue(client);
+			vi.spyOn(brokerClients, "daemonClientForProject").mockResolvedValue(unmanagedDaemonLease(client));
 			await startService(session, {
 				name: "old-service",
 				command: "echo service-ready; read answer; exit 3",
@@ -202,7 +203,7 @@ describe("session-owned supervised services", () => {
 			},
 		});
 		try {
-			vi.spyOn(brokerClients, "daemonClientForProject").mockImplementation(async () => client);
+			vi.spyOn(brokerClients, "daemonClientForProject").mockImplementation(async () => unmanagedDaemonLease(client));
 			await listServices(makeSession("original-session", [], callback => disposeOriginal.push(callback)));
 			const started = await client.request({
 				op: "start",

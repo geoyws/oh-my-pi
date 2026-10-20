@@ -16,6 +16,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { unmanagedDaemonLease } from "./helpers/daemon-lease";
 
 /**
  * An eval cell awaiting a subagent consumes the subagent's output after the
@@ -166,7 +167,7 @@ describe("AgentSession peek at consumed background completions", () => {
 			},
 			onCompletion: () => () => {},
 		} as unknown as DaemonBrokerClient;
-		vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(broker);
+		vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(unmanagedDaemonLease(broker));
 		const build = gatedJob("build", "bash");
 		const queued = Promise.withResolvers<void>();
 		const active = createSession(
