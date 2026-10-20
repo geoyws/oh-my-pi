@@ -488,6 +488,12 @@ export declare class Process {
   get pid(): number
   /** Parent process id for this process, when available. */
   get ppid(): number | null
+  /**
+   * Platform start-time token. Together with `pid` it identifies one process
+   * across pid reuse: a recycled pid reports a different value. The unit is
+   * platform-specific, so compare values for equality only.
+   */
+  get startTime(): number
   /** Launch arguments for this process. */
   args(): Array<string>
   /**
