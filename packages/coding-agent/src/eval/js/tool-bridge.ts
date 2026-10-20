@@ -308,9 +308,11 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 	}
 	try {
 		// A delegated-work tool pauses only the cell's runtime-work watchdog; the turn's
-		// signal still reaches it. Without a status sink the pause wrapper is a no-op.
-		const result = await withBridgeTimeoutPause(DELEGATED_WORK_TOOLS.has(name) ? options.emitStatus : undefined, () =>
-			tool.execute(toolCallId, validatedArgs, options.signal, undefined, options.session.getToolContext?.()),
+		// signal still reaches it. The pause rides the host-owned control channel, never
+		// the generic status sink (which drops colliding ops); without it this is a no-op.
+		const result = await withBridgeTimeoutPause(
+			DELEGATED_WORK_TOOLS.has(name) ? options.onTimeoutControl : undefined,
+			() => tool.execute(toolCallId, validatedArgs, options.signal, undefined, options.session.getToolContext?.()),
 		);
 		if (name === "todo") {
 			// A bridged call emits no `todo` toolResult entry, the only thing branch

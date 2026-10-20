@@ -289,7 +289,7 @@ describe("eval judge() bridge", () => {
 			});
 			const request = runEvalJudgment(
 				{ state: "x", questions: { tests: QUESTIONS.tests }, images: imageSources },
-				{ session: makeSession(), emitStatus: event => events.push(event) },
+				{ session: makeSession(), onTimeoutControl: event => events.push(event) },
 			);
 			expect(events).toEqual([{ op: "timeout-pause" }]);
 			expect(loaderStarted).toBe(false);

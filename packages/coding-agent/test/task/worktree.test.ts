@@ -1484,7 +1484,7 @@ describe("captureDeltaPatch with initialized submodules", () => {
 		expect(await fs.readFile(path.join(aix, "committed.txt"), "utf8")).toBe("aix commit\n");
 	});
 
-	it("refuses to capture, instead of returning nothing, when an intermediate submodule commits a pin move", async () => {
+	it("captures, instead of returning nothing, an intermediate submodule's committed pin move", async () => {
 		const repo = await makeTwoDepthSubmodules();
 		const aix = path.join(repo, "packages/aix-root");
 		const plugin = path.join(aix, "packages/plugin");
@@ -1492,14 +1492,18 @@ describe("captureDeltaPatch with initialized submodules", () => {
 		// The PX flow: commit the leaf, then record its new pin in the parent.
 		await fs.writeFile(path.join(plugin, "tracked.txt"), "plugin changed\n");
 		await runGit(plugin, ["commit", "-q", "-am", "leaf change"]);
+		const leafCommit = await runGit(plugin, ["rev-parse", "HEAD"]);
 		await fs.writeFile(path.join(aix, "tracked.txt"), "aix changed\n");
 		await runGit(aix, ["add", "tracked.txt", "packages/plugin"]);
 		await runGit(aix, ["commit", "-q", "-m", "bump plugin pin"]);
-		// The native renderer cannot draw the gitlink; an empty patch here would
-		// read as "no changes" and the workspace holding the commit would go.
-		await expect(captureDeltaPatch(repo, baseline)).rejects.toThrow(
-			/Cannot render the changes in .*packages\/aix-root/,
-		);
+		// An empty patch here would read as "no changes" and the workspace
+		// holding the commit would go. The native renderer draws the gitlink by
+		// commit ID (upstream ce993f6e99), so the pin move itself is captured.
+		const { nestedPatches } = await captureDeltaPatch(repo, baseline);
+		const byPath = new Map(nestedPatches.map(p => [p.relativePath, p.patch]));
+		expect(byPath.get("packages/aix-root")).toContain("+aix changed");
+		expect(byPath.get("packages/aix-root")).toContain(leafCommit);
+		expect(byPath.get("packages/aix-root/packages/plugin")).toContain("+plugin changed");
 	});
 });
 

@@ -33,9 +33,7 @@ async function diffTreeOrEmpty(repo: VcsGitRepo, base: string, head: string): Pr
 /**
  * Diff two trees while capturing a task's changes. Unlike
  * {@link diffTreeOrEmpty}, a render failure throws: an empty patch would read
- * as "no changes" and the workspace holding them would be torn down. The
- * native renderer refuses gitlink entries, so a committed submodule pin move
- * lands here.
+ * as "no changes" and the workspace holding them would be torn down.
  */
 async function diffTreeForCapture(repo: VcsGitRepo, repoDir: string, base: string, head: string): Promise<string> {
 	try {

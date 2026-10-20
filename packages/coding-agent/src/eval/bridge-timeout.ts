@@ -23,8 +23,8 @@
  * success path — which is what makes a pause lifecycle-coupled to a real
  * in-flight bridge call instead of to a message an evaluated cell can send.
  *
- * The status *data* channel (`__omp_emit_status__` in JS, an
- * `application/x-omp-status` display bundle in Python) is reachable by
+ * The status *data* channel (`__omp_emit_status__` in JS, `__omp_emit_status`
+ * in Python) is reachable by
  * evaluated code, so a runtime can forge a `timeout-pause` and disarm its own
  * deadline forever. Every runtime → host status boundary therefore drops these
  * ops with {@link rejectRuntimeTimeoutControl} and fails closed (deadline stays

@@ -520,8 +520,8 @@ export async function executeWithKernelBase<
 	};
 
 	/**
-	 * Kernel-originated display. Evaluated code can emit an
-	 * `application/x-omp-status` bundle, so a timeout pause/resume arriving here
+	 * Kernel-originated display. Evaluated code can call `__omp_emit_status`,
+	 * so a timeout pause/resume arriving here
 	 * is forged (or an echo) and is dropped: the deadline stays armed.
 	 */
 	const collectDisplay = (output: EvalDisplayOutput): void => {

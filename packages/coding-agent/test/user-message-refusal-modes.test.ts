@@ -38,6 +38,7 @@ async function createHarness(factory: ExtensionFactory) {
 		followUp: vi.fn(async (_text: string, _images?: ImageContent[]) => {}),
 		promptCustomMessage: vi.fn(async () => true),
 		abort: vi.fn(async () => {}),
+		prewarmModelConnection: vi.fn(),
 	};
 	const ctx = {
 		editor,
@@ -219,6 +220,7 @@ describe("print-mode refusal", () => {
 			prepareForHeadlessAdvisorDrain: () => {},
 			setTextOutputCommitted: () => {},
 			waitForAdvisorCatchup: async () => true,
+			waitForIdle: async () => {},
 			dispose: async () => {},
 		} as unknown as AgentSession;
 	}
