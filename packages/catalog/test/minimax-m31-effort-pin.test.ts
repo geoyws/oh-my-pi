@@ -9,7 +9,12 @@ import {
 import type { Api, Model, Provider } from "@oh-my-pi/pi-catalog/types";
 
 const M31_IDS = ["MiniMax-M3.1-Flash", "MiniMax-M3.1-Flash-Preview"] as const;
-const MINIMAX_HOSTS = ["minimax", "minimax-cn", "minimax-code", "minimax-code-cn"] as const satisfies readonly Provider[];
+const MINIMAX_HOSTS = [
+	"minimax",
+	"minimax-cn",
+	"minimax-code",
+	"minimax-code-cn",
+] as const satisfies readonly Provider[];
 const ALL_TIERS = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max];
 
 function buildM31<TApi extends Api>(id: string, provider: Provider, api: TApi): Model<TApi> {
