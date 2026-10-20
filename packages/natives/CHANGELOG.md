@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `Process.startTime`, a platform start-time token that, with `pid`, identifies one process across pid reuse (compare for equality only)
+
 ### Fixed
 
 - Fixed `Process.terminate({ group: true })` resolving `true` without escalating to `SIGKILL` when the group leader exited on `SIGTERM` while a TERM-ignoring group member reparented outside its tree kept running and holding inherited pipes. Descendants are now captured before the polite signal, and group termination always completes the hard group wave before reporting success.
