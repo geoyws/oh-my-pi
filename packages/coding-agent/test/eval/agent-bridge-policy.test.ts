@@ -1472,9 +1472,7 @@ describe("runEvalAgent isolation", () => {
 		});
 
 		const session = isolatedSession({ "task.isolation.merge": "branch" });
-		await expect(
-			runEvalAgentAndWait({ prompt: "scout", isolated: true, apply: true }, { session }),
-		).rejects.toThrow(
+		await expect(runEvalAgentAndWait({ prompt: "scout", isolated: true, apply: true }, { session })).rejects.toThrow(
 			/isolated apply failed.*Branch merge failed.*Captured branch preserved as omp\/task\//s,
 		);
 	});
