@@ -477,8 +477,71 @@ export async function captureDeltaPatch(isolationDir: string, baseline: Worktree
 	return { rootPatch, nestedPatches };
 }
 
+/** A submodule pin move inside a nested repo patch, keyed by the gitlink path in that repo. */
+interface GitlinkChange {
+	path: string;
+	/** Pin the task started from; undefined when the patch adds the gitlink. */
+	from: string | undefined;
+	/** Pin the task ended on; undefined when the patch removes the gitlink. */
+	to: string | undefined;
+	renamed: boolean;
+	/** The `diff --git` section carrying the change, reused to write the real pin. */
+	section: string;
+}
+
+const GITLINK_MODE_LINE = /^(?:index [0-9a-f]+\.\.[0-9a-f]+ 160000|(?:new file|deleted file|old|new) mode 160000)$/m;
+
+/**
+ * Split `patch` into its file sections and its gitlink sections. Worktree
+ * application cannot write a checked-out gitlink, so pins are carried apart
+ * from file content.
+ */
+function splitGitlinkSections(patch: string): { files: string; gitlinks: GitlinkChange[] } {
+	let files = "";
+	const gitlinks: GitlinkChange[] = [];
+	for (const section of patch.split(/^(?=diff --git )/m)) {
+		const header = section.split("\n", 1)[0];
+		const metadataEnd = section.search(/^(?:--- |@@ )/m);
+		const metadata = metadataEnd < 0 ? section : section.slice(0, metadataEnd);
+		if (!header.startsWith("diff --git ") || !GITLINK_MODE_LINE.test(metadata)) {
+			files += section;
+			continue;
+		}
+		const paths = parseDiffGitLinePaths(header);
+		gitlinks.push({
+			path: paths[paths.length - 1] ?? "",
+			from: section.match(/^-Subproject commit ([0-9a-f]+)$/m)?.[1],
+			to: section.match(/^\+Subproject commit ([0-9a-f]+)$/m)?.[1],
+			renamed: paths.length !== 1,
+			section,
+		});
+	}
+	return { files, gitlinks };
+}
+
+interface NestedRepoApply {
+	relativePath: string;
+	nestedDir: string;
+	repository: VcsGitRepo;
+	combinedDiff: string;
+	filePatches: string[];
+	touchedFiles: string[];
+	gitlinks: GitlinkChange[];
+	stashed: boolean;
+}
+
 /**
  * Apply nested repo patches directly to their working directories after parent merge.
+ *
+ * Repos are committed children before parents. A patch that moves a
+ * submodule pin (an intermediate repo committing its child's new commit) is
+ * carried by recording the child's resulting HEAD — the commit holding the
+ * child's own nested patch — as the parent's gitlink in the same commit, so
+ * the child change is applied once and the parent pin reaches it. Pin moves
+ * that cannot be carried (gitlink additions, removals, renames, an
+ * uninitialized child, a parent pin that moved since the task started, or a
+ * move with no carried child change behind it) are refused before any repo
+ * is touched.
  *
  * Pre-existing dirty state in a nested repo is stashed before the patch is
  * applied and popped back (with `--index` so staged WIP stays staged) after
@@ -505,51 +568,122 @@ export async function applyNestedPatches(
 	const byRepo = new Map<string, NestedRepoPatch[]>();
 	for (const p of patches) {
 		if (!p.patch.trim()) continue;
-		const group = byRepo.get(p.relativePath) ?? [];
+		const key = path.normalize(p.relativePath);
+		const group = byRepo.get(key) ?? [];
 		group.push(p);
-		byRepo.set(p.relativePath, group);
+		byRepo.set(key, group);
 	}
+	// Children first: a parent's pin can only name its child's commit once
+	// that commit exists.
+	const ordered = [...byRepo].sort(([a], [b]) => b.split(path.sep).length - a.split(path.sep).length);
 
-	for (const [relativePath, repoPatches] of byRepo) {
+	const plans: NestedRepoApply[] = [];
+	for (const [relativePath, repoPatches] of ordered) {
 		const nestedDir = path.join(repoRoot, relativePath);
 		try {
 			await fs.access(path.join(nestedDir, ".git"));
 		} catch {
 			continue;
 		}
-		const repository = vcs.requireGit(nestedDir);
+		const filePatches: string[] = [];
+		const pins = new Map<string, GitlinkChange>();
+		for (const { patch } of repoPatches) {
+			const { files, gitlinks } = splitGitlinkSections(patch);
+			if (files.trim()) filePatches.push(files);
+			for (const change of gitlinks) {
+				const earlier = pins.get(change.path);
+				pins.set(change.path, earlier ? { ...change, from: earlier.from } : change);
+			}
+		}
+		for (const change of pins.values()) {
+			const childRel = path.join(relativePath, change.path);
+			if (change.renamed || !change.from || !change.to) {
+				const verb = change.renamed ? "renames" : change.from ? "removes" : "adds";
+				throw new Error(
+					`Nested patch for ${relativePath} ${verb} submodule ${change.path}; merge-back carries only pin moves of initialized submodules.`,
+				);
+			}
+			const childDir = path.join(repoRoot, childRel);
+			if (!(await hasGitEntry(childDir))) {
+				throw new Error(
+					`Nested patch for ${relativePath} moves the pin of submodule ${change.path}, which is not initialized in ${repoRoot}.`,
+				);
+			}
+			const pinEntry = await runGitLine(nestedDir, ["ls-tree", "HEAD", "--", change.path]);
+			const pinned = pinEntry?.match(/^160000 commit ([0-9a-f]+)\t/)?.[1];
+			if (pinned !== change.from) {
+				throw new Error(
+					`Nested patch for ${relativePath} moves submodule ${change.path} from ${change.from}, but HEAD pins it at ${pinned ?? "nothing"}.`,
+				);
+			}
+			const childHead = await vcs.requireGit(childDir).headSha();
+			if (!byRepo.has(childRel) && childHead !== change.to) {
+				throw new Error(
+					`Nested patch for ${relativePath} moves submodule ${change.path} to ${change.to}, but ${childRel} carries no change producing that commit (checked out at ${childHead ?? "nothing"}); refusing to drop the pin move.`,
+				);
+			}
+		}
+		plans.push({
+			relativePath,
+			nestedDir,
+			repository: vcs.requireGit(nestedDir),
+			combinedDiff: repoPatches.map(p => p.patch).join("\n"),
+			filePatches,
+			touchedFiles: [...new Set(filePatches.flatMap(patchTouchedFiles))],
+			gitlinks: [...pins.values()],
+			stashed: false,
+		});
+	}
 
-		const combinedDiff = repoPatches.map(p => p.patch).join("\n");
-		const touchedFiles = [...new Set(repoPatches.flatMap(p => patchTouchedFiles(p.patch)))];
-
+	try {
 		// Preserve any pre-existing dirty state (tracked + untracked) so we
-		// commit only the agent delta, not the user's in-flight work.
-		const stashed = (await repository.isDirty())
-			? await repository.stashPush(`omp-isolation-${Snowflake.next()}`)
-			: false;
-		try {
-			for (const { patch } of repoPatches) {
+		// commit only the agent delta, not the user's in-flight work. Stashing
+		// every repo before the first commit keeps a child's new commit out of
+		// its parent's stash.
+		for (const plan of plans) {
+			plan.stashed = (await plan.repository.isDirty())
+				? await plan.repository.stashPush(`omp-isolation-${Snowflake.next()}`)
+				: false;
+		}
+		for (const plan of plans) {
+			const { relativePath, nestedDir, repository, touchedFiles } = plan;
+			for (const patch of plan.filePatches) {
 				await repository.applyPatch(patch, {});
 			}
-			if (await repository.isDirty()) {
-				if (touchedFiles.length === 0) {
-					throw new Error(`Nested repo patch for ${relativePath} did not include stageable file paths.`);
-				}
-				const msg = (await commitMessage?.(combinedDiff)) ?? "changes from isolated task(s)";
-				await repository.stageFiles(touchedFiles);
-				await repository.commitCreate(msg, {});
-			}
-		} finally {
-			if (stashed) {
-				const restored = await repository.stashTryPop(true).catch(() => false);
-				if (!restored) {
-					logger.warn("Pre-existing nested-repo dirty state could not be auto-restored", {
-						nestedDir,
-					});
-					warnings.push(
-						`Pre-existing dirty state in nested repo \`${relativePath}\` could not be auto-restored after the agent commit; stash entry preserved.`,
+			if (touchedFiles.length > 0) await repository.stageFiles(touchedFiles);
+			for (const change of plan.gitlinks) {
+				const childHead = await vcs.requireGit(path.join(nestedDir, change.path)).headSha();
+				if (!childHead || childHead === change.from) {
+					throw new Error(
+						`Nested patch for ${relativePath} moves submodule ${change.path} to ${change.to}, but applying ${path.join(relativePath, change.path)} produced no commit to pin; refusing to drop the pin move.`,
 					);
 				}
+				// Same section, both sides pinned explicitly: grouped patches keep
+				// the first preimage, and the index check refuses a moved pin.
+				const pinPatch = change.section
+					.replace(/^-Subproject commit [0-9a-f]+$/m, `-Subproject commit ${change.from}`)
+					.replace(/^\+Subproject commit [0-9a-f]+$/m, `+Subproject commit ${childHead}`)
+					.replace(/^index [0-9a-f]+\.\.[0-9a-f]+ 160000$/m, `index ${change.from}..${childHead} 160000`);
+				await repository.applyPatch(pinPatch, { cached: true });
+			}
+			if (await repository.hasDiff({ cached: true })) {
+				const msg = (await commitMessage?.(plan.combinedDiff)) ?? "changes from isolated task(s)";
+				await repository.commitCreate(msg, {});
+			} else if (touchedFiles.length === 0 && (await repository.isDirty())) {
+				throw new Error(`Nested repo patch for ${relativePath} did not include stageable file paths.`);
+			}
+		}
+	} finally {
+		for (const { stashed, repository, nestedDir, relativePath } of plans.toReversed()) {
+			if (!stashed) continue;
+			const restored = await repository.stashTryPop(true).catch(() => false);
+			if (!restored) {
+				logger.warn("Pre-existing nested-repo dirty state could not be auto-restored", {
+					nestedDir,
+				});
+				warnings.push(
+					`Pre-existing dirty state in nested repo \`${relativePath}\` could not be auto-restored after the agent commit; stash entry preserved.`,
+				);
 			}
 		}
 	}

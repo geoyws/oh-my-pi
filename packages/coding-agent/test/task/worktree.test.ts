@@ -16,6 +16,7 @@ import {
 	IsolationBaselineTooLargeError,
 	mergeTaskBranches,
 	parseIsolationBackend,
+	type WorktreeBaseline,
 } from "@oh-my-pi/pi-coding-agent/task/worktree";
 import * as natives from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
@@ -1504,6 +1505,77 @@ describe("captureDeltaPatch with initialized submodules", () => {
 		expect(byPath.get("packages/aix-root")).toContain("+aix changed");
 		expect(byPath.get("packages/aix-root")).toContain(leafCommit);
 		expect(byPath.get("packages/aix-root/packages/plugin")).toContain("+plugin changed");
+	});
+
+	/** Copy `source` as a self-contained isolation and return its baseline rebound to `source`. */
+	async function isolate(source: string): Promise<{ isolation: string; baseline: WorktreeBaseline }> {
+		const isolation = await fs.mkdtemp(path.join(os.tmpdir(), "omp-pin-iso-"));
+		tempDirs.push(isolation);
+		// Submodule gitfiles and `core.worktree` are relative, so the copy owns its admin dirs.
+		await fs.cp(source, isolation, { recursive: true });
+		return { isolation, baseline: await captureIsolationBaseline(isolation, source) };
+	}
+
+	it("carries an intermediate submodule's pin move through merge-back to the leaf commit", async () => {
+		const source = await makeTwoDepthSubmodules();
+		const aix = path.join(source, "packages/aix-root");
+		const plugin = path.join(aix, "packages/plugin");
+		const [aixBase, pluginBase] = await Promise.all([
+			runGit(aix, ["rev-parse", "HEAD"]),
+			runGit(plugin, ["rev-parse", "HEAD"]),
+		]);
+		const { isolation, baseline } = await isolate(source);
+		const isoAix = path.join(isolation, "packages/aix-root");
+		const isoPlugin = path.join(isoAix, "packages/plugin");
+		await fs.writeFile(path.join(isoPlugin, "tracked.txt"), "plugin changed\n");
+		await runGit(isoPlugin, ["commit", "-q", "-am", "leaf change"]);
+		await fs.writeFile(path.join(isoAix, "tracked.txt"), "aix changed\n");
+		await runGit(isoAix, ["add", "tracked.txt", "packages/plugin"]);
+		await runGit(isoAix, ["commit", "-q", "-m", "bump plugin pin"]);
+		const { nestedPatches } = await captureDeltaPatch(isolation, baseline);
+
+		expect(await applyNestedPatches(source, nestedPatches)).toEqual([]);
+
+		const leaf = await runGit(plugin, ["rev-parse", "HEAD"]);
+		expect(leaf).not.toBe(pluginBase);
+		expect(await runGit(plugin, ["cat-file", "-t", leaf])).toBe("commit");
+		expect(await runGit(plugin, ["show", `${leaf}:tracked.txt`])).toBe("plugin changed");
+		// A fresh read of the parent's recorded pin reaches the leaf change.
+		expect(await runGit(aix, ["rev-parse", "HEAD:packages/plugin"])).toBe(leaf);
+		expect(await runGit(aix, ["ls-tree", "HEAD", "packages/plugin"])).toContain(leaf);
+		expect(await runGit(aix, ["show", "HEAD:tracked.txt"])).toBe("aix changed");
+		// Each change lands once, and the checkouts match their pins.
+		expect(await runGit(aix, ["rev-list", "--count", `${aixBase}..HEAD`])).toBe("1");
+		expect(await runGit(plugin, ["rev-list", "--count", `${pluginBase}..HEAD`])).toBe("1");
+		expect(await runGit(aix, ["status", "--porcelain=v1"])).toBe("");
+		expect(await runGit(plugin, ["status", "--porcelain=v1"])).toBe("");
+	});
+
+	it("refuses merge-back, touching nothing, when a pin move has no carried child change", async () => {
+		const source = await makeTwoDepthSubmodules();
+		const aix = path.join(source, "packages/aix-root");
+		const plugin = path.join(aix, "packages/plugin");
+		const [aixBase, pluginBase] = await Promise.all([
+			runGit(aix, ["rev-parse", "HEAD"]),
+			runGit(plugin, ["rev-parse", "HEAD"]),
+		]);
+		const { isolation, baseline } = await isolate(source);
+		const isoAix = path.join(isolation, "packages/aix-root");
+		const isoPlugin = path.join(isoAix, "packages/plugin");
+		// An empty leaf commit leaves no tree delta to carry as a nested patch.
+		await runGit(isoPlugin, ["commit", "-q", "--allow-empty", "-m", "empty leaf"]);
+		await fs.writeFile(path.join(isoAix, "tracked.txt"), "aix changed\n");
+		await runGit(isoAix, ["add", "tracked.txt", "packages/plugin"]);
+		await runGit(isoAix, ["commit", "-q", "-m", "bump plugin pin"]);
+		const { nestedPatches } = await captureDeltaPatch(isolation, baseline);
+		expect(nestedPatches.map(p => p.relativePath)).toEqual(["packages/aix-root"]);
+
+		await expect(applyNestedPatches(source, nestedPatches)).rejects.toThrow(
+			/moves submodule packages\/plugin to [0-9a-f]+, but .* carries no change producing that commit/,
+		);
+		expect(await runGit(aix, ["rev-parse", "HEAD"])).toBe(aixBase);
+		expect(await runGit(plugin, ["rev-parse", "HEAD"])).toBe(pluginBase);
+		expect(await runGit(aix, ["status", "--porcelain=v1"])).toBe("");
 	});
 });
 
