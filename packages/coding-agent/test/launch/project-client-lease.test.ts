@@ -8,7 +8,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { findOpenIdaDatabase, releaseIdaDatabases } from "@oh-my-pi/pi-coding-agent/ida/client";
-import { idaHostEndpoint } from "@oh-my-pi/pi-coding-agent/ida/protocol";
+import { IDA_HOST_READY_PATTERN, idaHostEndpoint } from "@oh-my-pi/pi-coding-agent/ida/protocol";
 import {
 	closeDaemonClients,
 	daemonClientForProject,
@@ -72,10 +72,10 @@ async function exitsWithin(pid: number, deadlineMs: number): Promise<boolean> {
 	return true;
 }
 
-/** Pid of the project's live broker, tracked for cleanup. */
-async function brokerPid(): Promise<number> {
-	const pid = await readLiveDaemonBrokerPid(daemonRuntimeDir(await canonicalProjectDir(projectDir)));
-	if (pid === undefined) throw new Error("no live broker for the test project");
+/** Pid of `dir`'s live project broker (the test project by default), tracked for cleanup. */
+async function brokerPid(dir = projectDir): Promise<number> {
+	const pid = await readLiveDaemonBrokerPid(daemonRuntimeDir(await canonicalProjectDir(dir)));
+	if (pid === undefined) throw new Error(`no live broker for ${dir}`);
 	if (!brokerPids.includes(pid)) brokerPids.push(pid);
 	return pid;
 }
@@ -221,4 +221,70 @@ describe("IDA database broker leases", () => {
 		expect(sharedProjectClientCount()).toBe(0);
 		expect(await exitsWithin(pid, BROKER_EXIT_DEADLINE_MS)).toBe(true);
 	}, 60_000);
+
+	// Real brokers and a real broker-supervised host process (the fake-ida-host fixture), so the
+	// hosting broker's idle shutdown really SIGTERMs the host.
+	it("keeps a database hosted in another project's broker up for every session holding it, whatever its cwd", async () => {
+		const name = "omp.ida.cross-project";
+		// The opener works in its own project (an isolated subagent's worktree); the other session
+		// (its parent) works in a different one, with a different broker.
+		const hostingDir = projectDir;
+		const otherDir = path.join(root, "home", "other");
+		await fs.mkdir(otherDir);
+		const hosting = await canonicalProjectDir(hostingDir);
+		const starter = await daemonClientForProject(hostingDir);
+		const started = await starter.request({
+			op: "start",
+			spec: {
+				name,
+				application: process.execPath,
+				args: [path.join(import.meta.dir, "..", "fixtures", "fake-ida-host.ts")],
+				env: { OMP_TEST_IDA_ENDPOINT: idaHostEndpoint(daemonRuntimeDir(hosting), name) },
+				cwd: path.resolve(import.meta.dir, "..", ".."),
+				pty: false,
+				ready: { log: IDA_HOST_READY_PATTERN, timeoutMs: 20_000 },
+				restart: "no",
+				persist: false,
+				detached: false,
+			},
+		});
+		if (started.op !== "start" || started.daemon.pid === undefined || started.readyTimedOut) {
+			throw new Error(`fake IDA host did not start: ${JSON.stringify(started)}`);
+		}
+		const hostPid = started.daemon.pid;
+		cleanups.push(async () => {
+			await releaseIdaDatabases();
+			try {
+				process.kill(hostPid, "SIGKILL");
+			} catch {}
+		});
+		const hostingBroker = await brokerPid(hostingDir);
+
+		// The other session's own project broker, held for the whole test as its process's
+		// presence would hold it; it never supervises the host.
+		const otherProject = await daemonClientForProject(otherDir);
+		await otherProject.request({ op: "ping" });
+		cleanups.push(() => otherProject.release());
+		const otherBroker = await brokerPid(otherDir);
+		expect(otherBroker).not.toBe(hostingBroker);
+
+		const opener = disposableSession(hostingDir);
+		const other = disposableSession(otherDir);
+		const db = await findOpenIdaDatabase(opener.session, name);
+		expect(db?.status.state).toBe("open");
+		expect(await findOpenIdaDatabase(other.session, name)).toBe(db);
+		starter.release();
+
+		opener.dispose();
+		await Bun.sleep(PAST_IDLE_GRACE_MS);
+		// The other session's hold is on the hosting broker, so the host outlives the opener.
+		expect(processAlive(hostingBroker)).toBe(true);
+		expect(processAlive(hostPid)).toBe(true);
+		expect(db?.connected).toBe(true);
+		expect((await db!.refresh()).state).toBe("open");
+
+		other.dispose();
+		expect(await exitsWithin(hostingBroker, BROKER_EXIT_DEADLINE_MS)).toBe(true);
+		expect(await exitsWithin(hostPid, BROKER_EXIT_DEADLINE_MS)).toBe(true);
+	}, 90_000);
 });
