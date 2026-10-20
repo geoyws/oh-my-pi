@@ -731,10 +731,18 @@ export class SessionTools {
 		});
 	}
 
-	/** Whether a model transition crosses a Code Mode presentation boundary. */
+	/**
+	 * Whether a model transition crosses a Code Mode presentation boundary. An
+	 * undefined previous model is session startup, where the agent still holds
+	 * the unrestricted construction slate: that is the inactive surface, even
+	 * when provider-agnostic `tools.codeMode` would resolve active for it.
+	 */
 	codeModeChangesBetween(previousModel: Model | undefined, nextModel: Model): boolean {
 		const enabledToolNames = this.getEnabledToolNames();
-		const previous = this.#resolveCodeMode(previousModel, enabledToolNames);
+		const previous: CodeModeResolution =
+			previousModel === undefined
+				? { active: false, directToolNames: new Set(enabledToolNames) }
+				: this.#resolveCodeMode(previousModel, enabledToolNames);
 		const next = this.#resolveCodeMode(nextModel, enabledToolNames);
 		if (previous.active !== next.active) return true;
 		if (!next.active) return false;

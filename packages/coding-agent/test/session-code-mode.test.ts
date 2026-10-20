@@ -311,13 +311,16 @@ describe("Code Mode session reconciliation", () => {
 		setActiveToolNames?: (names: Iterable<string>) => void,
 		extraTools: AgentTool[] = [],
 		evalOverride?: AgentTool,
+		startOnDirectModel = false,
 	): { session: AgentSession; directModel: Model; codeModel: Model } {
 		const codeModel = model("openai-codex", "code_mode_only");
 		const directModel = model("openai");
 		const evalTool = evalOverride ?? { ...tool("eval"), supportsCodeModeTransport: () => settings.get("eval.js") };
 		const tools = [evalTool, tool("read"), ...extraTools];
 		const session = new AgentSession({
-			agent: new Agent({ initialState: { model: codeModel, systemPrompt: [], tools } }),
+			agent: new Agent({
+				initialState: { model: startOnDirectModel ? directModel : codeModel, systemPrompt: [], tools },
+			}),
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry: {
@@ -394,6 +397,21 @@ describe("Code Mode session reconciliation", () => {
 
 		expect(session.getEnabledToolNames()).toEqual(["eval", "read"]);
 		expect(session.getActiveToolNames()).toEqual(["eval"]);
+	});
+
+	test("tools.codeMode on demotes the long tail at startup on a non-codex provider", async () => {
+		const { session } = createSession(
+			Settings.isolated({ "tools.codeMode": "on", "tools.codeModeDirectTools": [] }),
+			undefined,
+			undefined,
+			[],
+			undefined,
+			true,
+		);
+		await session.initializeCodeMode();
+
+		expect(session.getEnabledToolNames()).toEqual(["eval", "read"]);
+		expect(session.agent.state.tools.map(value => value.name)).toEqual(["eval"]);
 	});
 
 	test("an eval replacement that cannot state transport support keeps the direct surface", async () => {
