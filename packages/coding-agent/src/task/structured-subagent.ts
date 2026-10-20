@@ -126,8 +126,9 @@ export interface StructuredSubagentRequest {
 	acquiredAt?: number;
 	isolation?: StructuredSubagentIsolationControls;
 	/**
-	 * Absolute checkout path the child works in. Isolated runs copy and merge
-	 * back that repo (never the caller cwd); non-isolated runs start there.
+	 * Absolute checkout path the child works in. Isolated runs copy that repo
+	 * (never the caller cwd) and, only when accepted, merge back into it;
+	 * non-isolated runs start there.
 	 * Validated fail-closed before any isolation is allocated.
 	 */
 	cwd?: string;
@@ -429,9 +430,7 @@ export async function resolveEffectiveSubagentPolicy(
 		planMode,
 		isIsolated,
 		mergeMode: request.isolation?.merge ?? cfgTaskIsolationMerge.get(request.session.settings),
-		applyChanges:
-			request.isolation?.apply ??
-			(request.invocationKind === "task" ? cfgTaskIsolationApply.get(request.session.settings) : true),
+		applyChanges: request.isolation?.apply ?? cfgTaskIsolationApply.get(request.session.settings),
 		enableLsp:
 			!planMode &&
 			(request.enableLsp ?? ((request.session.enableLsp ?? true) && cfgTaskEnableLsp.get(request.session.settings))),
@@ -691,8 +690,9 @@ async function isolationRecoveryHint(result: SingleResult, artifactsDir: string)
 }
 
 /**
- * Summary for an isolated run whose changes are captured but deliberately not
- * applied (`task.isolation.apply=false`). Every captured artifact is named:
+ * Summary for an isolated run whose changes are captured but not accepted
+ * (neither a per-call `apply: true` nor `task.isolation.apply=true`), so they
+ * are retained rather than applied. Every captured artifact is named:
  * the root patch only when it holds changes, and each nested-repo patch file,
  * so the parent knows exactly where the work lives.
  */

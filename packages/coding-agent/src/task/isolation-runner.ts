@@ -13,8 +13,8 @@
  *                                        baseline, run, capture changes, and
  *                                        transfer cleanup ownership.
  *   3. {@link mergeIsolatedChanges}     — apply captured changes back to the
- *                                        parent repo (skip when the caller
- *                                        opted out).
+ *                                        parent repo (only when explicitly
+ *                                        accepted).
  *
  * Step 1 happens once per top-level call; steps 2 and 3 are per-spawn.
  */
@@ -845,9 +845,9 @@ export interface IsolationMergeOutcome {
  * Apply changes captured by {@link runIsolatedSubprocess} back to the parent
  * repo: patch apply (patch mode) or cherry-pick + cleanup (branch mode).
  *
- * The caller decides whether to run this at all — eval `agent()` with
- * `apply=False` skips this step and surfaces the patch artifact / branch name
- * instead.
+ * Runs only on explicit acceptance (`task.isolation.apply=true` or a per-call
+ * `apply: true`); otherwise the caller skips this step and surfaces the patch
+ * artifact / branch name instead.
  */
 export async function mergeIsolatedChanges(opts: IsolationMergeOptions): Promise<IsolationMergeOutcome> {
 	const { result, repoRoot, mergeMode } = opts;
