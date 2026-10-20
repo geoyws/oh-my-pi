@@ -930,7 +930,10 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			request.detached === true ||
 			retainSalvagedArtifact ||
 			(request.retainArtifacts && (completedSuccessfully || hasValidStructuredOutput)) ||
-			(policy.isIsolated && (!policy.applyChanges || changesApplied === false || requiresRecoveryArtifacts));
+			// Unaccepted isolated work lives only in these artifacts, but a run whose
+			// isolation never started produced none to keep.
+			(policy.isIsolated &&
+				((!policy.applyChanges && settled !== undefined) || changesApplied === false || requiresRecoveryArtifacts));
 		const shouldCleanup = lease.temporary && !shouldRetainArtifacts;
 		const cleanupArtifacts = async (): Promise<void> => {
 			await fs.rm(lease.artifactsDir, { recursive: true, force: true });
