@@ -307,13 +307,30 @@ describe("Anthropic forced tool_choice", () => {
 		expect(payload.tool_choice?.type).toBe("auto");
 	});
 
-	it("preserves a forced tool_choice below the Opus 5.5 floor (Opus 5, Opus 4.8)", async () => {
+	it("preserves a forced tool_choice below the Opus 5.5 floor (Opus 5, Opus 4.8), pinning low effort", async () => {
 		for (const id of ["claude-opus-5", "claude-opus-4-8"]) {
 			const payload = await capturePayload(adaptiveModel(id), {
 				toolChoice: { type: "tool", name: "get_weather" },
 			});
 			expect(payload.tool_choice?.type).toBe("tool");
+			expect(payload.thinking).toBeUndefined();
+			expect(payload.output_config?.effort).toBe("low");
 		}
+	});
+
+	// The forced-tool disable pins the lowest tier through the effort map, so
+	// the classes/minimax.kdl medium pin holds instead of a literal `low`.
+	it.each([
+		["any", "any"],
+		["a named tool", { type: "tool", name: "get_weather" }],
+	] as const)("keeps MiniMax-M3.1-Flash at medium effort on a forced %s tool_choice", async (_label, toolChoice) => {
+		const payload = await capturePayload(makeMiniMaxAnthropicModel("MiniMax-M3.1-Flash", "minimax-code"), {
+			reasoning: Effort.High,
+			thinkingEnabled: true,
+			toolChoice,
+		});
+		expect(payload.tool_choice?.type).toBe(toolChoice === "any" ? "any" : "tool");
+		expect(payload.output_config?.effort).toBe("medium");
 	});
 });
 
@@ -324,6 +341,14 @@ describe("Anthropic adaptive-only thinking disable", () => {
 		});
 		expect(payload.thinking).toBeUndefined();
 		expect(payload.output_config?.effort).toBe("low");
+	});
+
+	it("pins the policy effort, not a literal low, when direct callers turn MiniMax-M3.1-Flash thinking off", async () => {
+		const payload = await capturePayload(makeMiniMaxAnthropicModel("MiniMax-M3.1-Flash", "minimax-code"), {
+			thinkingEnabled: false,
+		});
+		expect(payload.thinking).toBeUndefined();
+		expect(payload.output_config?.effort).toBe("medium");
 	});
 
 	it("turns thinking off with between_tools on Sonnet 5.5, without an effort pin or block_binding", async () => {
