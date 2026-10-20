@@ -4377,6 +4377,19 @@ export class AgentSession implements SettingsScope {
 			this.#advisors.onPrimaryTurnStart();
 			this.#goalRuntime.onTurnStart(`turn-${++this.#goalTurnCounter}`, this.#goalUsage());
 		}
+		// Any user-authored instruction (typed prompt, flushed steer/follow-up, abort-and-prompt,
+		// the `.`/`c` continue shortcut) re-arms goal continuation held by an interrupt or resume.
+		// Agent events are consumed asynchronously, so an aborted run's own prompt can surface
+		// here after abort() began; only runs started since the latest abort (whose generation
+		// bump precedes them) count as new instructions.
+		if (
+			event.type === "message_start" &&
+			this.#activeAgentPromptGeneration === eventPromptGeneration &&
+			((event.message.role === "user" && !event.message.synthetic) ||
+				(event.message.role === "developer" && event.message.userInitiated === true))
+		) {
+			this.#goalRuntime.rearmContinuation();
+		}
 
 		if (event.type === "tool_execution_start") {
 			this.#recordToolExecutionStart(event);
@@ -10661,6 +10674,10 @@ export class AgentSession implements SettingsScope {
 		const userInterrupt = options?.reason === USER_INTERRUPT_LABEL;
 		this.#pendingAbortErrorId = userInterrupt ? AIError.create(AIError.Flag.UserInterrupt) : undefined;
 		if (userInterrupt) this.#advisors.autoResumeSuppressed = true;
+		const goalReason = options?.goalReason ?? "interrupted";
+		// Hold goal continuation before any await, so a user message that starts while this abort
+		// is still unwinding re-arms it instead of being overridden when the abort finishes.
+		const goalTurnGeneration = this.#goalRuntime.beginTaskAbort({ reason: goalReason });
 		// Pull advisor concerns out of the steer/follow-up queues before any await so
 		// the post-abort stranded-message drain can't auto-resume the run on them.
 		// They are re-recorded as visible advice once the agent settles (below).
@@ -10719,7 +10736,7 @@ export class AgentSession implements SettingsScope {
 			// finishes, or the replacement turn's events are neither forwarded nor persisted.
 			await manualCompactionCleanup;
 			await this.#drainAutolearnCapture();
-			await this.#goalRuntime.onTaskAborted({ reason: options?.goalReason ?? "interrupted" });
+			await this.#goalRuntime.onTaskAborted({ reason: goalReason, turnGeneration: goalTurnGeneration });
 			// Clear prompt-in-flight state: waitForIdle resolves when the agent loop's finally
 			// block runs, but nested prompt setup/finalizers may still be unwinding. Without this,
 			// a subsequent prompt() can incorrectly observe the session as busy after an abort.

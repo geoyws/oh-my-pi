@@ -13,7 +13,7 @@ import type { SubmittedUserInput } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { UserMessageRefusedError } from "@oh-my-pi/pi-coding-agent/session/user-message-refused-error";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { normalizeCustomMessagePayload } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { normalizeCustomMessagePayload, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { executeBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
 import { createTools, type Tool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -656,6 +656,56 @@ describe("InteractiveMode goal mode integration", () => {
 		vi.advanceTimersByTime(800);
 		await waitForMicrotasks();
 		expect(waiter.getResolvedInput()?.customType).toBe("goal-continuation");
+		await waiter.inputPromise;
+	});
+
+	it("bare Esc keeps the goal active, holds continuation, and /goal resume re-arms it", async () => {
+		await harness.mode.handleGoalModeCommand("Ship the release");
+		await harness.session.abort({ reason: USER_INTERRUPT_LABEL });
+
+		expect(harness.session.getGoalModeState()?.goal.status).toBe("active");
+		expect(harness.mode.goalModeEnabled).toBe(true);
+		expect(harness.mode.goalModePaused).toBe(false);
+
+		vi.useFakeTimers();
+		const waiter = await armInputWaiter(harness.mode);
+		vi.advanceTimersByTime(800);
+		await waitForMicrotasks();
+		expect(waiter.getResolvedInput()).toBeUndefined();
+
+		await harness.mode.handleGoalModeCommand("resume");
+		vi.advanceTimersByTime(800);
+		await waitForMicrotasks();
+		vi.useRealTimers();
+		await waiter.inputPromise;
+
+		expect(waiter.getResolvedInput()?.customType).toBe("goal-continuation");
+		expect(harness.session.getGoalModeState()?.goal.status).toBe("active");
+	});
+
+	it("idle bare Esc with a pending continuation tick cancels it and holds continuation until the next message", async () => {
+		vi.spyOn(vcs, "repo").mockReturnValue(null);
+		vi.spyOn(vcs, "git").mockReturnValue(null);
+		await harness.mode.init({ suppressWelcomeIntro: true });
+		await harness.mode.handleGoalModeCommand("Ship the release");
+
+		vi.useFakeTimers();
+		// Idle between turns: getUserInput arms the 800ms continuation tick.
+		const waiter = await armInputWaiter(harness.mode);
+		vi.advanceTimersByTime(400);
+		const onEscape = harness.mode.editor.onEscape;
+		if (!onEscape) throw new Error("expected the interrupt handler to be installed");
+		onEscape();
+		vi.advanceTimersByTime(2_000);
+		await waitForMicrotasks();
+
+		expect(waiter.getResolvedInput()).toBeUndefined();
+		expect(harness.session.getGoalModeState()?.goal.status).toBe("active");
+		expect(harness.mode.goalModeEnabled).toBe(true);
+		expect(harness.session.goalRuntime.buildContinuationPrompt()).toBeUndefined();
+
+		harness.mode.onInputCallback?.(harness.mode.startPendingSubmission({ text: "cleanup" }));
+		vi.useRealTimers();
 		await waiter.inputPromise;
 	});
 

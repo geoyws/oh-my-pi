@@ -177,7 +177,7 @@ describe("RPC goal command", () => {
 		).toBe(true);
 	}, 30_000);
 
-	test("host abort of a continuation turn pauses the goal and starts no further goal turn", async () => {
+	test("host abort of a continuation turn keeps the goal active and starts no further goal turn", async () => {
 		const rpc = await start({ continuation: true, script: "slow" });
 		let agentStarts = 0;
 		const started = Promise.withResolvers<void>();
@@ -199,7 +199,7 @@ describe("RPC goal command", () => {
 			unsubscribe();
 		}
 		expect(agentStarts).toBe(1);
-		expect(state.goal?.goal.status).toBe("paused");
+		expect(state.goal?.goal.status).toBe("active");
 		expect(state.isStreaming).toBe(false);
 		expect(state.isSettled).toBe(true);
 	}, 30_000);
@@ -440,6 +440,7 @@ describe("RpcGoalController continuation gate", () => {
 		resumed.resolve();
 		let threadResumes = 0;
 		const preservedActive: boolean[] = [];
+		let rearms = 0;
 		const transcript = { id: "t1" };
 		const session = {
 			settings: Settings.isolated({ "goal.continuationModes": ["rpc"] }),
@@ -486,6 +487,9 @@ describe("RpcGoalController continuation gate", () => {
 			getTodoPhases: () => [],
 			goalRuntime: {
 				buildContinuationPrompt: () => "continue",
+				rearmContinuation: () => {
+					rearms++;
+				},
 				clearAccounting: () => {},
 				onThreadResumed: async (options?: { preserveActiveGoal?: boolean }) => {
 					threadResumes++;
@@ -523,6 +527,8 @@ describe("RpcGoalController continuation gate", () => {
 			threadResumes: () => threadResumes,
 			/** `preserveActiveGoal` of each `onThreadResumed` call, in order. */
 			preservedActive: () => preservedActive,
+			/** Calls to `goalRuntime.rearmContinuation`. */
+			rearms: () => rearms,
 			journalGoal: () => {
 				journaledGoal = true;
 			},
@@ -625,6 +631,26 @@ describe("RpcGoalController continuation gate", () => {
 		controller.observe(agentEnd);
 		await nextMacrotask();
 		expect(admitted).toEqual(["goal-continuation", "goal-continuation", "goal-continuation"]);
+	});
+
+	test("goal resume on an active goal held by a host abort re-arms continuation without a status change", async () => {
+		const admitted: string[] = [];
+		const { controller, goalState, rearms } = fakeSession(async customType => {
+			admitted.push(customType);
+			return true;
+		});
+
+		controller.stopForHostAbort();
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(admitted).toEqual([]);
+		expect(goalState()?.goal.status).toBe("active");
+
+		const result = await controller.handle({ op: "resume" });
+		expect(result.goal?.status).toBe("active");
+		expect(rearms()).toBe(1);
+		await nextMacrotask();
+		expect(admitted).toEqual(["goal-continuation"]);
 	});
 
 	test("a rejected continuation does not claim the next run as its own", async () => {
