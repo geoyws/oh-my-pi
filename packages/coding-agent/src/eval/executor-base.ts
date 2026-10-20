@@ -81,6 +81,8 @@ export interface KernelExecutorBaseOptions {
 	bridgeSessionId?: string;
 	artifactId?: string;
 	artifactPath?: string;
+	/** Model-visible note that this cell runs in a kernel restarted after an idle reap; leads the output. */
+	kernelRestartNotice?: string;
 }
 
 /** Normalised execution result produced by {@link executeWithKernelBase}. */
@@ -563,6 +565,7 @@ export async function executeWithKernelBase<
 		if (remainingMs !== undefined && remainingMs <= 0) {
 			throw new cancelledErrorClass(true);
 		}
+		if (options?.kernelRestartNotice) sink.push(options.kernelRestartNotice);
 
 		const result = await kernel.execute(code, {
 			cwd: options?.cwd,

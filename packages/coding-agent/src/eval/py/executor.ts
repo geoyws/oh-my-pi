@@ -29,6 +29,7 @@ import {
 	normalizeKernelSessionCwd,
 	requireRemainingKernelTimeoutMs,
 } from "../kernel-session-registry";
+import { resolveKernelIdleTimeoutMs } from "../kernel-idle-reaper";
 import type { PythonShadowPlan, PythonShadowSnapshot } from "./kernel";
 import {
 	checkPythonKernelAvailability,
@@ -128,6 +129,13 @@ export interface PythonExecutorOptions {
 	bridgeSessionId?: string;
 	/** @internal Bridge endpoint info, set by `executePython` before delegating. */
 	bridge?: { url: string; token: string };
+	/**
+	 * Retained-kernel idle window in ms. Defaults to `eval.kernelIdleTimeoutSeconds`
+	 * from `toolSession` (or process settings); `undefined` after resolution disables reaping.
+	 */
+	kernelIdleTimeoutMs?: number;
+	/** @internal Restart note the session registry sets after an idle reap. */
+	kernelRestartNotice?: string;
 }
 
 export interface PythonKernelExecutor {
@@ -475,6 +483,7 @@ const sessionRegistry = createKernelSessionRegistry<PythonKernel, PythonExecutor
 	},
 	shutdownSession: session => shutdownInvalidatedSession(session),
 	validateKernel: (session, kernel) => session.kernel === kernel,
+	isSessionBusy: session => session.replacement !== undefined,
 });
 
 interface PythonToolRequestOutcome {
@@ -526,6 +535,7 @@ async function invokePythonToolRequest(
 		return { execution, envelope: execution.reply };
 	} finally {
 		unregister();
+		sessionRegistry.noteSessionActivity(cwd, bridgeOptions);
 	}
 }
 
@@ -644,6 +654,7 @@ export async function executePython(code: string, options?: PythonExecutorOption
 		if (kernelMode === "per-call") {
 			return await executePerCall(code, cwd, executionOptions);
 		}
+		executionOptions.kernelIdleTimeoutMs ??= resolveKernelIdleTimeoutMs(executionOptions.toolSession?.settings);
 		return await sessionRegistry.executeOnSession(code, cwd, executionOptions);
 	} catch (err) {
 		if (isCancellationError(err, PythonExecutionCancelledError) || executionOptions.signal?.aborted) {

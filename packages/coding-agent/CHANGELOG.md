@@ -8,6 +8,7 @@
 - `providers.operationTimeoutSeconds` now bounds time without progress (output extends it) rather than total duration. The session saga's exhausted-budget replay bound is saga-wide: a model switch no longer refunds it, and a spent bound no longer consults the fallback chain, so the "at most twice" bound holds for any chain length. Side-request oneshots replay a budget exhaustion at most once, and negative values are treated as `0` (off).
 - Added global configuration persistence opt-outs via `config.readOnly` and `PI_CONFIG_READONLY=1`, project role routing with explicit missing-project refusal, and nonzero CLI refusal for protected writes.
 - Under the global read-only policy, `/settings` rows stay visible but disabled with the policy reason on focus and hover, keyboard display toggles and setup refuse with the reason instead of crashing the session, and clearing a default role in `/model` no longer attempts a rejected global `defaultThinkingLevel: auto` write.
+- `eval.kernelIdleTimeoutSeconds` (default 600) shuts down a retained JS eval process (`__omp_worker_js_eval_process`) or Python kernel after that long with no cell running, so idle sessions stop holding a runtime's memory. A running cell, kernel-defined tool call, or kernel replacement is never cut. The next eval starts a fresh kernel and its output opens with a note that the earlier state was reset. `0` keeps kernels alive as before.
 
 ### Fixed
 
