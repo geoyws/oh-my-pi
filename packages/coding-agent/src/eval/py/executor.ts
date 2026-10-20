@@ -394,12 +394,6 @@ async function executeWithKernel(
 	code: string,
 	options: PythonExecutorOptions | undefined,
 ): Promise<PythonResult> {
-	const remainingMs = getRemainingTimeoutMs(options?.deadlineMs);
-	await kernel.syncPreludes?.(
-		pythonPreludeSources(options?.toolSession),
-		options?.signal,
-		Math.max(1, remainingMs ?? 10_000),
-	);
 	return executeWithKernelBase<PythonExecutorOptions>({
 		kernel,
 		code,
@@ -410,6 +404,13 @@ async function executeWithKernel(
 		buildKernelEnvPatch: buildManagedKernelEnvPatch,
 		formatKernelTimeoutAnnotation,
 		formatTimeoutAnnotation,
+		prepare: async remainingMs => {
+			await kernel.syncPreludes?.(
+				pythonPreludeSources(options?.toolSession),
+				options?.signal,
+				Math.max(1, remainingMs ?? 10_000),
+			);
+		},
 	});
 }
 

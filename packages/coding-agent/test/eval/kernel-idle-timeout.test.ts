@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { $which, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../src/config/settings";
 import { disposeAllVmContexts } from "../../src/eval/js/context-manager";
+import type { EvalPreludeDefinition } from "../../src/eval/preludes";
 import { resolvePythonKernelIdentity } from "../../src/eval/py";
 import { callPythonTool, disposeAllKernelSessions, executePython, type PythonResult } from "../../src/eval/py/executor";
 import { PythonKernel } from "../../src/eval/py/kernel";
@@ -181,50 +182,71 @@ describe("eval.kernelIdleTimeoutSeconds", () => {
 		);
 	}
 
-	it.skipIf(!PYTHON_INTEGRATION)(
-		"py: delivers the restart note when the cell after a reap is out of time before it runs",
-		async () => {
-			const options = {
-				cwd: tempDir.path(),
-				sessionId: `kernel-idle-deadline-${crypto.randomUUID()}`,
-				interpreter: Bun.env.PYTHON ?? $which("python3") ?? $which("python") ?? undefined,
-				kernelIdleTimeoutMs: 300,
-			};
-			const first = await executePython("import os\nprint(f'pid={os.getpid()}')", options);
-			expect(await waitForExit(pidFrom(first.output), 10_000)).toBe(true);
+	// A realistic session installs non-empty preludes (e.g. the default browser prelude) on every fresh
+	// kernel; their sync is an awaited step bounded by the cell's remaining budget. This one takes 500 ms,
+	// so it deterministically overruns a budget that has already run out.
+	const idleProbePrelude: EvalPreludeDefinition = {
+		name: "idle-probe",
+		documentation: "Test prelude.",
+		javascript: "",
+		python: "__import__('time').sleep(0.5)\nomp_idle_probe = 1",
+		exports: ["omp_idle_probe"],
+		invoke: async () => ({ content: [] }),
+	};
+	for (const [variant, toolSession] of [
+		["without a tool session", () => undefined],
+		[
+			"with a tool session that installs a prelude",
+			(): ToolSession => ({ ...makeSession(0), getEvalPreludes: () => [idleProbePrelude] }),
+		],
+	] as const) {
+		it.skipIf(!PYTHON_INTEGRATION)(
+			`py: delivers the restart note when the cell after a reap is out of time before it runs (${variant})`,
+			async () => {
+				const options = {
+					cwd: tempDir.path(),
+					sessionId: `kernel-idle-deadline-${crypto.randomUUID()}`,
+					interpreter: Bun.env.PYTHON ?? $which("python3") ?? $which("python") ?? undefined,
+					kernelIdleTimeoutMs: 300,
+					toolSession: toolSession(),
+				};
+				const first = await executePython("import os\nprint(f'pid={os.getpid()}')", options);
+				expect(await waitForExit(pidFrom(first.output), 10_000)).toBe(true);
 
-			// Deterministic hook: the fresh kernel is real, but becomes ready only after this cell's
-			// deadline, so execution hits the already-expired-deadline exit.
-			const originalStart = PythonKernel.start;
-			PythonKernel.start = async startOptions => {
-				const kernel = await originalStart.call(PythonKernel, {
-					...startOptions,
-					signal: undefined,
-					deadlineMs: undefined,
-				});
-				const deadlineMs = startOptions.deadlineMs ?? Date.now();
-				while (Date.now() <= deadlineMs) await Bun.sleep(10);
-				return kernel;
-			};
-			let expired: PythonResult;
-			try {
-				expired = await executePython("print('never runs')", { ...options, timeoutMs: 1_000 });
-			} finally {
-				PythonKernel.start = originalStart;
-			}
-			expect(expired.cancelled).toBe(true);
-			expect(expired.output).toContain(
-				"[kernel] The previous Python kernel was shut down after 1s with no cell running",
-			);
-			expect(expired.output).toContain("timed out");
-			expect(expired.output).not.toContain("never runs");
+				// Deterministic hook: the fresh kernel is real, but becomes ready only after this cell's
+				// deadline, so every remaining step (prelude sync, execution) is out of time.
+				const originalStart = PythonKernel.start;
+				PythonKernel.start = async startOptions => {
+					const kernel = await originalStart.call(PythonKernel, {
+						...startOptions,
+						signal: undefined,
+						deadlineMs: undefined,
+					});
+					const deadlineMs = startOptions.deadlineMs ?? Date.now();
+					while (Date.now() <= deadlineMs) await Bun.sleep(10);
+					return kernel;
+				};
+				let expired: PythonResult;
+				try {
+					expired = await executePython("print('never runs')", { ...options, timeoutMs: 1_000 });
+				} finally {
+					PythonKernel.start = originalStart;
+				}
+				expect(expired.cancelled).toBe(true);
+				expect(expired.output).toContain(
+					"[kernel] The previous Python kernel was shut down after 1s with no cell running",
+				);
+				expect(expired.output).toContain("timed out");
+				expect(expired.output).not.toContain("never runs");
 
-			const after = await executePython("print('fresh')", options);
-			expect(after.output).toContain("fresh");
-			expect(after.output).not.toContain("[kernel] The previous");
-		},
-		30_000,
-	);
+				// Delivered once: the next cell does not repeat it.
+				const after = await executePython("print('fresh')", options);
+				expect(after.output).toContain("fresh");
+				expect(after.output).not.toContain("[kernel] The previous");
+			},
+			30_000,
+		);
+	}
 
 	it.skipIf(!PYTHON_INTEGRATION)(
 		"py: never reaps a kernel while an eval-defined tool call waits on a slow bridge start",

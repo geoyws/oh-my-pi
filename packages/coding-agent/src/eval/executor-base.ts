@@ -437,6 +437,12 @@ export interface ExecuteWithKernelBaseParams<
 	buildKernelEnvPatch: (options: TOptions) => TEnv;
 	formatKernelTimeoutAnnotation: (executionTimeoutMs: number | undefined, kernelKilled: boolean) => string;
 	formatTimeoutAnnotation: (executionTimeoutMs: number | undefined) => string | undefined;
+	/**
+	 * Awaited kernel setup before the cell (e.g. prelude sync), given the remaining budget. It runs after
+	 * the restart notice reaches the output and after the deadline check, so its timeout or abort settles
+	 * as this cell's cancelled result.
+	 */
+	prepare?: (remainingMs: number | undefined) => Promise<void>;
 }
 
 export async function executeWithKernelBase<
@@ -453,6 +459,7 @@ export async function executeWithKernelBase<
 		buildKernelEnvPatch,
 		formatKernelTimeoutAnnotation,
 		formatTimeoutAnnotation,
+		prepare,
 	} = params;
 
 	const settings = await Settings.init();
@@ -567,6 +574,7 @@ export async function executeWithKernelBase<
 		if (remainingMs !== undefined && remainingMs <= 0) {
 			throw new cancelledErrorClass(true);
 		}
+		await prepare?.(getRemainingTimeoutMs(deadlineMs));
 
 		const result = await kernel.execute(code, {
 			cwd: options?.cwd,
