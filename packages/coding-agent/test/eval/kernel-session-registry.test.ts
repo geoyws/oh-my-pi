@@ -32,6 +32,10 @@ class FakeKernel {
 		return this.alive;
 	}
 
+	isBusy(): boolean {
+		return false;
+	}
+
 	async shutdown(): Promise<{ confirmed: boolean }> {
 		this.alive = false;
 		this.shutdowns += 1;
