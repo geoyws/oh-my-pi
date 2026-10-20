@@ -326,6 +326,26 @@ describe("native composer", () => {
 		expect(nodes(chip)[1]!.p).toEqual({ level: "auto" });
 	});
 
+	it("labels a resolved `auto` chip as requested auto while its glyph and meter keep the resolved level", () => {
+		const state = { running: false, thinking: "high", thinkingLabel: "auto (high)" };
+		const chip = byRole(composer(state).describe(cx), "omp.composer.effort")!;
+		expect(nodes(chip).find(n => n.k === "effort")?.p).toEqual({ level: "high" });
+		expect(nodes(chip).find(n => n.k === "text")?.p).toMatchObject({ text: "auto (high)" });
+		const legacy = context(["row", "text", "icon", "meter", "editor", "kbd"]);
+		const fallback = byRole(composer(state).describe(legacy), "omp.composer.effort")!;
+		expect(nodes(fallback).find(n => n.k === "meter")?.p).toMatchObject({ value: 0.75 });
+	});
+
+	it("rebuilds the effort chip when only the label changes at the same effective level", () => {
+		let state: ComposerNativeState = { running: false, thinking: "high", thinkingLabel: "auto (high)" };
+		const editor = new CustomEditor(getEditorTheme());
+		editor.composerState = () => state;
+		const label = () => nodes(byRole(editor.describe(cx), "omp.composer.effort")!).find(n => n.k === "text")?.p;
+		expect(label()).toMatchObject({ text: "auto (high)" });
+		state = { running: false, thinking: "high" };
+		expect(label()).toMatchObject({ text: "high" });
+	});
+
 	it("falls back to a four-step blocks meter where the terminal lacks the effort kind", () => {
 		const legacy = context(["row", "text", "icon", "meter", "editor", "kbd"]);
 		const chipFor = (thinking: string) =>

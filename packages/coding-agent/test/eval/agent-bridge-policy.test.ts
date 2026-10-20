@@ -28,6 +28,7 @@ import { AgentOutputManager } from "../../src/task/output-manager";
 import type { AgentDefinition } from "../../src/task/types";
 import type { AgentProgress, SingleResult, StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "../../src/tools";
+import { EvalTool } from "../../src/tools/eval";
 
 const taskAgent = {
 	name: "task",
@@ -986,6 +987,66 @@ describe("agent() through eval runtimes", () => {
 		expect(idle.signal.aborted).toBe(false);
 	});
 
+	// Real timers on purpose: this drives the real eval worker's wall-clock timeout, which runs in
+	// a separate worker and cannot be advanced with fake timers.
+	it("does not extend compute time for an unwaited agent's progress and keeps its handle usable", async () => {
+		using tempDir = TempDir.createSync("@omp-eval-agent-background-progress-");
+		const { session, sessionId } = makeEvalSession(
+			tempDir,
+			"agent-background-progress",
+			Settings.isolated({ "task.isolation.enabled": false, "eval.autoBackground.enabled": false }),
+		);
+		session.getEvalSessionId = () => sessionId;
+		mockAgents();
+		const release = Promise.withResolvers<void>();
+		let progressCount = 0;
+		vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => {
+			const interval = setInterval(() => {
+				progressCount++;
+				options.onProgress?.({
+					...singleResult(options),
+					status: "running",
+					recentTools: [],
+					recentOutput: [],
+					toolCount: progressCount,
+					cost: 0,
+				});
+			}, 50);
+			try {
+				await release.promise;
+				return singleResult(options, { output: "background survived" });
+			} finally {
+				clearInterval(interval);
+			}
+		});
+		const tool = new EvalTool(session);
+		try {
+			await tool.execute("seed", { language: "js", code: "print('ready');" });
+			const result = await tool.execute("unwaited-agent", {
+				language: "js",
+				code: 'const handle = await agent("background"); print(handle.id); while (true) {}',
+				timeout: 1,
+			});
+			const text = result.content
+				.filter(block => block.type === "text")
+				.map(block => block.text)
+				.join("\n");
+			expect(text).toContain("timed out after 1 seconds");
+			expect(progressCount).toBeGreaterThan(1);
+			const jobs = session.asyncJobManager!.getRunningJobs({ ownerId: "Main" });
+			expect(jobs).toHaveLength(1);
+			const job = jobs[0]!;
+			expect(text).toContain(job.id);
+			release.resolve();
+			await job.promise;
+			const recovered = await runEvalWait({ items: [{ kind: "agent", id: job.id }] }, { session });
+			expect(recovered.items[0]?.text).toBe("background survived");
+		} finally {
+			release.resolve();
+			await session.asyncJobManager!.dispose({ timeoutMs: 5000 });
+		}
+	});
+
 	it("interrupting a JavaScript agent() aborts it at once but waits out its critical phase", async () => {
 		// Regression: `onAbort` used to hard-kill the worker straight away, which
 		// rejected the run while the untracked `handleToolCall` promise carried on
@@ -1235,6 +1296,71 @@ describe("runEvalAgent isolation", () => {
 		expect(pauseIdx).toBeGreaterThanOrEqual(0);
 		expect(prepareIdx).toBeGreaterThan(pauseIdx);
 		expect(prepareIdx).toBeLessThan(resumeIdx);
+	});
+
+	// Real timers on purpose: slow phases must outlast the real eval worker's 1s wall-clock budget,
+	// which runs in a separate worker and cannot be advanced with fake timers.
+	it("waits through slow isolation baseline capture and patch application", async () => {
+		using tempDir = TempDir.createSync("@omp-eval-isolation-budget-");
+		const { session, sessionId } = makeEvalSession(
+			tempDir,
+			"isolation-budget",
+			Settings.isolated({
+				"task.isolation.enabled": true,
+				"task.isolation.merge": "patch",
+				"eval.autoBackground.enabled": false,
+			}),
+		);
+		session.getEvalSessionId = () => sessionId;
+		mockAgents();
+		const baseline = {
+			repoRoot: "/repo-root",
+			baseline: {
+				root: {
+					repoRoot: "/repo-root",
+					headCommit: "HEAD",
+					staged: "",
+					unstaged: "",
+					untracked: [],
+					untrackedPatch: "",
+				},
+				nested: [],
+			},
+		};
+		vi.spyOn(isolationRunner, "prepareIsolationContext").mockImplementation(async () => {
+			await Bun.sleep(1250);
+			return baseline;
+		});
+		vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockImplementation(async opts =>
+			singleResult(opts.baseOptions, { output: "isolated result", patchPath: "/artifacts/result.patch" }),
+		);
+		vi.spyOn(isolationRunner, "mergeIsolatedChanges").mockImplementation(async () => {
+			await Bun.sleep(1250);
+			return {
+				summary: "\n\nApplied patches: yes",
+				changesApplied: true,
+				hadAnyChanges: true,
+				mergedBranchForNestedPatches: false,
+			};
+		});
+		const tool = new EvalTool(session);
+		try {
+			await tool.execute("seed", { language: "js", code: "print('ready');" });
+			const result = await tool.execute("isolated-wait", {
+				language: "js",
+				code: 'print(await agent("migration", { isolated: true }).wait());',
+				timeout: 1,
+			});
+			const text = result.content
+				.filter(block => block.type === "text")
+				.map(block => block.text)
+				.join("\n");
+			expect(text).toContain("isolated result");
+			expect(text).toContain("Applied patches: yes");
+			expect(result.details?.cells?.[0]?.status).toBe("complete");
+		} finally {
+			await session.asyncJobManager!.dispose({ timeoutMs: 5000 });
+		}
 	});
 
 	it("keeps schema-backed isolated output parseable by moving merge text into details", async () => {

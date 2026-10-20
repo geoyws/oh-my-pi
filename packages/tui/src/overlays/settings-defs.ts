@@ -152,6 +152,11 @@ export interface SettingsHost {
 	 * variable, that configures the setting still applies; otherwise the default does.
 	 */
 	unset(path: string): void;
+	/**
+	 * User-facing reason every {@link set} and {@link unset} is refused right now, or `undefined`
+	 * while settings are writable. Rows stay visible but disabled with this text.
+	 */
+	readOnlyReason(): string | undefined;
 	normalizeProviderLimits(value: unknown): Record<string, number>;
 	validateProviderLimits(value: unknown): Record<string, number>;
 }

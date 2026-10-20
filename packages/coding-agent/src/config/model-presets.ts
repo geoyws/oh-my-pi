@@ -18,7 +18,7 @@ import { isRecord } from "@oh-my-pi/pi-utils";
 import type { AgentSession } from "../session/agent-session";
 import { cfgDefaultThinkingLevel } from "../session/settings";
 import { pickDefaultAvailableModel, resolveModelRoleValue } from "./model-resolver";
-import { cfgModelPresets, cfgModelRoleStorage, type ModelPreset } from "./model-settings";
+import { cfgModelPresets, type ModelPreset } from "./model-settings";
 import type { Settings, SettingProvenance } from "./settings";
 
 /** Preset names: a letter, then letters, digits, `-` or `_` (the model hub's role-name rule). */
@@ -259,7 +259,7 @@ function resolveLiveDefault(
 
 /** Write the preset's roles into the model hub's storage scope, clearing roles it leaves out. */
 function writePresetRoles(settings: Settings, preset: ModelPreset): void {
-	const project = cfgModelRoleStorage.get(settings) === "project";
+	const project = settings.getModelRoleStorage() === "project";
 	const roles = new Set([...Object.keys(settings.getModelRoles()), ...Object.keys(preset.modelRoles)]);
 	if (project) {
 		for (const role of roles) {
@@ -284,7 +284,9 @@ function writePresetRoles(settings: Settings, preset: ModelPreset): void {
 		}
 	}
 	if (preset.defaultThinkingLevel !== undefined) {
-		cfgDefaultThinkingLevel.set(settings, preset.defaultThinkingLevel);
+		// Under the global read-only policy the preset's thinking level applies for this process only.
+		if (settings.isGlobalConfigReadOnly()) cfgDefaultThinkingLevel.override(settings, preset.defaultThinkingLevel);
+		else cfgDefaultThinkingLevel.set(settings, preset.defaultThinkingLevel);
 	}
 }
 

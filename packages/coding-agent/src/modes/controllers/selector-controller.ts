@@ -142,7 +142,7 @@ import type { SessionObserverRegistry } from "@oh-my-pi/pi-tui/overlays/session-
 
 import { cfgAdvisorSyncBacklog } from "../../advisor/settings";
 import { cfgBranchSummaryEnabled } from "../../session/context-settings";
-import { cfgCycleOrder, cfgDisabledProviders, cfgModelRoleStorage } from "../../config/model-settings";
+import { cfgCycleOrder, cfgDisabledProviders } from "../../config/model-settings";
 import { cfgDefaultThinkingLevel, cfgRetryFallbackChains } from "../../session/settings";
 import {
 	cfgStatusLineCompactThinkingLevel,
@@ -965,13 +965,18 @@ export class SelectorController {
 			{
 				onAssign: async (model, role, thinkingLevel, selector, scope?: ModelRoleSelectionScope) => {
 					const releaseDefaultMutation = role === "default" ? await this.#acquireDefaultRoleMutation() : undefined;
-					const configuredStorage = cfgModelRoleStorage.get(this.ctx.settings);
-					const targetScope = configuredStorage === "project" ? (scope ?? "project") : "global";
+					const configuredStorage = this.ctx.settings.getModelRoleStorage();
+					const targetScope = this.ctx.settings.isGlobalConfigReadOnly()
+						? "project"
+						: configuredStorage === "project"
+							? (scope ?? "project")
+							: "global";
 					const selectorValue = selector ?? `${model.provider}/${model.id}`;
 					const scopeLabel =
 						configuredStorage === "project" ? `${targetScope === "project" ? "Project" : "Global"} ` : "";
 					const defaultStatusLabel = configuredStorage === "project" ? `${scopeLabel}default` : "Default";
 					try {
+						this.ctx.settings.assertModelRoleWritable(role);
 						if (role === "default") {
 							// `auto` on the default role configures the active session. Other roles
 							// persist an explicit `:auto` suffix and must not mutate the current model.
@@ -995,7 +1000,11 @@ export class SelectorController {
 									formatModelSelectorValue(selectorValue, concreteThinking),
 								);
 								if (isAuto) {
-									cfgDefaultThinkingLevel.set(this.ctx.settings, AUTO_THINKING);
+									if (this.ctx.settings.isGlobalConfigReadOnly()) {
+										cfgDefaultThinkingLevel.override(this.ctx.settings, AUTO_THINKING);
+									} else {
+										cfgDefaultThinkingLevel.set(this.ctx.settings, AUTO_THINKING);
+									}
 								}
 							} else if (shadowedProject) {
 								this.ctx.settings.setProjectModelRole(
@@ -1003,7 +1012,11 @@ export class SelectorController {
 									formatModelSelectorValue(selectorValue, concreteThinking),
 								);
 								if (isAuto) {
-									cfgDefaultThinkingLevel.set(this.ctx.settings, AUTO_THINKING);
+									if (this.ctx.settings.isGlobalConfigReadOnly()) {
+										cfgDefaultThinkingLevel.override(this.ctx.settings, AUTO_THINKING);
+									} else {
+										cfgDefaultThinkingLevel.set(this.ctx.settings, AUTO_THINKING);
+									}
 								}
 							} else {
 								const { switched } = await this.ctx.session.setModel(model, role, {
@@ -1019,7 +1032,10 @@ export class SelectorController {
 									);
 								}
 								if (isAuto) {
-									this.ctx.session.setThinkingLevel(AUTO_THINKING, true);
+									this.ctx.session.setThinkingLevel(
+										AUTO_THINKING,
+										!this.ctx.settings.isGlobalConfigReadOnly(),
+									);
 								} else if (concreteThinking && concreteThinking !== ThinkingLevel.Inherit) {
 									this.ctx.session.setThinkingLevel(concreteThinking);
 								}
@@ -1051,8 +1067,12 @@ export class SelectorController {
 				},
 				onUnassign: async (role, scope?: ModelRoleSelectionScope) => {
 					const releaseDefaultMutation = role === "default" ? await this.#acquireDefaultRoleMutation() : undefined;
-					const configuredStorage = cfgModelRoleStorage.get(this.ctx.settings);
-					const targetScope = configuredStorage === "project" ? (scope ?? "project") : "global";
+					const configuredStorage = this.ctx.settings.getModelRoleStorage();
+					const targetScope = this.ctx.settings.isGlobalConfigReadOnly()
+						? "project"
+						: configuredStorage === "project"
+							? (scope ?? "project")
+							: "global";
 					const scopeLabel =
 						configuredStorage === "project" ? `${targetScope === "project" ? "Project" : "Global"} ` : "";
 					try {
@@ -1116,7 +1136,13 @@ export class SelectorController {
 									});
 									if (!switched) return;
 									if (effectiveIsAuto) {
-										this.ctx.session.setThinkingLevel(AUTO_THINKING, true);
+										// Same contract as onAssign: auto applies live, but the global
+										// default is persisted only while global config is writable —
+										// the role was already cleared and the model already switched.
+										this.ctx.session.setThinkingLevel(
+											AUTO_THINKING,
+											!this.ctx.settings.isGlobalConfigReadOnly(),
+										);
 									} else if (concreteThinking && concreteThinking !== ThinkingLevel.Inherit) {
 										this.ctx.session.setThinkingLevel(concreteThinking);
 									}

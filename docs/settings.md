@@ -38,6 +38,43 @@ The canonical global file is YAML at `config.yml`; `config.yaml` is accepted as 
 - Empty YAML (or YAML `null`) is treated as an empty settings mapping. Other non-mapping top levels are invalid. On writable startup, `omp` moves a syntactically invalid or non-mapping persistent settings file to a uniquely named `.broken-*` backup and exits with the original error and backup path. A `--config` overlay with a bare array/scalar is also a hard error, but is not moved.
 - Invalid values for ordinary schema entries warn and read as their schema defaults. Settings with explicit validators, such as per-agent compaction triggers or provider concurrency limits, can reject the configuration instead. Unknown keys in hand-written files are not a substitute for a registered setting.
 
+Persistent global and project settings writes preserve the authored YAML source: unrelated comments, quoting, blank lines, collection indentation, line endings, and the final newline stay unchanged. Writes re-read the resolved target under the existing file lock before merging pending changes, including when the config is a symlink. Editing an aliased model-role mapping detaches only that occurrence; the anchor and other aliases retain their values. When an anchor itself changes or is removed, dependent aliases are expanded to preserve their prior values. `<<` merge keys stay in place: changing an inherited value adds an explicit override to the merging mapping without editing the shared anchor, and removing an inherited key replaces that mapping's merge keys with its remaining values written explicitly. Flow mappings with authored trailing commas remain writable. New files and recovery after malformed-file quarantine use the normal YAML serialization format. Schema migrations still remove retired keys on the next write, including nested migrations that add sibling keys.
+
+### Global read-only policy
+
+Set `config: { readOnly: true }` in the global YAML, or launch with
+`PI_CONFIG_READONLY=1`, to opt out of global configuration persistence.
+The policy is captured at startup; setting it in writable mode takes effect on
+the next launch and runtime overrides cannot turn an active policy off.
+Startup does not migrate legacy settings, quarantine invalid global YAML, or
+seed migration marker files under this policy. Existing global bytes stay unchanged.
+Invalid YAML still reports an error; repair it manually rather than relying on quarantine.
+The policy covers configuration only: runtime storage in `agent.db` (model
+usage order, model performance, command usage and other caches) stays open
+and keeps recording, but legacy settings rows in it are neither migrated nor cleared.
+
+Role assignments route to `<cwd>/.omp/config.yml`, even when
+`modelRoleStorage` is global. The `.omp` directory must already exist;
+otherwise assignment is refused with the setting name and resolved global target.
+Writable mode continues to create project configuration directories normally.
+Other persistent settings writes are refused, including `omp config set` and
+`reset`, which exit nonzero instead of reporting success. Edit the managed file
+manually to disable the policy. Runtime overrides and `PI_CONFIG_FILES` retain
+their normal precedence and are never written back. The programmatic
+`SettingsOptions.readOnly` / `Settings.loadReadOnly` API remains stronger:
+it disables persistence for every layer, including project roles.
+
+Interactive surfaces refuse before changing anything. `/settings` keeps
+every row visible but dimmed and unchangeable; the focused or hovered row
+shows the policy reason in place of its description. Keyboard display
+toggles (tool activity, thinking blocks) report the reason and leave the
+view unchanged. Automatic onboarding does not open, `omp setup` reports the
+reason instead of opening the wizard, and `/setup providers` keeps provider
+sign-in available.
+Clearing a default role in `/model` still switches the live session to the
+exposed fallback, including `auto` thinking, without persisting
+`defaultThinkingLevel` globally.
+
 ## Reading and writing settings
 
 Use the interactive `/settings` panel inside a session, or the `omp config` command from a shell. The CLI reads effective values including setting environment variables. The panel shows and edits merged settings-layer values, not environment-supplied values; descriptions note active env overrides so env credentials are never pre-filled or persisted. Ordinary persistent writes land in the **global** file; model-selector role changes are the exception when `modelRoleStorage: project` (see [Where writes go](#where-writes-go)).
@@ -156,6 +193,7 @@ Environment variables are never written back to `config.yml`. Variables declared
 | `SEARXNG_BASIC_USERNAME` / `SEARXNG_BASIC_PASSWORD` | `searxng.basicUsername` / `searxng.basicPassword` | Fallbacks only when absent or null; configured empty strings remain valid credentials. |
 | `MNEMOPI_EMBEDDING_MODEL` | `mnemopi.embeddingModel` | Fallback when absent, null, or blank. |
 | `PI_CONFIG_FILES`       | CLI config overlays         | Platform path-list (`:` on Unix, `;` on Windows); files load in order before `--config` overlays. |
+| `PI_CONFIG_READONLY=1`  | `config.readOnly`           | Only `1`, at startup; project roles, `agent.db` still write; [policy](#global-read-only-policy).  |
 
 Provider API keys are resolved separately (stored auth, OAuth, `models.yml`, environment, and `.env` files); see [Providers](./providers.md) and the full [Environment variables](./environment-variables.md) reference.
 
@@ -493,7 +531,7 @@ thinkingBudgets:
 
 | Key                               | Type    | Default | Values                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | --------------------------------- | ------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `defaultThinkingLevel`            | enum    | `high`  | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `auto`. Override per run with `--thinking`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `defaultThinkingLevel`            | enum    | `high`  | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `auto`. Override per run with `--thinking`. The status line and composer show `auto` until a turn classifies it, then `auto (<level>)` with the resolved level's colour; an explicit level shows as itself.                                                                                                                                                                                                                                                                                                                                 |
 | `hideThinkingBlock`               | boolean | `false` | Hide thinking blocks in output. `--hide-thinking` sets it for the run (display only).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `thinkingBudgets.minimal`         | number  | `1024`  | Token budget for the `minimal` level.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `thinkingBudgets.low`             | number  | `2048`  | Token budget for `low`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |

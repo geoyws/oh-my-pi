@@ -11,6 +11,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ChainJudge, hasNativeJudge, JudgmentCache, journalJudgmentUsage } from "@oh-my-pi/pi-coding-agent/judgment";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { tinyModelClient } from "@oh-my-pi/pi-coding-agent/tiny/title-client";
+import { FindTool } from "@oh-my-pi/pi-coding-agent/tools/jfind";
 import { encodeRawPng } from "@oh-my-pi/pi-coding-agent/utils/png-encode";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
@@ -315,9 +316,9 @@ describe("ChainJudge", () => {
 		await expect(
 			new ChainJudge({ settings, registry, purpose: "test", sessionModel: ONLINE, onUsage }).judge(request),
 		).rejects.toThrow("402");
-		await expect(new ChainJudge({ settings, registry, purpose: "test", onUsage }).judge(request)).rejects.toThrow(
-			"rejected the account recently",
-		);
+		const cooled = new ChainJudge({ settings, registry, purpose: "test", onUsage }).judge(request);
+		await expect(cooled).rejects.toThrow("rejected the account recently");
+		await expect(cooled).rejects.toThrow("402");
 
 		expect(typesafeCalls).toHaveBeenCalledTimes(1);
 		expect(online).not.toHaveBeenCalled();
@@ -790,6 +791,38 @@ describe("ChainJudge", () => {
 
 		expect(native).not.toHaveBeenCalled();
 		expect(chat).not.toHaveBeenCalled();
+	});
+
+	it("makes find report a failed judge backend by name and status instead of no hits", async () => {
+		using tmp = TempDir.createSync("@judgment-find-");
+		await Bun.write(path.join(tmp.path(), "a.ts"), "export const dumpCommand = 1;\n");
+		await Bun.write(path.join(tmp.path(), "b.ts"), "export const dumpFormat = 2;\n");
+		const settings = Settings.isolated({ "find.enabled": "on", modelRoles: { judge: "typesafe/jev-preview" } });
+		const registry = makeRegistry([JEV_PREVIEW], { typesafe: "ts-key" });
+		vi.spyOn(globalThis, "fetch").mockImplementation(
+			asGlobalFetch(async () => Response.json({ detail: { error_type: "billing_error" } }, { status: 402 })),
+		);
+		const tool = new FindTool({
+			cwd: tmp.path(),
+			hasUI: false,
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			settings,
+			modelRegistry: registry,
+		});
+
+		const result = await tool.execute("x", { query: "dump slash command", grep_keywords: ["dump"] });
+		const text = result.content.map(part => (part.type === "text" ? part.text : "")).join("\n");
+
+		expect(result.isError).toBe(true);
+		expect(text.split("\n")[0]).toStartWith('find unavailable for "dump slash command"');
+		expect(text).not.toContain("no hits");
+		const failures = text.split("\n").filter(line => line.startsWith("  "));
+		expect(failures.length).toBeGreaterThan(0);
+		for (const line of failures) {
+			expect(line).toContain("typesafe/jev-preview");
+			expect(line).toContain("402");
+		}
 	});
 
 	it("propagates caller abort without attempting a fallback", async () => {

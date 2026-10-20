@@ -59,7 +59,7 @@ import { sameItems } from "@oh-my-pi/pi-tui/native/memo";
 import { describeSegmentTrack, renderSegmentTrack, type TrackSegment } from "@oh-my-pi/pi-tui/chrome/segment-track";
 import type { WorkingRowSpec } from "@oh-my-pi/pi-tui/components/loader";
 import { formatDoubleTap } from "@oh-my-pi/pi-tui/key-hint-format";
-import { thinkingLevelWord } from "@oh-my-pi/pi-tui/status-line/segments";
+import { thinkingLevelLabel, thinkingLevelWord } from "@oh-my-pi/pi-tui/status-line/segments";
 import type { TspChecklistItem, TspChecklistPhase, TspSpan, TspText, TspTreeNode } from "@oh-my-pi/pi-wire";
 import { isInsideTerminalMultiplexer } from "@oh-my-pi/pi-tui/terminal-capabilities";
 import {
@@ -4027,6 +4027,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					? { kind: "python", excluded: draft.startsWith("$$") }
 					: undefined,
 			thinking: thinkingLevelWord(this.viewSession),
+			thinkingLabel: thinkingLevelLabel(this.viewSession),
 			thinkingInModel: cfgStatusLineCompactThinkingLevel.get(settings),
 			rate: this.#nativeTokenRate(),
 			running: this.loadingAnimation !== undefined || this.session.isStreaming,

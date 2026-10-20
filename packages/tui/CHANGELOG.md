@@ -205,6 +205,18 @@
 - Removed the unused `app.tree.foldOrUp` / `app.tree.unfoldOrDown` keybinding ids, which no longer did anything.
 - Added `parksAsBackground(toolName, details)`, `asyncJobState(details)`, `isSettledJobFrame(details)` and `settleWithJobFrame(component, frame, toolCallId)` (`chat/tool-execution`): whether a returned call's card stays live for its background job's frames (`task` always; `bash` and `eval` under native rendering), the job state a frame reports, and settling the card with the job's last frame (a cancelled job keeps its output and seals as cancelled)
 - `BashToolDetails.async.state` and `EvalToolDetails.async.state` gain `cancelled` for a job killed before it finished
+### Added
+
+- `thinkingLevelLabel()` (`status-line/segments`): the thinking selection as shown to the user — an explicit level as itself, `auto` while auto thinking is pending, `auto (<level>)` once resolved; `thinkingLevelWord()` stays the effective level for colours and effort glyphs
+- `ComposerNativeState.thinkingLabel`: the effort chip's text and tooltip, defaulting to `thinking`, which keeps driving the `effort` glyph and fallback meter
+
+### Changed
+
+- The status line model segment (ANSI and native) and `FooterComponent` show resolved auto thinking as `auto (<level>)` (ANSI: the resolved level's glyph, then the label) instead of the bare level, so it no longer reads like an explicit pin
+
+### Fixed
+
+- Fixed `StatusLineComponent` reusing a cached bar after auto thinking's resolution changed while the effective level and auto flag stayed the same; `autoResolvedThinkingLevel()` is now a render-cache input
 
 ## [18.10.1] - 2026-10-12
 

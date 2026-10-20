@@ -155,12 +155,16 @@ const CANDIDATE_REJECTION_COOLDOWN_MS = 5 * 60 * 1000;
  * per-call consumers (auto-thinking, subagent starts) resolve a fresh judge.
  */
 const CANDIDATE_TTL_MS = 1_000;
-/** Skip-until timestamps keyed by routed model identity, carried by the registry that produced the rejection. */
+/** Account rejections keyed by routed model identity: skip-until timestamp plus the failure that caused it, carried by the registry that produced it. */
 const kRejections = Symbol("judgment.rejections");
 /** Last resolved judge role chain, carried by the registry it was drawn from. */
 const kRoleChain = Symbol("judgment.roleChain");
+interface CandidateRejection {
+	until: number;
+	reason: string;
+}
 interface RegistryWithRejections extends ModelRegistry {
-	[kRejections]?: Map<string, number>;
+	[kRejections]?: Map<string, CandidateRejection>;
 	[kRoleChain]?: {
 		settings: Settings;
 		revision: number;
@@ -438,10 +442,10 @@ export class ChainJudge implements Judge {
 				throw signal.reason instanceof Error ? signal.reason : new AIError.AbortError("judgment aborted");
 			}
 			const identity = formatModelStringWithRouting(candidate.model);
-			const skippedUntil = rejections.get(identity);
-			if (skippedUntil !== undefined) {
-				if (skippedUntil > Date.now()) {
-					lastUnavailable = `${identity} rejected the account recently`;
+			const rejection = rejections.get(identity);
+			if (rejection !== undefined) {
+				if (rejection.until > Date.now()) {
+					lastUnavailable = `${identity} rejected the account recently (${rejection.reason})`;
 					continue;
 				}
 				rejections.delete(identity);
@@ -465,8 +469,10 @@ export class ChainJudge implements Judge {
 				}
 				if (isAbortOrTimeout(error)) throw error;
 				const rejected = isAccountRejection(error);
-				if (rejected) rejections.set(identity, Date.now() + CANDIDATE_REJECTION_COOLDOWN_MS);
 				lastFailure = error instanceof Error ? error.message : String(error);
+				if (rejected) {
+					rejections.set(identity, { until: Date.now() + CANDIDATE_REJECTION_COOLDOWN_MS, reason: lastFailure });
+				}
 				logger.warn("judgment candidate failed", {
 					candidate: identity,
 					status: AIError.status(error),
@@ -507,7 +513,7 @@ export class ChainJudge implements Judge {
 		}).catch(error => logger.warn("judgment telemetry failed", { error: String(error) }));
 	}
 
-	#rejections(): Map<string, number> {
+	#rejections(): Map<string, CandidateRejection> {
 		const registry: RegistryWithRejections = this.#deps.registry;
 		return (registry[kRejections] ??= new Map());
 	}
