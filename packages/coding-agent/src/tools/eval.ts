@@ -46,6 +46,7 @@ import { generateCodeModeDeclarations } from "@oh-my-pi/pi-tui/tools/eval-format
 import { recordStatusEvent, type StatusEventLog } from "@oh-my-pi/pi-tui/tools/eval";
 import { formatOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { resolveOutputMaxColumns, resolveOutputSinkArtifactMaxBytes, resolveOutputSinkHeadBytes } from "./output-meta";
+import { codeModeBridgedTools, renderCodeModeIndex } from "../eval/stub-bridge";
 import { ToolAbortError, throwIfAborted } from "./tool-errors";
 import { hasWaitTool } from "./wait";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
@@ -59,6 +60,7 @@ import {
 	cfgEvalToolsEnabled,
 } from "../eval/settings";
 import { cfgTaskMaxRecursionDepth } from "../task/settings";
+import { cfgToolsCodeModeStubs } from "../session/settings";
 import { cfgToolsMaxTimeout, cfgToolsSpeculativeExecutionEnabled } from "./settings";
 
 /** Language tokens the eval tool accepts, in stable display order. */
@@ -411,28 +413,32 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 	}
 
 	/**
-	 * Codex Code Mode advertisement, pulled from the session's applied direct
+	 * Code Mode advertisement, pulled from the session's applied direct
 	 * partition on every read so the declarations can never advertise a tool the
 	 * model can already call directly (a plan-mode transport `write`), nor drift
-	 * from the active model or tool registry.
+	 * from the active model or tool registry. `tools.codeModeStubs: on-demand`
+	 * swaps the inline signatures for a one-line index; `tool.$stub(name)` serves
+	 * the typed stub from a cell.
 	 */
 	#codeModeDescription(baseDescription: string): string | undefined {
 		const session = this.session;
-		const directToolNames = session?.getCodeModeDirectToolNames?.();
-		if (!session || !directToolNames) return undefined;
-		const direct = new Set(directToolNames);
-		const declarations = generateCodeModeDeclarations(
-			(session.getEvalBridgeToolNames?.() ?? [...(session.toolRegistry?.keys() ?? [])]).flatMap(name => {
-				if (direct.has(name)) return [];
-				const tool = session.toolRegistry?.get(name);
-				return tool ? [{ name, parameters: (tool as { parameters?: unknown }).parameters }] : [];
-			}),
-		);
+		if (!session?.getCodeModeDirectToolNames?.()) return undefined;
+		const bridged = codeModeBridgedTools(session);
+		const onDemand = cfgToolsCodeModeStubs.get(session.settings) === "on-demand";
+		const declarations = onDemand
+			? ""
+			: generateCodeModeDeclarations(bridged.map(tool => ({ name: tool.name, parameters: tool.parameters })));
 		const preludeDeclarations = this.#advertisedPreludes(session)
 			.map(definition => definition.codeModeDeclarations?.trim())
 			.filter((declaration): declaration is string => Boolean(declaration))
 			.join("\n\n");
-		return prompt.render(evalCodeModeDescription, { baseDescription, declarations, preludeDeclarations });
+		return prompt.render(evalCodeModeDescription, {
+			baseDescription,
+			onDemand,
+			declarations,
+			index: onDemand ? renderCodeModeIndex(bridged) : "",
+			preludeDeclarations,
+		});
 	}
 	/** Only syntax not obvious from the field schema; filtered by enabled language. */
 	static readonly #examples: readonly ToolExample<typeof evalSchema.infer>[] = [

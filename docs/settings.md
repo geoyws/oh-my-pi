@@ -620,6 +620,9 @@ tools:
 | `tools.xdevInlineDevices` | array | `[]` | Dynamic-device name globs to inline in `builtins` mode; ignored in `catalog` mode. |
 | `async.enabled` | boolean | `true` | Enable async bash commands and background task execution. |
 | `async.maxJobs` | number | `100` | Running background-job cap, floored to at least 1; parked/queued jobs do not consume execution slots. |
+| `tools.codeMode`               | enum    | `off`   | `on` activates Code Mode for every provider: the provider tool block carries `eval`, `ask`, `todo`, `yield`, `think`, `checkpoint`, `rewind`, `new_context` plus `tools.codeModeDirectTools`; every other enabled tool is called from eval cells as `tool.<name>()`. Needs JavaScript eval (`eval.js`). Independent of `providers.openai-codex.codeMode`. |
+| `tools.codeModeDirectTools`    | array   | `["read","bash","edit","grep","glob"]` | Extra tools kept directly callable while `tools.codeMode` is `on`; names not enabled in the session are ignored. |
+| `tools.codeModeStubs`          | enum    | `inline` | How eval advertises bridged tools under either Code Mode. `inline` embeds every typed signature in the eval description. `on-demand` lists one line per tool and serves the typed stub plus full docs when a cell calls `await tool.$stub("name", …)`; `tool.$stub()` with no names returns the list. |
 
 Mounting still follows the session's explicit tool allow-list. A session that permits `read` but omits `write` can receive a device-only write transport; this does not grant filesystem writes.
 

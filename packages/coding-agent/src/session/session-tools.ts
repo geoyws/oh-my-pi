@@ -44,7 +44,12 @@ import {
 	PERMISSION_REQUIRED_TOOLS,
 } from "./acp-permission-gate";
 import type { ClientBridge, ClientBridgePermissionOutcome } from "./client-bridge";
-import { buildToolNamespacesInfo, resolveCodeMode, type ToolNamespacesInfo } from "./code-mode";
+import {
+	buildToolNamespacesInfo,
+	type CodeModeResolution,
+	resolveCodeMode,
+	type ToolNamespacesInfo,
+} from "./code-mode";
 import { toolReadsSkillUris } from "../system-prompt";
 
 import type { CustomMessage } from "./messages";
@@ -59,6 +64,8 @@ import {
 	cfgProvidersOpenaiCodexCodeMode,
 	cfgProvidersOpenaiCodexCodeModeDirectTools,
 	cfgSkillful,
+	cfgToolsCodeMode,
+	cfgToolsCodeModeDirectTools,
 } from "./settings";
 import { cfgStartupQuiet } from "../modes/settings";
 import { cfgToolsApproval, cfgToolsApprovalMode, cfgToolsXdevDocs, cfgToolsXdevInlineDevices } from "../tools/settings";
@@ -893,22 +900,34 @@ export class SessionTools {
 		}
 	}
 
-	/** Whether a model transition crosses a Code Mode presentation boundary. */
+	/** Resolves the Code Mode partition from every activation setting for one model and enabled set. */
+	#resolveCodeMode(model: Model | undefined, enabledToolNames: readonly string[]): CodeModeResolution {
+		const settings = this.#host.settings;
+		return resolveCodeMode({
+			provider: model?.provider ?? "",
+			toolMode: model?.toolMode,
+			setting: cfgProvidersOpenaiCodexCodeMode.get(settings),
+			extraDirectTools: cfgProvidersOpenaiCodexCodeModeDirectTools.get(settings),
+			anyProviderSetting: cfgToolsCodeMode.get(settings),
+			anyProviderDirectTools: cfgToolsCodeModeDirectTools.get(settings),
+			enabledToolNames,
+			evalTransportAvailable: this.#hasCodeModeEvalTransport(),
+		});
+	}
+
+	/**
+	 * Whether a model transition crosses a Code Mode presentation boundary. An
+	 * undefined previous model is session startup, where the agent still holds
+	 * the unrestricted construction slate: that is the inactive surface, even
+	 * when provider-agnostic `tools.codeMode` would resolve active for it.
+	 */
 	codeModeChangesBetween(previousModel: Model | undefined, nextModel: Model): boolean {
 		const enabledToolNames = this.getEnabledToolNames();
-		const setting = cfgProvidersOpenaiCodexCodeMode.get(this.#host.settings);
-		const extraDirectTools = cfgProvidersOpenaiCodexCodeModeDirectTools.get(this.#host.settings);
-		const resolve = (model: Model | undefined) =>
-			resolveCodeMode({
-				provider: model?.provider ?? "",
-				toolMode: model?.toolMode,
-				setting,
-				extraDirectTools,
-				enabledToolNames,
-				evalTransportAvailable: this.#hasCodeModeEvalTransport(),
-			});
-		const previous = resolve(previousModel);
-		const next = resolve(nextModel);
+		const previous: CodeModeResolution =
+			previousModel === undefined
+				? { active: false, directToolNames: new Set(enabledToolNames) }
+				: this.#resolveCodeMode(previousModel, enabledToolNames);
+		const next = this.#resolveCodeMode(nextModel, enabledToolNames);
 		if (previous.active !== next.active) return true;
 		if (!next.active) return false;
 		if (previous.directToolNames.size !== next.directToolNames.size) return true;
@@ -1081,14 +1100,7 @@ export class SessionTools {
 	async #applyActiveToolsByName(toolNames: string[], forcePromptRefresh = false, signal?: AbortSignal): Promise<void> {
 		signal?.throwIfAborted();
 		toolNames = normalizeToolNames(toolNames);
-		const codeMode = resolveCodeMode({
-			provider: this.#host.model()?.provider ?? "",
-			toolMode: this.#host.model()?.toolMode,
-			setting: cfgProvidersOpenaiCodexCodeMode.get(this.#host.settings),
-			extraDirectTools: cfgProvidersOpenaiCodexCodeModeDirectTools.get(this.#host.settings),
-			enabledToolNames: toolNames,
-			evalTransportAvailable: this.#hasCodeModeEvalTransport(),
-		});
+		const codeMode = this.#resolveCodeMode(this.#host.model(), toolNames);
 		let builtInWriteAvailable = this.#builtInToolNames.has("write");
 		const fullWriteSelected =
 			toolNames.includes("write") &&

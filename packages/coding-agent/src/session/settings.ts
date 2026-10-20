@@ -33,6 +33,7 @@ const EMPTY_STRING_ARRAY: string[] = [];
 const EMPTY_NUMBER_RECORD: Record<string, number> = {};
 const EMPTY_STRING_ARRAYS_RECORD: Record<string, string[]> = {};
 const DEFAULT_TOOL_CALL_LOOP_EXEMPT_TOOLS: string[] = ["wait"];
+const DEFAULT_CODE_MODE_DIRECT_TOOLS: string[] = ["read", "bash", "edit", "grep", "glob"];
 
 // Power assertions: macOS IOKit, Linux login1/ScreenSaver, Windows execution state.
 export const cfgPowerSleepPrevention = register({
@@ -165,6 +166,55 @@ export const cfgProvidersOpenaiCodexCodeModeDirectTools = register({
 	},
 });
 
+export const cfgToolsCodeMode = register({
+	id: "tools.codeMode",
+	type: "enum",
+	values: ["off", "on"] as const,
+	default: "off",
+	ui: {
+		tab: "tools",
+		group: "Discovery & MCP",
+		label: "Code Mode (Any Provider)",
+		description:
+			"Route every enabled tool outside the direct set through eval's tool.<name>() bridge on any provider, so the provider tool block carries eval plus the direct set. Needs JavaScript eval. The direct set is eval, ask, todo, yield, think, checkpoint, rewind and new_context plus Code Mode Direct Tools.",
+	},
+});
+
+export const cfgToolsCodeModeDirectTools = register({
+	id: "tools.codeModeDirectTools",
+	type: "array",
+	default: DEFAULT_CODE_MODE_DIRECT_TOOLS,
+	ui: {
+		tab: "tools",
+		group: "Discovery & MCP",
+		label: "Code Mode Direct Tools",
+		description:
+			"Extra tools kept directly callable while Code Mode (Any Provider) is on. Names not enabled in the session are ignored.",
+	},
+});
+
+export const cfgToolsCodeModeStubs = register({
+	id: "tools.codeModeStubs",
+	type: "enum",
+	values: ["inline", "on-demand"] as const,
+	default: "inline",
+	ui: {
+		tab: "tools",
+		group: "Discovery & MCP",
+		label: "Code Mode Stubs",
+		description:
+			"How eval advertises bridged tools under Code Mode. Inline embeds every typed signature in the eval description. On-demand lists one line per tool and serves the typed stub with its docs when a cell calls tool.$stub(name).",
+		options: [
+			{ value: "inline", label: "Inline", description: "Embed every bridged signature in the eval description." },
+			{
+				value: "on-demand",
+				label: "On Demand",
+				description: "List bridged tools; fetch typed stubs with docs via tool.$stub(name).",
+			},
+		],
+	},
+});
+
 /**
  * Settings that change the Code Mode tool partition. `edit.mode` belongs here because it renames
  * `EditTool` on the wire (`apply_patch` vs `edit`), which the namespace metadata is keyed by.
@@ -172,6 +222,8 @@ export const cfgProvidersOpenaiCodexCodeModeDirectTools = register({
 export const cfgCodeModeInputs = combine({
 	codeMode: cfgProvidersOpenaiCodexCodeMode,
 	directTools: cfgProvidersOpenaiCodexCodeModeDirectTools,
+	anyProviderCodeMode: cfgToolsCodeMode,
+	anyProviderDirectTools: cfgToolsCodeModeDirectTools,
 	evalJs: cfgEvalJs,
 	editMode: cfgEditMode,
 });
