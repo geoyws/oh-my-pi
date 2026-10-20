@@ -583,43 +583,43 @@ describe("processResponsesStream: parallel function_call items", () => {
 		// only `call_id`, then send argument deltas with `item_id = fc_<call_id>`
 		// even when `call_id` already starts with `fc_`.
 		// If the parser only indexes the bare call_id, every delta falls back to the
-		// most recently added call and earlier ast_grep calls execute with `{}`.
+		// most recently added call and earlier ast calls execute with `{}`.
 		const output = makeOutput();
 		const emitted: EmittedEvent[] = [];
 		const stream = { push: (e: unknown) => emitted.push(e as EmittedEvent), end: () => {} } as never;
 
-		const argsA = JSON.stringify({ pat: "console.log($$$)", paths: ["src/**/*.ts"] });
-		const argsB = JSON.stringify({ pat: "logger.$_($$$ARGS)", paths: ["src/**/*.ts"] });
-		const argsC = JSON.stringify({ pat: "processItems", paths: ["src/worker.ts"] });
+		const argsA = JSON.stringify({ mode: "search", pat: "console.log($$$)", path: "src/**/*.ts" });
+		const argsB = JSON.stringify({ mode: "search", pat: "logger.$_($$$ARGS)", path: "src/**/*.ts" });
+		const argsC = JSON.stringify({ mode: "search", pat: "processItems", path: "src/worker.ts" });
 
 		await processResponsesStream(
 			makeStream([
 				{
 					type: "response.output_item.added",
-					item: { type: "function_call", call_id: "x", name: "ast_grep", arguments: "" },
+					item: { type: "function_call", call_id: "x", name: "ast", arguments: "" },
 				},
 				{
 					type: "response.output_item.added",
-					item: { type: "function_call", call_id: "fc_x", name: "ast_grep", arguments: "" },
+					item: { type: "function_call", call_id: "fc_x", name: "ast", arguments: "" },
 				},
 				{
 					type: "response.output_item.added",
-					item: { type: "function_call", call_id: "call_c", name: "ast_grep", arguments: "" },
+					item: { type: "function_call", call_id: "call_c", name: "ast", arguments: "" },
 				},
 				{ type: "response.function_call_arguments.delta", item_id: "fc_x", delta: argsA },
 				{ type: "response.function_call_arguments.delta", item_id: "fc_fc_x", delta: argsB },
 				{ type: "response.function_call_arguments.delta", item_id: "fc_call_c", delta: argsC },
 				{
 					type: "response.output_item.done",
-					item: { type: "function_call", call_id: "x", name: "ast_grep", arguments: "" },
+					item: { type: "function_call", call_id: "x", name: "ast", arguments: "" },
 				},
 				{
 					type: "response.output_item.done",
-					item: { type: "function_call", call_id: "fc_x", name: "ast_grep", arguments: "" },
+					item: { type: "function_call", call_id: "fc_x", name: "ast", arguments: "" },
 				},
 				{
 					type: "response.output_item.done",
-					item: { type: "function_call", call_id: "call_c", name: "ast_grep", arguments: "" },
+					item: { type: "function_call", call_id: "call_c", name: "ast", arguments: "" },
 				},
 			]),
 			output,
@@ -632,9 +632,9 @@ describe("processResponsesStream: parallel function_call items", () => {
 		if (a?.type !== "toolCall" || b?.type !== "toolCall" || c?.type !== "toolCall") {
 			throw new Error("expected toolCalls");
 		}
-		expect(a.arguments).toEqual({ pat: "console.log($$$)", paths: ["src/**/*.ts"] });
-		expect(b.arguments).toEqual({ pat: "logger.$_($$$ARGS)", paths: ["src/**/*.ts"] });
-		expect(c.arguments).toEqual({ pat: "processItems", paths: ["src/worker.ts"] });
+		expect(a.arguments).toEqual({ mode: "search", pat: "console.log($$$)", path: "src/**/*.ts" });
+		expect(b.arguments).toEqual({ mode: "search", pat: "logger.$_($$$ARGS)", path: "src/**/*.ts" });
+		expect(c.arguments).toEqual({ mode: "search", pat: "processItems", path: "src/worker.ts" });
 
 		const ends = emitted.filter(e => e.type === "toolcall_end") as Array<{
 			toolCall: { id: string; arguments: Record<string, unknown> };
@@ -643,16 +643,19 @@ describe("processResponsesStream: parallel function_call items", () => {
 		expect(ends).toHaveLength(3);
 		const byCallId = new Map(ends.map(e => [e.toolCall.id.split("|")[0], e]));
 		expect(byCallId.get("x")?.toolCall.arguments).toEqual({
+			mode: "search",
 			pat: "console.log($$$)",
-			paths: ["src/**/*.ts"],
+			path: "src/**/*.ts",
 		});
 		expect(byCallId.get("fc_x")?.toolCall.arguments).toEqual({
+			mode: "search",
 			pat: "logger.$_($$$ARGS)",
-			paths: ["src/**/*.ts"],
+			path: "src/**/*.ts",
 		});
 		expect(byCallId.get("call_c")?.toolCall.arguments).toEqual({
+			mode: "search",
 			pat: "processItems",
-			paths: ["src/worker.ts"],
+			path: "src/worker.ts",
 		});
 		expect(byCallId.get("x")?.contentIndex).toBe(0);
 		expect(byCallId.get("fc_x")?.contentIndex).toBe(1);
@@ -666,43 +669,43 @@ describe("processResponsesStream: parallel function_call items", () => {
 		// `call_id`. The deltas then point at an `output_index` that was never
 		// registered while routing by `item_id = fc_<call_id>`. Trusting the stale
 		// output_index and skipping the prefixed-alias lookup folds every delta into
-		// the most-recently-added call, leaving earlier ast_grep calls with `{}`.
+		// the most-recently-added call, leaving earlier ast calls with `{}`.
 		const output = makeOutput();
 		const emitted: EmittedEvent[] = [];
 		const stream = { push: (e: unknown) => emitted.push(e as EmittedEvent), end: () => {} } as never;
 
-		const argsA = JSON.stringify({ pat: "console.log($$$)", paths: ["src/**/*.ts"] });
-		const argsB = JSON.stringify({ pat: "logger.$_($$$ARGS)", paths: ["src/**/*.ts"] });
-		const argsC = JSON.stringify({ pat: "processItems", paths: ["src/worker.ts"] });
+		const argsA = JSON.stringify({ mode: "search", pat: "console.log($$$)", path: "src/**/*.ts" });
+		const argsB = JSON.stringify({ mode: "search", pat: "logger.$_($$$ARGS)", path: "src/**/*.ts" });
+		const argsC = JSON.stringify({ mode: "search", pat: "processItems", path: "src/worker.ts" });
 
 		await processResponsesStream(
 			makeStream([
 				{
 					type: "response.output_item.added",
-					item: { type: "function_call", call_id: "a", name: "ast_grep", arguments: "" },
+					item: { type: "function_call", call_id: "a", name: "ast", arguments: "" },
 				},
 				{
 					type: "response.output_item.added",
-					item: { type: "function_call", call_id: "b", name: "ast_grep", arguments: "" },
+					item: { type: "function_call", call_id: "b", name: "ast", arguments: "" },
 				},
 				{
 					type: "response.output_item.added",
-					item: { type: "function_call", call_id: "c", name: "ast_grep", arguments: "" },
+					item: { type: "function_call", call_id: "c", name: "ast", arguments: "" },
 				},
 				{ type: "response.function_call_arguments.delta", output_index: 0, item_id: "fc_a", delta: argsA },
 				{ type: "response.function_call_arguments.delta", output_index: 1, item_id: "fc_b", delta: argsB },
 				{ type: "response.function_call_arguments.delta", output_index: 2, item_id: "fc_c", delta: argsC },
 				{
 					type: "response.output_item.done",
-					item: { type: "function_call", call_id: "a", name: "ast_grep", arguments: "" },
+					item: { type: "function_call", call_id: "a", name: "ast", arguments: "" },
 				},
 				{
 					type: "response.output_item.done",
-					item: { type: "function_call", call_id: "b", name: "ast_grep", arguments: "" },
+					item: { type: "function_call", call_id: "b", name: "ast", arguments: "" },
 				},
 				{
 					type: "response.output_item.done",
-					item: { type: "function_call", call_id: "c", name: "ast_grep", arguments: "" },
+					item: { type: "function_call", call_id: "c", name: "ast", arguments: "" },
 				},
 			]),
 			output,
@@ -715,9 +718,9 @@ describe("processResponsesStream: parallel function_call items", () => {
 		if (a?.type !== "toolCall" || b?.type !== "toolCall" || c?.type !== "toolCall") {
 			throw new Error("expected toolCalls");
 		}
-		expect(a.arguments).toEqual({ pat: "console.log($$$)", paths: ["src/**/*.ts"] });
-		expect(b.arguments).toEqual({ pat: "logger.$_($$$ARGS)", paths: ["src/**/*.ts"] });
-		expect(c.arguments).toEqual({ pat: "processItems", paths: ["src/worker.ts"] });
+		expect(a.arguments).toEqual({ mode: "search", pat: "console.log($$$)", path: "src/**/*.ts" });
+		expect(b.arguments).toEqual({ mode: "search", pat: "logger.$_($$$ARGS)", path: "src/**/*.ts" });
+		expect(c.arguments).toEqual({ mode: "search", pat: "processItems", path: "src/worker.ts" });
 
 		const ends = emitted.filter(e => e.type === "toolcall_end") as Array<{
 			toolCall: { id: string; arguments: Record<string, unknown> };
@@ -726,16 +729,19 @@ describe("processResponsesStream: parallel function_call items", () => {
 		expect(ends).toHaveLength(3);
 		const byCallId = new Map(ends.map(e => [e.toolCall.id.split("|")[0], e]));
 		expect(byCallId.get("a")?.toolCall.arguments).toEqual({
+			mode: "search",
 			pat: "console.log($$$)",
-			paths: ["src/**/*.ts"],
+			path: "src/**/*.ts",
 		});
 		expect(byCallId.get("b")?.toolCall.arguments).toEqual({
+			mode: "search",
 			pat: "logger.$_($$$ARGS)",
-			paths: ["src/**/*.ts"],
+			path: "src/**/*.ts",
 		});
 		expect(byCallId.get("c")?.toolCall.arguments).toEqual({
+			mode: "search",
 			pat: "processItems",
-			paths: ["src/worker.ts"],
+			path: "src/worker.ts",
 		});
 		expect(byCallId.get("a")?.contentIndex).toBe(0);
 		expect(byCallId.get("b")?.contentIndex).toBe(1);

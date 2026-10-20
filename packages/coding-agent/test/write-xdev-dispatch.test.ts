@@ -34,8 +34,8 @@ function mountedRenderContext(xdev: XdevState): WriteRenderContext {
 	};
 }
 
-// xdev mounting is default-on: discoverable tools like ast_edit unmount into
-// xd://, and a plain `write xd://ast_edit` dispatches them. These guard the
+// xdev mounting is default-on: discoverable tools like ast unmount into
+// xd://, and a plain `write xd://ast` dispatches them. These guard the
 // resolution-device symbols write.ts pulls from ./resolve — a missing import
 // threw `ReferenceError: isResolutionDeviceName is not defined` on *every*
 // xd:// write, in both the executor (approval + execute) and the streaming
@@ -61,7 +61,7 @@ function createTestXdevState(tools: Tool[], builtInNames: Iterable<string> = too
 }
 
 describe("read and write route xd:// device URLs", () => {
-	it("lists, documents, and dispatches an ast_edit device", async () => {
+	it("lists, documents, and dispatches an ast edit device", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "write-xdev-"));
 		try {
 			const filePath = path.join(tempDir, "legacy.ts");
@@ -75,36 +75,38 @@ describe("read and write route xd:// device URLs", () => {
 					steer: () => {},
 				}),
 			);
-			// xdev on: ast_edit is unmounted into xd://; write stays in the toolset.
+			// xdev on: ast is unmounted into xd://; write stays in the toolset.
 			const write = tools.find(entry => entry.name === "write");
 			const read = tools.find(entry => entry.name === "read");
 			expect(read).toBeDefined();
 			expect(write).toBeDefined();
-			expect(tools.some(entry => entry.name === "ast_edit")).toBe(false);
+			expect(tools.some(entry => entry.name === "ast")).toBe(false);
 
 			const listing = await read!.execute("read-xd-list", { path: "xd://" });
-			expect(listing.content.find(entry => entry.type === "text")?.text).toContain("xd://ast_edit");
-			const docs = await read!.execute("read-xd-docs", { path: "xd://ast_edit" });
-			expect(docs.content.find(entry => entry.type === "text")?.text).toContain("# ast_edit");
+			expect(listing.content.find(entry => entry.type === "text")?.text).toContain("xd://ast");
+			const docs = await read!.execute("read-xd-docs", { path: "xd://ast" });
+			expect(docs.content.find(entry => entry.type === "text")?.text).toContain("# ast");
 
+			// Default settings leave only edit mode, so the device schema is the
+			// modeless edit shape and `ops` alone classifies the call as an edit.
 			const content = JSON.stringify({
 				ops: [{ pat: "legacyWrap($A, $B)", out: "modernWrap($A, $B)" }],
-				paths: [filePath],
+				path: filePath,
 			});
 
 			// The write gate decodes the device payload and evaluates the mounted
-			// tool's own approval. ast_edit is write-tier for a filesystem path.
+			// tool's own approval. ast edit mode is write-tier for a filesystem path.
 			const approval = write!.approval;
 			expect(typeof approval).toBe("function");
 			if (typeof approval === "function") {
-				expect(approval({ path: "xd://ast_edit", content })).toEqual({ tier: "write", policyKey: "ast_edit" });
+				expect(approval({ path: "xd://ast", content })).toEqual({ tier: "write", policyKey: "ast" });
 			}
 
-			// Execute dispatches through the xdev registry to the mounted ast_edit,
+			// Execute dispatches through the xdev registry to the mounted ast tool,
 			// staging a preview (not a direct apply).
-			const previewResult = await write!.execute("write-xdev-preview", { path: "xd://ast_edit", content });
+			const previewResult = await write!.execute("write-xdev-preview", { path: "xd://ast", content });
 			expect(previewResult.isError).toBeUndefined();
-			expect(previewResult.details?.xdev?.tool).toBe("ast_edit");
+			expect(previewResult.details?.xdev?.tool).toBe("ast");
 			expect(previewResult.details?.xdev?.mode).toBe("execute");
 			// The dispatch records the wrapped tool's approval tier so prewalk can
 			// tell a mutation from a read-only device call (issue #7312).
@@ -269,17 +271,17 @@ describe("read and write route xd:// device URLs", () => {
 			if (typeof approval !== "function") throw new Error("expected a function approval");
 			const tier = (path: string, content: string) => approval({ path, content });
 
-			// ast_edit on a filesystem path → write; on internal URLs only → read.
+			// ast edit mode on a filesystem path → write; on internal URLs only → read.
 			const astFsPath = JSON.stringify({
 				ops: [{ pat: "legacyWrap($A, $B)", out: "modernWrap($A, $B)" }],
-				paths: [filePath],
+				path: filePath,
 			});
 			const astInternalPath = JSON.stringify({
 				ops: [{ pat: "a", out: "b" }],
-				paths: ["artifact://abc"],
+				path: "artifact://abc",
 			});
-			expect(tier("xd://ast_edit", astFsPath)).toEqual({ tier: "write", policyKey: "ast_edit" });
-			expect(tier("xd://ast_edit", astInternalPath)).toEqual({ tier: "read", policyKey: "ast_edit" });
+			expect(tier("xd://ast", astFsPath)).toEqual({ tier: "write", policyKey: "ast" });
+			expect(tier("xd://ast", astInternalPath)).toEqual({ tier: "read", policyKey: "ast" });
 
 			// debug: inspection action → read; a real launch → exec (control).
 			expect(tier("xd://debug", JSON.stringify({ action: "sessions" }))).toEqual({
@@ -294,11 +296,11 @@ describe("read and write route xd:// device URLs", () => {
 			// Fail closed: malformed JSON, non-object or schema-invalid payloads,
 			// missing content, and unknown devices all stay exec so the gate never
 			// under-prompts.
-			expect(tier("xd://ast_edit", "{ not json")).toBe("exec");
-			expect(tier("xd://ast_edit", "[1,2,3]")).toBe("exec");
-			expect(tier("xd://ast_edit", '"a string"')).toBe("exec");
-			expect(tier("xd://ast_edit", JSON.stringify({ paths: [null] }))).toBe("exec");
-			expect(approval({ path: "xd://ast_edit" })).toBe("exec");
+			expect(tier("xd://ast", "{ not json")).toBe("exec");
+			expect(tier("xd://ast", "[1,2,3]")).toBe("exec");
+			expect(tier("xd://ast", '"a string"')).toBe("exec");
+			expect(tier("xd://ast", JSON.stringify({ path: [null] }))).toBe("exec");
+			expect(approval({ path: "xd://ast" })).toBe("exec");
 			expect(tier("xd://no_such_device", "{}")).toBe("exec");
 		} finally {
 			await removeWithRetries(tempDir);
@@ -313,25 +315,25 @@ describe("read and write route xd:// device URLs", () => {
 
 		const content = JSON.stringify({
 			ops: [{ pat: "legacyWrap($A, $B)", out: "modernWrap($A, $B)" }],
-			paths: ["/tmp/legacy.ts"],
+			path: "/tmp/legacy.ts",
 		});
 
 		// Path still streaming (no content field yet): render nothing so the user
-		// never sees a half-typed "xd://ast_" frame.
-		expect(writeToolRenderer.renderCall({ path: "xd://ast_e" }, options, uiTheme)).toBeUndefined();
+		// never sees a half-typed "xd://as" frame.
+		expect(writeToolRenderer.renderCall({ path: "xd://as" }, options, uiTheme)).toBeUndefined();
 
 		// Path settled + content streaming, but the write has not executed yet:
 		// show a queued card instead of the inner tool's in-flight renderer.
-		const queued = writeToolRenderer.renderCall({ path: "xd://ast_edit", content }, options, uiTheme);
+		const queued = writeToolRenderer.renderCall({ path: "xd://ast", content }, options, uiTheme);
 		expect(queued).toBeDefined();
 		const queuedText = Bun.stripANSI(queued!.render(80).join("\n"));
 		expect(queuedText).toContain("queued");
-		expect(queuedText).toContain("ast_edit");
+		expect(queuedText).toContain("ast");
 
 		// Args can be final at message_end while an earlier exclusive write still
 		// runs — keep the queued card until this call's tool_execution_start.
 		const argsCompleteOnly = writeToolRenderer.renderCall(
-			{ path: "xd://ast_edit", content },
+			{ path: "xd://ast", content },
 			{ ...options, argsComplete: true },
 			uiTheme,
 		);
@@ -340,7 +342,7 @@ describe("read and write route xd:// device URLs", () => {
 		// Same payload after tool_execution_start: delegate to the inner renderer
 		// instead of throwing ReferenceError inside a generic Write frame.
 		const executing = writeToolRenderer.renderCall(
-			{ path: "xd://ast_edit", content },
+			{ path: "xd://ast", content },
 			{ ...options, argsComplete: true, executionStarted: true },
 			uiTheme,
 		);

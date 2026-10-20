@@ -1,4 +1,4 @@
-/** `ast_grep` — structural AST pattern search across files. */
+/** `ast` search mode (legacy `ast_grep`) — structural AST pattern search across files. */
 import type { ReactNode } from "react";
 import { Badge, Badges, CodeBlock, InvalidArg, Kv, KvGrid, Output, PathText, ResultText } from "../parts";
 import type { ToolRenderer, ToolRenderProps } from "../types";

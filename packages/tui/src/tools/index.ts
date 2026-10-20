@@ -4,6 +4,7 @@
  * tools without an entry fall back to `renderDefaultToolExecution`.
  */
 import { askToolRenderer } from "./ask";
+import { astToolRenderer } from "./ast";
 import { astEditToolRenderer } from "./ast-edit";
 import { astGrepToolRenderer } from "./ast-grep";
 import { bashToolRenderer } from "./bash";
@@ -34,6 +35,8 @@ export * from "./renderer";
 /** Renderers keyed by tool name (plus `apply_patch`/`reject` aliases that share a renderer). */
 export const toolRenderers: Record<string, ToolRenderer> = {
 	ask: askToolRenderer,
+	ast: astToolRenderer,
+	// Pre-`ast` transcript aliases; remove at the AST cutover with the `ast_grep`/`ast_edit` name aliases.
 	ast_grep: astGrepToolRenderer,
 	ast_edit: astEditToolRenderer,
 	bash: bashToolRenderer,

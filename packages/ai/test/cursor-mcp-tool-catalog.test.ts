@@ -12,20 +12,20 @@ const tool = (name: string, parameters: TSchema = { type: "object", properties: 
 
 describe("cursor buildMcpToolDefinitions", () => {
 	it("forwards the write transport alongside preview-staging devices so xd:// resolution stays reachable", () => {
-		// A Cursor session with xdev on: ast_edit is a mounted device, write is the
-		// xd:// transport carried top-level. ast_edit always stages a preview whose
+		// A Cursor session with xdev on: ast is a mounted device, write is the
+		// xd:// transport carried top-level. ast edit mode always stages a preview whose
 		// resolution rides `write xd://resolve` / `write xd://reject`.
 		const defs = buildMcpToolDefinitions([
 			tool("read"),
 			tool("write"),
 			tool("bash"),
 			tool("todo"),
-			tool("ast_edit"),
+			tool("ast"),
 			tool("task"),
 		]);
 		const names = defs.map(def => def.name);
 
-		expect(names).toContain("ast_edit");
+		expect(names).toContain("ast");
 		expect(names).toContain("task");
 		// `write` is the sole native-filtered tool re-included: without it the
 		// staged preview can never be resolved and the SoftToolRequirement('write')

@@ -8,4 +8,10 @@ describe("normalizeToolName", () => {
 		expect(normalizeToolName("CaseAdd")).toBe("CaseAdd");
 		expect(normalizeToolName("Constructor")).toBe("Constructor");
 	});
+
+	it("maps the pre-merge AST tool names to ast", () => {
+		expect(normalizeToolName("ast_grep")).toBe("ast");
+		expect(normalizeToolName("ast_edit")).toBe("ast");
+		expect(normalizeToolName("ast")).toBe("ast");
+	});
 });

@@ -437,7 +437,7 @@ Cursor's integration in `packages/ai` operates over an HTTP/2 Connect RPC transp
 - **Empty Grep Pattern Rejection**: `grepArgs` frames with an empty `pattern` and non-empty `glob` are rejected up front (`emptyGrepPatternRejection`) with a descriptive error, forcing the model to retry or switch tools rather than triggering local tool failure after block persistence.
 - **Native Tools & `SoftToolRequirement` Interplay**:
   - Native tools (`CURSOR_NATIVE_TOOL_NAMES`: `bash`, `read`, `write`, `delete`, `ls`, `grep`, `todo`) are omitted when building `requestContext` MCP tool definitions.
-  - **Exception**: `write` is explicitly re-included in `buildMcpToolDefinitions` whenever pi-agent tools are advertised. `write` acts as the `xd://` transport for staged previews (e.g. `ast_edit`). Without `write`, staged previews cannot be resolved and `SoftToolRequirement('write')` escalation aborts the turn.
+  - **Exception**: `write` is explicitly re-included in `buildMcpToolDefinitions` whenever pi-agent tools are advertised. `write` acts as the `xd://` transport for staged previews (e.g. `ast` edit mode). Without `write`, staged previews cannot be resolved and `SoftToolRequirement('write')` escalation aborts the turn.
 - **`rootPromptMessagesJson` & Blob Store**:
   - `buildGrpcRequest` passes conversation history as SHA-256 binary blob IDs (`blobStore`) in `rootPromptMessagesJson` and `turns`.
   - System prompts are stored as individual JSON blobs (`buildCursorSystemPromptJsons`), allowing independent server-side prefix blob caching hits when only downstream prompts change.

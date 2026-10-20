@@ -13,6 +13,7 @@
 ### Changed
 
 - Enhanced browser resilience with configurable HTTPS error ignoring, domain allow-listing, and automatic tab recycling for security-sensitive state changes
+- Merged the `ast_grep` and `ast_edit` tools into one `ast` tool with `mode: "search" | "edit"` (edit takes `path` as a string; pass several paths as a semicolon-delimited list). `astGrep.enabled` and `astEdit.enabled` now turn the two modes on and off, and only enabled modes appear in the schema and description. Edit mode also requires the `edit` tool, so read-only agents, plan mode, and reviewers only get search. The old names still work as aliases in tool lists, agent frontmatter, and transcripts, and will be removed at cutover.
 
 ### Fixed
 

@@ -1,4 +1,4 @@
-/** Gallery fixtures for the edit tools (edit, apply_patch, ast_edit). */
+/** Gallery fixtures for the edit tools (edit, apply_patch, ast edit mode). */
 import type { GalleryFixture } from "./types";
 
 export const editFixtures: Record<string, GalleryFixture> = {
@@ -186,15 +186,19 @@ export const editFixtures: Record<string, GalleryFixture> = {
 		},
 	},
 
-	ast_edit: {
-		label: "AST Edit",
+	// `ast` edit mode; the `ast` key itself showcases search mode (search.ts).
+	ast_rewrite: {
+		label: "AST",
+		renderer: "ast",
 		streamingArgs: {
+			mode: "edit",
 			ops: [{ pat: "countEditFiles($$$ARGS)" }],
-			paths: ["packages/coding-agent/src/**/*.ts"],
+			path: "packages/coding-agent/src/**/*.ts",
 		},
 		args: {
+			mode: "edit",
 			ops: [{ pat: "countEditFiles($$$ARGS)", out: "countDistinctFiles($$$ARGS)" }],
-			paths: ["packages/coding-agent/src/**/*.ts"],
+			path: "packages/coding-agent/src/**/*.ts",
 		},
 		result: {
 			content: [

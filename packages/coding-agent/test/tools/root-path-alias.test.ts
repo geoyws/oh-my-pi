@@ -129,13 +129,14 @@ describe("tool path root alias", () => {
 		expect(text).toContain("sample.ts");
 	});
 
-	it("ast_grep searches cwd when path is slash", async () => {
+	it("ast search searches cwd when path is slash", async () => {
 		const tools = await createTools(createTestSession(tempDir));
-		const tool = tools.find(entry => entry.name === "ast_grep");
+		const tool = tools.find(entry => entry.name === "ast");
 		expect(tool).toBeDefined();
-		if (!tool) throw new Error("Missing ast_grep tool");
+		if (!tool) throw new Error("Missing ast tool");
 
-		const result = await tool.execute("ast-grep-root-alias", {
+		const result = await tool.execute("ast-search-root-alias", {
+			mode: "search",
 			pat: "rootAliasSymbol",
 			path: "/**/*.ts",
 		});
@@ -145,7 +146,7 @@ describe("tool path root alias", () => {
 		expect(details?.scopePath).toBe(".");
 	});
 
-	it("ast_edit rewrites within cwd when path is slash", async () => {
+	it("ast edit rewrites within cwd when path is slash", async () => {
 		const queue = new ToolChoiceQueue();
 		const tools = await createTools(
 			createTestSession(tempDir, {
@@ -154,13 +155,14 @@ describe("tool path root alias", () => {
 				steer: () => {},
 			}),
 		);
-		const tool = tools.find(entry => entry.name === "ast_edit");
+		const tool = tools.find(entry => entry.name === "ast");
 		expect(tool).toBeDefined();
-		if (!tool) throw new Error("Missing ast_edit tool");
+		if (!tool) throw new Error("Missing ast tool");
 
 		const preview = await tool.execute("ast-edit-root-alias", {
+			mode: "edit",
 			ops: [{ pat: "legacyWrap($A, $B)", out: "modernWrap($A, $B)" }],
-			paths: ["/**/*.ts"],
+			path: "/**/*.ts",
 		});
 		const details = preview.details as { scopePath?: string; totalReplacements?: number } | undefined;
 

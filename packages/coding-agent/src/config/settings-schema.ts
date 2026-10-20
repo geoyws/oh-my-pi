@@ -4239,8 +4239,8 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "tools",
 			group: "Available Tools",
-			label: "AST Grep",
-			description: "Enable the ast_grep tool for structural AST search",
+			label: "AST Search",
+			description: "Enable search mode of the ast tool (structural AST search)",
 		},
 	},
 
@@ -4251,7 +4251,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "tools",
 			group: "Available Tools",
 			label: "AST Edit",
-			description: "Enable the ast_edit tool for structural AST rewrites",
+			description: "Enable edit mode of the ast tool (structural AST rewrites; needs the edit tool)",
 		},
 	},
 

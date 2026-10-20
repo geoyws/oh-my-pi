@@ -21,6 +21,7 @@ import isolationRecoveryHintTemplate from "../prompts/tools/isolation-recovery-h
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { TaskEffort } from "@oh-my-pi/pi-tui/thinking";
 import type { ToolSession } from "../tools";
+import { normalizeToolName } from "../tools/builtin-names";
 import { isIrcEnabled } from "../tools/hub";
 import { buildOutputValidator } from "../tools/output-schema-validator";
 import { trackLateCleanup } from "../utils/late-cleanup";
@@ -203,7 +204,9 @@ function resolveSchema(request: StructuredSubagentRequest, agent: AgentDefinitio
 }
 
 function createPlanModeAgent(agent: AgentDefinition): AgentDefinition {
-	const tools = [...PLAN_MODE_TOOLS, ...(agent.tools ?? []).filter(tool => tool === "ast_grep")];
+	// Plan mode grants no `edit`, so a carried-over `ast` is search-only.
+	const keepsAst = (agent.tools ?? []).some(tool => normalizeToolName(tool) === "ast");
+	const tools = [...PLAN_MODE_TOOLS, ...(keepsAst ? ["ast"] : [])];
 	return {
 		...agent,
 		systemPrompt: `${planModeSubagentPrompt}\n\n${agent.systemPrompt}`,

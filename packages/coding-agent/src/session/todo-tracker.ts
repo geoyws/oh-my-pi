@@ -18,7 +18,7 @@ const MUTATING_TOOLS: Record<string, true> = {
 	eval: true,
 	edit: true,
 	write: true,
-	ast_edit: true,
+	// `ast` counts only in edit mode (see `onToolResult`).
 };
 const MID_RUN_NUDGE_MESSAGE_TYPE = "mid-run-todo-nudge";
 const MARKDOWN_PROMPT_PREFIX_RE = /^(?:>\s*)?(?:(?:[-*+]|\d+[.)])\s+)*/;
@@ -105,10 +105,13 @@ export class TodoTracker {
 	}
 
 	/** Records a completed tool result before asynchronous event processing begins. */
-	onToolResult(toolName: string, isError: boolean): void {
+	onToolResult(toolName: string, isError: boolean, details?: unknown): void {
 		if (toolName === "todo") {
 			this.#mutationsSinceLastTouch = 0;
-		} else if (!isError && MUTATING_TOOLS[toolName]) {
+		} else if (
+			!isError &&
+			(MUTATING_TOOLS[toolName] || (toolName === "ast" && isRecord(details) && "totalReplacements" in details))
+		) {
 			this.#mutationsSinceLastTouch++;
 		}
 		this.#reminderAwaitingProgress = false;

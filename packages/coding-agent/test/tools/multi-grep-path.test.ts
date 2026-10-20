@@ -161,7 +161,7 @@ describe.skipIf(isWindows)("resolveExplicitSearchPaths shared non-root ancestor"
 	});
 
 	it("keeps a single collapsed walk when the common ancestor is a requested scope", async () => {
-		// `ast_edit` consumes the same targets and applies rewrites once per
+		// `ast` edit mode consumes the same targets and applies rewrites once per
 		// target; a dir + nested-file input must stay a single walk by default or
 		// overlapping targets would double-apply rewrites to the nested file.
 		const resolved = await resolveExplicitSearchPaths([".", "src/a.ts"], repo);
@@ -177,7 +177,7 @@ describe.skipIf(isWindows)("resolveExplicitSearchPaths shared non-root ancestor"
 		// commonIsRequestedScope identity check never held for an absolute
 		// ancestor — on Windows for every absolute spelling (`/` vs `\`), on
 		// POSIX for a non-canonical one (trailing separator or embedded `..`).
-		// The false fan-out made ast_edit double-apply the rewrite to the nested
+		// The false fan-out made `ast` edit mode double-apply the rewrite to the nested
 		// file. A trailing separator and an embedded `..` are distinct shapes a
 		// partial fix could normalize inconsistently, so both must collapse.
 		for (const ancestor of [`${repo}${path.sep}`, `${repo}${path.sep}src${path.sep}..`]) {

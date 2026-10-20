@@ -157,8 +157,13 @@ export function formatToolCallPrimaryArg(name: string, args: Record<string, unkn
 		const paths = primaryArgValue(args.path) || primaryArgValue(args.paths);
 		if (paths) return oneLine(paths);
 	}
-	if (name === "ast_grep") {
-		const pattern = primaryArgValue(args.pat);
+	// `ast_grep` is the pre-`ast` name; drop it with the name alias at the AST cutover.
+	if (name === "ast" || name === "ast_grep") {
+		// Edit calls carry their pattern in the first op.
+		const firstOp = Array.isArray(args.ops) ? args.ops[0] : undefined;
+		const pattern =
+			primaryArgValue(args.pat) ||
+			(firstOp && typeof firstOp === "object" && "pat" in firstOp ? primaryArgValue(firstOp.pat) : "");
 		if (pattern) return oneLine(pattern);
 	}
 	for (const key of PRIMARY_ARG_KEYS) {

@@ -7,13 +7,16 @@ import type { AgentDefinition } from "./types";
 // `hub` is deliberately absent: it declares `approval = hubApproval`, a
 // parameter-dependent function that returns "exec" for start/stop/restart,
 // process-stdin `send`, unrecognized ops and malformed params. Do not re-add it.
+//
+// `ast` is read-tier here: its edit mode requires the `edit` grant, which no
+// read-only tool set holds, so such agents only ever see `mode: "search"`.
 export const READ_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
 	"read",
 	"grep",
 	"glob",
 	"find",
 	"web_search",
-	"ast_grep",
+	"ast",
 	"yield",
 	"ask",
 	"todo",

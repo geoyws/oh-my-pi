@@ -42,9 +42,9 @@ const PLAN_YOLO_HANDOFF_MESSAGE_TYPE = "plan-yolo-handoff";
 /**
  * Whether a completed tool result is the first workspace-mutating action that
  * arms the prewalk hand-off. A direct `edit`/`write` call always counts; a
- * `write` that dispatched an `xd://` device (e.g. `lsp`, `ast_edit`, `debug`)
+ * `write` that dispatched an `xd://` device (e.g. `lsp`, `ast`, `debug`)
  * counts only when the wrapped tool resolved to a `write`/`exec` approval tier.
- * Read-only device calls — LSP navigation, `debug` inspection, `ast_edit` on
+ * Read-only device calls — LSP navigation, `debug` inspection, `ast` search or edits on
  * internal URLs, help lookups — leave the tier `read` (or absent) and must not
  * switch the model mid-investigation (issue #7312).
  */

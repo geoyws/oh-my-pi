@@ -4664,7 +4664,7 @@ export function buildMcpToolDefinitions(
 	}
 
 	// The `write` tool doubles as the xd:// transport: forwarded devices such as
-	// `ast_edit` stage previews finalized only by writing a reason to xd://resolve
+	// `ast` (edit mode) stage previews finalized only by writing a reason to xd://resolve
 	// or xd://reject. Cursor's native catalog may expose no write path, so
 	// re-include the built-in `write` (dropped as native above) whenever pi-agent
 	// devices are advertised — otherwise a staged preview can never be resolved

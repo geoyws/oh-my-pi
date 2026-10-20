@@ -658,7 +658,9 @@ def _hashline_ops(inp: str) -> list[str]:
 def _detect_edit_format(tool_name: str, args_obj: dict | None) -> str:
     if tool_name == "write":
         return "write"
-    if tool_name == "ast_edit":
+    if tool_name == "ast_edit" or (
+        tool_name == "ast" and isinstance(args_obj, dict) and args_obj.get("mode") == "edit"
+    ):
         return "ast_edit"
     if not isinstance(args_obj, dict):
         return "unknown"
@@ -781,7 +783,9 @@ def cmd_edits(args: argparse.Namespace) -> int:
         FROM ss_tool_calls c
         LEFT JOIN ss_tool_results r
           ON r.session_file = c.session_file AND r.call_id = c.call_id
-        WHERE c.tool_name IN ('edit','ast_edit','write') {sf_clause} {since_clause}
+        WHERE (c.tool_name IN ('edit','ast_edit','write')
+               OR (c.tool_name = 'ast' AND json_extract(c.arg_json, '$.mode') = 'edit'))
+          {sf_clause} {since_clause}
         ORDER BY c.timestamp
         """,
         where_args + since_params,

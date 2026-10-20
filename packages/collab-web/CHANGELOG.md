@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added an `ast` tool card for the merged `ast` tool. Search-mode and edit-mode calls each use their existing card, and the edit card reads the `path` string as well as the legacy `paths` array.
+
 ## [18.2.1] - 2026-09-15
 
 ### Fixed

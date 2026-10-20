@@ -28,7 +28,7 @@ const AGENT: AgentDefinition = {
 	description: "Test worker",
 	systemPrompt: "Do the assigned work.",
 	source: "bundled",
-	tools: ["read", "write", "ast_grep"],
+	tools: ["read", "write", "ast"],
 	output: { type: "object", properties: { agent: { type: "boolean" } } },
 };
 
@@ -188,7 +188,7 @@ describe("structured subagent primitive", () => {
 		const policy = await resolveEffectiveSubagentPolicy(
 			request({ session: session({ planMode: true }), enableLsp: true, enableIrc: true }),
 		);
-		expect(policy.effectiveAgent.tools).toEqual(["read", "grep", "glob", "web_search", "ast_grep"]);
+		expect(policy.effectiveAgent.tools).toEqual(["read", "grep", "glob", "web_search", "ast"]);
 		expect(policy.effectiveAgent.spawns).toBeUndefined();
 		expect(policy.enableLsp).toBe(false);
 		expect(policy.enableIrc).toBe(false);

@@ -141,12 +141,10 @@ NEVER open files hoping. AVOID unneeded files/sections.
 {{#has tools "find"}}- Unknown location → `{{toolRefs.find}}` with a descriptive query, then read only the returned ranges.{{/has}}
 {{#has tools "read"}}- Use `{{toolRefs.read}}` offset/limit, not whole-file reads.{{/has}}
 
-{{#ifAny (includes tools "ast_grep") (includes tools "ast_edit")}}
+{{#has tools "ast"}}
 # AST
-SHOULD use syntax-aware tools before text hacks:
-{{#has tools "ast_grep"}}- Structural discovery → `{{toolRefs.ast_grep}}`.{{/has}}
-{{#has tools "ast_edit"}}- Codemods → `{{toolRefs.ast_edit}}`.{{/has}}
-{{/ifAny}}
+SHOULD use syntax-aware tools before text hacks: structural discovery and codemods → `{{toolRefs.ast}}`.
+{{/has}}
 
 {{#has tools "task"}}
 # Delegation

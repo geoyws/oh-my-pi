@@ -4,6 +4,7 @@
  */
 import { genericRenderer } from "./generic";
 import { askRenderer } from "./tools/ask";
+import { astRenderer } from "./tools/ast";
 import { astEditRenderer } from "./tools/ast-edit";
 import { astGrepRenderer } from "./tools/ast-grep";
 import { bashRenderer } from "./tools/bash";
@@ -36,6 +37,8 @@ import type { ToolRenderer } from "./types";
 
 const RENDERERS: Record<string, ToolRenderer> = {
 	ask: askRenderer,
+	ast: astRenderer,
+	// Pre-`ast` transcript names; remove with the `ast_grep`/`ast_edit` aliases at the AST cutover.
 	ast_edit: astEditRenderer,
 	ast_grep: astGrepRenderer,
 	bash: bashRenderer,

@@ -586,7 +586,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				xdevTarget.name && this.session.xdev ? resolveXdevTool(this.session.xdev, xdevTarget.name) : undefined;
 			if (!inst) return "exec";
 			// Decode the device JSON payload and evaluate the mounted tool's own
-			// approval (which may be argument-dependent, e.g. ast_edit is read-tier
+			// approval (which may be argument-dependent, e.g. `ast` edits are read-tier
 			// for internal-URL paths, debug is read-tier for inspection actions).
 			// Malformed JSON, non-object payloads, missing content, and approval
 			// functions that reject schema-invalid objects stay exec so the gate

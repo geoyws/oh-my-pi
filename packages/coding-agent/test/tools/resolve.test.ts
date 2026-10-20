@@ -99,7 +99,7 @@ describe("dispatchResolutionDevice", () => {
 				details: {
 					action,
 					reason,
-					sourceToolName: "ast_edit",
+					sourceToolName: "ast",
 					label: "AST Edit: 2 replacements in 1 file",
 				},
 			};
@@ -115,7 +115,7 @@ describe("dispatchResolutionDevice", () => {
 		expect(result.details).toEqual({
 			action: "discard",
 			reason: "Preview changed wrong callsites",
-			sourceToolName: "ast_edit",
+			sourceToolName: "ast",
 			label: "AST Edit: 2 replacements in 1 file",
 		});
 		expect(xdev.tool).toBe(REJECT_DEVICE_NAME);
@@ -137,7 +137,7 @@ describe("dispatchResolutionDevice", () => {
 				details: {
 					action,
 					reason,
-					sourceToolName: "ast_edit",
+					sourceToolName: "ast",
 					label: "AST Edit: 1 replacement in 1 file",
 				},
 			};
@@ -153,7 +153,7 @@ describe("dispatchResolutionDevice", () => {
 		expect(result.details).toEqual({
 			action: "apply",
 			reason: "Preview is correct",
-			sourceToolName: "ast_edit",
+			sourceToolName: "ast",
 			label: "AST Edit: 1 replacement in 1 file",
 		});
 		expect(writeDeviceDispatch("write", { details: { xdev } })?.tool).toBe(RESOLVE_DEVICE_NAME);
@@ -206,7 +206,7 @@ it("renders a highlighted apply summary", async () => {
 			details: {
 				action: "apply",
 				reason: "All replacements are correct",
-				sourceToolName: "ast_edit",
+				sourceToolName: "ast",
 				label: "AST Edit: 2 replacements in 1 file",
 			},
 		},
@@ -234,7 +234,7 @@ it("keeps the inverse block color across the full line (no mid-line fg reset)", 
 			details: {
 				action: "apply",
 				reason: "All replacements are correct",
-				sourceToolName: "ast_edit",
+				sourceToolName: "ast",
 				label: "AST Edit: 2 replacements in 1 file",
 			},
 		},

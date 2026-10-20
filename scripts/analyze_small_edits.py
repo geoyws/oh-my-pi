@@ -28,7 +28,7 @@ else:
         list_recent_session_files,
     )
 
-TOOL_NAMES = ("edit", "ast_edit")
+TOOL_NAMES = ("edit", "ast:edit", "ast_edit")
 
 
 @dataclass(slots=True)
@@ -95,7 +95,7 @@ class RunStats:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Analyze small edit/ast_edit tool usage in session logs."
+        description="Analyze small edit/ast (edit mode) tool usage in session logs."
     )
     parser.add_argument(
         "--sessions-dir", type=Path, default=Path.home() / ".omp" / "agent" / "sessions"

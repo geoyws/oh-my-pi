@@ -1739,7 +1739,7 @@ describe("Anthropic request fingerprint alignment", () => {
 					required: ["requiredValue"],
 				} as TJsonSchema,
 			})),
-			...(["write", "grep", "read", "task", "todo", "web_search", "ast_grep"] as const).map(name => ({
+			...(["write", "grep", "read", "task", "todo", "web_search", "ast"] as const).map(name => ({
 				name,
 				description: `${name} tool`,
 				strict: true,

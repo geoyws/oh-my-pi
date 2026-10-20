@@ -1086,7 +1086,7 @@ export async function resolveExplicitFindPatterns(
  * Result of partitioning a list of user-supplied paths/globs into entries whose
  * base directory currently exists on disk versus those that do not.
  *
- * Used by multi-path tools (search, find, ast_grep, ast_edit) to tolerate one
+ * Used by multi-path tools (search, find, ast) to tolerate one
  * or more missing entries in a multi-path call: the surviving entries should
  * still be searched, with the missing entries surfaced as a non-fatal warning.
  */
@@ -1348,7 +1348,7 @@ export interface ToolScopeResolution {
 }
 
 /**
- * Shared path-input pipeline for `search`, `ast_grep`, and `ast_edit`:
+ * Shared path-input pipeline for `search` and `ast` (both modes):
  *  1. normalize + reject empty paths,
  *  2. resolve internal URLs through {@link InternalUrlRouter} to backing files,
  *  3. partition existing vs missing when multiple paths are supplied,

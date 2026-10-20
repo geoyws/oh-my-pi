@@ -39,8 +39,7 @@ import type { EventBus } from "../utils/event-bus";
 import { WebSearchTool } from "../web/search";
 import type { WorkspaceTree } from "../workspace-tree";
 import { AskTool } from "./ask";
-import { AstEditTool } from "./ast-edit";
-import { AstGrepTool } from "./ast-grep";
+import { AstTool } from "./ast";
 import { BashTool } from "./bash";
 import { type BuiltinToolName, type HiddenToolName, normalizeToolNames } from "./builtin-names";
 import { type CheckpointState, CheckpointTool, type CompletedRewindState, RewindTool } from "./checkpoint";
@@ -77,8 +76,7 @@ export * from "@oh-my-pi/pi-tui/tools/streaming-output";
 export * from "../task";
 export * from "../web/search";
 export * from "./ask";
-export * from "./ast-edit";
-export * from "./ast-grep";
+export * from "./ast";
 export * from "./bash";
 export type {
 	BashToolDetails,
@@ -509,8 +507,7 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	security_scan: s => new SecurityScanTool(s),
 	bash: s => new BashTool(s),
 	edit: s => new EditTool(s),
-	ast_grep: s => new AstGrepTool(s),
-	ast_edit: s => new AstEditTool(s),
+	ast: AstTool.createIf,
 	ask: AskTool.createIf,
 	debug: DebugTool.createIf,
 	eval: s => new EvalTool(s),
@@ -625,19 +622,13 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		if (goalModeActive && !requestedTools.includes("goal")) {
 			requestedTools.push("goal");
 		}
+		// `ast` search rides `grep`; `ast` edit rides `edit` (AstTool gates each mode).
 		if (
-			requestedTools.includes("grep") &&
-			!requestedTools.includes("ast_grep") &&
-			session.settings.get("astGrep.enabled")
+			!requestedTools.includes("ast") &&
+			((requestedTools.includes("grep") && session.settings.get("astGrep.enabled")) ||
+				(requestedTools.includes("edit") && session.settings.get("astEdit.enabled")))
 		) {
-			requestedTools.push("ast_grep");
-		}
-		if (
-			requestedTools.includes("edit") &&
-			!requestedTools.includes("ast_edit") &&
-			session.settings.get("astEdit.enabled")
-		) {
-			requestedTools.push("ast_edit");
+			requestedTools.push("ast");
 		}
 		if (["hindsight", "mnemopi"].includes(session.settings.get("memory.backend") ?? "")) {
 			for (const name of ["recall", "retain", "reflect"]) {
@@ -688,8 +679,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		if (name === "grep") return session.settings.get("grep.enabled");
 		if (name === "find") return session.settings.get("find.enabled");
 		if (name === "github") return session.settings.get("github.enabled");
-		if (name === "ast_grep") return session.settings.get("astGrep.enabled");
-		if (name === "ast_edit") return session.settings.get("astEdit.enabled");
+		if (name === "ast") return session.settings.get("astGrep.enabled") || session.settings.get("astEdit.enabled");
 		if (name === "web_search") return session.settings.get("web_search.enabled");
 		if (name === "security_scan") return session.settings.get("security.enabled");
 		if (name === "think") return externalThinkingActive;
@@ -812,7 +802,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		};
 		tools = kept;
 	}
-	// Staged previews from deferrable tools (e.g. ast_edit) resolve through a
+	// Staged previews from deferrable tools (e.g. `ast` edit mode) resolve through a
 	// `write` to xd://resolve/reject, so retain write whenever one can stage.
 	const xdevMounted = (session.xdev?.mountedNames.size ?? 0) > 0;
 	if (

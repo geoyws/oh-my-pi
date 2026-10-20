@@ -286,8 +286,7 @@ describe("createTools", () => {
 		expect(names).not.toContain("launch");
 		expect(names).not.toContain("glob");
 		expect(names).not.toContain("grep");
-		expect(names).not.toContain("ast_grep");
-		expect(names).not.toContain("ast_edit");
+		expect(names).not.toContain("ast");
 		expect(names).not.toContain("web_search");
 		expect(names).not.toContain("browser");
 

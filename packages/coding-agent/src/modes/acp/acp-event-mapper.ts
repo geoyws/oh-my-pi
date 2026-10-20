@@ -7,6 +7,7 @@ import type {
 	ToolCallLocation,
 	ToolKind,
 } from "@oh-my-pi/pi-utils/acp";
+import { astCallMode } from "../../tools/ast";
 import { parseXdUrl } from "@oh-my-pi/pi-tui/tools/xd-url";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { resolveToCwd, splitPathAndSelPreferringLiteralSync } from "../../tools/path-utils";
@@ -202,8 +203,10 @@ export function mapToolKind(toolName: string, args?: unknown): ToolKind {
 			return "execute";
 		case "grep":
 		case "glob":
-		case "ast_grep":
 			return "search";
+		case "ast":
+			// Edit mode only stages a preview; the apply is a later xd:// write.
+			return astCallMode(args) === "edit" ? "other" : "search";
 		case "web_search":
 			return "fetch";
 		case "todo":

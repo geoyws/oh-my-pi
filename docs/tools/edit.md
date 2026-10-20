@@ -118,7 +118,7 @@ MV lib/welcome.py
 
 ## Output and side effects
 
-Hashline applies in one tool call; it does not use the staged `xd://resolve` / `xd://reject` flow used by `ast_edit`.
+Hashline applies in one tool call; it does not use the staged `xd://resolve` / `xd://reject` flow used by `ast` edit mode.
 
 A successful section returns a fresh `[path#TAG]` header, optional block-resolution and move lines, a compact post-edit preview when available, and a `Warnings:` block when recovery or normalization produced warnings. `EditToolDetails` can include the unified `diff`, `firstChangedLine`, diagnostics/format results, operation (`update` or `delete` in hashline mode), path/move metadata, snapshots, and per-file results. Multi-section input returns one aggregate result.
 

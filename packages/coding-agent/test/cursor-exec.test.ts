@@ -897,8 +897,8 @@ describe("CursorExecHandlers mounted tool bridge", () => {
 	it("routes wrapped mounted devices through the approval gate", async () => {
 		let executed = false;
 		const device: AgentTool = {
-			name: "ast_edit",
-			label: "AST Edit",
+			name: "ast",
+			label: "AST",
 			description: "structural edit device",
 			parameters: type({}),
 			async execute() {
@@ -912,7 +912,7 @@ describe("CursorExecHandlers mounted tool bridge", () => {
 		const wrapped = new ExtensionToolWrapper(device, {
 			consumeToolCallEmitted: () => false,
 		} as unknown as ExtensionRunner);
-		const settings = Settings.isolated({ "tools.approval": { ast_edit: "deny" } });
+		const settings = Settings.isolated({ "tools.approval": { ast: "deny" } });
 		const handlers = new CursorExecHandlers({
 			cwd: ".",
 			// The canonical map contains the undecorated mounted tool. The execution

@@ -42,7 +42,7 @@ Plan mode installs a separate proposal handler through `setPlanProposalHandler(.
 
 Because previews and plan approval ride `write`, the harness keeps `write` available whenever needed:
 
-- `createTools(...)` auto-appends `write` when a deferrable tool such as `ast_edit` is active.
+- `createTools(...)` auto-appends `write` when a deferrable tool such as `ast` (with edit mode available) is active.
 - `createAgentSession(...)` keeps `write` registered when a deferrable tool exists or plan mode is enabled.
 
 ## Custom tools

@@ -123,27 +123,29 @@ describe("search tools with external URL paths", () => {
 		expect(text).not.toContain("outside after");
 	});
 
-	it("ast_edit rejects external URLs instead of staging read-cache files", async () => {
+	it("ast edit rejects external URLs instead of staging read-cache files", async () => {
 		stubLoadPage("legacyWrap(x, value)\n", "text/plain");
 		const tools = await createTools(createSession(testDir));
-		const tool = tools.find(entry => entry.name === "ast_edit");
+		const tool = tools.find(entry => entry.name === "ast");
 		expect(tool).toBeDefined();
 
 		await expect(
 			tool!.execute("ast-edit-url", {
+				mode: "edit",
 				ops: [{ pat: "legacyWrap($A, $B)", out: "modernWrap($A, $B)" }],
-				paths: ["https://example.com/snippet.ts"],
+				path: "https://example.com/snippet.ts",
 			}),
 		).rejects.toThrow("Cannot rewrite external URL");
 	});
 
-	it("ast_grep materializes URL content with the source extension", async () => {
+	it("ast search materializes URL content with the source extension", async () => {
 		stubLoadPage("export function remoteNeedle() {\n\treturn 1;\n}\n", "text/plain");
 		const tools = await createTools(createSession(testDir));
-		const tool = tools.find(entry => entry.name === "ast_grep");
+		const tool = tools.find(entry => entry.name === "ast");
 		expect(tool).toBeDefined();
 
-		const result = await tool!.execute("ast-grep-url", {
+		const result = await tool!.execute("ast-search-url", {
+			mode: "search",
 			pat: "remoteNeedle",
 			path: "https://example.com/snippet.ts",
 		});

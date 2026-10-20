@@ -141,6 +141,7 @@ function renderContext(): Record<string, unknown> {
 		discoverableMCPServerSummaries: [],
 		discoverableToolCount: 0,
 		duration: "1s",
+		edit: true,
 		files: [
 			{
 				messages: ["1:1 Example diagnostic"],
@@ -148,8 +149,6 @@ function renderContext(): Record<string, unknown> {
 				summary: "1 diagnostic",
 			},
 		],
-		hasAstEdit: true,
-		hasAstGrep: true,
 		hasDiscoverableBuiltinTools: false,
 		hasDiscoverableMCPServers: false,
 		hasFind: true,
@@ -170,6 +169,7 @@ function renderContext(): Record<string, unknown> {
 		multiple: false,
 		preview: "(sample task output omitted for token estimate)",
 		py: true,
+		search: true,
 		spawningDisabled: false,
 		spawns: true,
 		status: "completed",

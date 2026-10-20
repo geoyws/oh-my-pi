@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `astToolRenderer` (`tools/ast`) for the merged `ast` tool. It renders search-mode and edit-mode calls with the existing AST Grep and AST Edit renderers, and the AST Edit renderer now accepts a `path` string. The `ast_grep` and `ast_edit` registry keys stay only so old transcripts still render.
+
 ## [18.2.7] - 2026-09-21
 
 ### Breaking Changes

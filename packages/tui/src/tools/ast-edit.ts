@@ -11,6 +11,7 @@ import {
 	formatMoreItems,
 	formatParseErrorsCountLabel,
 	PREVIEW_LIMITS,
+	toPathList,
 } from "../render/render-utils";
 import { classifyGroupedLines, groupLineIndicesByBlank } from "./grouped-file-output";
 import type { OutputMeta } from "./output-meta";
@@ -43,6 +44,8 @@ export interface AstEditToolDetails {
 
 interface AstEditRenderArgs {
 	ops?: Array<{ pat?: string; out?: string }>;
+	path?: string;
+	/** Pre-`ast` (`ast_edit`) argument name; kept so historical transcripts still render a scope. */
 	paths?: string[];
 }
 
@@ -87,7 +90,8 @@ export const astEditToolRenderer = {
 	inline: true,
 	renderCall(args: AstEditRenderArgs, _options: RenderResultOptions, uiTheme: Theme): Component {
 		const meta: string[] = [];
-		if (args.paths?.length) meta.push(`in ${args.paths.join(", ")}`);
+		const scopePaths = toPathList(args.path ?? args.paths);
+		if (scopePaths.length) meta.push(`in ${scopePaths.join(", ")}`);
 		const rewriteCount = args.ops?.length ?? 0;
 		if (rewriteCount > 1) meta.push(`${rewriteCount} rewrites`);
 

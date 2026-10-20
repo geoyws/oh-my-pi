@@ -172,7 +172,34 @@ describe("formatSessionHistoryMarkdown", () => {
 		);
 	});
 
-	it("keeps the ast_grep pattern visible instead of only its paths scope", () => {
+	it("keeps the ast search pattern visible instead of only its path scope", () => {
+		const output = formatSessionHistoryMarkdown([
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "tc-astsearch",
+						name: "ast",
+						arguments: { mode: "search", pat: "console.log($$$)", path: "packages/coding-agent/src/**/*.ts" },
+					},
+				],
+				timestamp: 1,
+			},
+			{
+				role: "toolResult",
+				toolCallId: "tc-astsearch",
+				toolName: "ast",
+				content: [{ type: "text", text: "match" }],
+				isError: false,
+				timestamp: 2,
+			},
+		]);
+
+		expect(output).toContain("→ ast(console.log($$$)) ⇒ ok · 1 line");
+	});
+
+	it("keeps the pattern visible for legacy ast_grep transcript calls", () => {
 		const output = formatSessionHistoryMarkdown([
 			{
 				role: "assistant",
@@ -199,7 +226,7 @@ describe("formatSessionHistoryMarkdown", () => {
 		expect(output).toContain("→ ast_grep(console.log($$$)) ⇒ ok · 1 line");
 	});
 
-	it("keeps the ast_edit op pattern visible instead of only its paths scope", () => {
+	it("keeps the ast edit op pattern visible instead of only its path scope", () => {
 		const output = formatSessionHistoryMarkdown([
 			{
 				role: "assistant",
@@ -207,10 +234,11 @@ describe("formatSessionHistoryMarkdown", () => {
 					{
 						type: "toolCall",
 						id: "tc-astedit",
-						name: "ast_edit",
+						name: "ast",
 						arguments: {
+							mode: "edit",
 							ops: [{ pat: "oldApi($$$A)", out: "newApi($$$A)" }],
-							paths: ["packages/coding-agent/src/**/*.ts"],
+							path: "packages/coding-agent/src/**/*.ts",
 						},
 					},
 				],
@@ -219,7 +247,7 @@ describe("formatSessionHistoryMarkdown", () => {
 			{
 				role: "toolResult",
 				toolCallId: "tc-astedit",
-				toolName: "ast_edit",
+				toolName: "ast",
 				content: [{ type: "text", text: "1 change" }],
 				isError: false,
 				timestamp: 2,
@@ -227,7 +255,7 @@ describe("formatSessionHistoryMarkdown", () => {
 		]);
 
 		expect(output).toContain("oldApi($$$A)");
-		expect(output).not.toContain("→ ast_edit(packages/coding-agent/src/**/*.ts)");
+		expect(output).not.toContain("→ ast(packages/coding-agent/src/**/*.ts)");
 	});
 
 	it("renders tool intent comments immediately before tool call lines when includeToolIntent is true", () => {

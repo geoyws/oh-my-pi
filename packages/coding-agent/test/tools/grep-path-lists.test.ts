@@ -611,13 +611,14 @@ describe("tool path arrays", () => {
 		expect(details?.displayReadTargetLinks).toEqual([null, path.join(tempDir, "packages", "grep.txt")]);
 	});
 
-	it("ast_grep accepts quoted path and glob filters", async () => {
+	it("ast search accepts quoted path and glob filters", async () => {
 		const tools = await createTools(createTestSession(tempDir));
-		const tool = tools.find(entry => entry.name === "ast_grep");
+		const tool = tools.find(entry => entry.name === "ast");
 		expect(tool).toBeDefined();
-		if (!tool) throw new Error("Missing ast_grep tool");
+		if (!tool) throw new Error("Missing ast tool");
 
-		const result = await tool.execute("ast-grep-quoted-path", {
+		const result = await tool.execute("ast-search-quoted-path", {
+			mode: "search",
 			pat: "providerOptions",
 			path: '"packages/**/*.ts"',
 		});
@@ -630,13 +631,14 @@ describe("tool path arrays", () => {
 		expect(details?.scopePath).toBe("packages");
 	});
 
-	it("ast_grep accepts a semicolon-delimited path list", async () => {
+	it("ast search accepts a semicolon-delimited path list", async () => {
 		const tools = await createTools(createTestSession(tempDir));
-		const tool = tools.find(entry => entry.name === "ast_grep");
+		const tool = tools.find(entry => entry.name === "ast");
 		expect(tool).toBeDefined();
-		if (!tool) throw new Error("Missing ast_grep tool");
+		if (!tool) throw new Error("Missing ast tool");
 
-		const result = await tool.execute("ast-grep-path-array", {
+		const result = await tool.execute("ast-search-path-list", {
+			mode: "search",
 			pat: "providerOptions",
 			path: "apps/**/*.ts; packages/**/*.ts; phases/**/*.ts",
 		});
@@ -651,18 +653,19 @@ describe("tool path arrays", () => {
 		expect(details?.scopePath).toBe("apps/**/*.ts, packages/**/*.ts, phases/**/*.ts");
 	});
 
-	it("ast_grep expands delimited path entries", async () => {
+	it("ast search expands delimited path entries", async () => {
 		const tools = await createTools(createTestSession(tempDir));
-		const tool = tools.find(entry => entry.name === "ast_grep");
+		const tool = tools.find(entry => entry.name === "ast");
 		expect(tool).toBeDefined();
-		if (!tool) throw new Error("Missing ast_grep tool");
+		if (!tool) throw new Error("Missing ast tool");
 
 		for (const [name, entry] of [
 			["comma", "apps/**/*.ts, packages/**/*.ts"],
 			["semicolon", "apps/**/*.ts;packages/**/*.ts"],
 			["space", "apps/**/*.ts packages/**/*.ts"],
 		] as const) {
-			const result = await tool.execute(`ast-grep-delimited-${name}`, {
+			const result = await tool.execute(`ast-search-delimited-${name}`, {
+				mode: "search",
 				pat: "providerOptions",
 				path: entry,
 			});
@@ -678,7 +681,7 @@ describe("tool path arrays", () => {
 		}
 	});
 
-	it("ast_edit applies across an explicit path array", async () => {
+	it("ast edit applies across a semicolon-delimited path list", async () => {
 		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "search-path-lists-"));
 		await createSearchFixture(tmp);
 		const queue = new ToolChoiceQueue();
@@ -689,13 +692,14 @@ describe("tool path arrays", () => {
 				steer: () => {},
 			}),
 		);
-		const tool = tools.find(entry => entry.name === "ast_edit");
+		const tool = tools.find(entry => entry.name === "ast");
 		expect(tool).toBeDefined();
-		if (!tool) throw new Error("Missing ast_edit tool");
+		if (!tool) throw new Error("Missing ast tool");
 
-		const preview = await tool.execute("ast-edit-path-array", {
+		const preview = await tool.execute("ast-edit-path-list", {
+			mode: "edit",
 			ops: [{ pat: "legacyWrap($A, $B)", out: "modernWrap($A, $B)" }],
-			paths: ["apps/**/*.ts", "packages/**/*.ts", "phases/**/*.ts"],
+			path: "apps/**/*.ts; packages/**/*.ts; phases/**/*.ts",
 		});
 		const text = getText(preview);
 		const details = preview.details as { totalReplacements?: number; scopePath?: string } | undefined;

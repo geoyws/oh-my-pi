@@ -1,8 +1,8 @@
-/** `ast_edit` — structural AST rewrites: per-op pattern/replacement pairs, replacement counts, diffs. */
+/** `ast` edit mode (legacy `ast_edit`) — structural AST rewrites: per-op pattern/replacement pairs, replacement counts, diffs. */
 import type { ReactNode } from "react";
 import { Badge, CodeBlock, DiffBlock, InvalidArg, Note, Output, PathText, ResultText, Row } from "../parts";
 import type { ToolRenderer, ToolRenderProps } from "../types";
-import { detailsRecord, isRecord, languageFromPath, num, shortenPath, str } from "../util";
+import { detailsRecord, isRecord, languageFromPath, num, scopePaths, shortenPath, str } from "../util";
 
 interface AstEditOp {
 	pat: string;
@@ -19,16 +19,6 @@ interface AstEditDetails {
 	parseErrors: string[];
 	parseErrorsTotal: number | null;
 	displayContent: string | null;
-}
-
-function pathsOf(args: Record<string, unknown>): string[] {
-	if (!Array.isArray(args.paths)) return [];
-	const paths: string[] = [];
-	for (const p of args.paths) {
-		const s = str(p);
-		if (s) paths.push(s);
-	}
-	return paths;
 }
 
 function opsOf(args: Record<string, unknown>): AstEditOp[] {
@@ -73,14 +63,14 @@ function detailsOf(result: ToolRenderProps["result"]): AstEditDetails | null {
 }
 
 function Summary({ args, result }: ToolRenderProps): ReactNode {
-	const paths = pathsOf(args);
+	const paths = scopePaths(args);
 	const first = paths[0];
 	const opCount = Array.isArray(args.ops) ? args.ops.length : 0;
 	const details = detailsOf(result);
 	const total = details?.totalReplacements;
 	return (
 		<>
-			{first ? <PathText path={first} /> : <InvalidArg what="paths" />}
+			{first ? <PathText path={first} /> : <InvalidArg what="path" />}
 			{paths.length > 1 && <span className="tv-faint">+{paths.length - 1} more</span>}
 			<Badge tone="accent">
 				{opCount} op{opCount === 1 ? "" : "s"}
@@ -113,7 +103,7 @@ function OpCell({ op, lang }: { op: AstEditOp; lang: string | null }): ReactNode
 }
 
 function Body({ args, result }: ToolRenderProps): ReactNode {
-	const paths = pathsOf(args);
+	const paths = scopePaths(args);
 	const first = paths[0];
 	const ops = opsOf(args);
 	const details = result?.isError ? null : detailsOf(result);

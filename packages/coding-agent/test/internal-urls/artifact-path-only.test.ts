@@ -95,7 +95,7 @@ describe("resolveToolSearchScope handles large artifacts via pathOnly", () => {
 		await fs.rm(testDir, { recursive: true, force: true });
 	});
 
-	it("resolves ast_grep/ast_edit search scope to the backing file for large artifacts", async () => {
+	it("resolves ast search/edit scope to the backing file for large artifacts", async () => {
 		const scope = await resolveToolSearchScope({
 			rawPaths: ["artifact://0"],
 			cwd: testDir,

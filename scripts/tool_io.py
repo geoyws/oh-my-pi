@@ -18,10 +18,12 @@ DEFAULT_MAX_FILES = 500
 DEFAULT_SESSIONS_DIR = Path.home() / ".omp" / "agent" / "sessions"
 
 
+# `ast:edit` / `ast:search` select the merged `ast` tool by its `mode` argument;
+# `ast_edit` / `ast_grep` keep matching calls in historical session logs.
 TOOL_GROUPS: dict[str, tuple[str, ...]] = {
-    "edits": ("edit", "ast_edit"),
-    "reads": ("read", "grep", "find", "ast_grep", "lsp"),
-    "writes": ("edit", "ast_edit", "write"),
+    "edits": ("edit", "ast:edit", "ast_edit"),
+    "reads": ("read", "grep", "find", "ast:search", "ast_grep", "lsp"),
+    "writes": ("edit", "ast:edit", "ast_edit", "write"),
 }
 
 
@@ -181,13 +183,14 @@ def iter_tool_invocations(
                         continue
                     tool_name = _as_string(payload.get("name"))
                     tool_call_id = _as_string(payload.get("id"))
-                    if (
-                        tool_name is None
-                        or tool_call_id is None
-                        or tool_name not in wanted
-                    ):
+                    if tool_name is None or tool_call_id is None:
                         continue
                     arguments = _as_record(payload.get("arguments")) or {}
+                    if tool_name not in wanted and (
+                        tool_name != "ast"
+                        or f"ast:{arguments.get('mode')}" not in wanted
+                    ):
+                        continue
                     pending[tool_call_id] = ToolCall(
                         session_file=session_file,
                         tool_call_id=tool_call_id,
@@ -203,7 +206,7 @@ def iter_tool_invocations(
                 continue
             tool_name = _as_string(message.get("toolName"))
             tool_call_id = _as_string(message.get("toolCallId"))
-            if tool_name is None or tool_call_id is None or tool_name not in wanted:
+            if tool_name is None or tool_call_id is None:
                 continue
             pending_call = pending.pop(tool_call_id, None)
             if pending_call is None:

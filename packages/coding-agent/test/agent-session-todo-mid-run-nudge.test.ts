@@ -17,9 +17,9 @@ import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
  * gentle MODEL-ONLY hint — deliberately separate from the user-visible
  * stop-time reminder ladder. The contract this defends:
  *
- *   1. Only SUCCESSFUL MUTATING tool results (bash/eval/edit/write/ast_edit)
- *      tick the counter. Read-only exploration (grep/read/glob/lsp) and
- *      errored results never do.
+ *   1. Only SUCCESSFUL MUTATING tool results (bash/eval/edit/write, and `ast`
+ *      in edit mode) tick the counter. Read-only exploration (grep/read/glob/lsp,
+ *      `ast` search) and errored results never do.
  *   2. At {@link MID_RUN_TODO_NUDGE_MUTATION_THRESHOLD} mutations without a
  *      `todo` call, the aside provider injects a hidden custom message
  *      (`display: false`) — NO `todo_reminder` event, nothing renders.
@@ -100,7 +100,7 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 	}
 
 	/** Production-shaped tool round trip: assistant toolCall turn + toolResult. */
-	function emitToolResult(toolName: string, opts?: { isError?: boolean }): void {
+	function emitToolResult(toolName: string, opts?: { isError?: boolean; details?: unknown }): void {
 		const toolCallId = `call_${toolName}_${Date.now()}_${Math.random()}`;
 		session.agent.emitExternalEvent({ type: "message_end", message: toolUseAssistant(toolName) });
 		const content: TextContent[] = [{ type: "text", text: "ok" }];
@@ -112,6 +112,7 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 				toolName,
 				content,
 				isError: opts?.isError ?? false,
+				details: opts?.details,
 				timestamp: Date.now(),
 			},
 		});
@@ -209,6 +210,21 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 
 		expect(await drainNudges()).toEqual([]);
 		expect(reminderEvents).toEqual([]);
+	});
+
+	it("`ast` search results never tick the counter", async () => {
+		for (let i = 0; i < THRESHOLD * 2; i++) emitToolResult("ast", { details: { matchCount: 1, fileCount: 1 } });
+
+		expect(await drainNudges()).toEqual([]);
+		expect(reminderEvents).toEqual([]);
+	});
+
+	it("`ast` edit results tick the counter like other mutations", async () => {
+		for (let i = 0; i < THRESHOLD; i++) {
+			emitToolResult("ast", { details: { totalReplacements: 1, filesTouched: 1, applied: false } });
+		}
+
+		expect((await drainNudges()).length).toBe(1);
 	});
 
 	it("stays silent below the mutation threshold", async () => {

@@ -44,8 +44,8 @@ describe("ToolView xd:// dispatches", () => {
 							inner: {
 								action: "apply",
 								reason: "looks correct",
-								sourceToolName: "ast_edit",
-								label: "ast_edit: edit foo.ts",
+								sourceToolName: "ast",
+								label: "AST Edit: 1 replacement in 1 file",
 							},
 						},
 					},
@@ -56,7 +56,7 @@ describe("ToolView xd:// dispatches", () => {
 		expect(html).toContain("xd://resolve");
 		expect(html).toContain("proposed → resolved");
 		expect(html).toContain("tv-badge--ok");
-		expect(html).toContain("ast_edit: edit foo.ts");
+		expect(html).toContain("AST Edit: 1 replacement in 1 file");
 		// The historical args-only path once left the badge as a warn "?".
 		expect(html).not.toContain('tv-badge--warn">?');
 	});
@@ -150,6 +150,69 @@ describe("ToolView xd:// dispatches", () => {
 
 		expect(html).toContain("poll a1b2");
 		expect(html).not.toContain("tv-out-title");
+	});
+});
+
+describe("ToolView ast renderer", () => {
+	const ops = [{ pat: "oldApi($$$A)", out: "newApi($$$A)" }];
+	const editSummary = /1(?:<!-- -->)? op\b/;
+
+	it("renders mode: search calls with the search summary", () => {
+		const html = renderToStaticMarkup(
+			<ToolView name="ast" args={{ mode: "search", pat: "console.log($$$)", path: "src" }} result={{ content: [] }} />,
+		);
+
+		expect(html).toContain("tv-pattern");
+		expect(html).toContain("console.log($$$)");
+		expect(html).not.toMatch(editSummary);
+	});
+
+	it("renders mode: edit calls with the edit summary", () => {
+		const html = renderToStaticMarkup(
+			<ToolView name="ast" args={{ mode: "edit", ops, path: "src/a.ts" }} result={{ content: [] }} />,
+		);
+
+		expect(html).toMatch(editSummary);
+		expect(html).not.toContain("tv-pattern");
+	});
+
+	it("infers edit from ops when a single-mode call omits mode", () => {
+		const html = renderToStaticMarkup(
+			<ToolView name="ast" args={{ ops, path: "src/a.ts" }} result={{ content: [] }} />,
+		);
+
+		expect(html).toMatch(editSummary);
+		expect(html).not.toContain("tv-pattern");
+	});
+
+	it("infers search when a single-mode call omits mode and ops", () => {
+		const html = renderToStaticMarkup(
+			<ToolView name="ast" args={{ pat: "processItems", path: "src" }} result={{ content: [] }} />,
+		);
+
+		expect(html).toContain("tv-pattern");
+		expect(html).not.toMatch(editSummary);
+	});
+
+	it("falls back to edit when the result carries totalReplacements", () => {
+		const html = renderToStaticMarkup(
+			<ToolView name="ast" args={{}} result={{ content: [], details: { totalReplacements: 2 } }} />,
+		);
+
+		expect(html).not.toContain("tv-pattern");
+		expect(html).toMatch(/2(?:<!-- -->)? replacement/);
+	});
+
+	it("keeps legacy ast_grep and ast_edit transcript names renderable", () => {
+		const searchHtml = renderToStaticMarkup(
+			<ToolView name="ast_grep" args={{ pat: "console.log($$$)", path: "src" }} result={{ content: [] }} />,
+		);
+		expect(searchHtml).toContain("tv-pattern");
+
+		const editHtml = renderToStaticMarkup(
+			<ToolView name="ast_edit" args={{ ops, paths: ["src/a.ts"] }} result={{ content: [] }} />,
+		);
+		expect(editHtml).toMatch(editSummary);
 	});
 });
 
