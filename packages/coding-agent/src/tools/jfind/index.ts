@@ -126,7 +126,12 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 		const details: FindToolDetails = { query, keywords, threshold, hits, stats, elapsedMs, cwd, scopePath };
 		const where = scopePath === undefined ? "" : ` in ${scopePath}`;
 		const out: string[] = [];
-		if (hits.length === 0) {
+		const allFailed = stats.requests > 0 && stats.errors === stats.requests;
+		if (allFailed) {
+			out.push(
+				`find failed for "${query}"${where}: all ${stats.requests} judge requests failed, so no results were judged`,
+			);
+		} else if (hits.length === 0) {
 			out.push(`no hits for "${query}"${where} (τ ${threshold.toFixed(2)})`);
 		} else {
 			out.push(`${hits.length} hit(s) for "${query}"${where} (τ ${threshold.toFixed(2)}), strongest first`, "");
@@ -150,7 +155,7 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 			);
 		}
 		const builder = toolResult(details).text(out.join("\n"));
-		if (stats.requests > 0 && stats.errors === stats.requests) builder.error();
+		if (allFailed) builder.error();
 		else if (hits.length === 0) builder.useless();
 		return builder.done();
 	}
