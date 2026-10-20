@@ -457,6 +457,25 @@ function responsesEffort(body: Record<string, unknown>): string | undefined {
 	return (body.reasoning as { effort?: string } | undefined)?.effort;
 }
 
+/** Built through the catalog policy path so the classes/minimax.kdl exact-model rule applies. */
+function createMiniMaxM31Model<TApi extends "anthropic-messages" | "openai-completions">(
+	provider: "minimax-code" | "minimax-code-cn",
+	api: TApi,
+): Model<TApi> {
+	return buildModel({
+		id: "MiniMax-M3.1-Flash-Preview",
+		name: "MiniMax-M3.1-Flash-Preview",
+		api,
+		provider,
+		baseUrl: api === "anthropic-messages" ? "https://api.minimax.io/anthropic" : "https://api.minimax.io/v1",
+		reasoning: true,
+		input: ["text", "image"],
+		cost: { input: 0.3, output: 1.2, cacheRead: 0.06, cacheWrite: 0 },
+		contextWindow: 204_800,
+		maxTokens: 131_072,
+	});
+}
+
 describe("OpenAI reasoning effort fallback retry", () => {
 	it("retries Chat Completions xhigh as provider max", async () => {
 		const bodies: Record<string, unknown>[] = [];
@@ -966,28 +985,74 @@ describe("OpenAI reasoning effort fallback retry", () => {
 
 describe("OpenAI reasoning effort fallback under effort-preserving model policy", () => {
 	it.each(["minimax-code", "minimax-code-cn"] as const)(
-		"reads %s MiniMax M3.1's mandatory effort from the KDL rule tree",
+		"reads %s MiniMax M3.1's mandatory, medium-pinned effort from the KDL rule tree",
 		provider => {
-			// Built through the catalog policy path: the classes/minimax.kdl
-			// exact-model rule is the only source of the mandatory-effort fact.
-			const model = buildModel({
-				id: "MiniMax-M3.1-Flash-Preview",
-				name: "MiniMax-M3.1-Flash-Preview",
-				api: "anthropic-messages",
-				provider,
-				baseUrl: "https://api.minimax.io/anthropic",
-				reasoning: true,
-				input: ["text", "image"],
-				cost: { input: 0.3, output: 1.2, cacheRead: 0.06, cacheWrite: 0 },
-				contextWindow: 204_800,
-				maxTokens: 131_072,
-			});
-			expect(model.thinking?.requiresEffort).toBe(true);
-			// Its KDL effort map keeps distinct wire tiers, so it is not pinned.
-			expect(resolveOpenAIEffortFallbackConstraints(model, undefined)).toEqual({
+			const anthropicRoute = createMiniMaxM31Model(provider, "anthropic-messages");
+			expect(anthropicRoute.thinking?.requiresEffort).toBe(true);
+			expect(resolveOpenAIEffortFallbackConstraints(anthropicRoute, undefined)).toEqual({
 				requiresEffort: true,
-				pinnedEffort: false,
+				pinnedEffort: true,
 			});
+			const openAIRoute = createMiniMaxM31Model(provider, "openai-completions");
+			expect(resolveOpenAIEffortFallbackConstraints(openAIRoute, openAIRoute.compat)).toEqual({
+				requiresEffort: true,
+				pinnedEffort: true,
+			});
+		},
+	);
+
+	it.each(["minimax-code", "minimax-code-cn"] as const)(
+		"surfaces a %s M3.1 effort rejection instead of retrying without reasoning_effort",
+		async provider => {
+			const bodies: Record<string, unknown>[] = [];
+			const fetchMock: FetchImpl = Object.assign(
+				async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+					bodies.push(parseJsonBody(init));
+					return bodies.length === 1
+						? rejectedReasoningEffortResponse("reasoning_effort", "medium")
+						: createChatSseResponse();
+				},
+				{ preconnect: fetch.preconnect },
+			);
+
+			const result = await streamOpenAICompletions(
+				createMiniMaxM31Model(provider, "openai-completions"),
+				testContext,
+				{ apiKey: "test-key", fetch: fetchMock, reasoning: "high" },
+			).result();
+
+			expect(result.stopReason).toBe("error");
+			expect(result.errorStatus).toBe(400);
+			expect(bodies.map(body => body.reasoning_effort)).toEqual(["medium"]);
+		},
+	);
+
+	it.each(["minimax-code", "minimax-code-cn"] as const)(
+		"surfaces a %s M3.1 allowed-values rejection instead of remapping, without poisoning later turns",
+		async provider => {
+			const model = createMiniMaxM31Model(provider, "openai-completions");
+			const providerSessionState = new Map<string, ProviderSessionState>();
+			const bodies: Record<string, unknown>[] = [];
+			const fetchMock: FetchImpl = Object.assign(
+				async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+					bodies.push(parseJsonBody(init));
+					return bodies.length === 1
+						? rejectedReasoningEffortWithAllowedResponse("reasoning_effort")
+						: createChatSseResponse();
+				},
+				{ preconnect: fetch.preconnect },
+			);
+			const options = { apiKey: "test-key", fetch: fetchMock, reasoning: "high", providerSessionState } as const;
+
+			const rejected = await streamOpenAICompletions(model, testContext, options).result();
+			expect(rejected.stopReason).toBe("error");
+			expect(rejected.errorStatus).toBe(400);
+			expect(bodies).toHaveLength(1);
+
+			// A remembered remap would override the KDL medium pin on later turns.
+			const next = await streamOpenAICompletions(model, testContext, options).result();
+			expect(next.stopReason).toBe("stop");
+			expect(bodies.map(body => body.reasoning_effort)).toEqual(["medium", "medium"]);
 		},
 	);
 
