@@ -9,7 +9,7 @@ import { initTheme } from "@oh-my-pi/pi-tui/theme";
 
 const PRIVATE_MODE = "\x1b[?1049h\x1b[?1003h";
 
-describe("ast-grep control-byte filenames", () => {
+describe("ast control-byte filenames", () => {
 	beforeAll(async () => {
 		await initTheme();
 	});
@@ -28,8 +28,8 @@ describe("ast-grep control-byte filenames", () => {
 			try {
 				await Bun.write(absolutePath, "needle");
 				const component = new ToolExecutionComponent(
-					"ast_grep",
-					{ pat: "needle" },
+					"ast",
+					{ mode: "search", pat: "needle" },
 					{ useBuiltInRenderer: true },
 					undefined,
 					{ requestRender: vi.fn(), requestComponentRender: vi.fn(), resetDisplay: vi.fn() },

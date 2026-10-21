@@ -203,11 +203,11 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		const tempDir = makeTempDir();
 		const { session } = await createAgentSession({
 			...baseOptions(tempDir),
-			toolNames: ["read", "ast_edit"],
+			toolNames: ["read", "ast", "edit"],
 		});
 
 		try {
-			expect(session.getActiveToolNames()).toEqual(expect.arrayContaining(["read", "ast_edit", "write"]));
+			expect(session.getActiveToolNames()).toEqual(expect.arrayContaining(["read", "ast", "write"]));
 			expect(session.getMountedXdevToolNames()).toEqual([]);
 			const write = session.getToolByName("write");
 			expect(write).toBeDefined();
@@ -1625,12 +1625,12 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		try {
 			await session.refreshMCPTools([externalMcpTool]);
 			const deviceNames = session.getXdevToolEntries().map(entry => entry.name);
-			expect(deviceNames).toEqual(expect.arrayContaining(["ast_edit", "mcp__fixture_report"]));
+			expect(deviceNames).toEqual(expect.arrayContaining(["ast", "mcp__fixture_report"]));
 			expect(session.getActiveToolNames()).not.toContain("mcp__fixture_report");
 
 			const context = await session.agent.buildSideRequestContext([]);
 			const providerToolNames = context.tools?.map(tool => tool.name);
-			expect(providerToolNames).toEqual(expect.arrayContaining(["ast_edit", "mcp__fixture_report"]));
+			expect(providerToolNames).toEqual(expect.arrayContaining(["ast", "mcp__fixture_report"]));
 		} finally {
 			await session.dispose();
 		}

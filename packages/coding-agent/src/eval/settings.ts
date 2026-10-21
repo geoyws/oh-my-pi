@@ -88,6 +88,26 @@ export const cfgEvalAutoBackgroundThresholdMs = register({
 	default: 60_000,
 });
 
+export const cfgEvalKernelIdleTimeoutSeconds = register({
+	id: "eval.kernelIdleTimeoutSeconds",
+	type: "number",
+	default: 600,
+	ui: {
+		tab: "shell",
+		group: "Eval & Runtimes",
+		label: "Eval Kernel Idle Timeout",
+		description:
+			"Shut down a retained JavaScript or Python eval kernel after this many seconds with no cell running. A running cell is never cut; the next eval starts a fresh kernel and reports the reset. 0 keeps kernels alive.",
+		options: [
+			{ value: "0", label: "Never", description: "Keep idle kernels alive until the session ends." },
+			{ value: "300", label: "5 minutes" },
+			{ value: "600", label: "10 minutes", description: "Default." },
+			{ value: "1800", label: "30 minutes" },
+			{ value: "3600", label: "1 hour" },
+		],
+	},
+});
+
 // Runtime knobs (consumed by eval backends and the /python slash command)
 export const cfgPythonKernelMode = register({
 	id: "python.kernelMode",

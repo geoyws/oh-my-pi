@@ -226,6 +226,11 @@ export abstract class BaseKernel<TExecuteOptions extends KernelExecuteOptions = 
 		return this.#alive && !this.#disposed;
 	}
 
+	/** True while any cell, tool request, or control request awaits the runner. */
+	isBusy(): boolean {
+		return this.#pending.size > 0 || this.#pendingControls.size > 0;
+	}
+
 	/**
 	 * Settles once the kernel stops accepting work: subprocess exit or the start
 	 * of a shutdown. Retained-state reporting uses it to mark the kernel dead.

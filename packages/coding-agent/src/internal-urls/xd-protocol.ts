@@ -5,7 +5,7 @@ import { isResolutionDeviceName } from "@oh-my-pi/pi-tui/tools/resolve";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { parseXdTopicUrl, parseXdUrl } from "@oh-my-pi/pi-tui/tools/xd-url";
 import type { ToolSession } from "../tools";
-import { resolveToolTier } from "../tools/approval";
+import { resolveToolApprovalDecision } from "../tools/approval";
 import { dispatchReportIssueDevice, reportIssueDeviceUsage } from "../tools/report-tool-issue";
 import { dispatchResolutionDevice, resolutionDeviceUsage } from "../tools/resolve";
 import { dispatchXdevTool, resolveXdevTool, xdevDocs, xdevListing } from "../tools/xdev";
@@ -43,10 +43,13 @@ function deviceWriteTier(
 		if (typeof content !== "string") return "exec";
 		const parsed: unknown = JSON.parse(content);
 		if (!isRecord(parsed)) return "exec";
-		// The policyKey makes the outer gate consult `tools.approval.<device>` for
+		// The policyKey makes the outer gate consult `tools.approval.<key>` for
 		// this dispatch before falling back to `tools.approval.write`, so users can
-		// scope allow/deny/prompt to a single device (issue #7923).
-		return { tier: resolveToolTier(inst, parsed), policyKey: name };
+		// scope allow/deny/prompt to a single device (issue #7923). A mounted
+		// tool's own per-call policy key (e.g. `ast` edit mode -> `ast_edit`)
+		// wins over the device name so mode-scoped policies keep applying.
+		const decision = resolveToolApprovalDecision(inst, parsed);
+		return { tier: decision.tier, policyKey: decision.policyKey ?? name };
 	} catch {
 		return "exec";
 	}

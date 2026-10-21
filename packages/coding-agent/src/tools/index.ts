@@ -44,8 +44,7 @@ import type { EventBus } from "../utils/event-bus";
 import { WebSearchTool } from "../web/search";
 import type { WorkspaceTree } from "../workspace-tree";
 import { AskTool } from "./ask";
-import { AstEditTool } from "./ast-edit";
-import { AstGrepTool } from "./ast-grep";
+import { AstTool } from "./ast";
 import { BashTool } from "./bash";
 import { type BuiltinToolName, type HiddenToolName, normalizeToolNames } from "./builtin-names";
 import { type CheckpointState, CheckpointTool, type CompletedRewindState, RewindTool } from "./checkpoint";
@@ -560,8 +559,7 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	security_scan: s => new SecurityScanTool(s),
 	bash: s => new BashTool(s),
 	edit: s => new EditTool(s),
-	ast_grep: s => new AstGrepTool(s),
-	ast_edit: s => new AstEditTool(s),
+	ast: AstTool.createIf,
 	ask: AskTool.createIf,
 	debug: DebugTool.createIf,
 	ida: IdaTool.createIf,
@@ -692,18 +690,10 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 			requestedTools.push("goal");
 		}
 		if (
-			requestedTools.includes("grep") &&
-			!requestedTools.includes("ast_grep") &&
-			cfgAstGrepEnabled.get(session.settings)
+			(requestedTools.includes("grep") && cfgAstGrepEnabled.get(session.settings)) ||
+			(requestedTools.includes("edit") && cfgAstEditEnabled.get(session.settings))
 		) {
-			requestedTools.push("ast_grep");
-		}
-		if (
-			requestedTools.includes("edit") &&
-			!requestedTools.includes("ast_edit") &&
-			cfgAstEditEnabled.get(session.settings)
-		) {
-			requestedTools.push("ast_edit");
+			if (!requestedTools.includes("ast")) requestedTools.push("ast");
 		}
 		if (["hindsight", "mnemopi"].includes(cfgMemoryBackend.get(session.settings))) {
 			for (const name of ["recall", "retain", "reflect"]) {
@@ -754,8 +744,7 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 		if (name === "grep") return cfgGrepEnabled.get(session.settings);
 		if (name === "find") return isFindEnabled(session);
 		if (name === "github") return cfgGithubEnabled.get(session.settings);
-		if (name === "ast_grep") return cfgAstGrepEnabled.get(session.settings);
-		if (name === "ast_edit") return cfgAstEditEnabled.get(session.settings);
+		if (name === "ast") return cfgAstGrepEnabled.get(session.settings) || cfgAstEditEnabled.get(session.settings);
 		if (name === "web_search") return cfgWebSearchEnabled.get(session.settings);
 		if (name === "security_scan") return cfgSecurityEnabled.get(session.settings);
 		if (name === "think") return externalThinkingActive;
@@ -910,7 +899,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		session.xdev = createXdevState(session, toolRegistry, builtInNames, mountedNames);
 		tools = kept;
 	}
-	// Staged previews from deferrable tools (e.g. ast_edit) resolve through a
+	// Staged previews from deferrable tools (e.g. ast edit mode) resolve through a
 	// `write` to xd://resolve/reject, so retain write whenever one can stage.
 	const xdevMounted = (session.xdev?.mountedNames.size ?? 0) > 0;
 	if (

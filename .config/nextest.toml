@@ -22,3 +22,13 @@ fail-fast = false
 # No retries: a flaky test is a bug we want to see, not paper over.
 retries = 0
 slow-timeout = { period = "60s", terminate-after = 4 }
+
+# pi-shell's cancellation tests race real child processes against the 1 s
+# POSIX TERM grace: a trap must fork, sleep past the old 500 ms reader cancel
+# and write before the KILL wave. Their in-file `shell_test_lock` serialized
+# them under `cargo test`, but nextest gives each test its own process, so the
+# lock no longer holds and a full parallel sweep starves the trap's `sleep`
+# past the grace (omp t-34dd9e20). Run them with the runner to themselves.
+[[profile.default.overrides]]
+filter = 'package(pi-shell) & test(/^shell::tests::cancel/)'
+threads-required = "num-test-threads"
