@@ -40,6 +40,7 @@ import {
 	isOpenAIResponsesProgressEvent,
 	parseAzureDeploymentNameMap,
 	processResponsesStream,
+	resolveOpenAIEffortFallbackConstraints,
 } from "./openai-shared";
 
 export { parseAzureDeploymentNameMap } from "./openai-shared";
@@ -211,7 +212,12 @@ const streamAzureOpenAIResponsesOnce = (
 					}
 					const capturedErrorResponse = error instanceof OpenAIHttpError ? error.captured : undefined;
 					const reasoningEffortFallback: OpenAIReasoningEffortFallback | undefined = !requestSignal.aborted
-						? resolveOpenAIReasoningEffortFallback(error, capturedErrorResponse, params)
+						? resolveOpenAIReasoningEffortFallback(
+								error,
+								capturedErrorResponse,
+								params,
+								resolveOpenAIEffortFallbackConstraints(model, model.compat),
+							)
 						: undefined;
 					if (reasoningEffortFallback === undefined) throw error;
 					const retryMarker = `${reasoningEffortFallbackKey}:${String(reasoningEffortFallback)}`;

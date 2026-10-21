@@ -5,6 +5,7 @@ import type { Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
 import { isEnoent } from "@oh-my-pi/pi-utils";
+import { e2eHostRefusal, liveE2eHostProbe } from "../../../../scripts/e2e-host-guard";
 
 export async function withEnv(
 	overrides: Record<string, string | undefined>,
@@ -95,6 +96,12 @@ export function checkAuthGatewayE2EAvailable(): Promise<AuthGatewayE2EStatus> {
 
 async function readAuthGatewayE2EStatus(): Promise<AuthGatewayE2EStatus> {
 	if (!Bun.env.E2E) return { ok: false, reason: "E2E env not set" };
+	const refusal = e2eHostRefusal("e2e", liveE2eHostProbe());
+	if (refusal !== null) {
+		const reason = `auth-gateway e2e refused on this host: ${refusal} (omp e2e runs only on @@hal, kb rule g-ca3365d2)`;
+		console.warn(`[skip] ${reason}`);
+		return { ok: false, reason };
+	}
 	let token: string;
 	try {
 		token = (await Bun.file(AUTH_GATEWAY_TOKEN_PATH).text()).trim();

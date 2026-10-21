@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- MiniMax `MiniMax-M3.1-Flash` and `MiniMax-M3.1-Flash-Preview` (on `minimax`, `minimax-cn`, `minimax-code`, `minimax-code-cn`) now always send effort `medium`: every tier and the default selection map to wire `medium` as Anthropic `output_config.effort` (the bundled route), and as `reasoning_effort` if the model is configured on an OpenAI-compatible route, so requests never carry `max` or omit the effort. Thinking stays mandatory and the default level is `medium`.
+
 ## [18.12.3] - 2026-10-19
 
 ### Changed

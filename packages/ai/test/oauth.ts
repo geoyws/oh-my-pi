@@ -11,12 +11,16 @@ import path from "node:path";
 import { getOAuthApiKey } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthCredentials, OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
 import { $flag, getAgentDir, isEnoent } from "@oh-my-pi/pi-utils";
+import { assertE2eHost } from "../../../scripts/e2e-host-guard";
 
 /**
  * E2E tests require explicit opt-in via E2E=1 environment variable.
  * This prevents accidental API calls when keys happen to be in the environment.
  */
 const E2E_ENABLED = $flag("E2E");
+// E2E=1 is a request for live provider traffic; refuse it at load on any host
+// barred from e2e (the physical Mac) so the run fails loudly instead of calling out.
+if (E2E_ENABLED) assertE2eHost("e2e", "E2E=1 live-provider tests");
 
 /**
  * Get an API key from environment, but only if E2E tests are enabled.

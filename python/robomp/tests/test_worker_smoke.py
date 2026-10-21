@@ -34,6 +34,27 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _assert_e2e_host() -> None:
+    """Refuse the integration run on hosts barred from omp e2e (kb rule g-ca3365d2)."""
+    repo_root = Path(__file__).resolve().parents[3]
+    guard = repo_root / "scripts" / "e2e-host-guard.ts"
+    try:
+        result = subprocess.run(
+            ["bun", str(guard), "e2e", "robomp:test:integration"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+        )
+    except OSError as err:
+        pytest.fail(f"robomp:test:integration: cannot run e2e host guard ({err})", pytrace=False)
+    if result.returncode != 0:
+        pytest.fail(result.stderr.strip() or f"e2e host guard exited {result.returncode}", pytrace=False)
+
+
+if INTEGRATION:
+    _assert_e2e_host()
+
+
 def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     env = os.environ | {
         "GIT_AUTHOR_NAME": "t",

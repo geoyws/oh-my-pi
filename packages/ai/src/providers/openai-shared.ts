@@ -939,6 +939,27 @@ export function mapOpenAIReasoningEffort(
 	return compat?.reasoningEffortMap?.[level] ?? model.thinking?.effortMap?.[level] ?? effort;
 }
 
+/**
+ * Effort facts that constrain the 400/422 reasoning-effort fallback, read
+ * from the resolved model policy (KDL `thinking-requires-effort` →
+ * `thinking.requiresEffort`; the effort maps). `pinnedEffort`: several
+ * supported tiers all serialize to one wire value, so that value is policy
+ * and must not be renegotiated to another tier. A lone tier is not a pin.
+ */
+export function resolveOpenAIEffortFallbackConstraints(
+	model: Pick<Model, "thinking">,
+	compat: { reasoningEffortMap?: Partial<Record<Effort, string>> } | undefined,
+): { requiresEffort: boolean; pinnedEffort: boolean } {
+	const efforts = model.thinking?.efforts ?? [];
+	const firstWire = efforts.length > 1 ? mapOpenAIReasoningEffort(model, compat, efforts[0]!) : undefined;
+	return {
+		requiresEffort: model.thinking?.requiresEffort === true,
+		pinnedEffort:
+			firstWire !== undefined &&
+			efforts.every(effort => mapOpenAIReasoningEffort(model, compat, effort) === firstWire),
+	};
+}
+
 function isImplicitDisableWhenNotRequested(disableMode: OpenAIReasoningDisableMode): boolean {
 	return (
 		disableMode === "zai-thinking-disabled" ||
