@@ -11,6 +11,7 @@ import { InternalUrlRouter } from "../../internal-urls/router";
 import { extractUriScheme } from "../../internal-urls/parse";
 import type { SchemeSpec } from "../../internal-urls/types";
 import type { AgentSessionEvent } from "../../session/agent-session";
+import { astCallMode } from "../../tools/ast";
 import { resolveToCwd, splitPathAndSelPreferringLiteralSync } from "../../tools/path-utils";
 import type { TodoStatus } from "@oh-my-pi/pi-tui/tools/todo";
 import { canonicalizeMessage } from "@oh-my-pi/pi-tui/chat/thinking-display";
@@ -174,8 +175,10 @@ export function mapToolKind(toolName: string, args?: unknown): ToolKind {
 			return "execute";
 		case "grep":
 		case "glob":
-		case "ast_grep":
 			return "search";
+		case "ast":
+			// Edit mode only stages a preview; the apply is a later xd:// write.
+			return astCallMode(args) === "edit" ? "other" : "search";
 		case "web_search":
 			return "fetch";
 		case "todo":

@@ -220,13 +220,11 @@ function printTable(rows: PsDaemonRow[]): void {
 // Named actions
 // ---------------------------------------------------------------------------
 
-async function actionClient(flags: PsCommandArgs["flags"]): Promise<DaemonBrokerClient> {
-	if (flags.global) return daemonClientForGlobal(flags.global);
-	return daemonClientForProject(flags.dir ?? getProjectDir());
-}
-
 async function runAction(cmd: PsCommandArgs, name: string): Promise<void> {
-	const client = await actionClient(cmd.flags);
+	// Global scopes use the process-held global client (closed in `runPsCommand`);
+	// a project scope is leased only for this action.
+	using lease = cmd.flags.global ? undefined : await daemonClientForProject(cmd.flags.dir ?? getProjectDir());
+	const client: DaemonBrokerClient = lease ?? (await daemonClientForGlobal(cmd.flags.global!));
 	try {
 		switch (cmd.action) {
 			case "info": {

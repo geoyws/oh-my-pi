@@ -4,14 +4,15 @@
  * Instead of every omp process launching (and sometimes orphaning) a private
  * Chromium, the headless browser kind attaches to one broker-supervised Chrome
  * per project directory — sessions and subagents each open their own tabs in
- * it. The broker stops the daemon when the last omp client in the project
- * exits, so Chrome can never outlive omp, and concurrent acquisitions across
- * processes converge on a single launch instead of a launch storm.
+ * it. The broker stops the daemon once no omp process holds a broker lease
+ * for the project (each attached handle holds one), so Chrome can never
+ * outlive omp, and concurrent acquisitions across processes converge on a
+ * single launch instead of a launch storm.
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { acquireFileLock, type FileLockHandle, logger, withTimeout } from "@oh-my-pi/pi-utils";
-import { type DaemonBrokerClient, daemonClientForProject } from "../../launch/client";
+import { type DaemonBrokerClient, type DaemonBrokerLease, daemonClientForProject } from "../../launch/client";
 import { describeDaemon, describeQuietly, stopQuietly, waitReady } from "../../launch/ensure";
 import { daemonRuntimeDir } from "../../launch/paths";
 import type { DaemonSnapshot } from "@oh-my-pi/pi-tui/tools/daemon";
@@ -62,6 +63,11 @@ export interface SharedBrowserEndpoint {
 	daemonName: string;
 	/** Canonical project directory owning the broker (used to address later stop requests). */
 	projectDir: string;
+	/**
+	 * Broker lease the caller now owns. It keeps the project broker, and with it
+	 * the browser daemon, alive; release it when this process stops using the browser.
+	 */
+	broker: DaemonBrokerLease;
 }
 
 /** Stable broker daemon name for the shared automation browser. */
@@ -119,33 +125,42 @@ export async function ensureSharedBrowser(opts: {
 	signal?: AbortSignal;
 }): Promise<SharedBrowserEndpoint | null> {
 	const client = await daemonClientForProject(opts.projectDir);
-	const name = sharedBrowserDaemonName(opts.headless);
-	const userDataDir = sharedBrowserProfileDir(client.projectDir, name);
-	const launch = await resolveSharedBrowserLaunchSpec({
-		headless: opts.headless,
-		userDataDir,
-		viewport: opts.viewport,
-	});
-	if (!launch) return null;
-	await fs.mkdir(userDataDir, { recursive: true });
-	for (let attempt = 0; attempt < ENSURE_ATTEMPTS; attempt++) {
-		throwIfAborted(opts.signal);
-		// Chromium reads Preferences only at startup and rewrites them from
-		// memory, so only the client that launches it may write them, and only
-		// before the launch. The claim makes adopt-or-start one decision per
-		// profile: a racing client describes after the winner's start settled
-		// and adopts it, instead of renaming a stale Preferences snapshot over
-		// the live profile before its own start is rejected. Only a claim holder
-		// starts Chrome, so every launch runs on a prepared profile.
-		const claim = await claimProfile(userDataDir, opts.signal);
-		try {
-			const endpoint = await adoptOrStart(client, name, launch, userDataDir, claim !== null, opts.signal);
-			if (endpoint) return endpoint;
-		} finally {
-			claim?.release();
+	try {
+		const name = sharedBrowserDaemonName(opts.headless);
+		const userDataDir = sharedBrowserProfileDir(client.projectDir, name);
+		const launch = await resolveSharedBrowserLaunchSpec({
+			headless: opts.headless,
+			userDataDir,
+			viewport: opts.viewport,
+		});
+		if (!launch) {
+			client.release();
+			return null;
 		}
+		await fs.mkdir(userDataDir, { recursive: true });
+		for (let attempt = 0; attempt < ENSURE_ATTEMPTS; attempt++) {
+			throwIfAborted(opts.signal);
+			// Chromium reads Preferences only at startup and rewrites them from
+			// memory, so only the client that launches it may write them, and only
+			// before the launch. The claim makes adopt-or-start one decision per
+			// profile: a racing client describes after the winner's start settled
+			// and adopts it, instead of renaming a stale Preferences snapshot over
+			// the live profile before its own start is rejected. Only a claim holder
+			// starts Chrome, so every launch runs on a prepared profile.
+			const claim = await claimProfile(userDataDir, opts.signal);
+			try {
+				const wsEndpoint = await adoptOrStart(client, name, launch, userDataDir, claim !== null, opts.signal);
+				if (wsEndpoint) return { wsEndpoint, daemonName: name, projectDir: client.projectDir, broker: client };
+			} finally {
+				claim?.release();
+			}
+		}
+		client.release();
+		return null;
+	} catch (error) {
+		client.release();
+		throw error;
 	}
-	return null;
 }
 
 /** Claim the shared profile; null when another client held it past the wait. */
@@ -204,7 +219,7 @@ export async function restartSharedBrowser(
  * profile, after preparing it (seeding Preferences, discarding the previous
  * Chrome's session-restore state); adopting an existing browser never writes
  * the profile.
- * Resolves undefined when the caller should run another round.
+ * Resolves the reachable CDP ws endpoint, or undefined when the caller should run another round.
  */
 async function adoptOrStart(
 	client: DaemonBrokerClient,
@@ -213,7 +228,7 @@ async function adoptOrStart(
 	userDataDir: string,
 	claimed: boolean,
 	signal?: AbortSignal,
-): Promise<SharedBrowserEndpoint | undefined> {
+): Promise<string | undefined> {
 	const described = await describeDaemon(client, name, "Shared browser", signal);
 	// No settled answer: Chrome may be running on the profile, so it must not be
 	// prepared, and a start without preparing it restores the stale session.
@@ -224,9 +239,7 @@ async function adoptOrStart(
 		const settled =
 			existing.readyAt !== undefined ? existing : await waitReady(client, name, "Shared browser", signal);
 		const wsEndpoint = wsEndpointOf(settled);
-		if (wsEndpoint && (await probeEndpoint(wsEndpoint))) {
-			return { wsEndpoint, daemonName: name, projectDir: client.projectDir };
-		}
+		if (wsEndpoint && (await probeEndpoint(wsEndpoint))) return wsEndpoint;
 		// Live record but unreachable Chrome (wedged, or readiness never
 		// matched): replace it rather than handing out a dead endpoint.
 		await stopQuietly(client, name, "Shared browser", signal);
@@ -258,9 +271,7 @@ async function adoptOrStart(
 		);
 		if (started.op !== "start") return undefined;
 		const wsEndpoint = started.readyTimedOut ? undefined : wsEndpointOf(started.daemon);
-		if (wsEndpoint && (await probeEndpoint(wsEndpoint))) {
-			return { wsEndpoint, daemonName: name, projectDir: client.projectDir };
-		}
+		if (wsEndpoint && (await probeEndpoint(wsEndpoint))) return wsEndpoint;
 		await stopQuietly(client, name, "Shared browser", signal);
 	} catch (error) {
 		throwIfAborted(signal);
@@ -340,8 +351,9 @@ function isSameDaemonInstance(before: DaemonSnapshot, after: DaemonSnapshot | un
 async function checkSharedBrowserReachable(scope: SharedTargetScope, deps: SharedBrowserHealthDeps): Promise<boolean> {
 	const signal = deps.signal ?? AbortSignal.timeout(HEALTH_CHECK_BUDGET_MS);
 	const deadlineAt = Date.now() + HEALTH_CHECK_BUDGET_MS;
+	let lease: DaemonBrokerLease | undefined;
 	try {
-		const client = deps.client ?? (await daemonClientForProject(scope.projectDir));
+		const client = deps.client ?? (lease = await daemonClientForProject(scope.projectDir));
 		const existing = await describeQuietly(client, scope.daemonName, "Shared browser", signal);
 		if (!existing || existing.state === "exited" || existing.state === "failed") return false;
 		const wsEndpoint = wsEndpointOf(existing);
@@ -408,5 +420,7 @@ async function checkSharedBrowserReachable(scope: SharedTargetScope, deps: Share
 			error: error instanceof Error ? error.message : String(error),
 		});
 		return false;
+	} finally {
+		lease?.release();
 	}
 }

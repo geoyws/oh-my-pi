@@ -388,7 +388,7 @@ export class InternalUrlRouter {
 	}
 
 	/**
-	 * Whether file-editing tools (`edit`, `ast_edit`) may write the file `input` locates: its
+	 * Whether file-editing tools (`edit`, `ast` edit mode) may write the file `input` locates: its
 	 * scheme is mutable and tools own its writes (`spec.write.via === "file"`).
 	 */
 	fileWritable(input: string): boolean {

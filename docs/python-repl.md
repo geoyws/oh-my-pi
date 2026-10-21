@@ -120,6 +120,7 @@ Unknown magic names raise `NameError: UsageError: ...` inside the cell.
   - Foreground calls through the tool use exclusive scheduling; background cells and kernel-defined tool requests are separate.
   - A dead retained subprocess is replaced before execution.
   - If the subprocess dies during execution, the cell is not replayed because completion is uncertain. The next call starts a fresh kernel.
+  - After `eval.kernelIdleTimeoutSeconds` (default 600; `0` disables) with no cell or kernel-defined tool request in flight, the kernel is shut down. The next call starts a fresh kernel and prefixes its output with a `[kernel] … shut down after Ns with no cell running` note stating that earlier state is gone.
 - `per-call`
   - Spawns a fresh subprocess for each call.
   - Shuts the subprocess down after the call.

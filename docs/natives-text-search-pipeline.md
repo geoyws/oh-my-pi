@@ -37,9 +37,9 @@ Terminology follows `docs/natives-architecture.md`:
 | `fuzzyFind(options)`                                                            | `fuzzy_find`                                     | `fd.rs`        |
 | `glob(options, onMatch?)`                                                       | `glob`                                           | `glob.rs`      |
 | `invalidateFsScanCache(path?)`                                                  | `invalidate_fs_scan_cache`                       | `iofs.rs`      |
-| `astGrep(options)`                                                              | `ast_grep`                                       | `ast.rs`       |
+| `astGrep(options)`                                                              | `ast` (search mode)                              | `ast.rs`       |
 | `astMatch(options)`                                                             | `ast_match`                                      | `ast.rs`       |
-| `astEdit(options)`                                                              | `ast_edit`                                       | `ast.rs`       |
+| `astEdit(options)`                                                              | `ast` (edit mode)                                | `ast.rs`       |
 | `wrapTextWithAnsi(text, width, tabWidth)`                                       | `wrap_text_with_ansi`                            | `text.rs`      |
 | `truncateToWidth(text, maxWidth, ellipsis, pad, tabWidth)`                      | `truncate_to_width`                              | `text.rs`      |
 | `sliceWithWidth(line, startCol, length, strict, tabWidth)`                      | `slice_with_width`                               | `text.rs`      |

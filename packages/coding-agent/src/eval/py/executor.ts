@@ -29,6 +29,7 @@ import {
 	normalizeKernelSessionCwd,
 	requireRemainingKernelTimeoutMs,
 } from "../kernel-session-registry";
+import { resolveKernelIdleTimeoutMs } from "../kernel-idle-reaper";
 import type { PythonShadowPlan, PythonShadowSnapshot } from "./kernel";
 import {
 	checkPythonKernelAvailability,
@@ -128,6 +129,13 @@ export interface PythonExecutorOptions {
 	bridgeSessionId?: string;
 	/** @internal Bridge endpoint info, set by `executePython` before delegating. */
 	bridge?: { url: string; token: string };
+	/**
+	 * Retained-kernel idle window in ms. Defaults to `eval.kernelIdleTimeoutSeconds`
+	 * from `toolSession` (or process settings); `undefined` after resolution disables reaping.
+	 */
+	kernelIdleTimeoutMs?: number;
+	/** @internal Restart note the session registry sets after an idle reap. */
+	kernelRestartNotice?: string;
 }
 
 export interface PythonKernelExecutor {
@@ -386,12 +394,6 @@ async function executeWithKernel(
 	code: string,
 	options: PythonExecutorOptions | undefined,
 ): Promise<PythonResult> {
-	const remainingMs = getRemainingTimeoutMs(options?.deadlineMs);
-	await kernel.syncPreludes?.(
-		pythonPreludeSources(options?.toolSession),
-		options?.signal,
-		Math.max(1, remainingMs ?? 10_000),
-	);
 	return executeWithKernelBase<PythonExecutorOptions>({
 		kernel,
 		code,
@@ -402,6 +404,13 @@ async function executeWithKernel(
 		buildKernelEnvPatch: buildManagedKernelEnvPatch,
 		formatKernelTimeoutAnnotation,
 		formatTimeoutAnnotation,
+		prepare: async remainingMs => {
+			await kernel.syncPreludes?.(
+				pythonPreludeSources(options?.toolSession),
+				options?.signal,
+				Math.max(1, remainingMs ?? 10_000),
+			);
+		},
 	});
 }
 
@@ -475,6 +484,7 @@ const sessionRegistry = createKernelSessionRegistry<PythonKernel, PythonExecutor
 	},
 	shutdownSession: session => shutdownInvalidatedSession(session),
 	validateKernel: (session, kernel) => session.kernel === kernel,
+	isSessionBusy: session => session.replacement !== undefined,
 });
 
 interface PythonToolRequestOutcome {
@@ -497,35 +507,39 @@ async function invokePythonToolRequest(
 	options: PythonToolInvokeOptions,
 ): Promise<PythonToolRequestOutcome> {
 	const cwd = normalizeKernelSessionCwd(options.cwd);
-	const kernel = sessionRegistry.peekLiveKernel(cwd, {
+	// Held synchronously, before the first await: the idle reaper must not shut the kernel down while
+	// the bridge starts or the request runs.
+	const held = sessionRegistry.holdLiveKernel(cwd, {
 		cwd,
 		sessionId: options.sessionId,
 		interpreter: options.interpreter,
 		kernelOwnerId: options.kernelOwnerId,
 	});
-	if (!kernel) throw new EvalKernelNotRunningError("Python");
-
-	const bridgeOptions: PythonExecutorOptions = {
-		cwd,
-		sessionId: options.sessionId,
-		interpreter: options.interpreter,
-		kernelOwnerId: options.kernelOwnerId,
-		toolSession: options.toolSession,
-		signal: options.signal,
-	};
-	await ensureToolBridge(bridgeOptions);
-
-	const runId = Snowflake.next();
-	const unregister = registerPyToolBridge(options.sessionId, runId, {
-		toolSession: options.toolSession,
-		signal: options.signal,
-		emitStatus: undefined,
-	});
+	if (!held) throw new EvalKernelNotRunningError("Python");
 	try {
-		const execution = await kernel.invokeTool(request, { id: runId, signal: options.signal });
-		return { execution, envelope: execution.reply };
+		await ensureToolBridge({
+			cwd,
+			sessionId: options.sessionId,
+			interpreter: options.interpreter,
+			kernelOwnerId: options.kernelOwnerId,
+			toolSession: options.toolSession,
+			signal: options.signal,
+		});
+
+		const runId = Snowflake.next();
+		const unregister = registerPyToolBridge(options.sessionId, runId, {
+			toolSession: options.toolSession,
+			signal: options.signal,
+			emitStatus: undefined,
+		});
+		try {
+			const execution = await held.kernel.invokeTool(request, { id: runId, signal: options.signal });
+			return { execution, envelope: execution.reply };
+		} finally {
+			unregister();
+		}
 	} finally {
-		unregister();
+		held.release();
 	}
 }
 
@@ -644,6 +658,7 @@ export async function executePython(code: string, options?: PythonExecutorOption
 		if (kernelMode === "per-call") {
 			return await executePerCall(code, cwd, executionOptions);
 		}
+		executionOptions.kernelIdleTimeoutMs ??= resolveKernelIdleTimeoutMs(executionOptions.toolSession?.settings);
 		return await sessionRegistry.executeOnSession(code, cwd, executionOptions);
 	} catch (err) {
 		if (isCancellationError(err, PythonExecutionCancelledError) || executionOptions.signal?.aborted) {

@@ -10,6 +10,7 @@ import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-sessi
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
+import { unmanagedDaemonLease } from "../helpers/daemon-lease";
 
 function session(manager?: AsyncJobManager, agentId = "Main", launch = false): ToolSession {
 	return {
@@ -152,7 +153,7 @@ describe("wait", () => {
 			},
 			onCompletion: () => () => {},
 		} as unknown as DaemonBrokerClient;
-		vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(hungBroker);
+		vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(unmanagedDaemonLease(hungBroker));
 		const manager = new AsyncJobManager({ onJobComplete: () => {} });
 		const { promise, resolve } = Promise.withResolvers<string>();
 		const id = manager.register("bash", "build", async () => promise, { ownerId: "Main" });
@@ -171,7 +172,7 @@ describe("wait", () => {
 				},
 				onCompletion: () => () => {},
 			} as unknown as DaemonBrokerClient;
-			vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(broker);
+			vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(unmanagedDaemonLease(broker));
 		});
 
 		test("returns a settled job whose notice is still queued", async () => {
@@ -213,7 +214,7 @@ describe("wait", () => {
 				},
 				onCompletion: () => () => {},
 			} as unknown as DaemonBrokerClient;
-			vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(broker);
+			vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(unmanagedDaemonLease(broker));
 			const manager = new AsyncJobManager({ onJobComplete: () => {} });
 			const id = manager.register("bash", "unfinished", async () => Promise.withResolvers<string>().promise, {
 				ownerId: "Main",
