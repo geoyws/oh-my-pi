@@ -31,6 +31,7 @@ import { AgentRegistry } from "../registry/agent-registry";
 import type { ToolSession } from "../tools";
 import { generateCommitMessage } from "../utils/commit-message-generator";
 import { trackLateCleanup } from "../utils/late-cleanup";
+import { shutdownClientsUnder } from "../lsp/client";
 import type { ExecutorOptions } from "./executor";
 import { runSubprocess } from "./executor";
 import { needsNativeTeardown, writeRetainedBackend } from "./isolation-ownership";
@@ -546,7 +547,13 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 	const cleanupHandle = (): Promise<void> => {
 		cleanupPromise ??= (async () => {
 			await releaseBase();
-			if (handle && !retainWorkspace) await cleanupIsolation(handle);
+			if (!handle) return;
+			// Nothing works in the workspace any more, retained or not. Its language
+			// servers would otherwise run (and, through their broker-shared mux
+			// transports, keep the workspace's daemon broker alive) until this
+			// process exits.
+			await shutdownClientsUnder(handle.mergedDir);
+			if (!retainWorkspace) await cleanupIsolation(handle);
 		})();
 		return cleanupPromise;
 	};

@@ -100,6 +100,15 @@ impl Process {
 		self.inner.ppid()
 	}
 
+	/// Platform start-time token. Together with `pid` it identifies one process
+	/// across pid reuse: a recycled pid reports a different value. The unit is
+	/// platform-specific, so compare values for equality only.
+	#[napi(getter)]
+	#[allow(clippy::missing_const_for_fn, reason = "#[napi] generates a non-const wrapper")]
+	pub fn start_time(&self) -> f64 {
+		self.inner.start_time() as f64
+	}
+
 	/// Launch arguments for this process.
 	#[napi]
 	pub fn args(&self) -> Vec<String> {

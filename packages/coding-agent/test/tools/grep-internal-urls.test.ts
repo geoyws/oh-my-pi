@@ -20,7 +20,7 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { formatOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
-import { AstGrepTool } from "../../src/tools/ast-grep";
+import { runAstSearch } from "../../src/tools/ast-grep";
 import { GlobTool } from "../../src/tools/glob";
 import { GrepTool } from "../../src/tools/grep";
 
@@ -594,13 +594,13 @@ describe("GrepTool internal URL resolution", () => {
 		expect(text).toMatch(/^\*\d+:.*beta needle/m);
 	});
 
-	it("runs ast_grep over a local:// file", async () => {
+	it("runs ast search over a local:// file", async () => {
 		const localRoot = path.join(artifactsDir, "local");
 		await fs.mkdir(localRoot, { recursive: true });
 		await Bun.write(path.join(localRoot, "util.ts"), "export function greet() {\n\treturn 1;\n}\n");
 		LocalProtocolHandler.setOverride({ getArtifactsDir: () => artifactsDir, getSessionId: () => "session" });
 
-		const result = await new AstGrepTool(createSession()).execute("ast-local", {
+		const result = await runAstSearch(createSession(), {
 			pat: "function $NAME() { $$$BODY }",
 			path: "local://util.ts",
 		});

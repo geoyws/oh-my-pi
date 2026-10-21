@@ -1,4 +1,4 @@
-/** Gallery fixtures for the search tools (grep, ast_grep). */
+/** Gallery fixtures for the search tools (grep, ast). */
 import type { GalleryFixture } from "./types";
 
 export const searchFixtures: Record<string, GalleryFixture> = {
@@ -75,12 +75,14 @@ export const searchFixtures: Record<string, GalleryFixture> = {
 		},
 	},
 
-	ast_grep: {
-		label: "AST Grep",
+	ast: {
+		label: "AST",
 		streamingArgs: {
+			mode: "search",
 			pat: "useState(",
 		},
 		args: {
+			mode: "search",
 			pat: "useState($A)",
 			path: "packages/tui/src/components",
 		},

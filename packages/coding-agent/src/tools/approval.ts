@@ -133,7 +133,7 @@ export const TIER_RANK: Readonly<Record<ToolTier, number>> = {
 };
 
 /**
- * Fold the per-target decisions of a multi-target write tool (`edit`, `ast_edit`): the first
+ * Fold the per-target decisions of a multi-target write tool (`edit`, `ast` edit mode): the first
  * `policy: "deny"` decision wins with its reason (a read-only URL target); otherwise the highest
  * tier, starting from "read".
  */
@@ -304,6 +304,20 @@ function getToolDecision(
  */
 export function resolveToolTier(tool: ApprovalSubject, args: unknown): ToolTier {
 	return getToolDecision(tool, args).tier;
+}
+
+/**
+ * The tool's own approval decision as `{ tier, policyKey? }`, before any user
+ * policy is consulted. Dispatcher layers (the `xd://` device gate) use it so a
+ * mounted tool's per-call policy key survives the dispatch instead of being
+ * replaced by the device name.
+ */
+export function resolveToolApprovalDecision(
+	tool: ApprovalSubject,
+	args: unknown,
+): { tier: ToolTier; policyKey?: string } {
+	const decision = getToolDecision(tool, args);
+	return { tier: decision.tier, ...(decision.policyKey ? { policyKey: decision.policyKey } : {}) };
 }
 
 function modeApprovesTier(mode: ApprovalMode, tier: ToolTier): boolean {

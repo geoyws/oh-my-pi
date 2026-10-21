@@ -10,6 +10,7 @@ import {
 	type SessionOwners,
 	waitForPromiseWithCancellation,
 } from "./executor-base";
+import { KernelIdleTimer, ReapedKernelNotices } from "./kernel-idle-reaper";
 
 interface KernelSessionRegistryOptions {
 	sessionId?: string;
@@ -20,6 +21,10 @@ interface KernelSessionRegistryOptions {
 	deadlineMs?: number;
 	bridge?: unknown;
 	bridgeSessionId?: string;
+	/** Idle window after which a retained kernel with no running cell is shut down; `undefined` disables. */
+	kernelIdleTimeoutMs?: number;
+	/** @internal Set by the registry: model-visible note that an idle reap reset this session's state. */
+	kernelRestartNotice?: string;
 }
 
 interface RegistryKernelShutdownResult {
@@ -28,6 +33,8 @@ interface RegistryKernelShutdownResult {
 
 interface RegistryKernel {
 	isAlive(): boolean;
+	/** True while a cell, tool request, or control request is in flight; such a kernel is never reaped. */
+	isBusy(): boolean;
 	shutdown(options?: { timeoutMs: number }): Promise<RegistryKernelShutdownResult>;
 }
 
@@ -40,6 +47,14 @@ export interface KernelSession<TKernel extends RegistryKernel> extends SessionOw
 
 interface StartingKernelSession<TSession> extends SessionOwners {
 	promise: Promise<TSession>;
+}
+
+interface SessionIdleState {
+	timer: KernelIdleTimer;
+	/** `executeOnSession` calls currently holding the session; a held session is never reaped. */
+	uses: number;
+	/** Window from the latest caller's settings; `undefined` disables reaping. */
+	idleMs?: number;
 }
 
 export interface KernelSessionRegistryContext<
@@ -84,6 +99,8 @@ interface KernelSessionRegistryDescriptor<
 	isCancellation?: (error: unknown) => boolean;
 	isTimedOutCancellation?: (error: unknown, signal?: AbortSignal) => boolean;
 	validateKernel?: (session: TSession, kernel: TKernel) => boolean;
+	/** Language-specific in-flight work (e.g. a kernel replacement) that must block an idle reap. */
+	isSessionBusy?: (session: TSession) => boolean;
 }
 
 interface KernelSessionRegistry<
@@ -95,7 +112,11 @@ interface KernelSessionRegistry<
 	disposeAll(): Promise<void>;
 	disposeByOwner(ownerId: string): Promise<void>;
 	executeOnSession(code: string, cwd: string, options: TOptions): Promise<R>;
-	peekLiveKernel(cwd: string, options: TOptions): TKernel | undefined;
+	/**
+	 * The live retained kernel for a host-side request (e.g. an eval-defined tool call), held so the
+	 * idle reaper cannot shut it down until `release()`; releasing restarts the idle window.
+	 */
+	holdLiveKernel(cwd: string, options: TOptions): { kernel: TKernel; release(): void } | undefined;
 	getPresentSession(cwd: string, options: TOptions): TSession | undefined;
 }
 
@@ -149,6 +170,76 @@ export function createKernelSessionRegistry<
 		replaceSessionKernel,
 	};
 
+	const idleStates = new Map<TSession, SessionIdleState>();
+	const reapedNotices = new ReapedKernelNotices(descriptor.languageLabel);
+
+	function idleStateFor(session: TSession): SessionIdleState {
+		let state = idleStates.get(session);
+		if (!state) {
+			state = { timer: new KernelIdleTimer(idleMs => reapIdleSession(session, idleMs)), uses: 0 };
+			idleStates.set(session, state);
+		}
+		return state;
+	}
+
+	function forgetIdleState(session: TSession): void {
+		idleStates.get(session)?.timer.disarm();
+		idleStates.delete(session);
+	}
+
+	/** Marks `session` in use: never reaped until the returned (idempotent) release restarts its window. */
+	function holdSession(session: TSession): () => void {
+		const idle = idleStateFor(session);
+		idle.uses += 1;
+		idle.timer.disarm();
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			idle.uses -= 1;
+			if (idle.uses > 0 || idleStates.get(session) !== idle) return;
+			if (isCurrent(session)) idle.timer.arm(idle.idleMs);
+			else forgetIdleState(session);
+		};
+	}
+
+	function reapIdleSession(session: TSession, idleMs: number): void {
+		const state = idleStates.get(session);
+		if (!state || state.uses > 0) return;
+		if (sessions.get(session.sessionKey) !== session) {
+			forgetIdleState(session);
+			return;
+		}
+		// Never cut work: a cell, tool request, kernel replacement or reset still in flight restarts the window.
+		if (
+			session.kernel.isBusy() ||
+			replacingSessionKernels.has(session) ||
+			resettingSessions.has(session.sessionKey) ||
+			descriptor.isSessionBusy?.(session)
+		) {
+			state.timer.arm(state.idleMs);
+			return;
+		}
+		forgetIdleState(session);
+		descriptor.invalidateSession?.(session);
+		sessions.delete(session.sessionKey);
+		if (session.kernel.isAlive()) reapedNotices.record(session.sessionKey, idleMs, session.ownerIds);
+		logger.debug(`${descriptor.languageLabel} kernel idle; shutting it down`, {
+			sessionId: session.sessionId,
+			sessionKey: session.sessionKey,
+			idleMs,
+		});
+		void settleShutdown(session, false).then(result => {
+			if (result.status === "fulfilled" && result.value?.confirmed !== false) return;
+			logger.warn(`${descriptor.languageLabel} idle kernel shutdown not confirmed`, {
+				sessionId: session.sessionId,
+				sessionKey: session.sessionKey,
+				cwd: session.cwd,
+				reason: result.status === "rejected" ? result.reason : "not confirmed",
+			});
+		});
+	}
+
 	function waitForStartup(promise: Promise<TSession>, options: TOptions): Promise<TSession> {
 		return descriptor.waitForStartup?.(promise, options) ?? promise;
 	}
@@ -198,6 +289,10 @@ export function createKernelSessionRegistry<
 			});
 			if (startingSessions.get(sessionKey) === startingSession) {
 				sessions.set(sessionKey, session);
+				// A caller that gave up waiting still leaves a published kernel; reap it like any idle one.
+				const idle = idleStateFor(session);
+				idle.idleMs = options.kernelIdleTimeoutMs;
+				idle.timer.arm(idle.idleMs);
 			}
 			return session;
 		})();
@@ -315,6 +410,7 @@ export function createKernelSessionRegistry<
 		const existing =
 			sessions.get(sessionKey) ?? (await startingSessions.get(sessionKey)?.promise.catch(() => undefined));
 		if (!existing) return;
+		forgetIdleState(existing);
 		descriptor.invalidateSession?.(existing);
 		sessions.delete(sessionKey);
 		await shutdownSession(existing, true).catch(() => undefined);
@@ -324,6 +420,9 @@ export function createKernelSessionRegistry<
 		const pending = [...startingSessions.values()].map(starting => starting.promise);
 		startingSessions.clear();
 		if (descriptor.clearResetsOnDisposeAll) resettingSessions.clear();
+		for (const state of idleStates.values()) state.timer.disarm();
+		idleStates.clear();
+		reapedNotices.clear();
 		const all = [...sessions.entries()];
 		for (const [id, session] of all) {
 			descriptor.invalidateSession?.(session);
@@ -357,6 +456,7 @@ export function createKernelSessionRegistry<
 	}
 
 	async function disposeByOwner(ownerId: string): Promise<void> {
+		reapedNotices.forgetOwner(ownerId);
 		const toShutdown: TSession[] = [];
 		const startingToShutdown: StartingKernelSession<TSession>[] = [];
 		for (const session of Array.from(sessions.values())) {
@@ -377,6 +477,7 @@ export function createKernelSessionRegistry<
 			starting.ownerIds.delete(ownerId);
 		}
 		for (const session of toShutdown) {
+			forgetIdleState(session);
 			descriptor.invalidateSession?.(session);
 			if (sessions.get(session.sessionKey) === session) sessions.delete(session.sessionKey);
 		}
@@ -385,6 +486,7 @@ export function createKernelSessionRegistry<
 		for (const result of started) {
 			if (result.status !== "fulfilled") continue;
 			const session = result.value;
+			forgetIdleState(session);
 			descriptor.invalidateSession?.(session);
 			if (sessions.get(session.sessionKey) === session) sessions.delete(session.sessionKey);
 			toShutdown.push(session);
@@ -409,11 +511,10 @@ export function createKernelSessionRegistry<
 		}
 	}
 
-	function peekLiveKernel(cwd: string, options: TOptions): TKernel | undefined {
-		const sessionId = options.sessionId ?? `session:${cwd}`;
-		const sessionKey = descriptor.buildSessionKey(sessionId, cwd, options.interpreter);
-		const kernel = sessions.get(sessionKey)?.kernel;
-		return kernel?.isAlive() ? kernel : undefined;
+	function holdLiveKernel(cwd: string, options: TOptions): { kernel: TKernel; release(): void } | undefined {
+		const session = getPresentSession(cwd, options);
+		if (!session?.kernel.isAlive()) return undefined;
+		return { kernel: session.kernel, release: holdSession(session) };
 	}
 
 	function getPresentSession(cwd: string, options: TOptions): TSession | undefined {
@@ -428,6 +529,8 @@ export function createKernelSessionRegistry<
 			options.bridgeSessionId = sessionId;
 		}
 		if (options.reset) {
+			// An explicit reset already tells the caller the state is gone.
+			reapedNotices.forget(sessionKey);
 			const inFlight = resettingSessions.get(sessionKey);
 			if (inFlight) await inFlight.catch(() => undefined);
 			else {
@@ -447,15 +550,29 @@ export function createKernelSessionRegistry<
 			if (inFlight) await inFlight.catch(() => undefined);
 		}
 		const session = await acquireSession(sessionKey, sessionId, cwd, options);
+		idleStateFor(session).idleMs = options.kernelIdleTimeoutMs;
+		const release = holdSession(session);
+		try {
+			return await executeHeldSession(session, code, cwd, options);
+		} finally {
+			release();
+		}
+	}
+
+	async function executeHeldSession(session: TSession, code: string, cwd: string, options: TOptions): Promise<R> {
 		throwIfCallerCancelled(options);
 		const kernel = await acquireLiveSessionKernel(session, cwd, options);
 		if (!isCurrent(session, kernel)) throw new descriptor.cancelledErrorClass(false);
 		throwIfCallerCancelled(options);
-		const runOptions = { ...options, cwd };
+		// A reap removes the session, so a pending note means this cell runs on a fresh kernel.
+		const restartNotice = reapedNotices.take(session.sessionKey);
+		const runOptions = { ...options, cwd, kernelRestartNotice: restartNotice?.text };
 		let result: R;
 		try {
 			result = await descriptor.executeWithKernel(kernel, code, runOptions);
 		} catch (err) {
+			// Only a returned result carries the note; keep it for the next cell otherwise.
+			if (restartNotice) reapedNotices.restore(session.sessionKey, restartNotice);
 			if (
 				descriptor.isCancellation?.(err) ||
 				isCancellationError(err, descriptor.cancelledErrorClass) ||
@@ -471,5 +588,5 @@ export function createKernelSessionRegistry<
 		return result;
 	}
 
-	return { disposeAll, disposeByOwner, executeOnSession, peekLiveKernel, getPresentSession };
+	return { disposeAll, disposeByOwner, executeOnSession, holdLiveKernel, getPresentSession };
 }

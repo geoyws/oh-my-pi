@@ -25,6 +25,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/browser/shared-daemon";
 import type { DaemonSnapshot, DaemonState } from "@oh-my-pi/pi-tui/tools/daemon";
 import * as piUtils from "@oh-my-pi/pi-utils";
+import { unmanagedDaemonLease } from "../helpers/daemon-lease";
 
 async function makeProfileDir(): Promise<string> {
 	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-chrome-profile-test-"));
@@ -115,7 +116,7 @@ function fakeSharedBroker(
 		},
 	};
 	spies.push(
-		spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(client),
+		spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(unmanagedDaemonLease(client)),
 		spyOn(browserLaunch, "resolveSharedBrowserLaunchSpec").mockResolvedValue({
 			executablePath: "/fake/chrome",
 			args: [],
