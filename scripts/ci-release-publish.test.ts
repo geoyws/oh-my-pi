@@ -190,6 +190,8 @@ describe("published legal payloads", () => {
 				"native/version-sentinel.d.ts",
 				"native/loader-state.js",
 				"native/loader-state.d.ts",
+				"native/required-surface.js",
+				"native/required-surface.d.ts",
 				"native/path.js",
 				"native/path.d.ts",
 				"native/vcs.js",

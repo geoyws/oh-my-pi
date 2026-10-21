@@ -1,3 +1,5 @@
+import { isProvidedNativeFunction } from "./loader-state.js";
+
 const REQUIRED_METHODS = [
 	"click",
 	"capture",
@@ -28,7 +30,8 @@ const REQUIRED_GETTERS = ["escapeStops"];
 export function adaptDesktopSession(NativeDesktopSession) {
 	const prototype = NativeDesktopSession?.prototype;
 	const missing = [
-		...REQUIRED_METHODS.filter(method => typeof prototype?.[method] !== "function"),
+		// A stale workspace addon's missing methods carry loader stubs; they do not count as the current ABI.
+		...REQUIRED_METHODS.filter(method => !isProvidedNativeFunction(prototype?.[method])),
 		...REQUIRED_GETTERS.filter(getter => !prototype || !(getter in prototype)),
 	];
 	if (missing.length === 0) {
