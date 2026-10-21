@@ -1435,12 +1435,15 @@ describe("ACP agent", () => {
 
 		const loaded = await second.agent.loadSession({ sessionId, cwd: workspace, mcpServers: [] });
 		expectAcpStructure(zLoadSessionResponse, loaded);
-		const replayedUserText: string[] = [];
+		// The fake stores user content as a bare string, which ACP replay skips
+		// (real AgentSession stores a content array), so prove the history came
+		// from the stored file through the persisted assistant reply.
+		const replayedAgentText: string[] = [];
 		for (const { sessionId: updateSessionId, update } of second.updates) {
-			if (updateSessionId !== sessionId || update.sessionUpdate !== "user_message_chunk") continue;
-			if (update.content.type === "text") replayedUserText.push(update.content.text);
+			if (updateSessionId !== sessionId || update.sessionUpdate !== "agent_message_chunk") continue;
+			if (update.content.type === "text") replayedAgentText.push(update.content.text);
 		}
-		expect(replayedUserText.some(text => text.includes("remember me"))).toBe(true);
+		expect(replayedAgentText).toContain("pong");
 		await second.agent.dispose();
 
 		// session/resume runs the same lookup on another fresh server.
