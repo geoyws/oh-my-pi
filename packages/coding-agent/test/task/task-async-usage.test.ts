@@ -14,7 +14,8 @@
  *    job's details is never attributed to the job.
  * 3. A running job exposes its live usage; a cancelled or failed job reports
  *    its partial usage once its run settles — from the child's result, or the
- *    last live usage when the child threw without one.
+ *    last live usage when the child threw without one. A `wait` issued while a
+ *    cancelled run is still settling blocks on it and bills it exactly once.
  * 4. An auto-delivered result carries the usage, and a later wait does not
  *    bill it again.
  */
@@ -34,6 +35,7 @@ import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
 import type { AgentProgress, SingleResult, TaskParams } from "@oh-my-pi/pi-tui/tools/task";
 
 const taskAgent: AgentDefinition = {
@@ -313,6 +315,61 @@ describe("async task child usage", () => {
 		const repeat = buildJobResult(session, manager, "wait", [job], []);
 		expect(repeat.details?.usage).toBeUndefined();
 		expect(undeliveredJobs(manager, undefined).map(j => j.id)).not.toContain("WorkerC");
+	});
+
+	it("a wait issued before a cancelled job settles bills its partial usage exactly once", async () => {
+		const partial = usage(10);
+		// The kill must land on a running child, not a spawn still acquiring
+		// its permit (that path throws before the executor produces usage).
+		const childStarted = Promise.withResolvers<void>();
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			const id = options.id ?? "?";
+			const aborted = Promise.withResolvers<void>();
+			options.signal?.addEventListener("abort", () => aborted.resolve(), { once: true });
+			childStarted.resolve();
+			await aborted.promise;
+			// The child is still unwinding after the kill: its partial result
+			// (and usage) only exists once this gate opens.
+			await gate(id).promise;
+			return makeResult(id, options.agent.name, {
+				aborted: true,
+				exitCode: 1,
+				error: "Aborted",
+				usage: partial,
+			});
+		});
+		const manager = createManager();
+		const session = createSession(manager);
+		const tool = await TaskTool.create(session);
+		// No launch broker: `execute` reaches its job checks without awaiting.
+		const wait = new WaitTool({
+			...session,
+			settings: Settings.isolated({ "async.enabled": true, "task.batch": true, "launch.enabled": false }),
+		} as ToolSession);
+
+		await tool.execute("tc-cancel-before-settle", {
+			context: "ctx",
+			tasks: [{ name: "WorkerG", agent: "task", task: "Long work." }],
+		} as TaskParams);
+		await childStarted.promise;
+		const job = manager.getJob("WorkerG")!;
+		expect(manager.cancel("WorkerG")).toBe(true);
+		expect(job.status).toBe("cancelled");
+		expect(job.resultText ?? job.errorText).toBeUndefined();
+
+		// Issued while the cancelled run is still settling; never awaited
+		// `job.promise` first.
+		const waiting = wait.execute("wait-cancel-before-settle", {});
+		gate("WorkerG").resolve();
+		const first = await waiting;
+		expect(first.details?.jobs?.find(j => j.id === "WorkerG")?.status).toBe("cancelled");
+		expect(first.details?.usage).toEqual(partial);
+		expect(manager.isJobResultConsumed("WorkerG")).toBe(true);
+
+		// Billed once: nothing is left for a later wait to recover.
+		expect(undeliveredJobs(manager, undefined).map(j => j.id)).not.toContain("WorkerG");
+		await expect(wait.execute("wait-cancel-repeat", {})).rejects.toThrow("Nothing to wait for");
+		expect(buildJobResult(session, manager, "wait", [job], []).details?.usage).toBeUndefined();
 	});
 
 	it("bills a failed child's partial usage from its result", async () => {

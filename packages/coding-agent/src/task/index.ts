@@ -1329,7 +1329,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						? "completed"
 						: "failed";
 				spawn.progress.durationMs = result.durationMs;
-				if (result.usage) spawn.progress.usage = result.usage;
+				if (result.usage) spawn.progress.usage = { ...result.usage, cost: { ...result.usage.cost } };
 			} else {
 				spawn.progress.status = payloads[position] ? "failed" : "aborted";
 			}

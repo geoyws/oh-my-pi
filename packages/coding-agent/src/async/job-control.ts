@@ -44,13 +44,24 @@ export function visibleJobs(manager: AsyncJobManager, ids: string[], ownerId: st
 }
 
 /**
+ * A cancelled job whose body has not returned yet: `cancel` flips the status
+ * at once, but the result text and final partial usage exist only once the
+ * run settles. Same readiness predicate the manager applies before marking a
+ * result consumed; `wait` blocks on such jobs like running ones.
+ */
+export function isCancelPending(job: AsyncJob | undefined): boolean {
+	return job?.status === "cancelled" && job.resultText === undefined && job.errorText === undefined;
+}
+
+/**
  * Settled jobs owned by `ownerId` whose completion was accepted but has not
  * reached the owner yet: delivery queued or awaiting yield-queue injection,
- * dead-lettered, or skipped while a `wait` watched it. A cancelled job is a
- * settled result too: without it a `wait` after a kill throws "nothing to
+ * dead-lettered, or skipped while a `wait` watched it. A settled cancelled
+ * job is a result too: without it a `wait` after a kill throws "nothing to
  * wait for" and the job's partial usage (which `buildJobResult` bills on
  * first `wait`-consume) is unreachable in a live session. Consumed,
- * acknowledged, and currently watched results are excluded.
+ * acknowledged, currently watched, and still-settling cancelled results are
+ * excluded.
  */
 export function undeliveredJobs(manager: AsyncJobManager, ownerId: string | undefined): AsyncJob[] {
 	return manager
@@ -58,6 +69,7 @@ export function undeliveredJobs(manager: AsyncJobManager, ownerId: string | unde
 		.filter(
 			job =>
 				(job.status === "completed" || job.status === "failed" || job.status === "cancelled") &&
+				!isCancelPending(job) &&
 				!manager.isJobResultConsumed(job.id) &&
 				!manager.isDeliverySuppressed(job.id),
 		);
@@ -278,7 +290,12 @@ export function buildJobResult(
 	// later `wait` then finds nothing although the usage was never billed.
 	// `jobs` stays a read-only listing.
 	if (op === "wait") {
-		manager.consumeJobResults(jobResults.filter(j => j.status !== "running").map(j => j.id));
+		// A cancelled job still settling is left unacknowledged: consuming it
+		// now would suppress it before its result and partial usage exist, so
+		// no later wait could ever bill it.
+		manager.consumeJobResults(
+			jobResults.filter(j => j.status !== "running" && !isCancelPending(manager.getJob(j.id))).map(j => j.id),
+		);
 		// Bill only results this call recovered for the first time, so a job's
 		// usage is never summed twice across repeated waits or after delivery.
 		usage = sumJobUsage(

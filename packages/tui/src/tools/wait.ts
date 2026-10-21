@@ -146,11 +146,15 @@ export interface CoordinationDetails {
 	interrupted?: boolean;
 	/**
 	 * Summed child usage of the settled jobs whose results THIS `wait`
-	 * consumed (recovered for the first time). A job counts once across all
-	 * consuming surfaces: a result already auto-delivered or returned by an
-	 * earlier `wait` is excluded. `cancel` never consumes, so a cancelled job's
-	 * partial usage is billed by the next `wait`; `jobs` listings never consume.
-	 * Omitted when no consumed job reported usage.
+	 * consumed (recovered for the first time). A job counts once across the
+	 * surfaces that bill — `wait` results and `async-result` deliveries: a
+	 * result already auto-delivered or returned by an earlier `wait` is
+	 * excluded. Eval `agent()` handle waits consume results without surfacing
+	 * usage, so a job they consumed first is never billed here. `cancel` never
+	 * consumes; a cancelled job's partial usage is billed by the first `wait`
+	 * after its run settles (a `wait` issued while it is still settling blocks
+	 * on it). `jobs` listings never consume. Omitted when no consumed job
+	 * reported usage.
 	 */
 	usage?: Usage;
 }
