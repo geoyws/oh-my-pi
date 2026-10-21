@@ -445,8 +445,8 @@ export const cfgGlobEnabled = register({
 	ui: {
 		tab: "tools",
 		group: "Available Tools",
-		label: "Glob",
-		description: "Enable the glob tool for glob-based file lookup",
+		label: "Search: glob mode",
+		description: "Enable glob mode of the search tool (glob-based file lookup)",
 	},
 });
 
@@ -457,8 +457,8 @@ export const cfgGrepEnabled = register({
 	ui: {
 		tab: "tools",
 		group: "Available Tools",
-		label: "Grep",
-		description: "Enable the grep tool for regex content search",
+		label: "Search: regex mode",
+		description: "Enable regex mode of the search tool (regex content search)",
 	},
 });
 
@@ -533,9 +533,9 @@ export const cfgFindEnabled = register({
 	ui: {
 		tab: "tools",
 		group: "Available Tools",
-		label: "Find (semantic grep)",
+		label: "Search: semantic mode (semantic grep)",
 		description:
-			"Enable the find tool: natural-language search for files and line ranges, judged by the judge model role. Auto enables it only when the judge role resolves to a native TypeSafe jev model",
+			"Enable semantic mode of the search tool: natural-language search for files and line ranges, judged by the judge model role. Auto enables it only when the judge role resolves to a native TypeSafe jev model",
 		options: [
 			{
 				value: "auto",

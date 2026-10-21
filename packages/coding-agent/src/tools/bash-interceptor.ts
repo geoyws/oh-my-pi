@@ -7,6 +7,7 @@
  */
 import { extractFlatShellCommandSegments } from "./shell-tokenize";
 import { type BashInterceptorRule, DEFAULT_BASH_INTERCEPTOR_RULES } from "../exec/settings";
+import { legacySearchToolMode } from "./builtin-names";
 
 export interface InterceptionResult {
 	/** If true, the bash command should be blocked */
@@ -114,6 +115,8 @@ function interceptionCandidates(command: string): string[] {
  *
  * @param command The bash command to check
  * @param availableTools Set of tool names that are available
+ * @param toolModes Enabled modes per tool; a rule naming a `mode` fires only
+ *   while that mode is listed for its tool
  * @returns InterceptionResult indicating if the command should be blocked
  */
 export function checkBashInterception(
@@ -121,13 +124,21 @@ export function checkBashInterception(
 	availableTools: string[],
 	rules: BashInterceptorRule[] = DEFAULT_BASH_INTERCEPTOR_RULES,
 	originalCommand = command,
+	toolModes: Readonly<Record<string, readonly string[]>> = {},
 ): InterceptionResult {
 	const compiled = compileRules(rules);
 	const candidates = interceptionCandidates(command);
 
 	for (const { rule, regex } of compiled) {
-		// Only block if the suggested tool is actually available
-		if (!availableTools.includes(rule.tool)) {
+		// User rules saved before the search merge still name `grep`/`glob`/`find`.
+		const legacyMode = legacySearchToolMode(rule.tool);
+		const tool = legacyMode === undefined ? rule.tool : "search";
+		const mode = rule.mode ?? legacyMode;
+		// Only block if the suggested tool (and mode) is actually available
+		if (!availableTools.includes(tool)) {
+			continue;
+		}
+		if (mode !== undefined && !(Object.hasOwn(toolModes, tool) && toolModes[tool].includes(mode))) {
 			continue;
 		}
 
@@ -138,7 +149,7 @@ export function checkBashInterception(
 				return {
 					block: true,
 					message: `Blocked: ${rule.message}\n\nOriginal command: ${originalCommand}`,
-					suggestedTool: rule.tool,
+					suggestedTool: tool,
 				};
 			}
 		}

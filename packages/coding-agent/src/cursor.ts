@@ -555,8 +555,8 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 	}
 
 	/**
-	 * Modern Cursor builds paginate this frame with `offset`. The local `grep`
-	 * paginates by file through `skip`, which is the same unit its own
+	 * Modern Cursor builds paginate this frame with `offset`. The local regex
+	 * search paginates by file through `skip`, which is the same unit its own
 	 * "use skip=N for the next page" advice counts in — so an unforwarded
 	 * offset re-runs the identical search and returns page one forever.
 	 */
@@ -569,9 +569,10 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		});
 		const toolResultMessage = await executeTool(
 			this.options,
-			"grep",
+			"search",
 			toolCallId,
 			{
+				mode: "regex",
 				pattern: args.pattern,
 				path: searchPath,
 				case: args.caseInsensitive === true ? false : undefined,
@@ -786,9 +787,9 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 	}
 
 	/**
-	 * `literal` makes the pattern a fixed string; the local tool is regex-only,
-	 * so the pattern is escaped on the way in (same translation the legacy pi
-	 * shim does).
+	 * `literal` makes the pattern a fixed string; local regex search is
+	 * regex-only, so the pattern is escaped on the way in (same translation the
+	 * legacy pi shim does).
 	 *
 	 * `context` and `limit` are not expressible in the model-facing schema —
 	 * context width comes from settings fixed at tool construction — so the
@@ -808,9 +809,10 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		// frame's `ignore_case`.
 		return await executeTool(
 			this.options,
-			"grep",
+			"search",
 			call.toolCallId,
 			{
+				mode: "regex",
 				pattern: literal === true ? piEscapeRegexLiteral(pattern) : pattern,
 				path: glob ? piJoinPath(path, glob) : path || ".",
 				case: ignoreCase === true ? false : undefined,
@@ -820,9 +822,9 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 	}
 
 	/**
-	 * `pi_find` is a filename search, which is the local `glob` tool — not
-	 * `grep`. Its `pattern` is a glob, joined onto `path` because `glob` takes a
-	 * single combined path spec.
+	 * `pi_find` is a filename search, which is local `search` glob mode — not
+	 * regex. Its `pattern` is a glob, joined onto `path` because glob mode takes
+	 * a single combined path spec.
 	 *
 	 * `limit` is `optional int32`, so `0` is present rather than unset; the
 	 * reference clamps it with `Math.max(1, limit ?? 1000)`, and an unset limit
@@ -830,7 +832,8 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 	 */
 	async piFind(call: Parameters<NonNullable<ICursorExecHandlers["piFind"]>>[0]) {
 		const { pattern, path, limit } = call.args;
-		return await executeTool(this.options, "glob", call.toolCallId, {
+		return await executeTool(this.options, "search", call.toolCallId, {
+			mode: "glob",
 			path: piJoinPath(path, pattern),
 			limit: piLimit(limit),
 		});

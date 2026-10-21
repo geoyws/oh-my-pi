@@ -40,6 +40,7 @@ import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/ex
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { BUILTIN_TOOLS, GrepTool, ReadTool, type Tool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
+import { SearchTool } from "@oh-my-pi/pi-coding-agent/tools/search";
 import { TodoTool } from "@oh-my-pi/pi-coding-agent/tools/todo";
 import type { TruncationMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
 import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
@@ -85,16 +86,16 @@ function passthroughRunner(seen: string[] = []): ExtensionRunner {
 
 describe("CursorExecHandlers.grep bridge", () => {
 	let cwd: string;
-	let searchTool: GrepTool;
+	let searchTool: SearchTool;
 	let handlers: CursorExecHandlers;
 
 	beforeEach(async () => {
 		cwd = await fs.mkdtemp(path.join(os.tmpdir(), "cursor-exec-test-"));
 		await Bun.write(path.join(cwd, "sample.txt"), "Hello World\nhello world\n");
-		searchTool = new GrepTool(createTestSession(cwd));
+		searchTool = new SearchTool(createTestSession(cwd));
 		handlers = new CursorExecHandlers({
 			cwd,
-			tools: new Map([["grep", searchTool as any]]),
+			tools: new Map<string, Tool>([["search", searchTool]]),
 		});
 	});
 
@@ -137,7 +138,7 @@ describe("CursorExecHandlers.grep bridge", () => {
 		const session = createTestSession(cwd, { settings });
 		const scopedHandlers = new CursorExecHandlers({
 			cwd,
-			tools: new Map<string, Tool>([["grep", new GrepTool(session)]]),
+			tools: new Map<string, Tool>([["search", new SearchTool(session)]]),
 			createGrepTool: createBridgeGrepFactory(session, passthroughRunner()),
 			getToolContext: () => ({ settings }) as AgentToolContext,
 		});
@@ -180,7 +181,7 @@ describe("CursorExecHandlers.grep bridge", () => {
 		await Bun.write(path.join(cwd, "many.txt"), Array.from({ length: 10 }, (_, i) => `needle ${i}`).join("\n"));
 		const scopedHandlers = new CursorExecHandlers({
 			cwd,
-			tools: new Map<string, Tool>([["grep", searchTool]]),
+			tools: new Map<string, Tool>([["search", searchTool]]),
 			createGrepTool: options => new GrepTool(createTestSession(cwd), options),
 		});
 
@@ -204,7 +205,7 @@ describe("CursorExecHandlers.grep bridge", () => {
 		await Bun.write(path.join(cwd, "ctx.txt"), "before line\nneedle here\nafter line\n");
 		const scopedHandlers = new CursorExecHandlers({
 			cwd,
-			tools: new Map<string, Tool>([["grep", searchTool]]),
+			tools: new Map<string, Tool>([["search", searchTool]]),
 			createGrepTool: options => new GrepTool(createTestSession(cwd), options),
 		});
 
@@ -238,7 +239,7 @@ describe("CursorExecHandlers.grep bridge", () => {
 		);
 		const scopedHandlers = new CursorExecHandlers({
 			cwd,
-			tools: new Map<string, Tool>([["grep", searchTool]]),
+			tools: new Map<string, Tool>([["search", searchTool]]),
 			createGrepTool: options => new GrepTool(createTestSession(cwd), options),
 		});
 
@@ -2009,21 +2010,21 @@ describe("CursorExecHandlers Pi frame translation", () => {
 	it("inverts pi_grep's ignore_case into the local tool's case-sensitivity flag", async () => {
 		// `ignore_case` and `case` are opposites. Passing the frame's value
 		// straight through would flip every search's matching.
-		const { handlers, calls } = recordingHandlers("grep");
+		const { handlers, calls } = recordingHandlers("search");
 
 		await handlers.piGrep({ toolCallId: "c1", args: { pattern: "x", ignoreCase: true } } as never);
 		await handlers.piGrep({ toolCallId: "c2", args: { pattern: "x", ignoreCase: false } } as never);
 
 		expect(calls).toEqual([
-			{ pattern: "x", path: ".", case: false },
+			{ mode: "regex", pattern: "x", path: ".", case: false },
 			// Case-sensitive is the local default, so `false` maps to unset —
 			// the key is omitted rather than written as `case: undefined`.
-			{ pattern: "x", path: "." },
+			{ mode: "regex", pattern: "x", path: "." },
 		]);
 	});
 
 	it("folds pi_grep's separate glob onto the local tool's single path spec", async () => {
-		const { handlers, calls } = recordingHandlers("grep");
+		const { handlers, calls } = recordingHandlers("search");
 
 		await handlers.piGrep({ toolCallId: "c1", args: { pattern: "x", path: "src", glob: "**/*.ts" } } as never);
 		await handlers.piGrep({ toolCallId: "c2", args: { pattern: "x", glob: "**/*.ts" } } as never);
@@ -2093,7 +2094,7 @@ describe("CursorExecHandlers Pi frame translation", () => {
 		// `grep` paginates by file and reports "use skip=N for the next page" in
 		// that same unit. An unforwarded offset re-runs the identical search, so
 		// every page after the first repeats page one.
-		const { handlers, calls } = recordingHandlers("grep");
+		const { handlers, calls } = recordingHandlers("search");
 
 		await handlers.grep({ toolCallId: "c1", pattern: "x", path: "src", offset: 20 } as never);
 		await handlers.grep({ toolCallId: "c2", pattern: "x", path: "src" } as never);
@@ -2321,7 +2322,7 @@ describe("CursorExecHandlers Pi frame translation", () => {
 	it("escapes pi_grep's pattern when the frame asks for a literal search", async () => {
 		// The local tool is regex-only, so an unescaped literal turns regex
 		// metacharacters into operators and matches the wrong lines.
-		const { handlers, calls } = recordingHandlers("grep");
+		const { handlers, calls } = recordingHandlers("search");
 
 		await handlers.piGrep({ toolCallId: "c1", args: { pattern: "a.b(c)", literal: true } } as never);
 		await handlers.piGrep({ toolCallId: "c2", args: { pattern: "a.b(c)" } } as never);
@@ -2330,22 +2331,22 @@ describe("CursorExecHandlers Pi frame translation", () => {
 		expect((calls[1] as { pattern: string }).pattern).toBe("a.b(c)");
 	});
 
-	it("routes pi_find to glob, not grep, joining its pattern onto the path", async () => {
-		// `pi_find` searches filenames. Routing it to `grep` would search file
+	it("routes pi_find to search glob mode, not regex, joining its pattern onto the path", async () => {
+		// `pi_find` searches filenames. Routing it to regex mode would search file
 		// contents for the glob text and return nothing.
-		const { handlers, calls } = recordingHandlers("glob");
+		const { handlers, calls } = recordingHandlers("search");
 
 		await handlers.piFind({ toolCallId: "c1", args: { pattern: "*.ts", path: "src", limit: 10 } } as never);
 		await handlers.piFind({ toolCallId: "c2", args: { pattern: "*.ts", limit: 0 } } as never);
 		await handlers.piFind({ toolCallId: "c3", args: { pattern: "*.ts" } } as never);
 
 		expect(calls).toEqual([
-			{ path: path.join("src", "*.ts"), limit: 10 },
+			{ mode: "glob", path: path.join("src", "*.ts"), limit: 10 },
 			// `optional int32`: a present 0 is clamped to 1 (as the reference
 			// does), not silently widened to the tool's default.
-			{ path: "*.ts", limit: 1 },
+			{ mode: "glob", path: "*.ts", limit: 1 },
 			// Genuinely unset leaves the local tool's own default in place.
-			{ path: "*.ts", limit: undefined },
+			{ mode: "glob", path: "*.ts", limit: undefined },
 		]);
 	});
 

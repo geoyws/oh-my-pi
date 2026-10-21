@@ -204,36 +204,72 @@ describe("default echo/printf redirect rule", () => {
 });
 
 describe("default grep rule and pipeline stdin", () => {
-	const tools = ["grep"];
+	const tools = ["search"];
+	const modes = { search: ["regex", "glob"] };
+	const check = (command: string) =>
+		checkBashInterception(command, tools, DEFAULT_BASH_INTERCEPTOR_RULES, command, modes);
 
 	it("blocks standalone file searches", () => {
-		expect(checkBashInterception("grep pattern path", tools, DEFAULT_BASH_INTERCEPTOR_RULES).block).toBe(true);
-		expect(checkBashInterception("rg pattern src", tools, DEFAULT_BASH_INTERCEPTOR_RULES).block).toBe(true);
+		expect(check("grep pattern path").block).toBe(true);
+		expect(check("rg pattern src").block).toBe(true);
+		expect(check("grep pattern path").suggestedTool).toBe("search");
 	});
 
 	it("blocks a first-stage grep that produces pipeline input", () => {
-		expect(checkBashInterception("grep x file | wc -l", tools, DEFAULT_BASH_INTERCEPTOR_RULES).block).toBe(true);
+		expect(check("grep x file | wc -l").block).toBe(true);
 	});
 
 	it("does not block grep consuming pipeline stdin", () => {
-		expect(checkBashInterception("printf 'x\\n' | grep x", tools, DEFAULT_BASH_INTERCEPTOR_RULES).block).toBe(false);
-		expect(
-			checkBashInterception("tr -d '\\r' < input.log | grep -v '^ *foo'", tools, DEFAULT_BASH_INTERCEPTOR_RULES)
-				.block,
-		).toBe(false);
-		expect(checkBashInterception("printf 'x\\n' |\n grep x", tools, DEFAULT_BASH_INTERCEPTOR_RULES).block).toBe(
-			false,
-		);
-		expect(
-			checkBashInterception("printf 'x\\n' |\n # filter\n grep x", tools, DEFAULT_BASH_INTERCEPTOR_RULES).block,
-		).toBe(false);
-		expect(checkBashInterception("printf 'x\\n' |& grep x", tools, DEFAULT_BASH_INTERCEPTOR_RULES).block).toBe(false);
+		expect(check("printf 'x\\n' | grep x").block).toBe(false);
+		expect(check("tr -d '\\r' < input.log | grep -v '^ *foo'").block).toBe(false);
+		expect(check("printf 'x\\n' |\n grep x").block).toBe(false);
+		expect(check("printf 'x\\n' |\n # filter\n grep x").block).toBe(false);
+		expect(check("printf 'x\\n' |& grep x").block).toBe(false);
 	});
 
 	it("still blocks a standalone grep sequenced after a pipeline", () => {
+		expect(check("cat log | tr a b && grep err file").block).toBe(true);
+	});
+});
+
+describe("default search rules follow enabled search modes", () => {
+	const tools = ["search"];
+
+	it("redirects grep/rg only while regex mode is enabled", () => {
+		const globOnly = { search: ["glob"] };
+		expect(checkBashInterception("rg pattern src", tools, DEFAULT_BASH_INTERCEPTOR_RULES, "rg", globOnly).block).toBe(
+			false,
+		);
 		expect(
-			checkBashInterception("cat log | tr a b && grep err file", tools, DEFAULT_BASH_INTERCEPTOR_RULES).block,
+			checkBashInterception("find . -name '*.ts'", tools, DEFAULT_BASH_INTERCEPTOR_RULES, "find", globOnly).block,
 		).toBe(true);
+	});
+
+	it("redirects find/fd only while glob mode is enabled", () => {
+		const regexOnly = { search: ["regex"] };
+		expect(
+			checkBashInterception("find . -name '*.ts'", tools, DEFAULT_BASH_INTERCEPTOR_RULES, "find", regexOnly).block,
+		).toBe(false);
+		expect(
+			checkBashInterception("rg pattern src", tools, DEFAULT_BASH_INTERCEPTOR_RULES, "rg", regexOnly).block,
+		).toBe(true);
+	});
+
+	it("does not fire a mode rule without mode information", () => {
+		expect(checkBashInterception("rg pattern src", tools, DEFAULT_BASH_INTERCEPTOR_RULES).block).toBe(false);
+	});
+
+	it("maps custom rules naming pre-merge grep/glob to search in the matching mode", () => {
+		const legacyRules = [
+			{ pattern: "^\\s*ack\\s+", tool: "grep", message: "Use grep." },
+			{ pattern: "^\\s*fd\\s+", tool: "glob", message: "Use glob." },
+		];
+		const regexOnly = { search: ["regex"] };
+		const ack = checkBashInterception("ack foo", tools, legacyRules, "ack foo", regexOnly);
+		expect(ack.block).toBe(true);
+		expect(ack.suggestedTool).toBe("search");
+		expect(checkBashInterception("fd foo", tools, legacyRules, "fd foo", regexOnly).block).toBe(false);
+		expect(checkBashInterception("ack foo", ["grep"], legacyRules, "ack foo", regexOnly).block).toBe(false);
 	});
 });
 

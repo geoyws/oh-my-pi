@@ -4,6 +4,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { AstTool } from "@oh-my-pi/pi-coding-agent/tools/ast";
 import { GlobTool } from "@oh-my-pi/pi-coding-agent/tools/glob";
+import { SearchTool } from "@oh-my-pi/pi-coding-agent/tools/search";
 import { GrepTool } from "@oh-my-pi/pi-coding-agent/tools/grep";
 import { FindTool } from "@oh-my-pi/pi-coding-agent/tools/jfind";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
@@ -64,6 +65,7 @@ describe("ssh:// tools require exec-tier approval", () => {
 		["find", (session: ToolSession) => new FindTool(session)],
 		["glob", (session: ToolSession) => new GlobTool(session)],
 		["ast", (session: ToolSession) => new AstTool(session)],
+		["search", (session: ToolSession) => new SearchTool(session)],
 	])("%s: an ssh:// path is exec, local paths stay read", (_name, create) => {
 		const tool = create(createTestToolSession(os.tmpdir()));
 		expect(callApproval(tool, { path: "ssh://icaro/etc" })).toBe("exec");

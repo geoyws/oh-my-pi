@@ -111,13 +111,14 @@ bashInterceptor:
       tool: read
       message: "Use the read tool instead; it handles binary files and provides better context."
     - pattern: '^\s*(grep|rg)\s+'
-      tool: grep
-      message: "Use the grep tool instead; it respects .gitignore and returns structured results."
+      tool: search
+      mode: regex
+      message: "Use the search tool (regex mode) instead; it respects .gitignore and returns structured results."
 ```
 
-An interceptor rule only applies when its `tool` is available in the current session. If `read` is disabled, a `cat` rule targeting `read` does not block the Bash call. This makes the interceptor a best-effort capability preference rather than an execution-security boundary.
+An interceptor rule only applies when its `tool` is available in the current session. If `read` is disabled, a `cat` rule targeting `read` does not block the Bash call. A rule with `mode` also requires that mode of its tool to be enabled: a `search` rule with `mode: regex` stops firing when `grep.enabled` is off. Rules written for the pre-merge `grep`, `glob`, and `find` tools still work; they target `search` in regex, glob, and semantic mode respectively. This makes the interceptor a best-effort capability preference rather than an execution-security boundary.
 
-The built-in default rules route common operations such as `cat` to `read`, `rg` to `grep`, in-place `sed` to `edit`, shell redirection to `write`, and unmanaged services/watchers to named `bash` service mode. See `DEFAULT_BASH_INTERCEPTOR_RULES` in `packages/coding-agent/src/exec/settings.ts` for the complete list.
+The built-in default rules route common operations such as `cat` to `read`, `rg` to `search` regex mode, `find -name` to `search` glob mode, in-place `sed` to `edit`, shell redirection to `write`, and unmanaged services/watchers to named `bash` service mode. See `DEFAULT_BASH_INTERCEPTOR_RULES` in `packages/coding-agent/src/exec/settings.ts` for the complete list.
 
 For compatibility with existing custom regexes, the interceptor always checks the complete original command first. It then checks raw, flat command fragments separated by unquoted and unescaped `&&`, `||`, `;`, `|`, `&`, or newlines. It also checks fragments after leading environment assignments are removed:
 

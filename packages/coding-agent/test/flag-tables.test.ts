@@ -89,10 +89,10 @@ describe("--session-dir", () => {
 });
 
 describe("--tools validation", () => {
-	it("maps legacy search to grep and keeps find canonical", () => {
+	it("maps legacy grep/glob/find to search", () => {
 		const result = parseArgs(["--tools", "search,find,grep"]);
 
-		expect(result.tools).toEqual(["grep", "find"]);
+		expect(result.tools).toEqual(["search"]);
 	});
 
 	it("defers unknown-name validation until all session tools are discovered", () => {

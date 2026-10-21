@@ -48,18 +48,17 @@ import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 /**
  * Discoverable built-ins that must stay top-level even when xdev mounting is
  * active: `todo` feeds the todo prelude/prewalk machinery, `ask` is the
- * model's user-interaction affordance, `grep` is the redirect target of the
- * bash interceptor rules, and `web_search` is invoked directly by most models
- * (which have no notion of the `xd://` protocol) so hiding it behind dispatch
- * makes it unreachable in practice (issue #5973). `yield` terminates structured
- * subagent runs and must stay directly callable — each loses its harness
- * integration or usability if hidden behind dispatch.
+ * model's user-interaction affordance, and `web_search` is invoked directly by
+ * most models (which have no notion of the `xd://` protocol) so hiding it
+ * behind dispatch makes it unreachable in practice (issue #5973). `yield`
+ * terminates structured subagent runs and must stay directly callable — each
+ * loses its harness integration or usability if hidden behind dispatch.
+ * (`search`, the bash interceptor's redirect target, is already essential.)
  */
 export const XDEV_KEEP_TOP_LEVEL: Record<string, true> = {
 	todo: true,
 	yield: true,
 	ask: true,
-	grep: true,
 	web_search: true,
 };
 

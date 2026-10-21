@@ -136,8 +136,8 @@ describe("ExtensionContext.agent", () => {
 			advisorsSpy.mockRestore();
 		}
 		try {
-			const advisorGrep = advisorTools.find(tool => tool.name === "grep");
-			await advisorGrep!.execute("advisor-call", { pattern: "needle", path: tempDir });
+			const advisorSearch = advisorTools.find(tool => tool.name === "search");
+			await advisorSearch!.execute("advisor-call", { pattern: "needle", path: tempDir });
 			await session.getToolByName("read")!.execute("main-call", { path: path.join(tempDir, "probe.txt") });
 		} finally {
 			await session.dispose();
