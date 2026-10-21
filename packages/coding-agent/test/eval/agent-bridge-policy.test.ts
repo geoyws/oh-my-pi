@@ -1175,8 +1175,11 @@ describe("runEvalAgent isolation", () => {
 		expect(defaultResult.details.changesApplied).toBeUndefined();
 		expect(mergeSpy).not.toHaveBeenCalled();
 
-		// Explicit isolated=true — opt-in turns it on and surfaces merge details.
-		const explicitOn = await runEvalAgentAndWait({ prompt: "on", isolated: true }, { session: isolatedSession() });
+		// Explicit isolated=true with apply=true — opt-in turns it on and surfaces merge details.
+		const explicitOn = await runEvalAgentAndWait(
+			{ prompt: "on", isolated: true, apply: true },
+			{ session: isolatedSession() },
+		);
 		expect(isolatedSpy).toHaveBeenCalledTimes(1);
 		expect(plainSpy).toHaveBeenCalledTimes(1);
 		expect(explicitOn.details.isolated).toBe(true);
@@ -1201,7 +1204,10 @@ describe("runEvalAgent isolation", () => {
 
 		// Branch is the configured merge mode, but `merge: false` must demote to patch.
 		const session = isolatedSession({ "task.isolation.merge": "branch" });
-		const result = await runEvalAgentAndWait({ prompt: "migration", isolated: true, merge: false }, { session });
+		const result = await runEvalAgentAndWait(
+			{ prompt: "migration", isolated: true, apply: true, merge: false },
+			{ session },
+		);
 
 		expect(isolatedSpy).toHaveBeenCalledTimes(1);
 		const isolatedCall = isolatedSpy.mock.calls[0]?.[0];
@@ -1232,7 +1238,7 @@ describe("runEvalAgent isolation", () => {
 		});
 
 		await runEvalAgentAndWait(
-			{ prompt: "migration", isolated: true },
+			{ prompt: "migration", isolated: true, apply: true },
 			{
 				session: isolatedSession(),
 				onTimeoutControl: event => {
@@ -1348,7 +1354,7 @@ describe("runEvalAgent isolation", () => {
 			await tool.execute("seed", { language: "js", code: "print('ready');" });
 			const result = await tool.execute("isolated-wait", {
 				language: "js",
-				code: 'print(await agent("migration", { isolated: true }).wait());',
+				code: 'print(await agent("migration", { isolated: true, apply: true }).wait());',
 				timeout: 1,
 			});
 			const text = result.content
@@ -1384,6 +1390,7 @@ describe("runEvalAgent isolation", () => {
 			{
 				prompt: "structured",
 				isolated: true,
+				apply: true,
 				schema: {
 					type: "object",
 					properties: { status: { type: "string" } },
@@ -1420,6 +1427,7 @@ describe("runEvalAgent isolation", () => {
 				{
 					prompt: "structured",
 					isolated: true,
+					apply: true,
 					schema: {
 						type: "object",
 						properties: { status: { type: "string" } },
@@ -1467,7 +1475,7 @@ describe("runEvalAgent isolation", () => {
 		});
 
 		const session = isolatedSession({ "task.isolation.merge": "branch" });
-		await expect(runEvalAgentAndWait({ prompt: "scout", isolated: true }, { session })).rejects.toThrow(
+		await expect(runEvalAgentAndWait({ prompt: "scout", isolated: true, apply: true }, { session })).rejects.toThrow(
 			/isolated apply failed.*Branch merge failed.*Captured branch preserved as omp\/task\//s,
 		);
 	});
@@ -1492,7 +1500,7 @@ describe("runEvalAgent isolation", () => {
 
 		let caught: Error | undefined;
 		try {
-			await runEvalAgentAndWait({ prompt: "scout", isolated: true }, { session: isolatedSession() });
+			await runEvalAgentAndWait({ prompt: "scout", isolated: true, apply: true }, { session: isolatedSession() });
 		} catch (err) {
 			caught = err as Error;
 		}
@@ -1532,6 +1540,7 @@ describe("runEvalAgent isolation", () => {
 				{
 					prompt: "structured",
 					isolated: true,
+					apply: true,
 					schema: {
 						type: "object",
 						properties: { status: { type: "string" } },
@@ -1670,7 +1679,7 @@ describe("runEvalAgent isolation", () => {
 			mergedBranchForNestedPatches: false,
 		});
 
-		await runEvalAgentAndWait({ prompt: "scout", isolated: true }, { session: isolatedSession() });
+		await runEvalAgentAndWait({ prompt: "scout", isolated: true, apply: true }, { session: isolatedSession() });
 
 		const removedArtifactsDir = rmSpy.mock.calls.some(
 			([target]) => typeof target === "string" && target.includes("omp-eval-agent-"),

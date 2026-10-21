@@ -148,13 +148,13 @@ export const cfgTaskIsolationApply = register({
 	id: "task.isolation.apply",
 	protocolDefault: ["rpc", "acp"],
 	type: "boolean",
-	default: true,
+	default: false,
 	ui: {
 		tab: "tasks",
 		group: "Isolation",
 		label: "Apply Isolated Changes",
 		description:
-			"Automatically apply successful isolated task changes to the parent checkout; disable to retain patch or branch artifacts",
+			"Isolated task changes are retained as patch or branch artifacts unless accepted; enabling this is explicit acceptance to apply successful isolated changes into the checkout the task was isolated from",
 	},
 });
 

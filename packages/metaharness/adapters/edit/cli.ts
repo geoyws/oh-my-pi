@@ -16,6 +16,7 @@ import { type ResolvedThinkingLevel, ThinkingLevel } from "@oh-my-pi/pi-agent-co
 import { THINKING_EFFORTS } from "@oh-my-pi/pi-ai";
 import { postmortem, TempDir } from "@oh-my-pi/pi-utils";
 import { loadTasksFromDir, validateFixturesFromDir } from "@oh-my-pi/typescript-edit-benchmark/tasks";
+import { assertE2eHost } from "../../../../scripts/e2e-host-guard";
 import { LiveProgress } from "./live-progress";
 import { generateJsonReport, generateReport } from "./report";
 import { type BenchmarkConfig, type BenchmarkResult, buildBenchmarkResult, runBenchmark } from "./runner";
@@ -202,6 +203,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
 		printUsage();
 		return;
 	}
+	assertE2eHost("e2e", "metaharness bench:edit");
 
 	const fixtures = await resolveFixtures(values.fixtures);
 	try {

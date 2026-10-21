@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Isolated task and eval `agent()` changes are now retained as patch or branch artifacts by default instead of being applied to the parent checkout: `task.isolation.apply` defaults to `false`, and enabling it (or passing `apply: true` to `agent()`) is the explicit acceptance that integrates successful isolated changes. Previously an isolated run could copy its edits into a caller tree holding unrelated work and report `Applied patches: yes`.
+- Eval `agent()` now honors `task.isolation.apply` when `apply` is omitted instead of always applying; a per-call `apply: false` still forces artifact-only delivery.
+
 ### Added
 
 - `providers.operationTimeoutSeconds` (default 900) caps the wall clock one provider request may spend across its internal retries on the Anthropic, OpenAI Responses, Codex Responses, Google and Gemini CLI paths plus the shared replay-safe stream retry. A retry whose backoff would cross the budget fails immediately with an error naming the budget and the elapsed time instead of sleeping, and the session saga replays an exhausted budget at most twice rather than running the full retry ladder — so a wedged provider surfaces in minutes instead of leaving a turn silent for hours. `0` disables the budget ([#12786](https://github.com/can1357/oh-my-pi/pull/12786) by [@geoyws](https://github.com/geoyws)).

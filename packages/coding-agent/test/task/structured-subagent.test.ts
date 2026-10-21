@@ -1178,8 +1178,13 @@ describe("structured subagent primitive", () => {
 			return { ...result(), exitCode: 1, error: "agent failed", patchPath: "/recovery/Worker.patch" };
 		});
 
+		// Explicit acceptance: retention here must come from the recovery
+		// requirement, not from the artifact-only default.
 		const settled = await runStructuredSubagent(
-			request({ session: session({ isolationEnabled: true }), isolation: { requested: true } }),
+			request({
+				session: session({ isolationEnabled: true, isolationApply: true }),
+				isolation: { requested: true },
+			}),
 		);
 
 		expect(artifactsDirsFromRegistry()).toContain(settled.artifactsDir);
@@ -1231,29 +1236,56 @@ describe("structured subagent primitive", () => {
 		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
 	});
 
-	it("defaults task isolation to auto-apply and lets config retain artifacts", async () => {
+	it("retains isolated artifacts by default for every invocation kind and applies only on explicit acceptance", async () => {
 		mockDiscovery();
 		const defaultPolicy = await resolveEffectiveSubagentPolicy(
 			request({ session: session({ isolationEnabled: true }), isolation: { requested: true } }),
 		);
-		expect(defaultPolicy.applyChanges).toBe(true);
+		expect(defaultPolicy.applyChanges).toBe(false);
 
-		const capturePolicy = await resolveEffectiveSubagentPolicy(
-			request({
-				session: session({ isolationEnabled: true, isolationApply: false }),
-				isolation: { requested: true },
-			}),
-		);
-		expect(capturePolicy.applyChanges).toBe(false);
-
-		const evalPolicy = await resolveEffectiveSubagentPolicy(
+		const evalDefaultPolicy = await resolveEffectiveSubagentPolicy(
 			request({
 				invocationKind: "eval",
-				session: session({ isolationEnabled: true, isolationApply: false }),
+				session: session({ isolationEnabled: true }),
 				isolation: { requested: true },
 			}),
 		);
-		expect(evalPolicy.applyChanges).toBe(true);
+		expect(evalDefaultPolicy.applyChanges).toBe(false);
+
+		const acceptedPolicy = await resolveEffectiveSubagentPolicy(
+			request({
+				session: session({ isolationEnabled: true, isolationApply: true }),
+				isolation: { requested: true },
+			}),
+		);
+		expect(acceptedPolicy.applyChanges).toBe(true);
+
+		const evalAcceptedPolicy = await resolveEffectiveSubagentPolicy(
+			request({
+				invocationKind: "eval",
+				session: session({ isolationEnabled: true, isolationApply: true }),
+				isolation: { requested: true },
+			}),
+		);
+		expect(evalAcceptedPolicy.applyChanges).toBe(true);
+
+		const evalPerCallAccept = await resolveEffectiveSubagentPolicy(
+			request({
+				invocationKind: "eval",
+				session: session({ isolationEnabled: true }),
+				isolation: { requested: true, apply: true },
+			}),
+		);
+		expect(evalPerCallAccept.applyChanges).toBe(true);
+
+		const evalPerCallRetain = await resolveEffectiveSubagentPolicy(
+			request({
+				invocationKind: "eval",
+				session: session({ isolationEnabled: true, isolationApply: true }),
+				isolation: { requested: true, apply: false },
+			}),
+		);
+		expect(evalPerCallRetain.applyChanges).toBe(false);
 	});
 
 	it("retains successful isolated task artifacts when auto-apply is disabled", async () => {
