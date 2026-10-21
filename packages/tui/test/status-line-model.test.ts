@@ -209,6 +209,27 @@ describe("status line model segment pending switch", () => {
 		);
 	});
 
+	it("omits the current model's thinking/fast tail while a switch is queued", () => {
+		const base = createPendingContext({ model: pendingModel as never }, true);
+		for (const compactThinkingLevel of [false, true]) {
+			const ctx = {
+				...base,
+				compactThinkingLevel,
+				session: {
+					...base.session,
+					state: {
+						model: { id: "test-model", name: "Test Model", thinking: true },
+						thinkingLevel: ThinkingLevel.High,
+					},
+					isFastModeActive: () => true,
+				} as unknown as SegmentContext["session"],
+			} as SegmentContext;
+			expect(Bun.stripANSI(renderSegment("model", ctx).content)).toBe(
+				`${modelPrefix()}Test Model -> Opus (after this turn)`,
+			);
+		}
+	});
+
 	it("renders the plain chip when nothing is pending", () => {
 		expect(Bun.stripANSI(renderSegment("model", createPendingContext(null, true)).content)).toBe(
 			`${modelPrefix()}Test Model`,

@@ -393,7 +393,9 @@ const modelSegment: StatusLineSegment = {
 	id: "model",
 	render(ctx) {
 		const chip = modelChipLabel(ctx);
-		const thinkingDisplay = modelThinkingDisplay(ctx);
+		// While a switch is queued the fast/thinking tail describes A, not B, so it
+		// is omitted rather than wedged between `A -> B` and the trailer.
+		const thinkingDisplay = chip.pending ? "" : modelThinkingDisplay(ctx);
 
 		// Compact mode swaps the model icon for the thinking-level glyph and drops
 		// the " · <level>" tail, keeping the level visible as a single icon.
@@ -406,7 +408,7 @@ const modelSegment: StatusLineSegment = {
 		// theme.fg resets only the fg, so the spans are concatenated (not
 		// nested) to keep each color intact.
 		let tail = "";
-		if (ctx.session.isFastModeActive() && theme.icon.fast) {
+		if (!chip.pending && ctx.session.isFastModeActive() && theme.icon.fast) {
 			tail += ` ${theme.icon.fast}`;
 		}
 		if (!compact && thinkingDisplay) {
@@ -438,12 +440,15 @@ const modelSegment: StatusLineSegment = {
 		const spans: TspSpan[] = [span(chip.label, token)];
 		const advisor = modelAdvisorBadge(ctx);
 		if (advisor) spans.push(span(` ${advisor.icon}`, advisor.color));
-		if (ctx.session.isFastModeActive() && theme.icon.fast) spans.push(span(` ${theme.icon.fast}`, token));
-		const showThinking = ctx.options.model?.showThinkingLevel !== false;
-		const level = showThinking ? thinkingLevelWord(ctx.session) : undefined;
-		const label = showThinking ? thinkingLevelLabel(ctx.session) : undefined;
-		if (level !== undefined && label !== undefined) {
-			spans.push(span(" · ", "dim"), span(label, thinkingLevelToken(level)));
+		// While pending, the fast/thinking tail (A's) is omitted, as in `render`.
+		if (!chip.pending) {
+			if (ctx.session.isFastModeActive() && theme.icon.fast) spans.push(span(` ${theme.icon.fast}`, token));
+			const showThinking = ctx.options.model?.showThinkingLevel !== false;
+			const level = showThinking ? thinkingLevelWord(ctx.session) : undefined;
+			const label = showThinking ? thinkingLevelLabel(ctx.session) : undefined;
+			if (level !== undefined && label !== undefined) {
+				spans.push(span(" · ", "dim"), span(label, thinkingLevelToken(level)));
+			}
 		}
 		if (chip.pending) spans.push(span(PENDING_MODEL_SUFFIX, "dim"));
 		const slowModeLabel = ctx.session.getAnthropicSlowModeLabel?.();
