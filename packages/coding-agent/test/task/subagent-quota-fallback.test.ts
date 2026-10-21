@@ -1,8 +1,8 @@
 /**
- * A task subagent whose role model answers a subscription-quota 429 with a
- * multi-day retry-after must walk `retry.fallbackChains` exactly like the main
- * loop: the next rung answers and the task succeeds instead of exiting on the
- * first 429.
+ * A task subagent whose role model answers a usage-limit error (a
+ * subscription-quota 429 with a multi-day retry-after, or a 402 billing cap)
+ * must walk `retry.fallbackChains` exactly like the main loop: the next rung
+ * answers and the task succeeds instead of exiting on the first error.
  */
 import { afterEach, beforeEach, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -25,6 +25,10 @@ const MOCK_API_SOURCE = "test/subagent-quota-fallback";
 const ENV_KEYS = ["HOME", "PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE"] as const;
 const QUOTA_429 =
 	"429 Subscription quota exhausted. Your usage window resets at 2026-10-19T00:00:00Z. retry-after-ms=310373000";
+// xAI Grok Build credits exhausted: a 402 billing cap, the same usage-limit
+// class as the 429 above (packages/ai/src/error/rate-limit.ts is402BillingCapBody).
+const BILLING_CAP_402 =
+	'402 {"code":"Payment Required","error":"Grok Build usage balance exhausted. Add credits at https://console.x.ai to continue."}';
 
 let savedEnv: Record<string, string | undefined> = {};
 let root: string;
@@ -72,14 +76,14 @@ const OPUS = "anthropic/claude-opus-5-5:medium";
 
 /**
  * Spawns a `task` subagent through the real executor and session on the
- * `task` role model, which answers every request with the subscription-quota
- * 429. Mirrors the reported config: the model's own chain names glm then grok,
- * and the `task` role chain (installed as the child's `subagent:<id>` chain)
- * starts with opus. `suppressed` selectors start on a sibling-recorded cooldown
- * in the shared registry, as when an earlier child's walk already found them
+ * `task` role model, which answers every request with `errorMessage`. Mirrors
+ * the reported config: the model's own chain names glm then grok, and the
+ * `task` role chain (installed as the child's `subagent:<id>` chain) starts
+ * with opus. `suppressed` selectors start on a sibling-recorded cooldown in
+ * the shared registry, as when an earlier child's walk already found them
  * exhausted.
  */
-async function runQuotaExhaustedTaskSubagent(suppressed: readonly string[]) {
+async function runQuotaExhaustedTaskSubagent(suppressed: readonly string[], errorMessage = QUOTA_429) {
 	const cwd = path.join(root, "home", "work");
 	const artifactsDir = path.join(root, "artifacts");
 	await fs.mkdir(cwd, { recursive: true });
@@ -97,7 +101,7 @@ async function runQuotaExhaustedTaskSubagent(suppressed: readonly string[]) {
 		provider: "muse-code",
 		id: "muse-spark-1.3-contributor",
 		reasoning: true,
-		handler: { stopReason: "error", errorMessage: QUOTA_429 },
+		handler: { stopReason: "error", errorMessage },
 	});
 	const glm = createMockModel({
 		provider: "zhipu-coding-plan",
@@ -180,6 +184,17 @@ it("walks the model's own chain when the task role model is quota-exhausted with
 
 it("falls through to the subagent's role chain when every model-keyed rung is unusable", async () => {
 	const { result, muse, glm, grok, opus } = await runQuotaExhaustedTaskSubagent([GLM, GROK]);
+
+	expect(muse.calls.length).toBeGreaterThan(0);
+	expect(glm.calls).toHaveLength(0);
+	expect(grok.calls).toHaveLength(0);
+	expect(opus.calls.length).toBeGreaterThan(0);
+	expect(result.exitCode).toBe(0);
+	expect(result.output).toContain("answered by opus");
+}, 20_000);
+
+it("falls through to the subagent's role chain when the task role model dies on a 402 billing cap", async () => {
+	const { result, muse, glm, grok, opus } = await runQuotaExhaustedTaskSubagent([GLM, GROK], BILLING_CAP_402);
 
 	expect(muse.calls.length).toBeGreaterThan(0);
 	expect(glm.calls).toHaveLength(0);
