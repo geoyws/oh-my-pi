@@ -115,6 +115,7 @@ import {
 	readOpenRouterRawMetadata,
 	resolveOpenAICompatPolicy,
 	resolveOpenAICompletionsOutputClamp,
+	resolveOpenAIEffortFallbackConstraints,
 	resolveOpenAIOutputTokenParam,
 	resolveOpenAIRequestSetup,
 	shouldDropAutoToolChoiceForReasoning,
@@ -980,10 +981,13 @@ const streamOpenAICompletionsOnce = (
 				// resulting `none` resolves to a delete-effort retry that gets
 				// cached and strips later enabled turns.
 				const isExplicitDisable = options?.disableReasoning === true;
+				// Mandatory/pinned-effort models never drop or renegotiate the
+				// effort: the server would fall back to its own default tier.
 				const reasoningEffortFallback =
 					activeReasoningEffortFallbackKey && activeRequestParams && !requestSignal.aborted
 						? resolveOpenAIReasoningEffortFallback(error, capturedErrorResponse, activeRequestParams, {
 								explicitDisable: isExplicitDisable,
+								...resolveOpenAIEffortFallbackConstraints(model, model.compat),
 							})
 						: undefined;
 				if (reasoningEffortFallback !== undefined && activeReasoningEffortFallbackKey) {
