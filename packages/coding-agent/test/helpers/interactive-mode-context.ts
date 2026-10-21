@@ -304,6 +304,10 @@ export function createInteractiveModeContext(overrides: ContextOverrides = {}): 
 		reconcileOptimisticSkillMessage: vi.fn(),
 		flushCompactionQueue: vi.fn(async () => {}),
 		flushPendingModelSwitch: vi.fn(async () => {}),
+		getPendingModelSwitch: vi.fn(() => undefined),
+		onPendingModelSwitchChange: vi.fn(() => () => {}),
+		// Idle default: every user model switch applies immediately.
+		queueUserModelSwitch: vi.fn(() => false),
 		reloadTodos: vi.fn(async () => {}),
 		setTodos: vi.fn(),
 	} satisfies ContextOverrides;

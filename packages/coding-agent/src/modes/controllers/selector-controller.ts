@@ -786,11 +786,15 @@ export class SelectorController {
 	): Promise<void> {
 		const target = this.ctx.viewSession;
 		const focusedAgentId = this.ctx.focusedAgentId;
-		const apply = async () => {
-			const level = thinkingLevel ?? target.resolveTemporaryModelThinkingLevel(model);
+		const level = thinkingLevel ?? target.resolveTemporaryModelThinkingLevel(model);
+		const switchModel = async () => {
 			await target.setModelTemporary(model, level);
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorBorderColor();
+		};
+		const apply = async () => {
+			if (this.ctx.queueUserModelSwitch({ target, model, thinkingLevel: level, apply: switchModel })) return;
+			await switchModel();
 			if (focusedAgentId) {
 				this.ctx.showStatus(`Agent ${focusedAgentId} model: ${selector}`);
 				return;
@@ -886,6 +890,22 @@ export class SelectorController {
 				},
 				onPickRole: async entry => {
 					if (!isCurrent() || selectOnly) return;
+					const target = this.ctx.viewSession;
+					const queued = this.ctx.queueUserModelSwitch({
+						target,
+						model: entry.model,
+						thinkingLevel: entry.explicitThinkingLevel ? entry.thinkingLevel : undefined,
+						role: entry.role,
+						apply: async () => {
+							await target.applyRoleModel(entry);
+							this.ctx.statusLine.invalidate();
+							this.ctx.updateEditorBorderColor();
+						},
+					});
+					if (queued) {
+						done();
+						return;
+					}
 					try {
 						await this.ctx.viewSession.applyRoleModel(entry);
 						this.ctx.statusLine.invalidate();
@@ -1019,28 +1039,48 @@ export class SelectorController {
 									}
 								}
 							} else {
-								const { switched } = await this.ctx.session.setModel(model, role, {
-									selector,
-									thinkingLevel: isAuto ? ThinkingLevel.Inherit : concreteThinking,
-									persist: targetScope === "global",
+								// Switches the live session and records the role. While a turn
+								// streams it runs at the turn end instead, under the same lock.
+								const assignDefault = async (): Promise<boolean> => {
+									const { switched } = await this.ctx.session.setModel(model, role, {
+										selector,
+										thinkingLevel: isAuto ? ThinkingLevel.Inherit : concreteThinking,
+										persist: targetScope === "global",
+									});
+									if (!switched) return false;
+									if (targetScope === "project") {
+										this.ctx.settings.setProjectModelRole(
+											"default",
+											formatModelSelectorValue(selectorValue, concreteThinking),
+										);
+									}
+									if (isAuto) {
+										this.ctx.session.setThinkingLevel(
+											AUTO_THINKING,
+											!this.ctx.settings.isGlobalConfigReadOnly(),
+										);
+									} else if (concreteThinking && concreteThinking !== ThinkingLevel.Inherit) {
+										this.ctx.session.setThinkingLevel(concreteThinking);
+									}
+									this.ctx.statusLine.invalidate();
+									this.ctx.updateEditorBorderColor();
+									return true;
+								};
+								const queued = this.ctx.queueUserModelSwitch({
+									target: this.ctx.session,
+									model,
+									thinkingLevel: isAuto ? AUTO_THINKING : concreteThinking,
+									apply: async () => {
+										const release = await this.#acquireDefaultRoleMutation();
+										try {
+											await assignDefault();
+										} finally {
+											release();
+										}
+									},
 								});
-								if (!switched) return false;
-								if (targetScope === "project") {
-									this.ctx.settings.setProjectModelRole(
-										"default",
-										formatModelSelectorValue(selectorValue, concreteThinking),
-									);
-								}
-								if (isAuto) {
-									this.ctx.session.setThinkingLevel(
-										AUTO_THINKING,
-										!this.ctx.settings.isGlobalConfigReadOnly(),
-									);
-								} else if (concreteThinking && concreteThinking !== ThinkingLevel.Inherit) {
-									this.ctx.session.setThinkingLevel(concreteThinking);
-								}
-								this.ctx.statusLine.invalidate();
-								this.ctx.updateEditorBorderColor();
+								if (queued) return true;
+								if (!(await assignDefault())) return false;
 							}
 							this.ctx.showStatus(`${defaultStatusLabel} model: ${selector ?? model.id}`);
 						} else {
@@ -1128,26 +1168,45 @@ export class SelectorController {
 										}
 									}
 									const effectiveIsAuto = isAuto || isAutoFromDefault;
-									const { switched } = await this.ctx.session.setModel(fallbackModel, "default", {
-										persist: false,
-										thinkingLevel: effectiveIsAuto
-											? ThinkingLevel.Inherit
-											: (concreteThinking ?? ThinkingLevel.Inherit),
+									// While a turn streams, the role clear above stands and only the
+									// live switch to the fallback waits for the turn end.
+									const switchToFallback = async (): Promise<boolean> => {
+										const { switched } = await this.ctx.session.setModel(fallbackModel, "default", {
+											persist: false,
+											thinkingLevel: effectiveIsAuto
+												? ThinkingLevel.Inherit
+												: (concreteThinking ?? ThinkingLevel.Inherit),
+										});
+										if (!switched) return false;
+										if (effectiveIsAuto) {
+											// Same contract as onAssign: auto applies live, but the global
+											// default is persisted only while global config is writable —
+											// the role was already cleared and the model already switched.
+											this.ctx.session.setThinkingLevel(
+												AUTO_THINKING,
+												!this.ctx.settings.isGlobalConfigReadOnly(),
+											);
+										} else if (concreteThinking && concreteThinking !== ThinkingLevel.Inherit) {
+											this.ctx.session.setThinkingLevel(concreteThinking);
+										}
+										this.ctx.statusLine.invalidate();
+										this.ctx.updateEditorBorderColor();
+										return true;
+									};
+									const queued = this.ctx.queueUserModelSwitch({
+										target: this.ctx.session,
+										model: fallbackModel,
+										thinkingLevel: effectiveIsAuto ? AUTO_THINKING : concreteThinking,
+										apply: async () => {
+											const release = await this.#acquireDefaultRoleMutation();
+											try {
+												await switchToFallback();
+											} finally {
+												release();
+											}
+										},
 									});
-									if (!switched) return;
-									if (effectiveIsAuto) {
-										// Same contract as onAssign: auto applies live, but the global
-										// default is persisted only while global config is writable —
-										// the role was already cleared and the model already switched.
-										this.ctx.session.setThinkingLevel(
-											AUTO_THINKING,
-											!this.ctx.settings.isGlobalConfigReadOnly(),
-										);
-									} else if (concreteThinking && concreteThinking !== ThinkingLevel.Inherit) {
-										this.ctx.session.setThinkingLevel(concreteThinking);
-									}
-									this.ctx.statusLine.invalidate();
-									this.ctx.updateEditorBorderColor();
+									if (queued || !(await switchToFallback())) return;
 									this.ctx.showStatus(`Default model: ${fallbackModel.provider}/${fallbackModel.id}`);
 								}
 							}

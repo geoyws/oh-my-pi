@@ -7,10 +7,11 @@
  * correction to the wrong plan model takes effect at the next turn boundary
  * (issue #5657).
  *
- * This module holds only the pure decision — what transition a given
- * (current model, resolved role, streaming) triple implies — so the branching
- * is testable without a live session or TUI. The interactive mode performs the
- * resulting side effect.
+ * This module holds only the pure decisions — what transition a given
+ * (current model, resolved role, streaming) triple implies, and whether a
+ * user-initiated switch applies now or waits for the turn to end — so the
+ * branching is testable without a live session or TUI. The interactive mode
+ * performs the resulting side effect.
  */
 import type { Model } from "@oh-my-pi/pi-ai";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
@@ -48,4 +49,31 @@ export function resolvePlanModelTransition(
 		return planThinkingLevel ? { kind: "thinking", thinkingLevel: planThinkingLevel } : { kind: "none" };
 	}
 	return { kind: "apply", model: resolved.model, thinkingLevel: planThinkingLevel, deferred: isStreaming };
+}
+
+/** The action implied by a user-initiated model switch (picker, ctrl+p, model hub). */
+export type UserModelSwitchDecision =
+	/** The session is idle: switch now. */
+	| { kind: "apply" }
+	/**
+	 * A turn is streaming: queue the switch for the turn end. Applying it now
+	 * would split one turn across two models (the agent loop re-resolves the
+	 * model per provider request).
+	 */
+	| { kind: "queue"; from: Model | undefined; to: Model };
+
+/**
+ * Decide whether a user-initiated model switch applies now or is queued until
+ * the current turn ends.
+ *
+ * @param currentModel - The session's active model, or `undefined` before one is set.
+ * @param target - The model the user switched to.
+ * @param isStreaming - Whether the session is mid-turn (forces a queued switch).
+ */
+export function resolveUserModelSwitch(
+	currentModel: Model | undefined,
+	target: Model,
+	isStreaming: boolean,
+): UserModelSwitchDecision {
+	return isStreaming ? { kind: "queue", from: currentModel, to: target } : { kind: "apply" };
 }

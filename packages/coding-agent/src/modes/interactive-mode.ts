@@ -127,6 +127,7 @@ import { onDownloadActivity } from "../downloads/activity";
 import { DownloadActivityHud, JudgmentBatchProgressHud } from "./progress-hud";
 import { autosaveApprovedPlan, planSaveFileName } from "../plan-mode/plan-autosave";
 import { resolvePlanModelTransition } from "../plan-mode/model-transition";
+import { ModelSwitchQueue, type PendingModelSwitch, type UserModelSwitchRequest } from "./model-switch-queue";
 import guidedGoalInterviewPrompt from "../prompts/goals/guided-goal-interview.md" with { type: "text" };
 import planFilenamePrompt from "../prompts/system/plan-filename.md" with { type: "text" };
 import planModeApprovedPrompt from "../prompts/system/plan-mode-approved.md" with { type: "text" };
@@ -1661,9 +1662,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	#previousGoalContinuationActivity: string | undefined;
 	#goalSuppressNextContinuation = false;
 	#planModePreviousModelState: { model: Model; thinkingLevel?: ConfiguredThinkingLevel } | undefined;
-	#pendingModelSwitch: { model: Model; thinkingLevel?: ConfiguredThinkingLevel } | undefined;
-	/** Whether #pendingModelSwitch was queued by the live plan-role reconciler. */
-	#pendingPlanModelSwitch = false;
+	/** The single model switch deferred to the end of the current turn (user picks and plan transitions). */
+	readonly #modelSwitchQueue = new ModelSwitchQueue(this);
 	#planModeHasEntered = false;
 	#planReviewOverlay: PlanReviewOverlay | undefined;
 	#planReviewOverlayHandle: OverlayHandle | undefined;
@@ -4943,9 +4943,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * model) remain intact.
 	 */
 	#clearPendingPlanModelSwitch(): void {
-		if (!this.#pendingPlanModelSwitch) return;
-		this.#pendingModelSwitch = undefined;
-		this.#pendingPlanModelSwitch = false;
+		this.#modelSwitchQueue.clear("plan");
 	}
 
 	/** Apply (or defer) the model/thinking change implied by the resolved plan role. */
@@ -4962,11 +4960,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				return;
 			case "apply":
 				if (transition.deferred) {
-					this.#pendingModelSwitch = {
-						model: transition.model,
-						thinkingLevel: transition.thinkingLevel,
-					};
-					this.#pendingPlanModelSwitch = true;
+					this.#modelSwitchQueue.queuePlan("plan", transition.model, transition.thinkingLevel);
 					return;
 				}
 				try {
@@ -4981,18 +4975,23 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	/** Apply any deferred model switch after the current stream ends. */
-	async flushPendingModelSwitch(): Promise<void> {
-		const pending = this.#pendingModelSwitch;
-		this.#pendingModelSwitch = undefined;
-		this.#pendingPlanModelSwitch = false;
-		if (!pending) return;
-		try {
-			await this.session.setModelTemporary(pending.model, pending.thinkingLevel);
-		} catch (error) {
-			this.showWarning(
-				`Failed to switch model after streaming: ${error instanceof Error ? error.message : String(error)}`,
-			);
-		}
+	flushPendingModelSwitch(): Promise<void> {
+		return this.#modelSwitchQueue.flush();
+	}
+
+	/** The model switch queued for the end of the current turn, if any. */
+	getPendingModelSwitch(): PendingModelSwitch | undefined {
+		return this.#modelSwitchQueue.pending;
+	}
+
+	/** Subscribe to changes of {@link getPendingModelSwitch}; returns the unsubscribe. */
+	onPendingModelSwitchChange(listener: () => void): () => void {
+		return this.#modelSwitchQueue.subscribe(listener);
+	}
+
+	/** Queue a user model switch while the main session streams; `false` means apply it now. */
+	queueUserModelSwitch(request: UserModelSwitchRequest): boolean {
+		return this.#modelSwitchQueue.queueUser(request);
 	}
 
 	async #clearTransientModeState(options?: {
@@ -5018,8 +5017,9 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.planModePlanFilePath = undefined;
 				this.#planModePreviousToolPresentation = undefined;
 				this.#planModePreviousModelState = undefined;
-				this.#pendingModelSwitch = undefined;
-				this.#pendingPlanModelSwitch = false;
+				// Plan state is gone, so drop its queued transitions; a switch the
+				// user queued during plan mode still applies at the turn end.
+				this.#modelSwitchQueue.clear("plan", "plan-restore");
 				this.#planModeHasEntered = false;
 				this.#updatePlanModeStatus();
 			}
@@ -5262,11 +5262,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			// which would reset provider-side sessions and break continuity.
 			this.session.setThinkingLevel(prev.thinkingLevel);
 		} else if (this.session.isStreaming) {
-			this.#pendingModelSwitch = {
-				model: prev.model,
-				thinkingLevel: prev.thinkingLevel,
-			};
-			this.#pendingPlanModelSwitch = false;
+			this.#modelSwitchQueue.queuePlan("plan-restore", prev.model, prev.thinkingLevel);
 		} else {
 			await this.session.setModelTemporary(prev.model, prev.thinkingLevel);
 		}

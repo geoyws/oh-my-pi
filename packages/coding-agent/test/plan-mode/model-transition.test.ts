@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import type { ResolvedModelRoleValue } from "../../src/config/model-resolver";
-import { resolvePlanModelTransition } from "../../src/plan-mode/model-transition";
+import { resolvePlanModelTransition, resolveUserModelSwitch } from "../../src/plan-mode/model-transition";
 import { AUTO_THINKING } from "@oh-my-pi/pi-tui/thinking";
 
 /**
@@ -56,5 +56,24 @@ describe("resolvePlanModelTransition", () => {
 	it("is a no-op when the plan role resolves to no model", () => {
 		const transition = resolvePlanModelTransition(model("openai", "gpt"), resolved(undefined), false);
 		expect(transition).toEqual({ kind: "none" });
+	});
+});
+
+describe("resolveUserModelSwitch", () => {
+	it("applies a user switch immediately when the session is idle", () => {
+		expect(resolveUserModelSwitch(model("openai", "gpt"), model("anthropic", "opus"), false)).toEqual({
+			kind: "apply",
+		});
+	});
+
+	it("queues a user switch while a turn is streaming", () => {
+		const current = model("openai", "gpt");
+		const target = model("anthropic", "opus");
+		expect(resolveUserModelSwitch(current, target, true)).toEqual({ kind: "queue", from: current, to: target });
+	});
+
+	it("queues while streaming even before any model is set", () => {
+		const target = model("anthropic", "opus");
+		expect(resolveUserModelSwitch(undefined, target, true)).toEqual({ kind: "queue", from: undefined, to: target });
 	});
 });

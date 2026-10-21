@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
+import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import {
 	type AutocompleteProvider,
 	type Component,
@@ -2812,7 +2813,16 @@ export class InputController {
 	async cycleRoleModel(direction: "forward" | "backward" = "forward"): Promise<void> {
 		try {
 			const cycleOrder = cfgCycleOrder.get(settings);
-			const result = await this.ctx.viewSession.cycleRoleModels(cycleOrder, direction);
+			const target = this.ctx.viewSession;
+			const queuedRole = target === this.ctx.session ? this.#queueRoleModelCycle(cycleOrder, direction) : undefined;
+			if (queuedRole !== undefined) {
+				this.ctx.showModelCycleTrack(
+					cycleOrder.map(role => ({ label: role })),
+					cycleOrder.indexOf(queuedRole),
+				);
+				return;
+			}
+			const result = await target.cycleRoleModels(cycleOrder, direction);
 			if (!result) {
 				this.ctx.showStatus("Only one role model available");
 				return;
@@ -2832,6 +2842,42 @@ export class InputController {
 		} catch (error) {
 			this.ctx.showError(error instanceof Error ? error.message : String(error));
 		}
+	}
+
+	/**
+	 * Queue the ctrl+p step while the main session streams; returns the queued
+	 * role, or `undefined` when the step must apply now. The step advances from
+	 * a pending user switch rather than the live model, so repeated presses in
+	 * one turn walk the cycle (A → B → C) and only the last pick is applied.
+	 */
+	#queueRoleModelCycle(cycleOrder: readonly string[], direction: "forward" | "backward"): string | undefined {
+		const session = this.ctx.session;
+		const cycle = session.getRoleModelCycle(cycleOrder);
+		if (!cycle || cycle.models.length <= 1) return undefined;
+		let index = cycle.currentIndex;
+		const pending = this.ctx.getPendingModelSwitch();
+		if (pending?.source === "user") {
+			const sameRole = cycle.models.findIndex(
+				entry => entry.role === pending.role && modelsAreEqual(entry.model, pending.model),
+			);
+			const pendingIndex =
+				sameRole !== -1 ? sameRole : cycle.models.findIndex(entry => modelsAreEqual(entry.model, pending.model));
+			if (pendingIndex !== -1) index = pendingIndex;
+		}
+		const step = direction === "backward" ? -1 : 1;
+		const next = cycle.models[(index + step + cycle.models.length) % cycle.models.length];
+		const queued = this.ctx.queueUserModelSwitch({
+			target: session,
+			model: next.model,
+			thinkingLevel: next.explicitThinkingLevel ? next.thinkingLevel : undefined,
+			role: next.role,
+			apply: async () => {
+				await session.applyRoleModel(next);
+				this.ctx.statusLine.invalidate();
+				this.ctx.updateEditorBorderColor();
+			},
+		});
+		return queued ? next.role : undefined;
 	}
 
 	toggleToolOutputExpansion(): void {

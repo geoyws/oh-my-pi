@@ -16,9 +16,10 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
+import { ModelSwitchQueue } from "@oh-my-pi/pi-coding-agent/modes/model-switch-queue";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import * as titleGenerator from "@oh-my-pi/pi-coding-agent/utils/title-generator";
@@ -396,6 +397,53 @@ describe("EventController — terminal title across a non-terminal agent_end", (
 		continuation.resolve();
 		await tornDown.promise;
 		expect(stateSpy).toHaveBeenCalledWith("idle");
+	});
+
+	it("applies a user model switch queued mid-turn exactly once across the non-terminal settle and the abort teardown", async () => {
+		vi.spyOn(titleGenerator, "setTerminalTitleState").mockImplementation(() => {});
+		let streaming = true;
+		let continuationPending = true;
+		const continuation = Promise.withResolvers<void>();
+		const ctx = createInteractiveModeContext({
+			sessionManager: { getSessionName: () => "test-session" },
+			session: {
+				get isStreaming() {
+					return streaming;
+				},
+				get hasPostPromptWork() {
+					return continuationPending;
+				},
+				waitForIdle: () => continuation.promise,
+			},
+		});
+		const showStatus = vi.spyOn(ctx, "showStatus");
+		const queue = new ModelSwitchQueue(ctx);
+		ctx.flushPendingModelSwitch = () => queue.flush();
+		const target = { provider: "anthropic", id: "claude-opus-4-5" } as unknown as Model;
+		const apply = vi.fn(async () => {});
+		expect(queue.queueUser({ target: ctx.session, model: target, apply })).toBe(true);
+		streaming = false;
+
+		const markActivityEnd = vi.spyOn(ctx.statusLine, "markActivityEnd");
+		const tornDown = Promise.withResolvers<void>();
+		markActivityEnd.mockImplementation(() => tornDown.resolve());
+		const controller = new EventController(ctx);
+		await controller.handleEvent({
+			...makeAgentEndEvent([makeAssistantMessage("stop")]),
+			isTerminal: false,
+		} as Extract<AgentSessionEvent, { type: "agent_end" }> & { isTerminal: false });
+		await nextMacrotask();
+		expect(apply).toHaveBeenCalledTimes(1);
+		expect(queue.pending).toBeUndefined();
+
+		// Esc cancels the scheduled continuation: the settle teardown flushes again.
+		continuationPending = false;
+		continuation.resolve();
+		await tornDown.promise;
+		await nextMacrotask();
+		expect(apply).toHaveBeenCalledTimes(1);
+		const switchedLines = showStatus.mock.calls.filter(([message]) => message.startsWith("Model switched to"));
+		expect(switchedLines).toEqual([["Model switched to anthropic/claude-opus-4-5"]]);
 	});
 
 	it("keeps the working title on a queued steer/follow-up or IRC continuation (isTerminal:false, yielded:true, no awaitingAsyncWork)", async () => {

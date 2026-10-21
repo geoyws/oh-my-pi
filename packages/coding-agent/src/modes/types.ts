@@ -53,6 +53,7 @@ import type { EventController } from "./controllers/event-controller";
 import type { LoopConditionConfig, LoopLimitRuntime } from "@oh-my-pi/pi-tui/status-line/loop";
 import type { ContextUsage } from "@oh-my-pi/pi-tui/status-line/types";
 import type { OAuthManualInputManager } from "./oauth-manual-input";
+import type { PendingModelSwitch, UserModelSwitchRequest } from "./model-switch-queue";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import type { TodoItem, TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 
@@ -367,6 +368,15 @@ export interface InteractiveModeContext {
 	flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void>;
 	flushPendingBashComponents(): void;
 	flushPendingModelSwitch(): Promise<void>;
+	/** The model switch queued for the end of the current turn, if any. */
+	getPendingModelSwitch(): PendingModelSwitch | undefined;
+	/** Subscribe to changes of {@link getPendingModelSwitch}; returns the unsubscribe. */
+	onPendingModelSwitchChange(listener: () => void): () => void;
+	/**
+	 * Queue a user-initiated model switch while the main session streams.
+	 * Returns `false` when the caller must apply it now (idle, or another session).
+	 */
+	queueUserModelSwitch(request: UserModelSwitchRequest): boolean;
 	setWorkingMessage(message?: string): void;
 	applyPendingWorkingMessage(): void;
 	ensureLoadingAnimation(): void;

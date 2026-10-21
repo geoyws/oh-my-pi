@@ -2290,7 +2290,7 @@ describe("InteractiveMode plan review rendering", () => {
 		// Regression: handleCompactCommand flushes queued input before it returns,
 		// so the model transition must run inside the before-flush hook. Otherwise a
 		// turn queued during compaction dispatches on the plan model (the restore,
-		// recorded while streaming, lands one turn later via #pendingModelSwitch).
+		// recorded while streaming, lands one turn later via the pending model switch).
 		const planModel = session.modelRegistry.find("anthropic", "claude-opus-4-5");
 		const prePlanModel = session.modelRegistry.find("anthropic", "claude-sonnet-4-5");
 		if (!planModel || !prePlanModel) throw new Error("Expected sonnet + opus to exist in registry");
