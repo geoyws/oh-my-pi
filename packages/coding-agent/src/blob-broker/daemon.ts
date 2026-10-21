@@ -3,7 +3,8 @@
  *
  * `connectDaemonBlobBackend` ensures the blob daemon is running under the
  * daemon broker (same lifecycle as the shared Chromium and LSP mux: started on
- * first use, stopped when the last omp process in the project exits), then
+ * first use, stopped when the last omp session using the project releases its
+ * broker lease), then
  * speaks the HTTP-over-Unix-socket control plane from `protocol.ts`. Every
  * failure returns `null` so callers fall back to an in-process backend.
  */
@@ -11,7 +12,7 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger, ptree } from "@oh-my-pi/pi-utils";
-import { daemonClientForProject } from "../launch/client";
+import { type DaemonBrokerLease, daemonClientForProject } from "../launch/client";
 import { describeQuietly, stopQuietly, waitReady } from "../launch/ensure";
 import { daemonRuntimeDir } from "../launch/paths";
 import { resolveWorkerSpawnCmd, SMOKE_TEST_TIMEOUT_MS, workerEnvFromParent } from "../subprocess/worker-client";
@@ -72,10 +73,8 @@ async function probeDaemon(socket: string): Promise<DaemonInfo | null> {
 	}
 }
 
-async function liveBlobBrokerSocket(projectDir: string): Promise<string | null> {
-	if (process.platform === "win32") return null;
+async function liveBlobBrokerSocket(client: DaemonBrokerLease): Promise<string | null> {
 	try {
-		const client = await daemonClientForProject(projectDir);
 		await client.request({ op: "ping" });
 		const socket = blobBrokerEndpoint(daemonRuntimeDir(client.projectDir));
 		return (await probeDaemon(socket)) ? socket : null;
@@ -84,23 +83,43 @@ async function liveBlobBrokerSocket(projectDir: string): Promise<string | null> 
 	}
 }
 
+/**
+ * Run `query` against the project's running blob daemon under one broker lease,
+ * so the daemon cannot lose its last broker connection mid-query. `null` means
+ * stopped or unreachable.
+ */
+async function withLiveBlobBroker<T>(projectDir: string, query: (socket: string) => Promise<T>): Promise<T | null> {
+	if (process.platform === "win32") return null;
+	let client: DaemonBrokerLease;
+	try {
+		client = await daemonClientForProject(projectDir);
+	} catch {
+		return null;
+	}
+	try {
+		const socket = await liveBlobBrokerSocket(client);
+		return socket ? await query(socket) : null;
+	} finally {
+		client.release();
+	}
+}
+
 /** Query a running blob daemon without starting one; `null` means stopped. */
-export async function queryBlobBrokerStatus(projectDir: string): Promise<BlobBrokerStatus | null> {
-	const socket = await liveBlobBrokerSocket(projectDir);
-	return socket ? fetchUnix<BlobBrokerStatus>(socket, "/status") : null;
+export function queryBlobBrokerStatus(projectDir: string): Promise<BlobBrokerStatus | null> {
+	return withLiveBlobBroker(projectDir, socket => fetchUnix<BlobBrokerStatus>(socket, "/status"));
 }
 
 /** Run diagnostics on a running blob daemon; `null` means stopped. */
-export async function queryBlobBrokerDoctor(
+export function queryBlobBrokerDoctor(
 	projectDir: string,
 	request: BlobBrokerDoctorRequest = {},
 ): Promise<BlobBrokerDoctorResponse | null> {
-	const socket = await liveBlobBrokerSocket(projectDir);
-	if (!socket) return null;
-	return fetchUnix<BlobBrokerDoctorResponse>(socket, "/doctor", {
-		method: "POST",
-		body: JSON.stringify(request),
-	});
+	return withLiveBlobBroker(projectDir, socket =>
+		fetchUnix<BlobBrokerDoctorResponse>(socket, "/doctor", {
+			method: "POST",
+			body: JSON.stringify(request),
+		}),
+	);
 }
 
 /**
@@ -113,37 +132,37 @@ export async function queryBlobBrokerProbe(
 	request: BlobBrokerProbeRequest = {},
 ): Promise<BlobBrokerProbeResponse | null> {
 	if (process.platform === "win32") return null;
-	const info = await ensureBlobDaemon(projectDir, config);
+	using client = await daemonClientForProject(projectDir);
+	const info = await ensureBlobDaemon(client, config);
 	if (!info) return null;
-	const socket = await liveBlobBrokerSocket(projectDir);
+	const socket = await liveBlobBrokerSocket(client);
 	if (!socket) return null;
-	return fetchUnix<BlobBrokerProbeResponse>(socket, "/probe", {
+	return await fetchUnix<BlobBrokerProbeResponse>(socket, "/probe", {
 		method: "POST",
 		body: JSON.stringify(request),
 	});
 }
 
 /** Preview or apply cleanup on a running daemon; `null` means stopped. */
-export async function queryBlobBrokerPurge(
+export function queryBlobBrokerPurge(
 	projectDir: string,
 	request: BlobBrokerPurgeRequest = {},
 ): Promise<BlobBrokerPurgeResponse | null> {
-	const socket = await liveBlobBrokerSocket(projectDir);
-	if (!socket) return null;
-	return fetchUnix<BlobBrokerPurgeResponse>(socket, "/purge", {
-		method: "POST",
-		body: JSON.stringify(request),
-	});
+	return withLiveBlobBroker(projectDir, socket =>
+		fetchUnix<BlobBrokerPurgeResponse>(socket, "/purge", {
+			method: "POST",
+			body: JSON.stringify(request),
+		}),
+	);
 }
 
 /**
  * Ensure the project's blob daemon runs with `config` and return its info.
- * A live daemon with a different config is replaced (settings changed).
+ * A live daemon with a different config is replaced (settings changed). The
+ * caller's broker lease doubles as the presence lease keeping the daemon alive.
  */
-async function ensureBlobDaemon(projectDir: string, config: BlobBrokerWorkerConfig): Promise<DaemonInfo | null> {
-	const client = await daemonClientForProject(projectDir);
+async function ensureBlobDaemon(client: DaemonBrokerLease, config: BlobBrokerWorkerConfig): Promise<DaemonInfo | null> {
 	const socket = blobBrokerEndpoint(daemonRuntimeDir(client.projectDir));
-	// The broker connection doubles as the presence lease keeping the daemon alive.
 	await client.request({ op: "ping" });
 	const wantKey = blobBrokerConfigKey(config);
 	const spawn = resolveWorkerSpawnCmd(BLOB_BROKER_WORKER_ARG);
@@ -202,11 +221,14 @@ async function ensureBlobDaemon(projectDir: string, config: BlobBrokerWorkerConf
 class DaemonBlobBackend implements BlobBackend {
 	#socket: string;
 	#callbacks: RenderCallbackHost;
+	/** Keeps this project's broker connection, and with it the daemon, alive until {@link stop}. */
+	#broker: DaemonBrokerLease;
 	readonly supportsLazy: boolean;
 
-	constructor(socket: string, info: DaemonInfo, callbacks: RenderCallbackHost) {
+	constructor(socket: string, info: DaemonInfo, callbacks: RenderCallbackHost, broker: DaemonBrokerLease) {
 		this.#socket = socket;
 		this.#callbacks = callbacks;
+		this.#broker = broker;
 		this.supportsLazy = info.lazy;
 	}
 
@@ -263,7 +285,9 @@ class DaemonBlobBackend implements BlobBackend {
 	}
 
 	stop(): void {
-		// The daemon outlives this session; the broker lease handles teardown.
+		// The daemon outlives this session; dropping the lease lets the broker
+		// retire it once no omp process in the project uses it.
+		this.#broker.release();
 	}
 }
 
@@ -279,13 +303,18 @@ export async function connectDaemonBlobBackend(
 	callbacks: RenderCallbackHost,
 ): Promise<BlobBackend | null> {
 	if (process.platform === "win32") return null;
+	let client: DaemonBrokerLease | undefined;
 	try {
-		const client = await daemonClientForProject(projectDir);
+		client = await daemonClientForProject(projectDir);
 		const socket = blobBrokerEndpoint(daemonRuntimeDir(client.projectDir));
-		const info = await ensureBlobDaemon(projectDir, config);
-		if (!info) return null;
-		return new DaemonBlobBackend(socket, info, callbacks);
+		const info = await ensureBlobDaemon(client, config);
+		if (!info) {
+			client.release();
+			return null;
+		}
+		return new DaemonBlobBackend(socket, info, callbacks, client);
 	} catch (error) {
+		client?.release();
 		logger.debug("Shared blob daemon unavailable; falling back to in-process broker", {
 			error: error instanceof Error ? error.message : String(error),
 		});

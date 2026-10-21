@@ -6,7 +6,7 @@ import * as path from "node:path";
 import type { VcsCommitAuthor, VcsGitRepo } from "@oh-my-pi/pi-natives";
 import * as natives from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
-import { formatBytes, getWorktreeDir, logger, Snowflake } from "@oh-my-pi/pi-utils";
+import { formatBytes, getWorktreeDir, isEnoent, logger, Snowflake } from "@oh-my-pi/pi-utils";
 import type { SettingValueOf } from "../config/registry";
 
 import { withRepoLock } from "../utils/repo-lock";
@@ -33,9 +33,7 @@ async function diffTreeOrEmpty(repo: VcsGitRepo, base: string, head: string): Pr
 /**
  * Diff two trees while capturing a task's changes. Unlike
  * {@link diffTreeOrEmpty}, a render failure throws: an empty patch would read
- * as "no changes" and the workspace holding them would be torn down. The
- * native renderer refuses gitlink entries, so a committed submodule pin move
- * lands here.
+ * as "no changes" and the workspace holding them would be torn down.
  */
 async function diffTreeForCapture(repo: VcsGitRepo, repoDir: string, base: string, head: string): Promise<string> {
 	try {
@@ -85,17 +83,45 @@ export function getGitNoIndexNullPath(): string {
 	return GIT_NO_INDEX_NULL_PATH;
 }
 
+/** Real path of the git common dir owning `dir`, or `undefined` outside any repo. */
+async function realCommonDir(dir: string): Promise<string | undefined> {
+	const commonDir = vcs.gitInfo(dir)?.commonDir;
+	if (!commonDir) return undefined;
+	// git writes realpath'd admin pointers; match them across symlinked
+	// prefixes (macOS /var -> /private/var).
+	return fs.realpath(commonDir).catch(() => path.resolve(commonDir));
+}
+
 /**
  * Find every repository under `repoRoot` whose edits the root diff cannot
- * carry: each initialized submodule at every depth (the root diff never
- * renders a gitlink, let alone the submodule's files) plus every
- * non-submodule nested repo. Paths are relative to `repoRoot`; a submodule
- * always precedes the repos nested inside it.
+ * carry: each initialized submodule at every depth plus every non-submodule
+ * nested repo. Paths are relative to `repoRoot`; a submodule always precedes
+ * the repos nested inside it.
+ *
+ * A directory whose common dir belongs to one of `ownRepos` is a linked
+ * worktree of the same repository, not a nested repo, and is skipped with
+ * everything under it. A copied isolation carries every in-tree linked
+ * worktree (e.g. gitignored `.claude/worktrees/*`); baselining each one
+ * re-hashes its whole tree and froze the host (#16068). Isolation setup
+ * detaches those copies onto private admins, so the same relative path under
+ * every other `ownRepos` root (the source checkout) is judged too.
  */
-async function discoverNestedRepos(repoRoot: string): Promise<string[]> {
+async function discoverNestedRepos(repoRoot: string, ownRepos: readonly string[]): Promise<string[]> {
 	// Initialized submodules, recursively; uninitialized ones have no edits.
 	const submodules = await vcs.requireGit(repoRoot).submodulePaths();
 	const submodulePaths = new Set(submodules);
+	const ownCommonDirs = new Set(
+		(await Promise.all(ownRepos.map(realCommonDir))).filter((dir): dir is string => dir !== undefined),
+	);
+	const counterpartRoots = ownRepos.filter(root => path.resolve(root) !== path.resolve(repoRoot));
+	const isOwnLinkedWorktree = async (full: string, rel: string): Promise<boolean> => {
+		if (ownCommonDirs.size === 0) return false;
+		for (const dir of [full, ...counterpartRoots.map(root => path.join(root, rel))]) {
+			const commonDir = await realCommonDir(dir);
+			if (commonDir && ownCommonDirs.has(commonDir)) return true;
+		}
+		return false;
+	};
 
 	// Find all .git dirs/files that aren't the root or known submodules
 	const result: string[] = [...submodules];
@@ -119,6 +145,7 @@ async function discoverNestedRepos(repoRoot: string): Promise<string[]> {
 				hasGit = true;
 			} catch {}
 			if (hasGit && !submodulePaths.has(rel)) {
+				if (await isOwnLinkedWorktree(full, rel)) continue;
 				result.push(rel);
 				// Don't recurse into nested repos — they manage their own tree
 				continue;
@@ -286,14 +313,17 @@ async function writeSyntheticTree(
  * Capture the baseline of `repoRoot` and every nested repo under it. Each repo
  * baseline may buffer at most `budgetBytes` of uncommitted content (the
  * isolation-snapshot budget, {@link ISOLATION_BASELINE_MAX_CONTENT_BYTES}).
+ * Linked worktrees of any repo in `ownRepos` are not nested repos (see
+ * {@link discoverNestedRepos}).
  */
 export async function captureBaseline(
 	repoRoot: string,
 	budgetBytes: number = ISOLATION_BASELINE_MAX_CONTENT_BYTES,
+	ownRepos: readonly string[] = [repoRoot],
 ): Promise<WorktreeBaseline> {
 	const [root, nestedPaths] = await Promise.all([
 		captureRepoBaseline(repoRoot, budgetBytes),
-		discoverNestedRepos(repoRoot),
+		discoverNestedRepos(repoRoot, ownRepos),
 	]);
 	const nested = await Promise.all(
 		nestedPaths.map(async relativePath => ({
@@ -312,13 +342,16 @@ export async function captureBaseline(
  * own state is the only exact baseline: a baseline read from the live parent
  * before or after the copy also absorbs whatever other agents or merges wrote
  * in between, and that drift would surface as this task's changes.
+ *
+ * Copied linked worktrees may point at either the isolation's or the parent's
+ * admin dir, so both count as the root repository.
  */
 export async function captureIsolationBaseline(
 	isolationDir: string,
 	repoRoot: string,
 	budgetBytes: number = ISOLATION_BASELINE_MAX_CONTENT_BYTES,
 ): Promise<WorktreeBaseline> {
-	const { root, nested } = await captureBaseline(isolationDir, budgetBytes);
+	const { root, nested } = await captureBaseline(isolationDir, budgetBytes, [isolationDir, repoRoot]);
 	return {
 		root: { ...root, repoRoot },
 		nested: nested.map(({ relativePath, baseline }) => ({
@@ -394,7 +427,34 @@ export interface DeltaPatchResult {
 	nestedPatches: NestedRepoPatch[];
 }
 
+async function hasGitEntry(dir: string): Promise<boolean> {
+	try {
+		await fs.lstat(path.join(dir, ".git"));
+		return true;
+	} catch (error) {
+		if (isEnoent(error)) return false;
+		throw error;
+	}
+}
+
 export async function captureDeltaPatch(isolationDir: string, baseline: WorktreeBaseline): Promise<DeltaPatchResult> {
+	// Synthetic tree construction may read a new gitlink commit before the
+	// root patch exists. Keep isolation-local objects in the source ODB first;
+	// this does not change its refs, HEAD, or index. Submodules added inside
+	// the isolation have no source checkout or `modules/<name>` admin dir (a
+	// patch apply never creates one), so their objects go to the source root
+	// ODB — the only store that survives isolation cleanup.
+	const sourceRoot = baseline.root.repoRoot;
+	const relativePaths = new Set([
+		...(await vcs.requireGit(sourceRoot).submodulePaths()),
+		...(await vcs.requireGit(isolationDir).submodulePaths()),
+	]);
+	for (const relativePath of relativePaths) {
+		const isolatedDir = path.join(isolationDir, relativePath);
+		const sourceDir = path.join(sourceRoot, relativePath);
+		if (!(await hasGitEntry(isolatedDir))) continue;
+		await vcs.copyGitObjects(isolatedDir, (await hasGitEntry(sourceDir)) ? sourceDir : sourceRoot);
+	}
 	const rootPatch = await captureRepoDeltaPatch(isolationDir, baseline.root, baseline.root.repoRoot);
 	const nestedPatches: NestedRepoPatch[] = [];
 
@@ -417,8 +477,71 @@ export async function captureDeltaPatch(isolationDir: string, baseline: Worktree
 	return { rootPatch, nestedPatches };
 }
 
+/** A submodule pin move inside a nested repo patch, keyed by the gitlink path in that repo. */
+interface GitlinkChange {
+	path: string;
+	/** Pin the task started from; undefined when the patch adds the gitlink. */
+	from: string | undefined;
+	/** Pin the task ended on; undefined when the patch removes the gitlink. */
+	to: string | undefined;
+	renamed: boolean;
+	/** The `diff --git` section carrying the change, reused to write the real pin. */
+	section: string;
+}
+
+const GITLINK_MODE_LINE = /^(?:index [0-9a-f]+\.\.[0-9a-f]+ 160000|(?:new file|deleted file|old|new) mode 160000)$/m;
+
+/**
+ * Split `patch` into its file sections and its gitlink sections. Worktree
+ * application cannot write a checked-out gitlink, so pins are carried apart
+ * from file content.
+ */
+function splitGitlinkSections(patch: string): { files: string; gitlinks: GitlinkChange[] } {
+	let files = "";
+	const gitlinks: GitlinkChange[] = [];
+	for (const section of patch.split(/^(?=diff --git )/m)) {
+		const header = section.split("\n", 1)[0];
+		const metadataEnd = section.search(/^(?:--- |@@ )/m);
+		const metadata = metadataEnd < 0 ? section : section.slice(0, metadataEnd);
+		if (!header.startsWith("diff --git ") || !GITLINK_MODE_LINE.test(metadata)) {
+			files += section;
+			continue;
+		}
+		const paths = parseDiffGitLinePaths(header);
+		gitlinks.push({
+			path: paths[paths.length - 1] ?? "",
+			from: section.match(/^-Subproject commit ([0-9a-f]+)$/m)?.[1],
+			to: section.match(/^\+Subproject commit ([0-9a-f]+)$/m)?.[1],
+			renamed: paths.length !== 1,
+			section,
+		});
+	}
+	return { files, gitlinks };
+}
+
+interface NestedRepoApply {
+	relativePath: string;
+	nestedDir: string;
+	repository: VcsGitRepo;
+	combinedDiff: string;
+	filePatches: string[];
+	touchedFiles: string[];
+	gitlinks: GitlinkChange[];
+	stashed: boolean;
+}
+
 /**
  * Apply nested repo patches directly to their working directories after parent merge.
+ *
+ * Repos are committed children before parents. A patch that moves a
+ * submodule pin (an intermediate repo committing its child's new commit) is
+ * carried by recording the child's resulting HEAD — the commit holding the
+ * child's own nested patch — as the parent's gitlink in the same commit, so
+ * the child change is applied once and the parent pin reaches it. Pin moves
+ * that cannot be carried (gitlink additions, removals, renames, an
+ * uninitialized child, a parent pin that moved since the task started, or a
+ * move with no carried child change behind it) are refused before any repo
+ * is touched.
  *
  * Pre-existing dirty state in a nested repo is stashed before the patch is
  * applied and popped back (with `--index` so staged WIP stays staged) after
@@ -445,51 +568,122 @@ export async function applyNestedPatches(
 	const byRepo = new Map<string, NestedRepoPatch[]>();
 	for (const p of patches) {
 		if (!p.patch.trim()) continue;
-		const group = byRepo.get(p.relativePath) ?? [];
+		const key = path.normalize(p.relativePath);
+		const group = byRepo.get(key) ?? [];
 		group.push(p);
-		byRepo.set(p.relativePath, group);
+		byRepo.set(key, group);
 	}
+	// Children first: a parent's pin can only name its child's commit once
+	// that commit exists.
+	const ordered = [...byRepo].sort(([a], [b]) => b.split(path.sep).length - a.split(path.sep).length);
 
-	for (const [relativePath, repoPatches] of byRepo) {
+	const plans: NestedRepoApply[] = [];
+	for (const [relativePath, repoPatches] of ordered) {
 		const nestedDir = path.join(repoRoot, relativePath);
 		try {
 			await fs.access(path.join(nestedDir, ".git"));
 		} catch {
 			continue;
 		}
-		const repository = vcs.requireGit(nestedDir);
+		const filePatches: string[] = [];
+		const pins = new Map<string, GitlinkChange>();
+		for (const { patch } of repoPatches) {
+			const { files, gitlinks } = splitGitlinkSections(patch);
+			if (files.trim()) filePatches.push(files);
+			for (const change of gitlinks) {
+				const earlier = pins.get(change.path);
+				pins.set(change.path, earlier ? { ...change, from: earlier.from } : change);
+			}
+		}
+		for (const change of pins.values()) {
+			const childRel = path.join(relativePath, change.path);
+			if (change.renamed || !change.from || !change.to) {
+				const verb = change.renamed ? "renames" : change.from ? "removes" : "adds";
+				throw new Error(
+					`Nested patch for ${relativePath} ${verb} submodule ${change.path}; merge-back carries only pin moves of initialized submodules.`,
+				);
+			}
+			const childDir = path.join(repoRoot, childRel);
+			if (!(await hasGitEntry(childDir))) {
+				throw new Error(
+					`Nested patch for ${relativePath} moves the pin of submodule ${change.path}, which is not initialized in ${repoRoot}.`,
+				);
+			}
+			const pinEntry = await runGitLine(nestedDir, ["ls-tree", "HEAD", "--", change.path]);
+			const pinned = pinEntry?.match(/^160000 commit ([0-9a-f]+)\t/)?.[1];
+			if (pinned !== change.from) {
+				throw new Error(
+					`Nested patch for ${relativePath} moves submodule ${change.path} from ${change.from}, but HEAD pins it at ${pinned ?? "nothing"}.`,
+				);
+			}
+			const childHead = await vcs.requireGit(childDir).headSha();
+			if (!byRepo.has(childRel) && childHead !== change.to) {
+				throw new Error(
+					`Nested patch for ${relativePath} moves submodule ${change.path} to ${change.to}, but ${childRel} carries no change producing that commit (checked out at ${childHead ?? "nothing"}); refusing to drop the pin move.`,
+				);
+			}
+		}
+		plans.push({
+			relativePath,
+			nestedDir,
+			repository: vcs.requireGit(nestedDir),
+			combinedDiff: repoPatches.map(p => p.patch).join("\n"),
+			filePatches,
+			touchedFiles: [...new Set(filePatches.flatMap(patchTouchedFiles))],
+			gitlinks: [...pins.values()],
+			stashed: false,
+		});
+	}
 
-		const combinedDiff = repoPatches.map(p => p.patch).join("\n");
-		const touchedFiles = [...new Set(repoPatches.flatMap(p => patchTouchedFiles(p.patch)))];
-
+	try {
 		// Preserve any pre-existing dirty state (tracked + untracked) so we
-		// commit only the agent delta, not the user's in-flight work.
-		const stashed = (await repository.isDirty())
-			? await repository.stashPush(`omp-isolation-${Snowflake.next()}`)
-			: false;
-		try {
-			for (const { patch } of repoPatches) {
+		// commit only the agent delta, not the user's in-flight work. Stashing
+		// every repo before the first commit keeps a child's new commit out of
+		// its parent's stash.
+		for (const plan of plans) {
+			plan.stashed = (await plan.repository.isDirty())
+				? await plan.repository.stashPush(`omp-isolation-${Snowflake.next()}`)
+				: false;
+		}
+		for (const plan of plans) {
+			const { relativePath, nestedDir, repository, touchedFiles } = plan;
+			for (const patch of plan.filePatches) {
 				await repository.applyPatch(patch, {});
 			}
-			if (await repository.isDirty()) {
-				if (touchedFiles.length === 0) {
-					throw new Error(`Nested repo patch for ${relativePath} did not include stageable file paths.`);
-				}
-				const msg = (await commitMessage?.(combinedDiff)) ?? "changes from isolated task(s)";
-				await repository.stageFiles(touchedFiles);
-				await repository.commitCreate(msg, {});
-			}
-		} finally {
-			if (stashed) {
-				const restored = await repository.stashTryPop(true).catch(() => false);
-				if (!restored) {
-					logger.warn("Pre-existing nested-repo dirty state could not be auto-restored", {
-						nestedDir,
-					});
-					warnings.push(
-						`Pre-existing dirty state in nested repo \`${relativePath}\` could not be auto-restored after the agent commit; stash entry preserved.`,
+			if (touchedFiles.length > 0) await repository.stageFiles(touchedFiles);
+			for (const change of plan.gitlinks) {
+				const childHead = await vcs.requireGit(path.join(nestedDir, change.path)).headSha();
+				if (!childHead || childHead === change.from) {
+					throw new Error(
+						`Nested patch for ${relativePath} moves submodule ${change.path} to ${change.to}, but applying ${path.join(relativePath, change.path)} produced no commit to pin; refusing to drop the pin move.`,
 					);
 				}
+				// Same section, both sides pinned explicitly: grouped patches keep
+				// the first preimage, and the index check refuses a moved pin.
+				const pinPatch = change.section
+					.replace(/^-Subproject commit [0-9a-f]+$/m, `-Subproject commit ${change.from}`)
+					.replace(/^\+Subproject commit [0-9a-f]+$/m, `+Subproject commit ${childHead}`)
+					.replace(/^index [0-9a-f]+\.\.[0-9a-f]+ 160000$/m, `index ${change.from}..${childHead} 160000`);
+				await repository.applyPatch(pinPatch, { cached: true });
+			}
+			if (await repository.hasDiff({ cached: true })) {
+				const msg = (await commitMessage?.(plan.combinedDiff)) ?? "changes from isolated task(s)";
+				await repository.commitCreate(msg, {});
+			} else if (touchedFiles.length === 0 && (await repository.isDirty())) {
+				throw new Error(`Nested repo patch for ${relativePath} did not include stageable file paths.`);
+			}
+		}
+	} finally {
+		for (const { stashed, repository, nestedDir, relativePath } of plans.toReversed()) {
+			if (!stashed) continue;
+			const restored = await repository.stashTryPop(true).catch(() => false);
+			if (!restored) {
+				logger.warn("Pre-existing nested-repo dirty state could not be auto-restored", {
+					nestedDir,
+				});
+				warnings.push(
+					`Pre-existing dirty state in nested repo \`${relativePath}\` could not be auto-restored after the agent commit; stash entry preserved.`,
+				);
 			}
 		}
 	}
@@ -1331,7 +1525,9 @@ async function verifyCopiedSubmodulesDetached(
  */
 async function detachNestedGitfileRepos(repoRoot: string, mergedDir: string): Promise<void> {
 	const submodules = new Set(await vcs.requireGit(repoRoot).submodulePaths());
-	for (const relativePath of await discoverNestedRepos(repoRoot)) {
+	// Linked worktrees of the root repository are detached too: a copied
+	// pointer into the source admin would share its HEAD, index and refs.
+	for (const relativePath of await discoverNestedRepos(repoRoot, [])) {
 		if (submodules.has(relativePath)) continue;
 		const copyRoot = path.join(mergedDir, relativePath);
 		const stat = await fs.lstat(path.join(copyRoot, ".git")).catch((err: NodeJS.ErrnoException) => {
@@ -1341,6 +1537,20 @@ async function detachNestedGitfileRepos(repoRoot: string, mergedDir: string): Pr
 		if (!stat?.isFile()) continue;
 		const sourceRoot = path.join(repoRoot, relativePath);
 		await detachCopiedRepo(sourceRoot, copyRoot, vcs.requireGit(sourceRoot).info().commonDir);
+	}
+}
+
+/**
+ * Copy every initialized source submodule tree the isolation lacks, parents
+ * first. `git worktree add` (rcopy) checks out gitlinks but not their trees;
+ * the copied gitfiles are then privatized like any other copied submodule.
+ */
+async function materializeCopiedSubmodules(sourceRoot: string, isolationRoot: string): Promise<void> {
+	for (const relativePath of await vcs.requireGit(sourceRoot).submodulePaths()) {
+		const sourceDir = path.join(sourceRoot, relativePath);
+		const isolatedDir = path.join(isolationRoot, relativePath);
+		if (!(await hasGitEntry(sourceDir)) || (await hasGitEntry(isolatedDir))) continue;
+		await fs.cp(sourceDir, isolatedDir, { recursive: true });
 	}
 }
 
@@ -1368,6 +1578,9 @@ export async function ensureIsolation(
 		await writeIsolationOwner(baseDir, id);
 		try {
 			await natives.isoStart(candidate, repoRoot, mergedDir);
+			// `git worktree add` (rcopy) checks out gitlinks but not their
+			// trees; materialize them before the rebind and hand-out gates.
+			await materializeCopiedSubmodules(repoRoot, mergedDir);
 			await detachCopiedRepo(repoRoot, mergedDir, sourceCommonDir);
 			await detachNestedGitfileRepos(repoRoot, mergedDir);
 			// The fail-closed hand-out gates, on the final copy: the nested-repo

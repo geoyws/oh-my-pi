@@ -21,6 +21,7 @@ import type {
 	ProviderSessionState,
 } from "@oh-my-pi/pi-ai/types";
 import { __resetProxyCache } from "@oh-my-pi/pi-ai/utils/proxy";
+import { resetRequestCompressionForTesting } from "@oh-my-pi/pi-ai/utils/request-compression";
 import { validateToolArguments } from "@oh-my-pi/pi-ai/utils/validation";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
@@ -719,6 +720,38 @@ describe("openai-codex streaming", () => {
 		expect(result.stopReason).toBe("stop");
 		expect(capturedBody?.reasoning).toEqual({ effort: "medium" });
 		expect(capturedBody?.text).toBeUndefined();
+	});
+
+	it.each([
+		["lowest-effort", { effort: "low" }],
+		["none-effort", { effort: "none" }],
+	] as const)("honors disableReasoning over a requested effort on a %s model", async (disableMode, expected) => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const base = createCodexTestModel("https://chatgpt.com/backend-api");
+		const model = {
+			...base,
+			preferWebsockets: false,
+			compat: { ...base.compat, reasoningDisableMode: disableMode },
+		};
+		let capturedBody: Record<string, unknown> | undefined;
+		const fetchMock: FetchImpl = async (_input, init) => {
+			capturedBody = JSON.parse(decodeCodexRequestBody(init?.body)) as Record<string, unknown>;
+			return new Response(createCompletedCodexSse("Hello"), {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			});
+		};
+
+		const result = await streamSimple(model, createCodexTestContext(), {
+			apiKey: createCodexTestToken(),
+			fetch: fetchMock,
+			reasoning: Effort.High,
+			disableReasoning: true,
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(capturedBody?.reasoning).toEqual(expected);
 	});
 
 	async function runCodexSseEvents(events: unknown[]) {
@@ -1957,7 +1990,6 @@ describe("openai-codex streaming", () => {
 				clientMetadata: {
 					workspace_kind: "repo",
 					parent_turn_id: "forged-parent-turn",
-					code_mode_tool_names: "forged-code-mode",
 					"x-codex-turn-metadata": '{"thread_id":"caller"}',
 				},
 				parentTurnId: "turn_parent-1",
@@ -1991,11 +2023,6 @@ describe("openai-codex streaming", () => {
 		// x-codex-turn-metadata JSON blob.
 		expect(metadata.parent_turn_id).toBe("turn_parent-1");
 		expect(turnMetadata.parent_turn_id).toBe("turn_parent-1");
-		// `code_mode_tool_names` is likewise reserved (codex-rs
-		// CODE_MODE_TOOL_NAMES_KEY, #35271): OMP never emits it, and caller extras
-		// cannot smuggle it into either projection.
-		expect(metadata.code_mode_tool_names).toBeUndefined();
-		expect(turnMetadata.code_mode_tool_names).toBeUndefined();
 		expect(capturedHeaders?.["x-codex-installation-id"]).toBeUndefined();
 		expect(metadata.session_id).toBe(capturedHeaders?.["session-id"]);
 		expect(metadata.thread_id).toBe(capturedHeaders?.["thread-id"]);
@@ -2901,6 +2928,85 @@ describe("openai-codex streaming", () => {
 		expect(result.content.find(block => block.type === "text")?.text).toBe("Recovered after watchdog timeout");
 	});
 
+	it("recovers an empty SSE watchdog timeout without inheriting the aborted transport", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		let requestCount = 0;
+		const fetchMock: FetchImpl = async (input, init) => {
+			requestCount += 1;
+			const signal = getRequestSignal(input, init);
+			if (signal?.aborted) throw signal.reason;
+			if (requestCount === 1) return createStalledErrorResponse(200, signal);
+			return new Response(createStatefulCodexSse("Recovered after empty SSE stall", "resp_empty_stall_retry"), {
+				headers: { "content-type": "text/event-stream" },
+			});
+		};
+		const model = { ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false };
+		const result = await streamOpenAICodexResponses(model, createCodexTestContext(), {
+			apiKey: createCodexTestToken(),
+			fetch: fetchMock,
+			streamFirstEventTimeoutMs: 10,
+		}).result();
+
+		expect(requestCount).toBe(2);
+		expect(result.stopReason).toBe("stop");
+		expect(result.content.find(block => block.type === "text")?.text).toBe("Recovered after empty SSE stall");
+	});
+
+	it("exhausts the provider retry budget on repeated empty SSE stalls", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		let requestCount = 0;
+		const fetchMock: FetchImpl = async (input, init) => {
+			requestCount += 1;
+			const signal = getRequestSignal(input, init);
+			if (signal?.aborted) throw signal.reason;
+			return createStalledErrorResponse(200, signal);
+		};
+		const model = { ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false };
+		const result = await streamOpenAICodexResponses(model, createCodexTestContext(), {
+			apiKey: createCodexTestToken(),
+			fetch: fetchMock,
+			streamFirstEventTimeoutMs: 10,
+		}).result();
+
+		expect(requestCount).toBe(6);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("timed out while waiting for the first event");
+		expect(AIError.is(result.errorId, AIError.Flag.Timeout)).toBe(true);
+		expect(AIError.is(result.errorId, AIError.Flag.Transient)).toBe(true);
+	});
+
+	it("honors caller cancellation during backoff after an empty SSE stall", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const callerAbort = new AbortController();
+		const wait = scheduler.wait.bind(scheduler);
+		vi.spyOn(scheduler, "wait").mockImplementation((delay, options) => {
+			queueMicrotask(() => callerAbort.abort());
+			return wait(delay, options);
+		});
+		let requestCount = 0;
+		const fetchMock: FetchImpl = async (input, init) => {
+			requestCount += 1;
+			const signal = getRequestSignal(input, init);
+			if (signal?.aborted) throw signal.reason;
+			return createStalledErrorResponse(200, signal);
+		};
+		const model = { ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false };
+		const result = await streamOpenAICodexResponses(model, createCodexTestContext(), {
+			apiKey: createCodexTestToken(),
+			fetch: fetchMock,
+			signal: callerAbort.signal,
+			streamFirstEventTimeoutMs: 10,
+		}).result();
+
+		expect(requestCount).toBe(1);
+		expect(result.stopReason).toBe("aborted");
+	});
+
 	it.each([
 		["non-retryable 403 parsed by CodexApiError.fromResponse", 403],
 		["retryable 503 inspected by fetchWithRetry", 503],
@@ -2983,6 +3089,25 @@ describe("openai-codex streaming", () => {
 			expect(result.stopReason).toBe("error");
 			expect(result.errorMessage).toContain("socket connection was closed unexpectedly");
 		}
+	});
+
+	it("names the host and cause when the Codex SSE transport rejects", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const model = { ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false };
+		const fetchMock: FetchImpl = async () => {
+			throw Object.assign(new TypeError("getaddrinfo ETIMEOUT chatgpt.com"), { code: "ETIMEOUT" });
+		};
+
+		const result = await streamOpenAICodexResponses(model, createCodexTestContext(), {
+			apiKey: token,
+			fetch: fetchMock,
+			codexSseMaxAttempts: 1,
+		}).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("No internet connection: couldn't reach chatgpt.com");
 	});
 
 	it("does not retry a caller abort before response headers", async () => {
@@ -7970,22 +8095,26 @@ describe("openai-codex recovery attempt gate", () => {
 		it.each(["spent budget", "caller abort", "live budget"] as const)(
 			"gates the uncompressed replay after HTTP " + status + " (%s)",
 			async mode => {
-				await withEnv({ PI_CODEX_ZSTD: "1" }, async () => {
+				await withEnv({ PI_REQUEST_COMPRESSION: undefined }, async () => {
+					resetRequestCompressionForTesting();
 					const caller = new AbortController();
 					const options = { apiKey: createCodexTestToken(), signal: caller.signal, ...createBudget() };
 					const encodings: Array<string | null> = [];
-					let cancelled = false;
+					let inspected = false;
 					const fetchMock: FetchImpl = async (_input, init) => {
 						encodings.push(new Headers(init?.headers).get("content-encoding"));
 						if (encodings.length === 1) {
 							return new Response(
 								new ReadableStream<Uint8Array>({
-									cancel() {
-										cancelled = true;
-										// Rejection cleanup is awaited before replay; spend the
-										// budget here to exercise that exact transport boundary.
+									pull(controller) {
+										inspected = true;
+										// The compression wrapper reads the rejection before the
+										// replay; spend the budget here to exercise that exact
+										// transport boundary.
 										if (mode !== "live budget") spendBudget(options);
 										if (mode === "caller abort") caller.abort();
+										controller.enqueue(new TextEncoder().encode("Bad Request"));
+										controller.close();
 									},
 								}),
 								{ status },
@@ -7997,11 +8126,12 @@ describe("openai-codex recovery attempt gate", () => {
 					};
 					const result = await streamOpenAICodexResponses(
 						{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
-						createCodexTestContext(),
+						// Above the 1 KiB compression floor.
+						{ ...createCodexTestContext(), systemPrompt: ["Be helpful. ".repeat(100)] },
 						Object.assign(options, { fetch: fetchMock }),
 					).result();
 
-					expect(cancelled).toBe(true);
+					expect(inspected).toBe(true);
 					expect(encodings).toEqual(mode === "live budget" ? ["zstd", null] : ["zstd"]);
 					if (mode === "live budget") {
 						expect(result.stopReason).toBe("stop");
@@ -8034,6 +8164,8 @@ describe("openai-codex recovery attempt gate", () => {
 		["first-event", "", FIRST_EVENT_TIMEOUT, false],
 		["first-event", " past the operation deadline", FIRST_EVENT_TIMEOUT, true],
 	] as const)("surfaces an SSE %s timeout%s as StreamTimeoutError", async (_label, _suffix, scenario, withBudget) => {
+		// A watchdog abort is retried on a fresh attempt signal until the provider
+		// retry budget is spent; past the operation deadline the first timeout is final.
 		// Real 20 ms watchdogs: Bun fake timers misfire the production idle
 		// watchdog (see the pre-response deadline test above). The budgeted
 		// cases let the timed-out gap outlive a 10 ms operation budget.
@@ -8055,7 +8187,7 @@ describe("openai-codex recovery attempt gate", () => {
 			},
 		).result();
 
-		expect(fetchCount).toBe(1);
+		expect(fetchCount).toBe(withBudget ? 1 : 6);
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toBe(scenario.message);
 		expect(AIError.is(result.errorId, AIError.Flag.Timeout)).toBe(true);

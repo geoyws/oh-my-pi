@@ -2,7 +2,8 @@
  * Timeout suspension for in-flight host-side eval bridge calls.
  *
  * The eval watchdog caps a cell's `timeout` as a budget on the cell runtime's
- * own work. Host-side waits on `agent()` / `completion()` handles hand control
+ * own work. Host-side waits on `agent()` / `completion()` handles, delegated
+ * `tool.task()` / `tool.wait()` calls, and browser/computer preludes hand control
  * to the outer TypeScript process, where the Python kernel or JS VM is
  * only waiting for a result. While that delegated work is in flight, the cell
  * timeout must be ignored completely; once the bridge returns and the runtime is
@@ -22,8 +23,8 @@
  * success path — which is what makes a pause lifecycle-coupled to a real
  * in-flight bridge call instead of to a message an evaluated cell can send.
  *
- * The status *data* channel (`__omp_emit_status__` in JS, an
- * `application/x-omp-status` display bundle in Python) is reachable by
+ * The status *data* channel (`__omp_emit_status__` in JS, `__omp_emit_status`
+ * in Python) is reachable by
  * evaluated code, so a runtime can forge a `timeout-pause` and disarm its own
  * deadline forever. Every runtime → host status boundary therefore drops these
  * ops with {@link rejectRuntimeTimeoutControl} and fails closed (deadline stays

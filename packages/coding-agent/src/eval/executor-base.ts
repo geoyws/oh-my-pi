@@ -15,9 +15,9 @@ import {
 	rejectTimeoutControlCollision,
 } from "./bridge-timeout";
 import type { JsStatusEvent } from "./js/shared/types";
-import type { KernelDisplayOutput } from "./py/display";
 import { registerPyToolBridge } from "./py/tool-bridge";
 import { getActiveEvalShadowCell } from "./speculation/runtime-context";
+import type { EvalDisplayOutput } from "./types";
 
 /**
  * Constructor for a language executor's cancellation error. Each backend
@@ -42,13 +42,12 @@ export class EvalKernelNotRunningError extends Error {
  * over agents keeps one event per handle instead of one per poll tick. Shared
  * by the kernel (Python) and VM (JS) executors.
  */
-export class DisplayOutputCollector<T extends KernelDisplayOutput> {
-	readonly outputs: T[] = [];
+export class DisplayOutputCollector {
+	readonly outputs: EvalDisplayOutput[] = [];
 	readonly #snapshotIndex = new Map<string, number>();
 
-	push(output: T): void {
-		const display: KernelDisplayOutput = output;
-		const key = display.type === "status" ? statusEventKey(display.event) : undefined;
+	push(output: EvalDisplayOutput): void {
+		const key = output.type === "status" ? statusEventKey(output.event) : undefined;
 		if (key !== undefined) {
 			const index = this.#snapshotIndex.get(key);
 			if (index !== undefined) {
@@ -82,6 +81,8 @@ export interface KernelExecutorBaseOptions {
 	bridgeSessionId?: string;
 	artifactId?: string;
 	artifactPath?: string;
+	/** Model-visible note that this cell runs in a kernel restarted after an idle reap; leads the output. */
+	kernelRestartNotice?: string;
 }
 
 /** Normalised execution result produced by {@link executeWithKernelBase}. */
@@ -98,7 +99,7 @@ export interface KernelExecutionResult {
 	totalBytes: number;
 	outputLines: number;
 	outputBytes: number;
-	displayOutputs: KernelDisplayOutput[];
+	displayOutputs: EvalDisplayOutput[];
 	stdinRequested: boolean;
 }
 
@@ -113,7 +114,7 @@ export interface GenericKernel<TEnv> {
 			id: string;
 			signal?: AbortSignal;
 			onChunk: (text: string) => Promise<void> | void;
-			onDisplay: (output: KernelDisplayOutput) => Promise<void> | void;
+			onDisplay: (output: EvalDisplayOutput) => Promise<void> | void;
 		},
 	): Promise<{
 		status: "ok" | "error";
@@ -436,6 +437,12 @@ export interface ExecuteWithKernelBaseParams<
 	buildKernelEnvPatch: (options: TOptions) => TEnv;
 	formatKernelTimeoutAnnotation: (executionTimeoutMs: number | undefined, kernelKilled: boolean) => string;
 	formatTimeoutAnnotation: (executionTimeoutMs: number | undefined) => string | undefined;
+	/**
+	 * Awaited kernel setup before the cell (e.g. prelude sync), given the remaining budget. It runs after
+	 * the restart notice reaches the output and after the deadline check, so its timeout or abort settles
+	 * as this cell's cancelled result.
+	 */
+	prepare?: (remainingMs: number | undefined) => Promise<void>;
 }
 
 export async function executeWithKernelBase<
@@ -452,6 +459,7 @@ export async function executeWithKernelBase<
 		buildKernelEnvPatch,
 		formatKernelTimeoutAnnotation,
 		formatTimeoutAnnotation,
+		prepare,
 	} = params;
 
 	const settings = await Settings.init();
@@ -464,7 +472,7 @@ export async function executeWithKernelBase<
 		maxColumns: resolveOutputMaxColumns(settings),
 	});
 
-	const display = new DisplayOutputCollector<KernelDisplayOutput>();
+	const display = new DisplayOutputCollector();
 	const displayOutputs = display.outputs;
 	const deadlineMs = getExecutionDeadlineMs(options);
 	const remainingMs = getRemainingTimeoutMs(deadlineMs);
@@ -521,11 +529,11 @@ export async function executeWithKernelBase<
 	};
 
 	/**
-	 * Kernel-originated display. Evaluated code can emit an
-	 * `application/x-omp-status` bundle, so a timeout pause/resume arriving here
+	 * Kernel-originated display. Evaluated code can call `__omp_emit_status`,
+	 * so a timeout pause/resume arriving here
 	 * is forged (or an echo) and is dropped: the deadline stays armed.
 	 */
-	const collectDisplay = (output: KernelDisplayOutput): void => {
+	const collectDisplay = (output: EvalDisplayOutput): void => {
 		if (output.type === "status") {
 			if (rejectRuntimeTimeoutControl(output.event, errorLogLabel)) return;
 			options?.onStatus?.(output.event);
@@ -561,9 +569,12 @@ export async function executeWithKernelBase<
 			: null;
 
 	try {
+		// Before any early exit: every result dumped from this sink, a timeout included, carries the note.
+		if (options?.kernelRestartNotice) sink.push(options.kernelRestartNotice);
 		if (remainingMs !== undefined && remainingMs <= 0) {
 			throw new cancelledErrorClass(true);
 		}
+		await prepare?.(getRemainingTimeoutMs(deadlineMs));
 
 		const result = await kernel.execute(code, {
 			cwd: options?.cwd,

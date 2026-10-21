@@ -3,7 +3,8 @@
  *
  * `connectSharedLspTransport` ensures the per-project mux daemon is running
  * under the daemon broker (same lifecycle as the shared Chromium: started on
- * first use, stopped when the last omp process in the project exits), dials
+ * first use, stopped once no omp process holds a broker lease for the project;
+ * each transport holds one until it exits), dials
  * its socket, performs the `omp/muxConnect` handshake, and returns an
  * {@link LspTransport} the ordinary LSP client machinery drives exactly like
  * a locally spawned server. Every failure degrades to `null` so callers fall
@@ -13,7 +14,7 @@ import * as os from "node:os";
 import { IpcConnection, ipcEndpoint } from "@oh-my-pi/pi-natives";
 import { logger, ptree } from "@oh-my-pi/pi-utils";
 import { encodeMessageFrame, MessageFramer } from "../../jsonrpc/message-framing";
-import { daemonClientForProject } from "../../launch/client";
+import { type DaemonBrokerLease, daemonClientForProject } from "../../launch/client";
 import { describeQuietly, stopQuietly, waitReady } from "../../launch/ensure";
 import { daemonRuntimeDir } from "../../launch/paths";
 import { resolveWorkerSpawnCmd, SMOKE_TEST_TIMEOUT_MS, workerEnvFromParent } from "../../subprocess/worker-client";
@@ -231,12 +232,11 @@ async function probeMux(endpoint: string): Promise<boolean> {
 
 /**
  * Ensure the project's mux daemon is running under the broker and reachable.
- * Returns its endpoint, or null when the shared path is unavailable.
+ * Returns its endpoint, or null when the shared path is unavailable. The
+ * caller's broker lease doubles as the presence lease keeping the daemon alive.
  */
-async function ensureLspMuxDaemon(projectDir: string, signal?: AbortSignal): Promise<string | null> {
-	const client = await daemonClientForProject(projectDir);
+async function ensureLspMuxDaemon(client: DaemonBrokerLease, signal?: AbortSignal): Promise<string | null> {
 	const endpoint = ipcEndpoint(daemonRuntimeDir(client.projectDir), "lsp-mux");
-	// The broker connection doubles as the presence lease keeping the daemon alive.
 	await client.request({ op: "ping" }, signal);
 	if (await probeMux(endpoint)) return endpoint;
 	const spawn = resolveWorkerSpawnCmd(LSP_MUX_WORKER_ARG);
@@ -294,25 +294,37 @@ async function ensureLspMuxDaemon(projectDir: string, signal?: AbortSignal): Pro
 /**
  * Open a broker-shared transport for one language server, ensuring the mux
  * daemon first. Returns null (after a debug log) when the shared path is
- * unavailable so the caller falls back to a process-local spawn.
+ * unavailable so the caller falls back to a process-local spawn. The
+ * transport holds a broker lease for the project until it exits.
  */
 export async function connectSharedLspTransport(opts: {
 	command: string;
 	args: string[];
 	cwd: string;
 	env?: Record<string, string>;
+	initializationOptions: unknown;
 	signal?: AbortSignal;
 }): Promise<LspTransport | null> {
+	let client: DaemonBrokerLease | undefined;
 	try {
-		const endpoint = await ensureLspMuxDaemon(opts.cwd, opts.signal);
-		if (!endpoint) return null;
-		return await dialMuxServer(endpoint, {
+		client = await daemonClientForProject(opts.cwd);
+		const endpoint = await ensureLspMuxDaemon(client, opts.signal);
+		if (!endpoint) {
+			client.release();
+			return null;
+		}
+		const transport = await dialMuxServer(endpoint, {
 			command: opts.command,
 			args: opts.args,
 			cwd: opts.cwd,
 			env: opts.env,
+			initializationOptions: opts.initializationOptions,
 		});
+		const lease = client;
+		void transport.exited.finally(() => lease.release());
+		return transport;
 	} catch (error) {
+		client?.release();
 		if (opts.signal?.aborted) throw error;
 		logger.debug("Shared LSP transport unavailable; falling back to local spawn", {
 			command: opts.command,

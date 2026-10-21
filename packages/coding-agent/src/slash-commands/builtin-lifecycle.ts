@@ -1,5 +1,6 @@
+import { SEANCE_SLASH_COMMAND } from "./seance";
 import { admitTuiSlashText, clearSubmittedText, restoreRefusedLine } from "./helpers/draft";
-import { UserMessageRefusedError } from "../session/agent-session";
+import { UserMessageRefusedError } from "../session/user-message-refused-error";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { CompactionCancelledError } from "@oh-my-pi/pi-agent-core/compaction";
@@ -162,7 +163,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		description: "Start a new session",
 		handleTui: async (_command, runtime) => {
 			clearSubmittedText(runtime);
-			await runtime.ctx.handleClearCommand();
+			await runtime.ctx.handleNewCommand();
 		},
 	},
 	{
@@ -408,6 +409,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 			}
 		},
 	},
+	SEANCE_SLASH_COMMAND,
 	{
 		name: "resume",
 		icon: "history",
@@ -605,6 +607,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				case "view": {
 					const payload = await backend.buildDeveloperInstructions(
 						runtime.settings.getAgentDir(),
+						runtime.cwd,
 						runtime.settings,
 						runtime.session,
 					);

@@ -5,12 +5,13 @@ import type { DaemonSnapshot, DaemonSpec } from "@oh-my-pi/pi-tui/tools/daemon";
 import { formatDuration, replaceTabs } from "@oh-my-pi/pi-tui/render/render-utils";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { getDaemonRuntimeDir, logger, sanitizeText } from "@oh-my-pi/pi-utils";
-import { type DaemonBrokerClient, daemonClientForProject } from "./client";
+import { type DaemonBrokerLease, daemonClientForProject } from "./client";
 import { canonicalProjectDir } from "./paths";
 import type { DaemonOperation, DaemonRpcResult } from "./protocol";
 import { renderTerminalOutputIsolated } from "./terminal-output-worker-client";
 import type { ToolSession } from "../tools";
 import { resolveToCwd } from "../tools/path-utils";
+import { isSharedBrowserDaemonName } from "../tools/browser/shared-daemon";
 
 import { cfgLaunchEnabled } from "../tools/settings";
 
@@ -33,14 +34,15 @@ interface ServiceSession extends ToolSession {
 	[serviceStateKey]?: {
 		owned: Map<string, { id: string; startedAt: number }>;
 		listeners: Set<() => void>;
-		subscribed: Set<DaemonBrokerClient>;
+		/** Completion subscriptions by canonical project dir; each holds a broker lease until the session ends. */
+		subscribed: Map<string, DaemonBrokerLease>;
 	};
 }
 function serviceState(session: ToolSession): NonNullable<ServiceSession[typeof serviceStateKey]> {
 	return ((session as ServiceSession)[serviceStateKey] ??= {
 		owned: new Map(),
 		listeners: new Set(),
-		subscribed: new Set(),
+		subscribed: new Map(),
 	});
 }
 
@@ -74,13 +76,17 @@ function track(session: ToolSession, daemon: DaemonSnapshot): void {
 	else services.set(daemon.name, { id: daemon.id, startedAt: daemon.startedAt });
 }
 
-function subscribe(session: ToolSession, client: DaemonBrokerClient): void {
+function subscribe(session: ToolSession, client: DaemonBrokerLease): void {
 	const owner = serviceOwner(session);
 	if (!owner) return;
 	const clients = serviceState(session).subscribed;
-	if (clients.has(client)) return;
-	clients.add(client);
-	const unsubscribe = client.onCompletion(owner, notification => {
+	if (clients.has(client.projectDir)) return;
+	// The subscription outlives the request that created it, so it keeps its own
+	// lease: the project's broker connection stays open until this session ends
+	// or changes id, and no longer than that.
+	const lease = client.retain();
+	clients.set(lease.projectDir, lease);
+	const unsubscribe = lease.onCompletion(owner, notification => {
 		const tracked = serviceState(session).owned.get(notification.daemon.name);
 		if (tracked?.id === notification.daemon.id && tracked.startedAt === notification.daemon.startedAt) {
 			track(session, notification.daemon);
@@ -88,20 +94,19 @@ function subscribe(session: ToolSession, client: DaemonBrokerClient): void {
 		}
 		return session.queueLaunchCompletion?.(notification);
 	});
-	session.registerDisposeCallback?.(() => {
+	// Disposal and a session change both detach. The previous session stays
+	// resumable (`/resume`, fork parent), so its completions stay queued in the
+	// broker for replay when that session id re-subscribes.
+	const detach = (): void => {
+		if (clients.get(lease.projectDir) !== lease) return;
 		unsubscribe({ preservePending: true });
-		clients.delete(client);
+		clients.delete(lease.projectDir);
+		lease.release();
 		serviceState(session).owned.clear();
 		for (const listener of serviceState(session).listeners) listener();
-	});
-	session.registerSessionChangeCallback?.(() => {
-		// The previous session stays resumable (`/resume`, fork parent), so keep its
-		// completions queued in the broker for replay when that session id re-subscribes.
-		unsubscribe({ preservePending: true });
-		clients.delete(client);
-		serviceState(session).owned.clear();
-		for (const listener of serviceState(session).listeners) listener();
-	});
+	};
+	session.registerDisposeCallback?.(detach);
+	session.registerSessionChangeCallback?.(detach);
 }
 
 async function request(
@@ -109,7 +114,7 @@ async function request(
 	operation: DaemonOperation,
 	signal?: AbortSignal,
 ): Promise<DaemonRpcResult> {
-	const client = await daemonClientForProject(session.cwd);
+	using client = await daemonClientForProject(session.cwd);
 	subscribe(session, client);
 	const result = await client.request(operation, signal);
 	if (result.op === "list") {
@@ -199,14 +204,22 @@ export async function serviceLogs(session: ToolSession, name: string, signal?: A
 	return (await serviceLogsWithRows(session, name, signal)).text;
 }
 
+/**
+ * Start a session-owned daemon and wait for its requested readiness condition.
+ * `readyInterrupt` ends only the readiness wait, after the broker acknowledged
+ * the launch: the call then resolves `readyInterrupted` with the launched
+ * snapshot while the service keeps starting. Validation, connection, and launch
+ * failures still reject.
+ */
 export async function startService(
 	session: ToolSession,
 	params: ServiceStart,
 	signal?: AbortSignal,
+	readyInterrupt?: AbortSignal,
 ): Promise<{
 	daemon: DaemonSnapshot;
 	readyTimedOut: boolean;
-	log: string;
+	readyInterrupted: boolean;
 }> {
 	if (!cfgLaunchEnabled.get(session.settings)) throw new ToolError("Service launch is disabled in this session.");
 	if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$/.test(params.name))
@@ -244,15 +257,46 @@ export async function startService(
 	};
 	const result = await request(
 		session,
-		{ op: "start", spec, owner: serviceOwner(session) ?? undefined, replace: true },
+		{
+			op: "start",
+			spec,
+			owner: serviceOwner(session) ?? undefined,
+			replace: true,
+			awaitReady: readyInterrupt === undefined,
+		},
 		signal,
 	);
 	if (result.op !== "start") throw new Error("Unexpected daemon start response");
-	return {
-		daemon: result.daemon,
-		readyTimedOut: result.readyTimedOut,
-		log: await serviceLogs(session, params.name, signal),
-	};
+	const launched = result.daemon;
+	// A legacy broker ignores `awaitReady` and already waited: its result is
+	// ready, terminal, or timed out, so the wait phase is skipped.
+	if (
+		!readyInterrupt ||
+		!spec.ready ||
+		result.readyTimedOut ||
+		launched.readyAt !== undefined ||
+		TERMINAL_STATES[launched.state]
+	)
+		return { daemon: launched, readyTimedOut: result.readyTimedOut, readyInterrupted: false };
+	const timeoutMs = Math.max(0, spec.ready.timeoutMs - (Date.now() - launched.startedAt));
+	try {
+		const waited = await request(
+			session,
+			{ op: "wait", name: params.name, for: "ready", timeoutMs },
+			signal ? AbortSignal.any([signal, readyInterrupt]) : readyInterrupt,
+		);
+		if (waited.op !== "wait") throw new Error("Unexpected daemon wait response");
+		// A pre-ready exit is reported by its terminal state, not as a timeout.
+		return {
+			daemon: waited.daemon,
+			readyTimedOut: waited.timedOut && !TERMINAL_STATES[waited.daemon.state],
+			readyInterrupted: false,
+		};
+	} catch (error) {
+		if (readyInterrupt.aborted && !signal?.aborted)
+			return { daemon: launched, readyTimedOut: false, readyInterrupted: true };
+		throw error;
+	}
 }
 
 export async function sendService(
@@ -279,6 +323,10 @@ export async function modeService(
 	mode: "persist" | "session" | "detached",
 	signal?: AbortSignal,
 ): Promise<DaemonSnapshot> {
+	// The broker detaches a service by relaunching it, which would start the
+	// shared Chrome on an unprepared profile and reopen its previous pages.
+	if (mode === "detached" && isSharedBrowserDaemonName(name))
+		throw new Error(`${name} is omp's project-shared browser and cannot be detached`);
 	const result = await request(session, { op: "mode", name, mode }, signal);
 	if (result.op !== "mode") throw new Error("Unexpected daemon mode response");
 	return result.daemon;

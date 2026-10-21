@@ -2,6 +2,7 @@ import * as path from "node:path";
 import { getLogsDir, isCompiledBinary, logger, untilAborted, withTimeout, workerHostEntry } from "@oh-my-pi/pi-utils";
 import type { Subprocess } from "bun";
 import type { Browser, CDPSession } from "puppeteer-core";
+import type { DaemonBrokerLease } from "../../launch/client";
 import { ToolAbortError } from "../tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { findFreeCdpPort, findReusableCdp, gracefulKillTreeOnce, resolveSpawnArgs, waitForCdp } from "./attach";
@@ -20,7 +21,7 @@ import { reapOrphanSharedTargets } from "./orphan-registry";
 import { ensureRelayDaemon, isLoopbackRelayUrl, restartRelayDaemon } from "./relay/daemon";
 import type { RelayKind } from "./relay/kind";
 import { waitForRelayExtension } from "./relay/probe";
-import { ensureSharedBrowser } from "./shared-daemon";
+import { ensureSharedBrowser, type SharedBrowserEndpoint } from "./shared-daemon";
 import type { TernKind } from "./tern/kind";
 import { TernSocketClient } from "./tern/wire";
 
@@ -61,8 +62,11 @@ export interface PuppeteerBrowserHandle extends BrowserHandleCommon {
 	pid?: number;
 	/** OMP-owned temp Chromium profile directory removed on dispose (process-local headless launches). */
 	userDataDir?: string;
-	/** Broker daemon backing this handle; dispose disconnects instead of closing, kill routes to the broker. */
-	sharedDaemon?: { name: string; projectDir: string };
+	/**
+	 * Broker daemon backing this handle; dispose disconnects instead of closing, kill routes to the broker.
+	 * `broker` is the project broker lease keeping the daemon alive while this handle exists.
+	 */
+	sharedDaemon?: { name: string; projectDir: string; broker?: DaemonBrokerLease };
 	subprocess?: Subprocess;
 	stealth: { browserSession: CDPSession | null; override: UserAgentOverride | null };
 }
@@ -415,11 +419,12 @@ async function disposeBrowserHandle(handle: BrowserHandle, opts: ReleaseBrowserO
 	if (handle.kind.kind === "headless") {
 		if (handle.sharedDaemon) {
 			// The broker owns the Chromium; this process only drops its CDP
-			// connection. `kill` is scoped to spawned-app browsers — stopping the
-			// shared daemon here would tear down every other session's tabs. The
-			// daemon dies with the last omp client in the project (broker idle
-			// teardown), when its CDP endpoint stops answering after a failed tab
-			// cleanup (`stopSharedBrowserIfUnreachable`), or via an explicit stop
+			// connection and its broker lease. `kill` is scoped to spawned-app
+			// browsers — stopping the shared daemon here would tear down every
+			// other session's tabs. The daemon dies once no omp process holds a
+			// broker lease for the project (broker idle teardown), when its CDP
+			// endpoint stops answering after a failed tab cleanup
+			// (`stopSharedBrowserIfUnreachable`), or via an explicit stop
 			// (`write proc://<name>/kill`).
 			if (handle.browser.connected) {
 				try {
@@ -428,6 +433,7 @@ async function disposeBrowserHandle(handle: BrowserHandle, opts: ReleaseBrowserO
 					logger.debug("Failed to disconnect from shared browser", { error: (err as Error).message });
 				}
 			}
+			handle.sharedDaemon.broker?.release();
 			return;
 		}
 		if (handle.browser.connected) {
@@ -490,8 +496,9 @@ async function openSharedHeadlessHandle(
 		);
 	}
 	const vp = opts.viewport ?? DEFAULT_VIEWPORT;
+	let shared: SharedBrowserEndpoint | null = null;
 	try {
-		const shared = await ensureSharedBrowser({
+		shared = await ensureSharedBrowser({
 			projectDir: opts.cwd,
 			headless: kind.headless,
 			viewport: vp,
@@ -523,11 +530,12 @@ async function openSharedHeadlessHandle(
 			key: browserKey(kind),
 			kind,
 			browser,
-			sharedDaemon: { name: shared.daemonName, projectDir: shared.projectDir },
+			sharedDaemon: { name: shared.daemonName, projectDir: shared.projectDir, broker: shared.broker },
 			refCount: 0,
 			stealth: { browserSession: null, override: null },
 		};
 	} catch (err) {
+		shared?.broker.release();
 		if (err instanceof ToolAbortError || err instanceof ToolError) throw err;
 		if (opts.signal?.aborted) throw new ToolAbortError("Browser open aborted");
 		throw new ToolError(`Shared browser attach failed: ${err instanceof Error ? err.message : String(err)}`);

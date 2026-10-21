@@ -115,7 +115,7 @@ class SocketDaemonClient implements DaemonBrokerClient {
 	readonly projectDir: string;
 	readonly #runtimeDir: string;
 	readonly #endpoint: string;
-	readonly #token: string;
+	#token: string;
 	readonly #seenCompletionIds = new Set<string>();
 	readonly #idleGraceMs: number | undefined;
 	readonly #pending = new Map<string, PendingRequest>();
@@ -162,6 +162,17 @@ class SocketDaemonClient implements DaemonBrokerClient {
 				if (!this.#pending.delete(id)) return;
 				clearTimeout(timer);
 				reject(new Error("Daemon broker request aborted"));
+				// Dropping the local entry alone leaves the broker polling a wait or
+				// follow until its own timeout; ask it to stop. The answer is unread.
+				if ((operation.op === "wait" || operation.op === "logs") && !socket.closed) {
+					socket.send(
+						JSON.stringify({
+							id: crypto.randomUUID(),
+							token: this.#token,
+							operation: { op: "cancel", requestId: id } satisfies DaemonOperation,
+						}),
+					);
+				}
 			};
 			signal.addEventListener("abort", abort, { once: true });
 			pending.removeAbort = () => signal.removeEventListener("abort", abort);
@@ -261,6 +272,10 @@ class SocketDaemonClient implements DaemonBrokerClient {
 	}
 
 	async #connectOnce(): Promise<void> {
+		// The broker authenticates against the token file it read at startup. A
+		// replacement broker may have started from a different file, or a deleted
+		// runtime dir may need a fresh one before any broker can start.
+		this.#token = await readOrCreateToken(this.#runtimeDir);
 		try {
 			this.#bindSocket(await IpcConnection.connect(this.#endpoint, { framing: "lines", timeoutMs: 250 }));
 			return;
@@ -422,19 +437,90 @@ class SocketDaemonClient implements DaemonBrokerClient {
 	}
 }
 
-const sharedClients = new Map<string, Promise<DaemonBrokerClient>>();
+/**
+ * One counted use of the process-shared broker connection for a project.
+ * The connection closes when the last lease for its project is released, so
+ * the broker's idle grace can retire a scope (e.g. an isolated subagent
+ * worktree) once nothing in this process works in it any more. Holders that
+ * keep a daemon alive (blob broker, LSP mux, shared browser, IDA host, session
+ * service subscriptions) keep their lease for exactly that long; one-shot
+ * callers release when their operation ends (`using`).
+ */
+export interface DaemonBrokerLease extends DaemonBrokerClient, Disposable {
+	/** Take another independent reference to the same shared connection. */
+	retain(): DaemonBrokerLease;
+	/** Drop this reference; idempotent. `close()` and `[Symbol.dispose]()` are aliases. */
+	release(): void;
+}
+
+interface SharedProjectClient {
+	readonly key: string;
+	readonly client: Promise<DaemonBrokerClient>;
+	refs: number;
+}
+
+const projectClients = new Map<string, SharedProjectClient>();
+const globalClients = new Map<string, Promise<DaemonBrokerClient>>();
 let cancelExitCleanup: (() => void) | undefined;
 
-function sharedDaemonClient(key: string, create: () => Promise<DaemonBrokerClient>): Promise<DaemonBrokerClient> {
-	let pending = sharedClients.get(key);
-	if (!pending) {
-		pending = create();
-		sharedClients.set(key, pending);
-		if (!cancelExitCleanup) {
-			cancelExitCleanup = postmortem.register("daemon-broker-clients", () => closeDaemonClients());
-		}
+function releaseProjectClient(entry: SharedProjectClient): void {
+	entry.refs--;
+	if (entry.refs > 0) return;
+	if (projectClients.get(entry.key) === entry) projectClients.delete(entry.key);
+	void entry.client.then(
+		client => client.close(),
+		() => {},
+	);
+}
+
+class ProjectClientLease implements DaemonBrokerLease {
+	readonly #client: DaemonBrokerClient;
+	#entry: SharedProjectClient | undefined;
+
+	/** Adopts one reference already counted on `entry`. */
+	constructor(entry: SharedProjectClient, client: DaemonBrokerClient) {
+		this.#entry = entry;
+		this.#client = client;
 	}
-	return pending;
+
+	get projectDir(): string {
+		return this.#client.projectDir;
+	}
+
+	request(operation: DaemonOperation, signal?: AbortSignal): Promise<DaemonRpcResult> {
+		if (!this.#entry) return Promise.reject(new Error("Daemon broker lease was released"));
+		return this.#client.request(operation, signal);
+	}
+
+	onCompletion(
+		owner: string,
+		sink: (notification: DaemonCompletionNotification) => Promise<void> | void,
+	): (options?: DaemonCompletionUnregisterOptions) => void {
+		if (!this.#entry) throw new Error("Daemon broker lease was released");
+		return this.#client.onCompletion(owner, sink);
+	}
+
+	retain(): DaemonBrokerLease {
+		const entry = this.#entry;
+		if (!entry) throw new Error("Daemon broker lease was released");
+		entry.refs++;
+		return new ProjectClientLease(entry, this.#client);
+	}
+
+	release(): void {
+		const entry = this.#entry;
+		if (!entry) return;
+		this.#entry = undefined;
+		releaseProjectClient(entry);
+	}
+
+	close(): void {
+		this.release();
+	}
+
+	[Symbol.dispose](): void {
+		this.release();
+	}
 }
 
 /** Create an independent socket connection to one daemon broker scope. */
@@ -448,31 +534,66 @@ export async function createDaemonBrokerClient(
 	return new SocketDaemonClient(canonical, runtimeDir, token, options);
 }
 
-/** Get the process-shared daemon broker client for one canonical project directory. */
-export async function daemonClientForProject(projectDir: string): Promise<DaemonBrokerClient> {
+/**
+ * Lease the process-shared daemon broker client for one canonical project
+ * directory. Every lease MUST be released; the shared connection closes when
+ * the project's last lease goes.
+ */
+export async function daemonClientForProject(projectDir: string): Promise<DaemonBrokerLease> {
 	const canonical = await canonicalProjectDir(projectDir);
-	return sharedDaemonClient(`project:${canonical}`, () => createDaemonBrokerClient(canonical));
+	let entry = projectClients.get(canonical);
+	if (!entry) {
+		entry = { key: canonical, client: createDaemonBrokerClient(canonical), refs: 0 };
+		projectClients.set(canonical, entry);
+		cancelExitCleanup ??= postmortem.register("daemon-broker-clients", () => closeDaemonClients());
+	}
+	// Count before awaiting so a concurrent last release cannot close the
+	// connection this caller is about to receive.
+	entry.refs++;
+	let client: DaemonBrokerClient;
+	try {
+		client = await entry.client;
+	} catch (error) {
+		// A failed creation is not cached: the next caller retries.
+		releaseProjectClient(entry);
+		throw error;
+	}
+	return new ProjectClientLease(entry, client);
 }
 
-/** Get the process-shared client that leases one profile-independent, machine-global daemon broker. */
+/** Number of projects with a live shared broker connection in this process. Test seam. */
+export function sharedProjectClientCount(): number {
+	return projectClients.size;
+}
+
+/**
+ * Get the process-shared client that leases one profile-independent, machine-global daemon broker.
+ * Global scopes are one per service, not per project, so this connection is held for the process
+ * lifetime and closed by {@link closeDaemonClients}.
+ */
 export async function daemonClientForGlobal(service: string): Promise<DaemonBrokerClient> {
 	const runtimeDir = getGlobalDaemonRuntimeDir(service);
 	// Canonicalize only after creation so the first caller and later callers
 	// derive the same Windows pipe key even when an ancestor is a symlink.
 	await fs.mkdir(runtimeDir, { recursive: true, mode: 0o700 });
 	const canonical = await fs.realpath(runtimeDir);
-	return sharedDaemonClient(`global:${canonical}`, () =>
-		createDaemonBrokerClient(canonical, {
-			runtimeDir: canonical,
-		}),
-	);
+	let pending = globalClients.get(canonical);
+	if (!pending) {
+		pending = createDaemonBrokerClient(canonical, { runtimeDir: canonical });
+		globalClients.set(canonical, pending);
+		cancelExitCleanup ??= postmortem.register("daemon-broker-clients", () => closeDaemonClients());
+	}
+	return pending;
 }
 
-/** Close every project and machine-global broker connection held by this omp process. */
+/** Close every project and machine-global broker connection held by this omp process, leased or not. */
 export async function closeDaemonClients(): Promise<void> {
-	const pending = [...sharedClients.values()];
-	sharedClients.clear();
-	for (const client of await Promise.all(pending)) client.close();
+	const pending = [...Array.from(projectClients.values(), entry => entry.client), ...globalClients.values()];
+	projectClients.clear();
+	globalClients.clear();
+	for (const settled of await Promise.allSettled(pending)) {
+		if (settled.status === "fulfilled") settled.value.close();
+	}
 	cancelExitCleanup?.();
 	cancelExitCleanup = undefined;
 }

@@ -32,6 +32,9 @@ import { EVAL_WORKPOOL_BRIDGE_NAME, type EvalWorkpoolResult, runEvalWorkpool } f
 import type { RuntimeCallIdentity } from "./shared/runtime";
 import type { JsStatusEvent } from "./shared/types";
 
+/** These tools await delegated subagents/jobs, not the cell runtime's own work. */
+const DELEGATED_WORK_TOOLS = new Set(["task", "wait"]);
+
 export type { JsStatusEvent } from "./shared/types";
 
 export interface ToolBridgeOptions {
@@ -304,12 +307,12 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 		if (claimed) return bridgeValueFromToolResult(name, validatedArgs, claimed, options.emitStatus);
 	}
 	try {
-		const result = await tool.execute(
-			toolCallId,
-			validatedArgs,
-			options.signal,
-			undefined,
-			options.session.getToolContext?.(),
+		// A delegated-work tool pauses only the cell's runtime-work watchdog; the turn's
+		// signal still reaches it. The pause rides the host-owned control channel, never
+		// the generic status sink (which drops colliding ops); without it this is a no-op.
+		const result = await withBridgeTimeoutPause(
+			DELEGATED_WORK_TOOLS.has(name) ? options.onTimeoutControl : undefined,
+			() => tool.execute(toolCallId, validatedArgs, options.signal, undefined, options.session.getToolContext?.()),
 		);
 		if (name === "todo") {
 			// A bridged call emits no `todo` toolResult entry, the only thing branch

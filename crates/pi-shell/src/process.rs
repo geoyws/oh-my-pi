@@ -51,6 +51,11 @@ mod platform {
 			self.pid
 		}
 
+		/// `starttime` clock ticks since boot.
+		pub const fn start_time(&self) -> u64 {
+			self.start_time
+		}
+
 		pub fn children(&self) -> Vec<Self> {
 			if !self.live_identity() {
 				return Vec::new();
@@ -277,6 +282,14 @@ mod platform {
 
 		pub const fn pid(&self) -> i32 {
 			self.pid
+		}
+
+		/// Start time in microseconds since the Unix epoch.
+		pub const fn start_time(&self) -> u64 {
+			self
+				.start_tvsec
+				.saturating_mul(1_000_000)
+				.saturating_add(self.start_tvusec)
 		}
 
 		pub fn children(&self) -> Vec<Self> {
@@ -520,6 +533,11 @@ mod platform {
 			self.pid
 		}
 
+		/// Creation time as a `FILETIME` tick count.
+		pub const fn start_time(&self) -> u64 {
+			self.creation_time
+		}
+
 		pub fn parent_pid(&self) -> Option<i32> {
 			sys::parent_pid(&self.handle)
 		}
@@ -674,6 +692,16 @@ impl Process {
 	#[must_use]
 	pub const fn pid(&self) -> i32 {
 		self.inner.pid()
+	}
+
+	/// Platform start-time token for this process. Together with the pid it
+	/// identifies one process across pid reuse: a recycled pid reports a
+	/// different value. The unit is platform-specific (clock ticks since boot on
+	/// Linux, microseconds since the epoch on macOS, `FILETIME` ticks on
+	/// Windows), so compare values for equality only.
+	#[must_use]
+	pub const fn start_time(&self) -> u64 {
+		self.inner.start_time()
 	}
 
 	/// Parent process id for this process, when available.

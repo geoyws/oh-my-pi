@@ -164,10 +164,10 @@ describe.skipIf(!PYTHON_AVAILABLE)("EvalTool python timeout containment", () => 
 			const startedAt = Date.now();
 			const result = await python.execute("call-forged-pause", {
 				language: "py",
-				// A display bundle is the runtime's own status channel, so the cell
+				// `__omp_emit_status` is the runtime's own status channel, so the cell
 				// can mint what looks exactly like a host bridge pause.
 				code: [
-					'__omp_display({"application/x-omp-status": {"op": "timeout-pause"}}, raw=True)',
+					'__omp_emit_status("timeout-pause")',
 					uninterruptibleCell(markerFile, pidFile),
 				].join("\n"),
 				timeout: 1,
