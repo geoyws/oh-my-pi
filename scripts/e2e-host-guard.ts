@@ -85,7 +85,8 @@ export function e2eHostRefusal(kind: E2eWorkloadKind, probe: E2eHostProbe): stri
 	if (kind === "e2e") return null;
 
 	const dockerHost = probe.env.DOCKER_HOST?.trim();
-	if (dockerHost && dockerHost !== LOCAL_DOCKER_SOCKET) return `DOCKER_HOST points away from the local engine (${dockerHost})`;
+	if (dockerHost && dockerHost !== LOCAL_DOCKER_SOCKET)
+		return `DOCKER_HOST points away from the local engine (${dockerHost})`;
 	const dockerContext = probe.env.DOCKER_CONTEXT?.trim();
 	if (dockerContext && dockerContext !== "default") return `DOCKER_CONTEXT is ${dockerContext}, not default`;
 	const engine = probe.dockerEngine();

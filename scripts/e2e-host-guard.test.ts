@@ -55,7 +55,12 @@ describe("e2eHostRefusal", () => {
 	test("admits a bare-metal Linux host for e2e and container work", () => {
 		expect(e2eHostRefusal("e2e", bareLinux())).toBeNull();
 		expect(e2eHostRefusal("container", bareLinux())).toBeNull();
-		expect(e2eHostRefusal("container", bareLinux({ env: { DOCKER_HOST: "unix:///var/run/docker.sock", DOCKER_CONTEXT: "default" } }))).toBeNull();
+		expect(
+			e2eHostRefusal(
+				"container",
+				bareLinux({ env: { DOCKER_HOST: "unix:///var/run/docker.sock", DOCKER_CONTEXT: "default" } }),
+			),
+		).toBeNull();
 	});
 
 	test("refuses native Darwin whatever the environment says", () => {
@@ -77,7 +82,9 @@ describe("e2eHostRefusal", () => {
 	});
 
 	test.each(["/.dockerenv", "/run/.containerenv", "/opt/orbstack-guest"])("refuses guest marker %s", marker => {
-		expect(e2eHostRefusal("e2e", bareLinux({ files: { [marker]: "" } }))).toBe(`container or VM guest marker ${marker}`);
+		expect(e2eHostRefusal("e2e", bareLinux({ files: { [marker]: "" } }))).toBe(
+			`container or VM guest marker ${marker}`,
+		);
 	});
 
 	test.each([
@@ -86,7 +93,9 @@ describe("e2eHostRefusal", () => {
 		["/sys/class/dmi/id/sys_vendor", "QEMU"],
 		["/sys/class/dmi/id/product_name", "VMware Virtual Platform"],
 	])("refuses virtual hardware %s=%s", (file, value) => {
-		expect(e2eHostRefusal("e2e", bareLinux({ files: { [file]: `${value}\n` } }))).toBe(`virtual hardware ${file}=${value}`);
+		expect(e2eHostRefusal("e2e", bareLinux({ files: { [file]: `${value}\n` } }))).toBe(
+			`virtual hardware ${file}=${value}`,
+		);
 	});
 
 	test.each(["apple", "kvm", "qemu", "docker", "podman", "wsl"])("refuses systemd-detect-virt %s", virt => {
@@ -166,7 +175,9 @@ describe("assertE2eHost", () => {
 describe("runE2eHostGuardCli", () => {
 	test("exits 0 when admitted and EX_NOPERM when refused", () => {
 		expect(runE2eHostGuardCli(["e2e", "test:e2e"], bareLinux())).toBe(0);
-		expect(runE2eHostGuardCli(["container", "pi:image"], bareLinux({ platform: "darwin" }))).toBe(E2E_HOST_REFUSED_EXIT);
+		expect(runE2eHostGuardCli(["container", "pi:image"], bareLinux({ platform: "darwin" }))).toBe(
+			E2E_HOST_REFUSED_EXIT,
+		);
 	});
 
 	test.each([[[]], [["e2e"]], [["vm", "x"]], [["e2e", "x", "extra"]]])("rejects usage %j", argv => {
