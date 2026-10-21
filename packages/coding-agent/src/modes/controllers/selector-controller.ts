@@ -1062,7 +1062,18 @@ export class SelectorController {
 										release();
 									}
 								};
-								const outcome = this.ctx.routeUserModelSwitch(session, model, switchLive);
+								// Same credential gate as `setModel`, before anything is queued or
+								// persisted: mid-turn the role write would otherwise land for a
+								// model the settle can never switch to.
+								if (!session.modelRegistry.hasConfiguredAuth(model)) {
+									throw new Error(`No API key for ${model.provider}/${model.id}`);
+								}
+								const defaultStatus = `${defaultStatusLabel} model: ${selector ?? model.id}`;
+								// Mid-turn the router's queued/cancelled line carries the default
+								// status too: consecutive status lines replace each other.
+								const outcome = this.ctx.routeUserModelSwitch(session, model, switchLive, {
+									statusPrefix: `${defaultStatus}. `,
+								});
 								if (outcome === "apply") {
 									const { switched } = await session.setModel(model, role, {
 										selector,
@@ -1083,6 +1094,7 @@ export class SelectorController {
 									}
 									this.ctx.statusLine.invalidate();
 									this.ctx.updateEditorBorderColor();
+									this.ctx.showStatus(defaultStatus);
 								} else {
 									// Mid-turn: the assignment is recorded now, so replacing or
 									// dropping the queued live switch never loses it. (Routed
@@ -1099,6 +1111,7 @@ export class SelectorController {
 										cfgDefaultThinkingLevel.set(this.ctx.settings, AUTO_THINKING);
 									}
 								}
+								return true;
 							}
 							this.ctx.showStatus(`${defaultStatusLabel} model: ${selector ?? model.id}`);
 						} else {
@@ -1186,27 +1199,51 @@ export class SelectorController {
 										}
 									}
 									const effectiveIsAuto = isAuto || isAutoFromDefault;
-									const { switched } = await this.ctx.session.setModel(fallbackModel, "default", {
-										persist: false,
-										thinkingLevel: effectiveIsAuto
-											? ThinkingLevel.Inherit
-											: (concreteThinking ?? ThinkingLevel.Inherit),
-									});
-									if (!switched) return;
-									if (effectiveIsAuto) {
-										// Same contract as onAssign: auto applies live, but the global
-										// default is persisted only while global config is writable —
-										// the role was already cleared and the model already switched.
-										this.ctx.session.setThinkingLevel(
-											AUTO_THINKING,
-											!this.ctx.settings.isGlobalConfigReadOnly(),
-										);
-									} else if (concreteThinking && concreteThinking !== ThinkingLevel.Inherit) {
-										this.ctx.session.setThinkingLevel(concreteThinking);
+									const session = this.ctx.session;
+									const globalWritable = !this.ctx.settings.isGlobalConfigReadOnly();
+									// Live half: the role is already cleared. Same contract as
+									// onAssign: auto applies live, but the global default is
+									// persisted only while global config is writable.
+									const applyFallback = async (persistAuto: boolean): Promise<boolean> => {
+										const { switched } = await session.setModel(fallbackModel, "default", {
+											persist: false,
+											thinkingLevel: effectiveIsAuto
+												? ThinkingLevel.Inherit
+												: (concreteThinking ?? ThinkingLevel.Inherit),
+										});
+										if (!switched) return false;
+										if (effectiveIsAuto) {
+											session.setThinkingLevel(AUTO_THINKING, persistAuto);
+										} else if (concreteThinking && concreteThinking !== ThinkingLevel.Inherit) {
+											session.setThinkingLevel(concreteThinking);
+										}
+										this.ctx.statusLine.invalidate();
+										this.ctx.updateEditorBorderColor();
+										return true;
+									};
+									const defaultStatus = `Default model: ${fallbackModel.provider}/${fallbackModel.id}`;
+									// Mid-turn the live switch waits for the settle, under the
+									// default-role mutation lock like onAssign's queued switch.
+									const outcome = this.ctx.routeUserModelSwitch(
+										session,
+										fallbackModel,
+										async () => {
+											const release = await this.#acquireDefaultRoleMutation();
+											try {
+												return await applyFallback(false);
+											} finally {
+												release();
+											}
+										},
+										{ statusPrefix: `${defaultStatus}. ` },
+									);
+									if (outcome === "apply") {
+										if (!(await applyFallback(globalWritable))) return;
+										this.ctx.showStatus(defaultStatus);
+									} else if (effectiveIsAuto && globalWritable) {
+										// The clear is recorded now; so is its auto thinking default.
+										cfgDefaultThinkingLevel.set(this.ctx.settings, AUTO_THINKING);
 									}
-									this.ctx.statusLine.invalidate();
-									this.ctx.updateEditorBorderColor();
-									this.ctx.showStatus(`Default model: ${fallbackModel.provider}/${fallbackModel.id}`);
 								}
 							}
 						}

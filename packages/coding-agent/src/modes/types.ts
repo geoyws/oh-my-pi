@@ -378,14 +378,16 @@ export interface InteractiveModeContext {
 	 * mid-turn, so the switch is held (replacing any queued one) and the queued
 	 * status line is already shown; `apply` runs once when main settles and
 	 * resolves `true` only if the model actually switched. `"cancelled"`: main
-	 * is mid-turn and `target` is its live model; any queued switch was dropped
-	 * and the status line already says so.
+	 * is mid-turn and `target` is its live model; a queued user switch was
+	 * dropped (a plan-origin one stays) and the status line already says so.
+	 * `statusPrefix` leads the queued/cancelled status line, so a caller that
+	 * also records something (the hub's role write) states both in one line.
 	 */
 	routeUserModelSwitch(
 		session: AgentSession,
 		target: Model,
 		apply: () => Promise<boolean>,
-		options?: { role?: string },
+		options?: { role?: string; statusPrefix?: string },
 	): "apply" | "queued" | "cancelled";
 	/** The user model switch waiting for the running turn to settle, if any. */
 	readonly pendingUserModelSwitch: { model: Model; role?: string } | undefined;

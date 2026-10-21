@@ -115,6 +115,23 @@ describe("queued user model switch", () => {
 			type: "agent_end",
 			messages: [{ role: "assistant", content: [], stopReason: "aborted" } as unknown as AssistantMessage],
 		}) as AgentSessionEvent;
+	/** Open the model hub with a stub component and hand back the controller's real callbacks. */
+	const openHub = (): modelHubModule.ModelHubCallbacks => {
+		let callbacks: modelHubModule.ModelHubCallbacks | undefined;
+		vi.spyOn(modelHubModule, "ModelHubComponent").mockImplementation(function (this: unknown, ...args: unknown[]) {
+			callbacks = args[4] as modelHubModule.ModelHubCallbacks;
+			return {
+				render: () => [],
+				invalidate: () => {},
+				handleInput: () => {},
+				dispose: () => {},
+				refreshAfterExternalMutation: () => {},
+			};
+		} as never);
+		mode.showModelSelector();
+		if (!callbacks) throw new Error("model hub did not open");
+		return callbacks;
+	};
 
 	it("queues ctrl+p while streaming, shows it on the chip, and applies it once at settle", async () => {
 		const showStatus = vi.spyOn(mode, "showStatus");
@@ -256,7 +273,7 @@ describe("queued user model switch", () => {
 		expect(session.model?.id).toBe(opus.id);
 	});
 
-	it("plan entry mid-turn absorbs the queued switch as the model to restore, and says so", async () => {
+	it("plan entry mid-turn absorbs the queued switch as the model to restore, and replays it in full on exit", async () => {
 		const showStatus = vi.spyOn(mode, "showStatus");
 		await mode.cycleRoleModel("forward");
 		vi.spyOn(session, "resolveRoleModelWithThinking").mockReturnValue({
@@ -275,14 +292,64 @@ describe("queued user model switch", () => {
 			`Queued model switch to ${selector(opus)} replaced by plan mode; it is restored when plan mode exits`,
 		);
 
-		// The settle applies the plan model; exiting plan mode then restores the user's target.
+		// The settle applies the plan model; exiting plan mode then replays the
+		// user's queued switch itself (role and thinking included), not a bare swap.
 		isStreaming = false;
 		await mode.flushPendingModelSwitch();
 		expect(setModelTemporary).toHaveBeenLastCalledWith(haiku, undefined);
 		vi.spyOn(mode, "showHookConfirm").mockResolvedValue(true);
 		await mode.handlePlanModeCommand();
 		expect(mode.planModeEnabled).toBe(false);
-		expect(setModelTemporary).toHaveBeenLastCalledWith(opus, undefined);
+		expect(setModelTemporary).toHaveBeenCalledTimes(1);
+		expect(session.applyRoleModel).toHaveBeenCalledTimes(1);
+		expect(session.applyRoleModel).toHaveBeenCalledWith(expect.objectContaining({ role: "slow", model: opus }));
+		expect(session.model?.id).toBe(opus.id);
+		expect(statusLines(showStatus)).toContain(`Model switched to ${selector(opus)}`);
+	});
+
+	it("plan exit mid-turn re-queues the absorbed user switch on the chip", async () => {
+		await mode.cycleRoleModel("forward");
+		vi.spyOn(session, "resolveRoleModelWithThinking").mockReturnValue({
+			model: haiku,
+			thinkingLevel: undefined,
+			explicitThinkingLevel: false,
+			warning: undefined,
+		});
+		vi.spyOn(session, "sendPlanModeContext").mockResolvedValue(undefined);
+		vi.spyOn(session, "setModelTemporary").mockResolvedValue(undefined);
+		await mode.handlePlanModeCommand();
+		expect(mode.pendingUserModelSwitch).toBeUndefined();
+
+		vi.spyOn(mode, "showHookConfirm").mockResolvedValue(true);
+		await mode.handlePlanModeCommand();
+		expect(mode.planModeEnabled).toBe(false);
+		expect(mode.pendingUserModelSwitch).toEqual({ model: opus, role: "slow" });
+		expectPendingChip(sonnet, opus);
+
+		isStreaming = false;
+		await mode.flushPendingModelSwitch();
+		expect(session.applyRoleModel).toHaveBeenCalledTimes(1);
+		expect(session.applyRoleModel).toHaveBeenCalledWith(expect.objectContaining({ role: "slow" }));
+		expect(session.model?.id).toBe(opus.id);
+	});
+
+	it("picking the live model while only a plan switch is queued keeps it and does not claim a cancel", async () => {
+		await mode.init({ suppressWelcomeIntro: true });
+		mode.planModeEnabled = true;
+		// Mid-turn plan-role reassignment queues a silent plan-role switch to haiku.
+		session.settings.setModelRole("plan", "anthropic/claude-haiku-4-5");
+		await Promise.resolve();
+		const setModelTemporary = vi.spyOn(session, "setModelTemporary").mockResolvedValue(undefined);
+		const showStatus = vi.spyOn(mode, "showStatus");
+
+		await executeBuiltinSlashCommand(`/model ${selector(sonnet)}`, { ctx: mode } as never);
+
+		expect(statusLines(showStatus).at(-1)).toBe(`Already on ${selector(sonnet)}`);
+		expect(statusLines(showStatus).some(line => line.startsWith("Queued model switch cancelled"))).toBe(false);
+		isStreaming = false;
+		await mode.flushPendingModelSwitch();
+		expect(setModelTemporary).toHaveBeenCalledTimes(1);
+		expect(setModelTemporary).toHaveBeenCalledWith(haiku, undefined);
 	});
 
 	it("/model <selector> queues on the main session even while a subagent view is focused", async () => {
@@ -331,25 +398,11 @@ describe("queued user model switch", () => {
 	});
 
 	it("model hub default assignment while focused: persists now, queues only the live switch", async () => {
-		type HubCallbacks = {
-			onAssign: (model: Model, role: string, thinkingLevel: undefined, selector: string) => Promise<boolean>;
-		};
-		let callbacks: HubCallbacks | undefined;
-		vi.spyOn(modelHubModule, "ModelHubComponent").mockImplementation(function (this: unknown, ...args: unknown[]) {
-			callbacks = args[4] as HubCallbacks;
-			return {
-				render: () => [],
-				invalidate: () => {},
-				handleInput: () => {},
-				dispose: () => {},
-				refreshAfterExternalMutation: () => {},
-			};
-		} as never);
 		const setModel = vi.spyOn(session, "setModel");
+		const showStatus = vi.spyOn(mode, "showStatus");
 
 		// The hub only opens on the main view; the subagent is focused while it is up.
-		mode.showModelSelector();
-		if (!callbacks) throw new Error("model hub did not open");
+		const callbacks = openHub();
 		focusSubagent();
 		expect(await callbacks.onAssign(opus, "default", undefined, selector(opus))).toBe(true);
 
@@ -357,6 +410,10 @@ describe("queued user model switch", () => {
 		expect(session.settings.getModelRole("default")).toContain(opus.id);
 		expect(setModel).not.toHaveBeenCalled();
 		expect(mode.pendingUserModelSwitch?.model.id).toBe(opus.id);
+		// One visible line states both the role write and the queued live switch.
+		expect(statusLines(showStatus).at(-1)).toBe(
+			`Default model: ${selector(opus)}. Model switch queued for after this turn: ${selector(sonnet)} -> ${selector(opus)}`,
+		);
 
 		// A later switch replaces the queued live switch, never the persisted role.
 		await mode.cycleRoleModel("backward");
@@ -368,6 +425,59 @@ describe("queued user model switch", () => {
 		expect(setModel).not.toHaveBeenCalled();
 		expect(session.applyRoleModel).toHaveBeenCalledTimes(1);
 		expect(session.settings.getModelRole("default")).toContain(opus.id);
+	});
+
+	it("model hub default assignment back onto the live model mid-turn keeps the cancel notice visible", async () => {
+		const showStatus = vi.spyOn(mode, "showStatus");
+		const callbacks = openHub();
+		expect(await callbacks.onAssign(opus, "default", undefined, selector(opus))).toBe(true);
+		expect(await callbacks.onAssign(sonnet, "default", undefined, selector(sonnet))).toBe(true);
+
+		expect(mode.pendingUserModelSwitch).toBeUndefined();
+		expect(session.settings.getModelRole("default")).toContain(sonnet.id);
+		expect(statusLines(showStatus).at(-1)).toBe(
+			`Default model: ${selector(sonnet)}. Queued model switch cancelled; staying on ${selector(sonnet)}`,
+		);
+	});
+
+	it("model hub default assignment mid-turn refuses a model without credentials and persists nothing", async () => {
+		const callbacks = openHub();
+		const showError = vi.spyOn(mode, "showError");
+		vi.spyOn(session.modelRegistry, "hasConfiguredAuth").mockImplementation(model => model.id !== opus.id);
+
+		expect(await callbacks.onAssign(opus, "default", undefined, selector(opus))).toBe(false);
+
+		expect(showError).toHaveBeenCalledWith(`No API key for ${selector(opus)}`);
+		expect(session.settings.getModelRole("default")).toBe("anthropic/claude-sonnet-4-5");
+		expect(mode.pendingUserModelSwitch).toBeUndefined();
+		expect(chip()).not.toContain("(after this turn)");
+	});
+
+	it("model hub unassign of the default role mid-turn clears it now and queues the live switch", async () => {
+		// A project default shadowed by nothing once the global one is cleared.
+		session.settings.setProjectModelRole("default", "anthropic/claude-opus-4-5");
+		const setModel = vi.spyOn(session, "setModel");
+		const showStatus = vi.spyOn(mode, "showStatus");
+		const callbacks = openHub();
+
+		await callbacks.onUnassign("default");
+
+		// The clear is recorded at once; the live model waits for the settle.
+		expect(session.settings.getModelRoleProvenance("default")).toBe("project");
+		expect(setModel).not.toHaveBeenCalled();
+		expect(session.model?.id).toBe(sonnet.id);
+		expect(mode.pendingUserModelSwitch?.model.id).toBe(opus.id);
+		expectPendingChip(sonnet, opus);
+		expect(statusLines(showStatus).at(-1)).toBe(
+			`Default model: ${selector(opus)}. Model switch queued for after this turn: ${selector(sonnet)} -> ${selector(opus)}`,
+		);
+
+		isStreaming = false;
+		await mode.flushPendingModelSwitch();
+		expect(setModel).toHaveBeenCalledTimes(1);
+		expect(setModel).toHaveBeenCalledWith(opus, "default", expect.objectContaining({ persist: false }));
+		expect(session.model?.id).toBe(opus.id);
+		expect(statusLines(showStatus)).toContain(`Model switched to ${selector(opus)}`);
 	});
 
 	it("a non-plan role edit in plan mode keeps the queued user switch; a plan-role edit says so", async () => {
