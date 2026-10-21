@@ -23,10 +23,13 @@ function createTestToolSession(cwd: string): ToolSession {
 	};
 }
 
+// A dynamic approval returns a bare tier or a `{ tier, policyKey? }` decision
+// (ast carries a per-mode policy key); these tests pin the tier.
 function callApproval(tool: { approval?: unknown }, args: unknown): string {
 	const approval = tool.approval;
 	if (typeof approval !== "function") throw new Error("expected a dynamic approval function");
-	return approval(args) as string;
+	const decision = approval(args) as string | { tier: string };
+	return typeof decision === "string" ? decision : decision.tier;
 }
 
 describe("ssh:// tools require exec-tier approval", () => {
