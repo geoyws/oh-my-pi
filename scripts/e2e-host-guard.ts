@@ -91,7 +91,8 @@ export function e2eHostRefusal(kind: E2eWorkloadKind, probe: E2eHostProbe): stri
 	if (virt !== "none") return `virtualized host (systemd-detect-virt: ${virt})`;
 	const machineId = probe.readText("/etc/machine-id")?.trim() ?? "";
 	const approved = APPROVED_E2E_HOSTS.find(host => host.hostname === probe.hostname && host.machineId === machineId);
-	if (!approved) return `${probe.hostname} is not an approved e2e host (${APPROVED_E2E_HOSTS.map(h => h.label).join(", ")})`;
+	if (!approved)
+		return `${probe.hostname} is not an approved e2e host (${APPROVED_E2E_HOSTS.map(h => h.label).join(", ")})`;
 	if (kind === "e2e") return null;
 
 	const dockerHost = probe.env.DOCKER_HOST?.trim();

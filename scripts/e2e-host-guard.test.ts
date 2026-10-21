@@ -81,11 +81,16 @@ describe("e2eHostRefusal", () => {
 
 	test("refuses a host named hal without hal's machine-id", () => {
 		const reason = "hal is not an approved e2e host (@@hal)";
-		expect(e2eHostRefusal("e2e", bareLinux({ files: { "/etc/machine-id": "ffffffffffffffffffffffffffffffff\n" } }))).toBe(
-			reason,
-		);
+		expect(
+			e2eHostRefusal("e2e", bareLinux({ files: { "/etc/machine-id": "ffffffffffffffffffffffffffffffff\n" } })),
+		).toBe(reason);
 		const noMachineId = bareLinux();
-		expect(e2eHostRefusal("e2e", { ...noMachineId, readText: p => (p === "/etc/machine-id" ? null : noMachineId.readText(p)) })).toBe(reason);
+		expect(
+			e2eHostRefusal("e2e", {
+				...noMachineId,
+				readText: p => (p === "/etc/machine-id" ? null : noMachineId.readText(p)),
+			}),
+		).toBe(reason);
 	});
 
 	test("refuses native Darwin whatever the environment says", () => {
