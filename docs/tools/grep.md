@@ -1,5 +1,7 @@
 # grep
 
+> **Now a mode of [`search`](./search.md):** the model-facing tool is `search` with `mode: "regex"`; `grep` survives as a legacy name alias. `GrepTool` below is the regex-mode runner (also constructed directly by the Cursor bridge and SDK shims).
+
 > Grep file contents with a regex across files, directories, globs, and internal URLs.
 
 ## Source

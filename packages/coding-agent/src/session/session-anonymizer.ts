@@ -1585,13 +1585,11 @@ export class SessionAnonymizer {
 	/** Tool-call args: built-in tools walk their known schema; any other tool's args are opaque. */
 	#toolArgs(value: unknown, parent: JsonObject): unknown {
 		const toolName = typeof parent.name === "string" ? parent.name : parent.toolName;
-		// Legacy names (grep/glob/find, ast_grep/ast_edit) resolve to their merged
-		// tool's schema so historical transcripts keep argument-level redaction.
-		const schema =
-			typeof toolName === "string"
-				? (ARG_SCHEMAS[normalizeToolName(toolName)] ??
-					(isBuiltinTool(toolName) ? ARG_SCHEMAS[toolName] : undefined))
-				: undefined;
+		// Exact names first so historical grep/glob/find and ast_grep/ast_edit calls
+		// keep their own field schemas; other legacy spellings resolve to the merged tool.
+		const schema = isBuiltinTool(toolName)
+			? (ARG_SCHEMAS[toolName as string] ?? ARG_SCHEMAS[normalizeToolName(toolName as string)])
+			: undefined;
 		if (!schema) return this.#opaque(value);
 		if (typeof value !== "string") return this.#argValue(value, undefined, schema);
 		// Wire payloads carry arguments as JSON text; partial streams may not parse.

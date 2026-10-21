@@ -52,7 +52,7 @@
 | `grep_keywords` | `string[]` | Yes (may be `[]`) | Likely verbatim terms. |
 | `path` | `string` | No | One directory or file, host path or internal URL. Default workspace root. |
 
-Sending a field from another mode is a `ToolError`. Modeless calls infer the mode: `query` → semantic, `pattern` → regex, otherwise glob.
+Only the mode-defining fields are cross-checked: regex rejects `query`/`grep_keywords`, glob rejects `pattern`/`query`, and semantic rejects `pattern`, each with a `ToolError`; a mode missing its required field (`pattern` for regex, a non-empty `query` for semantic) or not enabled in the session is also a `ToolError`. Any other field from another mode (`case`, `skip`, `hidden`, `limit`, …) is silently dropped. Modeless calls infer the mode: `query` → semantic, `pattern` → regex, otherwise glob.
 
 ## Outputs
 Per mode, the result and `details` are exactly what the former tools produced (`GrepToolDetails`, `GlobToolDetails`, `FindToolDetails`); the TUI and collab renderers dispatch on the call's mode, falling back to the details shape (`hits` → semantic, `fileMatches` → regex, else glob).

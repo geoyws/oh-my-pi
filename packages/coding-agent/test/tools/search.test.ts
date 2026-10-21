@@ -61,7 +61,8 @@ describe("search tool modes", () => {
 		const tool = new SearchTool(createTestSession("/tmp/test", {}, { glob: false }));
 		const properties = asSchemaObject(toolWireSchema(tool).properties);
 		expect(Object.keys(properties).sort()).toEqual(["case", "gitignore", "path", "pattern", "skip"]);
-		expect(tool.description).toContain('Search file contents (`mode: "regex"`)');
+		expect(tool.description).toContain("Search file contents by regex.");
+		expect(tool.description).not.toContain("mode:");
 	});
 
 	it("advertises a modeless glob-only schema when other modes are off", () => {
@@ -98,7 +99,7 @@ describe("search tool mode mismatches", () => {
 		);
 	});
 
-	it("rejects semantic fields on regex and regex fields on semantic", async () => {
+	it("rejects semantic fields on regex and an unavailable semantic mode", async () => {
 		const tool = new SearchTool(createTestSession());
 		await expect(tool.execute("s2", { mode: "regex", pattern: "x", query: "y" })).rejects.toThrow(
 			"`query` and `grep_keywords` are semantic-only",
@@ -108,7 +109,7 @@ describe("search tool mode mismatches", () => {
 		);
 	});
 
-	it("requires pattern for regex and query for semantic", async () => {
+	it("requires pattern for regex and rejects pattern on glob", async () => {
 		const tool = new SearchTool(createTestSession());
 		await expect(tool.execute("s4", { mode: "regex" })).rejects.toThrow("regex mode requires `pattern`.");
 		await expect(tool.execute("s5", { mode: "glob", pattern: "x" })).rejects.toThrow("`pattern` is regex-only");
@@ -169,7 +170,7 @@ describe("search execute", () => {
 		}
 	});
 
-	it("keeps only regex mode when createTools omits the other names", async () => {
+	it("advertises a modeless regex-only search from createTools when glob is disabled", async () => {
 		const tools = await createTools(createTestSession("/tmp/test", {}, { glob: false }), ["search"]);
 		const tool = tools.find(entry => entry.name === "search");
 		expect(tool).toBeDefined();

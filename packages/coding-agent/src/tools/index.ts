@@ -54,10 +54,9 @@ import { cfgIdaAvailable } from "../ida/install";
 import { EvalTool } from "./eval";
 import { resolveEvalBackends } from "./eval-backends";
 import { GithubTool } from "./gh";
-import { SearchTool } from "./search";
+import { resolveSearchModes, SearchTool } from "./search";
 import { IdaTool } from "./ida";
 import { isIrcEnabled } from "../irc/messaging";
-import { isFindEnabled } from "./jfind";
 import { LearnTool } from "./learn";
 import { ManageSkillTool } from "./manage-skill";
 import { MemoryEditTool } from "./memory-edit";
@@ -84,8 +83,6 @@ import {
 	cfgCheckpointEnabled,
 	cfgDebugEnabled,
 	cfgGithubEnabled,
-	cfgGlobEnabled,
-	cfgGrepEnabled,
 	cfgLaunchEnabled,
 	cfgSecurityEnabled,
 	cfgTodoEnabled,
@@ -737,8 +734,7 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 		if (name === "ida") return cfgIdaAvailable.get(session.settings);
 		if (name === "todo")
 			return (!includeYield || session.prewalkArmed === true) && cfgTodoEnabled.get(session.settings);
-		if (name === "search")
-			return cfgGrepEnabled.get(session.settings) || cfgGlobEnabled.get(session.settings) || isFindEnabled(session);
+		if (name === "search") return resolveSearchModes(session).length > 0;
 		if (name === "github") return cfgGithubEnabled.get(session.settings);
 		if (name === "ast") return cfgAstGrepEnabled.get(session.settings) || cfgAstEditEnabled.get(session.settings);
 		if (name === "web_search") return cfgWebSearchEnabled.get(session.settings);

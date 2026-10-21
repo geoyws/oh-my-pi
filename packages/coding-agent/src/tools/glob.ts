@@ -143,7 +143,9 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 	readonly loadMode = "essential";
 	readonly label = "Glob";
 	get description(): string {
-		const hasFind = this.session.isToolActive?.("find") ?? isFindEnabled(this.session);
+		// Semantic `search` mode availability (`activeSearchModes(...).includes("semantic")`,
+		// inlined: search.ts imports this module).
+		const hasFind = this.session.isToolActive?.("search") !== false && isFindEnabled(this.session);
 		const eagerDelegation = sessionDelegationBias(this.session) === "eager";
 		const scoutAvailable = isScoutSpawnable(
 			cfgTaskDisabledAgents.get(this.session.settings),
