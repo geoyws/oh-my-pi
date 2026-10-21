@@ -175,7 +175,8 @@ export class SessionFocusController {
 		const generation = ++this.#attachGeneration;
 		try {
 			this.ctx.unsubscribe?.();
-			this.ctx.clearTransientSessionUi();
+			// Retargeting the view keeps the main session's queued model switch.
+			this.ctx.clearTransientSessionUi({ keepPendingModelSwitch: true });
 			this.ctx.eventController.resetTranscriptAnchors();
 			let assistantStreamSynced = false;
 			const restoreAssistant = async (message: AssistantMessage): Promise<void> => {

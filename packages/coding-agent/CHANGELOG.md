@@ -33,6 +33,7 @@
 
 - Merged the `ast_grep` and `ast_edit` tools into one `ast` tool with `mode: "search"` and `mode: "edit"`. The wire schema narrows to the modes a session may use (search follows `astGrep.enabled`; edit follows `astEdit.enabled` plus the `edit` grant), staged edit previews still resolve through `xd://resolve`/`xd://reject`, and the old names remain as aliases for existing agent definitions and sessions.
 - The status line, footer and composer effort chip now show a requested `auto` thinking level as `auto` until a turn classifies it and as `auto (high)` (the resolved level) afterwards, so an auto-resolved effort no longer reads like an explicit `high` pin; the chip keeps the resolved level's colour and glyph
+- A model switch made while a turn is running (model hub default assignment, alt+p and `/switch`, ctrl+p / shift+ctrl+p, `/model <selector>`) is now queued until the turn settles instead of moving the turn's remaining requests to the new model mid-turn. The chat shows `Model switch queued for after this turn: A -> B`, the model chip reads `A -> B (after this turn)` (presets without the model segment get one line above the editor), and at the settle the chip drops the arrow and `Model switched to B` is shown once. Switching again while one is queued replaces it, ctrl+p advances from the queued model, an aborted turn still applies it at the settle, and a session switch or handoff discards it. `/model <selector>` now works in the TUI. Idle switches and extension `pi.setModel()` stay immediate.
 
 ### Fixed
 

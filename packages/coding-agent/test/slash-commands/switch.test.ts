@@ -9,18 +9,23 @@ const MODELS = [
 	{ provider: "openai", id: "gpt-5.2", contextWindow: 400_000 },
 ];
 
-function createRuntime() {
+function createRuntime(routeOutcome: "apply" | "queued" = "apply") {
 	const showModelSelector = vi.fn();
 	const switchSessionModel = vi.fn(async () => {});
 	const showError = vi.fn();
 	const showStatus = vi.fn();
 	const setText = vi.fn();
+	const setModel = vi.fn(async () => ({ switched: true }));
+	const routeUserModelSwitch = vi.fn((_target: unknown, _apply: () => Promise<void>) => routeOutcome);
 	const settings = Settings.isolated();
 	return {
 		showModelSelector,
 		switchSessionModel,
 		showError,
+		showStatus,
 		setText,
+		setModel,
+		routeUserModelSwitch,
 		settings,
 		runtime: {
 			ctx: {
@@ -29,11 +34,14 @@ function createRuntime() {
 				session: {
 					scopedModels: [],
 					modelRegistry: { getAll: () => MODELS, getAvailable: () => MODELS },
+					setModel,
+					setThinkingLevel: vi.fn(),
 				},
 				showModelSelector,
 				switchSessionModel,
 				showError,
 				showStatus,
+				routeUserModelSwitch,
 			} as unknown as InteractiveModeContext,
 		},
 	};
@@ -48,6 +56,33 @@ describe("/model slash command", () => {
 		expect(handled).toBe(true);
 		expect(harness.showModelSelector.mock.calls).toEqual([[]]);
 		expect(harness.setText).toHaveBeenCalledWith("");
+	});
+
+	it("/model <selector> while idle switches now and reports `Model set to ...`", async () => {
+		const harness = createRuntime("apply");
+
+		const handled = await executeBuiltinSlashCommand("/model opus", harness.runtime);
+
+		expect(handled).toBe(true);
+		expect(harness.routeUserModelSwitch).toHaveBeenCalledTimes(1);
+		expect(harness.setModel).toHaveBeenCalledWith(MODELS[0]);
+		expect(harness.showStatus).toHaveBeenCalledWith("Model set to anthropic/claude-opus-4-5.");
+		expect(harness.showModelSelector).not.toHaveBeenCalled();
+	});
+
+	it("/model <selector> mid-turn defers the switch and skips `Model set to ...`", async () => {
+		const harness = createRuntime("queued");
+
+		await executeBuiltinSlashCommand("/model opus", harness.runtime);
+
+		expect(harness.routeUserModelSwitch).toHaveBeenCalledTimes(1);
+		expect(harness.routeUserModelSwitch.mock.calls[0]?.[0]).toBe(MODELS[0]);
+		expect(harness.setModel).not.toHaveBeenCalled();
+		expect(harness.showStatus).not.toHaveBeenCalled();
+
+		// The queued apply is what the turn-settle flush runs.
+		await harness.routeUserModelSwitch.mock.calls[0]?.[1]();
+		expect(harness.setModel).toHaveBeenCalledWith(MODELS[0]);
 	});
 });
 

@@ -189,3 +189,37 @@ describe("status line model segment compact thinking level", () => {
 		expect(Bun.stripANSI(renderSegment("model", autoResolved(true)).content)).toBe(`${glyph} Test Model`);
 	});
 });
+
+describe("status line model segment pending switch", () => {
+	const pendingModel = { provider: "anthropic", id: "claude-opus", name: "Claude Opus" };
+	const modelPrefix = () => (theme.icon.model ? `${theme.icon.model} ` : "");
+	function createPendingContext(pending: SegmentContext["pendingModelSwitch"], isStreaming: boolean): SegmentContext {
+		const base = createModelContext(false);
+		return {
+			...base,
+			pendingModelSwitch: pending,
+			session: { ...base.session, isStreaming } as SegmentContext["session"],
+		} as SegmentContext;
+	}
+
+	it("renders `A -> B (after this turn)` while a switch is queued during a turn", () => {
+		const ctx = createPendingContext({ model: pendingModel as never }, true);
+		expect(Bun.stripANSI(renderSegment("model", ctx).content)).toBe(
+			`${modelPrefix()}Test Model -> Opus (after this turn)`,
+		);
+	});
+
+	it("renders the plain chip when nothing is pending", () => {
+		expect(Bun.stripANSI(renderSegment("model", createPendingContext(null, true)).content)).toBe(
+			`${modelPrefix()}Test Model`,
+		);
+		expect(Bun.stripANSI(renderSegment("model", createPendingContext(undefined, true)).content)).toBe(
+			`${modelPrefix()}Test Model`,
+		);
+	});
+
+	it("renders the plain chip when a switch is pending but the session is not streaming", () => {
+		const ctx = createPendingContext({ model: pendingModel as never }, false);
+		expect(Bun.stripANSI(renderSegment("model", ctx).content)).toBe(`${modelPrefix()}Test Model`);
+	});
+});

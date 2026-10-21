@@ -126,7 +126,7 @@ import {
 import { onDownloadActivity } from "../downloads/activity";
 import { DownloadActivityHud, JudgmentBatchProgressHud } from "./progress-hud";
 import { autosaveApprovedPlan, planSaveFileName } from "../plan-mode/plan-autosave";
-import { resolvePlanModelTransition } from "../plan-mode/model-transition";
+import { resolvePlanModelTransition, resolveUserModelSwitch } from "../plan-mode/model-transition";
 import guidedGoalInterviewPrompt from "../prompts/goals/guided-goal-interview.md" with { type: "text" };
 import planFilenamePrompt from "../prompts/system/plan-filename.md" with { type: "text" };
 import planModeApprovedPrompt from "../prompts/system/plan-mode-approved.md" with { type: "text" };
@@ -1268,6 +1268,17 @@ const CTRL_L_APPEARANCE_RESPONSE_DEADLINE_MS = 2000;
 /** Repaint cadence of the open jobs sheet: output tails, pids and list ages are polled, not pushed. */
 const JOBS_SHEET_REFRESH_MS = 250;
 
+/**
+ * Model switch held until the running turn settles (single slot, last write
+ * wins). `plan-role`: queued by the live plan-role reconciler, the only kind
+ * `#clearPendingPlanModelSwitch` drops; `plan-restore`: the pre-plan model
+ * restored on plan exit; `user`: a user switch, shown on the model chip and
+ * replayed through its entry point's `apply` at settle.
+ */
+type PendingModelSwitch =
+	| { source: "plan-role" | "plan-restore"; model: Model; thinkingLevel?: ConfiguredThinkingLevel }
+	| { source: "user"; model: Model; role?: string; apply: () => Promise<void> };
+
 export class InteractiveMode implements InteractiveModeContext {
 	#ownsStartedUi: boolean;
 	session: AgentSession;
@@ -1661,9 +1672,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#previousGoalContinuationActivity: string | undefined;
 	#goalSuppressNextContinuation = false;
 	#planModePreviousModelState: { model: Model; thinkingLevel?: ConfiguredThinkingLevel } | undefined;
-	#pendingModelSwitch: { model: Model; thinkingLevel?: ConfiguredThinkingLevel } | undefined;
-	/** Whether #pendingModelSwitch was queued by the live plan-role reconciler. */
-	#pendingPlanModelSwitch = false;
+	#pendingModelSwitch: PendingModelSwitch | undefined;
 	#planModeHasEntered = false;
 	#planReviewOverlay: PlanReviewOverlay | undefined;
 	#planReviewOverlayHandle: OverlayHandle | undefined;
@@ -1791,7 +1800,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.composer.setHoveredClickId(id);
 	}
 
-	clearTransientSessionUi(): void {
+	clearTransientSessionUi(options?: { keepPendingModelSwitch?: boolean }): void {
 		this.#hideSessionInfo();
 		if (this.loadingAnimation) {
 			this.loadingAnimation.stop();
@@ -1815,6 +1824,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		this.statusContainer.disposeChildren();
 		this.pendingMessagesContainer.disposeChildren();
+		// A user switch queued in the outgoing session must not land on the next
+		// one (session switch, handoff). Focus retargeting keeps the main session.
+		if (!options?.keepPendingModelSwitch && this.#pendingModelSwitch?.source === "user") {
+			this.#pendingModelSwitch = undefined;
+			this.statusLine.setPendingModelSwitch(undefined);
+		}
 		this.#clearJudgmentBatchProgress();
 		this.#cancelModelCycleClearTimer();
 		this.modelCycleContainer.disposeChildren();
@@ -4943,9 +4958,20 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * model) remain intact.
 	 */
 	#clearPendingPlanModelSwitch(): void {
-		if (!this.#pendingPlanModelSwitch) return;
-		this.#pendingModelSwitch = undefined;
-		this.#pendingPlanModelSwitch = false;
+		if (this.#pendingModelSwitch?.source !== "plan-role") return;
+		this.#setPendingModelSwitch(undefined);
+	}
+
+	/**
+	 * Replace the single queued model switch and mirror user-origin entries on
+	 * the model chip (plus the fallback line for presets without a model
+	 * segment). Plan-origin entries stay silent.
+	 */
+	#setPendingModelSwitch(next: PendingModelSwitch | undefined): void {
+		this.#pendingModelSwitch = next;
+		this.statusLine.setPendingModelSwitch(next?.source === "user" ? { model: next.model } : undefined);
+		this.updatePendingMessagesDisplay();
+		this.ui.requestRender();
 	}
 
 	/** Apply (or defer) the model/thinking change implied by the resolved plan role. */
@@ -4962,11 +4988,11 @@ export class InteractiveMode implements InteractiveModeContext {
 				return;
 			case "apply":
 				if (transition.deferred) {
-					this.#pendingModelSwitch = {
+					this.#setPendingModelSwitch({
+						source: "plan-role",
 						model: transition.model,
 						thinkingLevel: transition.thinkingLevel,
-					};
-					this.#pendingPlanModelSwitch = true;
+					});
 					return;
 				}
 				try {
@@ -4983,16 +5009,38 @@ export class InteractiveMode implements InteractiveModeContext {
 	/** Apply any deferred model switch after the current stream ends. */
 	async flushPendingModelSwitch(): Promise<void> {
 		const pending = this.#pendingModelSwitch;
-		this.#pendingModelSwitch = undefined;
-		this.#pendingPlanModelSwitch = false;
 		if (!pending) return;
+		// The turn has settled: drop the `A -> B` chip before awaiting the switch.
+		this.#setPendingModelSwitch(undefined);
 		try {
-			await this.session.setModelTemporary(pending.model, pending.thinkingLevel);
+			if (pending.source === "user") {
+				await pending.apply();
+				this.showStatus(`Model switched to ${formatModelString(pending.model)}`);
+			} else {
+				await this.session.setModelTemporary(pending.model, pending.thinkingLevel);
+			}
 		} catch (error) {
 			this.showWarning(
 				`Failed to switch model after streaming: ${error instanceof Error ? error.message : String(error)}`,
 			);
 		}
+	}
+
+	get pendingUserModelSwitch(): { model: Model; role?: string } | undefined {
+		const pending = this.#pendingModelSwitch;
+		return pending?.source === "user" ? { model: pending.model, role: pending.role } : undefined;
+	}
+
+	routeUserModelSwitch(target: Model, apply: () => Promise<void>, options?: { role?: string }): "apply" | "queued" {
+		// The queue belongs to the main session; a focused subagent view switches its own model now.
+		if (this.focusedAgentId) return "apply";
+		const decision = resolveUserModelSwitch(this.session.model, target, this.session.isStreaming);
+		if (decision.kind === "apply") return "apply";
+		this.#setPendingModelSwitch({ source: "user", model: decision.to, role: options?.role, apply });
+		this.showStatus(
+			`Model switch queued for after this turn: ${decision.from ? formatModelString(decision.from) : "no model"} -> ${formatModelString(decision.to)}`,
+		);
+		return "queued";
 	}
 
 	async #clearTransientModeState(options?: {
@@ -5018,8 +5066,10 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.planModePlanFilePath = undefined;
 				this.#planModePreviousToolPresentation = undefined;
 				this.#planModePreviousModelState = undefined;
-				this.#pendingModelSwitch = undefined;
-				this.#pendingPlanModelSwitch = false;
+				// Plan-origin switches die with plan mode; a user's queued switch still lands.
+				if (this.#pendingModelSwitch && this.#pendingModelSwitch.source !== "user") {
+					this.#setPendingModelSwitch(undefined);
+				}
 				this.#planModeHasEntered = false;
 				this.#updatePlanModeStatus();
 			}
@@ -5262,11 +5312,11 @@ export class InteractiveMode implements InteractiveModeContext {
 			// which would reset provider-side sessions and break continuity.
 			this.session.setThinkingLevel(prev.thinkingLevel);
 		} else if (this.session.isStreaming) {
-			this.#pendingModelSwitch = {
+			this.#setPendingModelSwitch({
+				source: "plan-restore",
 				model: prev.model,
 				thinkingLevel: prev.thinkingLevel,
-			};
-			this.#pendingPlanModelSwitch = false;
+			});
 		} else {
 			await this.session.setModelTemporary(prev.model, prev.thinkingLevel);
 		}

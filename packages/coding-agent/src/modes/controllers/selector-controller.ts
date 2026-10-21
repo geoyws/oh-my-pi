@@ -786,11 +786,14 @@ export class SelectorController {
 	): Promise<void> {
 		const target = this.ctx.viewSession;
 		const focusedAgentId = this.ctx.focusedAgentId;
-		const apply = async () => {
+		const switchModel = async () => {
 			const level = thinkingLevel ?? target.resolveTemporaryModelThinkingLevel(model);
 			await target.setModelTemporary(model, level);
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorBorderColor();
+		};
+		const apply = async () => {
+			await switchModel();
 			if (focusedAgentId) {
 				this.ctx.showStatus(`Agent ${focusedAgentId} model: ${selector}`);
 				return;
@@ -798,18 +801,23 @@ export class SelectorController {
 			const roleSelectorHint = appKey(this.ctx.keybindings, "app.model.select") || formatKeyHint("alt+m");
 			this.ctx.showStatus(`Session-only model: ${selector}. Use ${roleSelectorHint} or /model for roles.`);
 		};
-		if (!compactFirst || focusedAgentId) {
-			await apply();
-			return;
-		}
-		let switched = false;
-		const switchAfterCompaction = async (outcome: CompactionOutcome) => {
-			if (switched || outcome !== "ok") return;
-			switched = true;
-			await apply();
+		const run = async (onSwitch: () => Promise<void>) => {
+			if (!compactFirst || focusedAgentId) {
+				await onSwitch();
+				return;
+			}
+			let switched = false;
+			const switchAfterCompaction = async (outcome: CompactionOutcome) => {
+				if (switched || outcome !== "ok") return;
+				switched = true;
+				await onSwitch();
+			};
+			const outcome = await this.ctx.handleCompactCommand(undefined, undefined, switchAfterCompaction);
+			await switchAfterCompaction(outcome);
 		};
-		const outcome = await this.ctx.handleCompactCommand(undefined, undefined, switchAfterCompaction);
-		await switchAfterCompaction(outcome);
+		// Mid-turn: hold the whole pick (compaction included) until the turn settles.
+		if (this.ctx.routeUserModelSwitch(model, () => run(switchModel)) !== "apply") return;
+		await run(apply);
 	}
 
 	/**
@@ -887,9 +895,15 @@ export class SelectorController {
 				onPickRole: async entry => {
 					if (!isCurrent() || selectOnly) return;
 					try {
-						await this.ctx.viewSession.applyRoleModel(entry);
-						this.ctx.statusLine.invalidate();
-						this.ctx.updateEditorBorderColor();
+						const target = this.ctx.viewSession;
+						const applyRole = async () => {
+							await target.applyRoleModel(entry);
+							this.ctx.statusLine.invalidate();
+							this.ctx.updateEditorBorderColor();
+						};
+						if (this.ctx.routeUserModelSwitch(entry.model, applyRole, { role: entry.role }) === "apply") {
+							await applyRole();
+						}
 						this.ctx.showModelCycleTrack(
 							quickRoleOrder.map(role => ({ label: role })),
 							quickRoleOrder.indexOf(entry.role),
@@ -1019,28 +1033,38 @@ export class SelectorController {
 									}
 								}
 							} else {
-								const { switched } = await this.ctx.session.setModel(model, role, {
-									selector,
-									thinkingLevel: isAuto ? ThinkingLevel.Inherit : concreteThinking,
-									persist: targetScope === "global",
+								const commit = async (): Promise<boolean> => {
+									const { switched } = await this.ctx.session.setModel(model, role, {
+										selector,
+										thinkingLevel: isAuto ? ThinkingLevel.Inherit : concreteThinking,
+										persist: targetScope === "global",
+									});
+									if (!switched) return false;
+									if (targetScope === "project") {
+										this.ctx.settings.setProjectModelRole(
+											"default",
+											formatModelSelectorValue(selectorValue, concreteThinking),
+										);
+									}
+									if (isAuto) {
+										this.ctx.session.setThinkingLevel(
+											AUTO_THINKING,
+											!this.ctx.settings.isGlobalConfigReadOnly(),
+										);
+									} else if (concreteThinking && concreteThinking !== ThinkingLevel.Inherit) {
+										this.ctx.session.setThinkingLevel(concreteThinking);
+									}
+									this.ctx.statusLine.invalidate();
+									this.ctx.updateEditorBorderColor();
+									return true;
+								};
+								// Mid-turn: the whole commit (switch + role persistence) waits for
+								// the turn to settle; the router already reported the queue.
+								const outcome = this.ctx.routeUserModelSwitch(model, async () => {
+									await commit();
 								});
-								if (!switched) return false;
-								if (targetScope === "project") {
-									this.ctx.settings.setProjectModelRole(
-										"default",
-										formatModelSelectorValue(selectorValue, concreteThinking),
-									);
-								}
-								if (isAuto) {
-									this.ctx.session.setThinkingLevel(
-										AUTO_THINKING,
-										!this.ctx.settings.isGlobalConfigReadOnly(),
-									);
-								} else if (concreteThinking && concreteThinking !== ThinkingLevel.Inherit) {
-									this.ctx.session.setThinkingLevel(concreteThinking);
-								}
-								this.ctx.statusLine.invalidate();
-								this.ctx.updateEditorBorderColor();
+								if (outcome !== "apply") return true;
+								if (!(await commit())) return false;
 							}
 							this.ctx.showStatus(`${defaultStatusLabel} model: ${selector ?? model.id}`);
 						} else {

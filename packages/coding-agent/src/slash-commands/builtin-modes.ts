@@ -458,6 +458,8 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		icon: "model",
 		description: "Switch model for this session",
 		acpDescription: "Show current model selection",
+		inlineHint: "[model]",
+		allowArgs: true,
 		getTuiAutocompleteDescription: runtime => {
 			const model = runtime.ctx.viewSession.model;
 			return model ? `Model: ${model.provider}/${model.id}` : "Model: none selected";
@@ -491,9 +493,32 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			);
 			return commandConsumed();
 		},
-		handleTui: (_command, runtime) => {
-			runtime.ctx.showModelSelector();
+		handleTui: async (command, runtime) => {
 			clearSubmittedText(runtime);
+			const selector = command.args.trim();
+			if (!selector) {
+				runtime.ctx.showModelSelector();
+				return;
+			}
+			const ctx = runtime.ctx;
+			const resolved = resolveSessionModelSelector(selector, ctx.session, ctx.settings);
+			const match = resolved.model;
+			if (!match) {
+				ctx.showError(`Unknown model: ${selector}`);
+				return;
+			}
+			const apply = async () => {
+				await ctx.session.setModel(match);
+				if (resolved.thinkingLevel !== undefined) ctx.session.setThinkingLevel(resolved.thinkingLevel);
+			};
+			// Mid-turn the router prints the queued line instead of `Model set to ...`.
+			if (ctx.routeUserModelSwitch(match, apply) === "queued") return;
+			try {
+				await apply();
+				ctx.showStatus(`Model set to ${match.provider}/${match.id}.`);
+			} catch (err) {
+				ctx.showError(`Failed to set model: ${errorMessage(err)}`);
+			}
 		},
 	},
 	{

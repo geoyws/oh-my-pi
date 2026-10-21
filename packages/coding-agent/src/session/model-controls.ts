@@ -397,6 +397,34 @@ export class ModelControls {
 	}
 
 	/**
+	 * The role model one step from the active slot in `roleOrder`, without
+	 * applying it; undefined when fewer than two roles resolve. `from` moves the
+	 * starting slot to a switch queued for after the running turn, so repeated
+	 * presses advance past it instead of re-picking the same neighbour.
+	 */
+	nextRoleModel(
+		roleOrder: readonly string[],
+		direction: "forward" | "backward" = "forward",
+		from?: { model: Model; role?: string },
+	): ResolvedRoleModel | undefined {
+		const cycle = this.getRoleModelCycle(roleOrder);
+		if (!cycle || cycle.models.length <= 1) return undefined;
+
+		let index = cycle.currentIndex;
+		if (from) {
+			const byRole =
+				from.role === undefined
+					? -1
+					: cycle.models.findIndex(entry => entry.role === from.role && modelsAreEqual(entry.model, from.model));
+			const found =
+				byRole !== -1 ? byRole : cycle.models.findIndex(entry => modelsAreEqual(entry.model, from.model));
+			if (found !== -1) index = found;
+		}
+		const step = direction === "backward" ? -1 : 1;
+		return cycle.models[(index + step + cycle.models.length) % cycle.models.length];
+	}
+
+	/**
 	 * Cycle through configured role models in a fixed order.
 	 * Skips missing roles and changes only the active session model.
 	 * @param roleOrder - Order of roles to cycle through (e.g., ["slow", "default", "smol"])
@@ -406,11 +434,8 @@ export class ModelControls {
 		roleOrder: readonly string[],
 		direction: "forward" | "backward" = "forward",
 	): Promise<RoleModelCycleResult | undefined> {
-		const cycle = this.getRoleModelCycle(roleOrder);
-		if (!cycle || cycle.models.length <= 1) return undefined;
-
-		const step = direction === "backward" ? -1 : 1;
-		const next = cycle.models[(cycle.currentIndex + step + cycle.models.length) % cycle.models.length];
+		const next = this.nextRoleModel(roleOrder, direction);
+		if (!next) return undefined;
 
 		await this.applyRoleModel(next);
 

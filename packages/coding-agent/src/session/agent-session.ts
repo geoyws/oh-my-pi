@@ -11104,6 +11104,15 @@ export class AgentSession implements SettingsScope {
 		return this.#models.applyRoleModel(entry);
 	}
 
+	/** The role model one step along `roleOrder` (from `from` when given), without applying it. */
+	nextRoleModel(
+		roleOrder: readonly string[],
+		direction: "forward" | "backward" = "forward",
+		from?: { model: Model; role?: string },
+	): ResolvedRoleModel | undefined {
+		return this.#models.nextRoleModel(roleOrder, direction, from);
+	}
+
 	/** Cycles the configured role models in the supplied order. */
 	cycleRoleModels(
 		roleOrder: readonly string[],

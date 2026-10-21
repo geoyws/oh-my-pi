@@ -179,8 +179,11 @@ export interface InteractiveModeContext {
 	togglePinnedHudExpanded(): void;
 	/** Point the inline hover band at a click-candidate id (or clear it). */
 	setClickHoverId(id: string | undefined): void;
-	/** Clear loader, transient HUD/pending containers, streaming state, and pending tools. */
-	clearTransientSessionUi(): void;
+	/**
+	 * Clear loader, transient HUD/pending containers, streaming state, and pending tools.
+	 * Also drops a queued user model switch unless `keepPendingModelSwitch` (focus retargeting).
+	 */
+	clearTransientSessionUi(options?: { keepPendingModelSwitch?: boolean }): void;
 	settings: Settings;
 	keybindings: KeybindingsManager;
 	agent: AgentSession["agent"];
@@ -367,6 +370,16 @@ export interface InteractiveModeContext {
 	flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void>;
 	flushPendingBashComponents(): void;
 	flushPendingModelSwitch(): Promise<void>;
+	/**
+	 * Route a user model switch (model hub, alt+p, `/switch`, ctrl+p, `/model`)
+	 * through `resolveUserModelSwitch`. `"apply"`: the caller switches now, as
+	 * before. `"queued"`: the main session is mid-turn, so the switch is held
+	 * (replacing any queued one) and the queued status line is already shown;
+	 * `apply` runs once from `flushPendingModelSwitch` when the turn settles.
+	 */
+	routeUserModelSwitch(target: Model, apply: () => Promise<void>, options?: { role?: string }): "apply" | "queued";
+	/** The user model switch waiting for the running turn to settle, if any. */
+	readonly pendingUserModelSwitch: { model: Model; role?: string } | undefined;
 	setWorkingMessage(message?: string): void;
 	applyPendingWorkingMessage(): void;
 	ensureLoadingAnimation(): void;

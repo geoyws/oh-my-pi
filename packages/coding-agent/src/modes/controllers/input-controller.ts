@@ -2812,6 +2812,42 @@ export class InputController {
 	async cycleRoleModel(direction: "forward" | "backward" = "forward"): Promise<void> {
 		try {
 			const cycleOrder = cfgCycleOrder.get(settings);
+			const showTrack = (role: string) =>
+				// The status line already reports the resolved model + thinking level, so
+				// the cycle status is just a status-line-style chip track (active role
+				// filled), matching the plan-approval model slider. It renders into its
+				// own anchored container above the editor (cleared+rebuilt each cycle),
+				// so it updates in place instead of stacking duplicates in the scrollback.
+				this.ctx.showModelCycleTrack(
+					cycleOrder.map(entry => ({ label: entry })),
+					cycleOrder.indexOf(role),
+				);
+			// Mid-turn presses on the main session queue; a focused subagent view
+			// cycles its own session immediately.
+			if (!this.ctx.focusedAgentId) {
+				const session = this.ctx.session;
+				// Advance from a switch already queued for after this turn, so a second
+				// press mid-turn reads `A -> C` instead of re-picking `B`.
+				const next = session.nextRoleModel(cycleOrder, direction, this.ctx.pendingUserModelSwitch);
+				if (!next) {
+					this.ctx.showStatus("Only one role model available");
+					return;
+				}
+				const outcome = this.ctx.routeUserModelSwitch(
+					next.model,
+					async () => {
+						await session.applyRoleModel(next);
+						this.ctx.statusLine.invalidate();
+						this.ctx.updateEditorBorderColor();
+					},
+					{ role: next.role },
+				);
+				if (outcome === "queued") {
+					showTrack(next.role);
+					return;
+				}
+			}
+
 			const result = await this.ctx.viewSession.cycleRoleModels(cycleOrder, direction);
 			if (!result) {
 				this.ctx.showStatus("Only one role model available");
@@ -2820,15 +2856,7 @@ export class InputController {
 
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorBorderColor();
-			// The status line already reports the resolved model + thinking level, so
-			// the cycle status is just a status-line-style chip track (active role
-			// filled), matching the plan-approval model slider. It renders into its
-			// own anchored container above the editor (cleared+rebuilt each cycle),
-			// so it updates in place instead of stacking duplicates in the scrollback.
-			this.ctx.showModelCycleTrack(
-				cycleOrder.map(role => ({ label: role })),
-				cycleOrder.indexOf(result.role),
-			);
+			showTrack(result.role);
 		} catch (error) {
 			this.ctx.showError(error instanceof Error ? error.message : String(error));
 		}

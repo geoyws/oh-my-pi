@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `StatusLineComponent.setPendingModelSwitch()` and `SegmentContext.pendingModelSwitch`: while the session streams, the `model` segment renders a queued switch as `A -> B` followed by a dim ` (after this turn)`; `StatusLineComponent.hasSegment()` reports whether the effective layout shows a segment
+
 ### Fixed
 
 - The usage dashboard now labels Anthropic accounts as Claude.

@@ -1267,6 +1267,14 @@ export class UiHelpers {
 				new QueuedMessagesBand(groups, dequeueKey, () => this.ctx.handleDequeue()),
 			);
 		}
+		// Presets without the `model` segment have no chip to carry a queued
+		// switch, so it gets one line here instead (main session only).
+		const pendingSwitch = this.ctx.focusedAgentId ? undefined : this.ctx.pendingUserModelSwitch;
+		if (pendingSwitch && this.ctx.session.isStreaming && !this.ctx.statusLine.hasSegment("model")) {
+			const current = this.ctx.session.model;
+			const line = `Model: ${current ? `${current.provider}/${current.id}` : "no model"} -> ${pendingSwitch.model.provider}/${pendingSwitch.model.id} (after this turn)`;
+			this.ctx.pendingMessagesContainer.addChild(new Text(line, 1, 0).setStyleFn(t => theme.fg("dim", t)));
+		}
 		this.ctx.ui.requestComponentRender(this.ctx.pendingMessagesContainer);
 	}
 

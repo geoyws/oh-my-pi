@@ -283,11 +283,33 @@ const statusSegment: StatusLineSegment = {
 	},
 };
 
-/** Display name of the active model (`Claude ` prefix dropped). */
-function modelDisplayName(ctx: SegmentContext): string {
-	const state = ctx.session.state;
-	const modelName = state.model?.name || state.model?.id || "no-model";
+/** Display name of a model (`Claude ` prefix dropped). */
+function modelDisplayName(model: { name?: string; id: string } | undefined): string {
+	const modelName = model?.name || model?.id || "no-model";
 	return modelName.startsWith("Claude ") ? modelName.slice(7) : modelName;
+}
+
+/** Dim trailer after `current -> pending` while a model switch waits for the turn to settle. */
+const PENDING_MODEL_SUFFIX = " (after this turn)";
+
+/**
+ * Model chip label: the active model's name, or `current -> pending` while a
+ * user model switch is queued for after the running turn. Idle sessions (the
+ * flush at turn settle is imminent) and a pending target equal to the active
+ * model render the plain name.
+ */
+function modelChipLabel(ctx: SegmentContext): { label: string; pending: boolean } {
+	const current = ctx.session.state.model;
+	const name = modelDisplayName(current);
+	const target = ctx.pendingModelSwitch?.model;
+	if (
+		!target ||
+		!ctx.session.isStreaming ||
+		(current && current.provider === target.provider && current.id === target.id)
+	) {
+		return { label: name, pending: false };
+	}
+	return { label: `${name} -> ${modelDisplayName(target)}`, pending: true };
 }
 
 type ThinkingDisplaySession = Pick<StatusLineSession, "isAutoThinking" | "autoResolvedThinkingLevel"> & {
@@ -370,7 +392,7 @@ function modelAdvisorBadge(ctx: SegmentContext): { icon: string; color: ThemeCol
 const modelSegment: StatusLineSegment = {
 	id: "model",
 	render(ctx) {
-		const modelName = modelDisplayName(ctx);
+		const chip = modelChipLabel(ctx);
 		const thinkingDisplay = modelThinkingDisplay(ctx);
 
 		// Compact mode swaps the model icon for the thinking-level glyph and drops
@@ -393,13 +415,14 @@ const modelSegment: StatusLineSegment = {
 
 		// `statusLineModel` is aliased to `accent` in many themes, so the badge
 		// uses status colors to stay visibly distinct from the model name color.
-		let content = accentFg(ctx, "statusLineModel", withIcon(modelIcon, modelName));
+		let content = accentFg(ctx, "statusLineModel", withIcon(modelIcon, chip.label));
 		// Per-advisor detail lives in `/advisor status`.
 		const advisor = modelAdvisorBadge(ctx);
 		if (advisor) content += theme.fg(advisor.color, ` ${advisor.icon}`);
 		if (tail) {
 			content += accentFg(ctx, "statusLineModel", tail);
 		}
+		if (chip.pending) content += theme.fg("dim", PENDING_MODEL_SUFFIX);
 
 		// Anthropic usage-limit stage (wrap-up allowance or low priority): a
 		// warning-colored badge so past-the-limit service is never mistaken for normal.
@@ -411,7 +434,8 @@ const modelSegment: StatusLineSegment = {
 		// Name, then the thinking selection (`high`, `auto`, `auto (high)`) in the
 		// effective level's colour after a quiet separator; the terminal draws the model icon.
 		const token = accentToken(ctx, "statusLineModel");
-		const spans: TspSpan[] = [span(modelDisplayName(ctx), token)];
+		const chip = modelChipLabel(ctx);
+		const spans: TspSpan[] = [span(chip.label, token)];
 		const advisor = modelAdvisorBadge(ctx);
 		if (advisor) spans.push(span(` ${advisor.icon}`, advisor.color));
 		if (ctx.session.isFastModeActive() && theme.icon.fast) spans.push(span(` ${theme.icon.fast}`, token));
@@ -421,6 +445,7 @@ const modelSegment: StatusLineSegment = {
 		if (level !== undefined && label !== undefined) {
 			spans.push(span(" · ", "dim"), span(label, thinkingLevelToken(level)));
 		}
+		if (chip.pending) spans.push(span(PENDING_MODEL_SUFFIX, "dim"));
 		const slowModeLabel = ctx.session.getAnthropicSlowModeLabel?.();
 		if (slowModeLabel) spans.push(span(`${theme.sep.dot}${slowModeLabel}`, "warning"));
 		return segView(spans, "model", slowModeLabel ? "warning" : undefined);
