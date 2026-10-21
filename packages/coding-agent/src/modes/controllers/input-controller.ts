@@ -575,6 +575,9 @@ export class InputController {
 			}
 			if (this.ctx.loadingAnimation) {
 				if (this.ctx.cancelPendingSubmission()) {
+					// The cancelled submission may be the goal continuation itself; hold so the next
+					// idle window does not re-fire it.
+					this.ctx.holdGoalContinuation();
 					return;
 				}
 				this.restoreQueuedMessagesToEditor({ abort: true });
@@ -596,6 +599,9 @@ export class InputController {
 				// Esc must not destroy an in-progress draft.
 				this.ctx.lastEscapeTime = 0;
 			} else {
+				// Idle bare Esc stops goal auto-continuation (a pending tick included) the same way a
+				// streaming Esc does; the goal stays active.
+				this.ctx.holdGoalContinuation();
 				// Double-interrupt with an empty editor runs the configured action:
 				// the transcript rewind selector (default) or the session tree.
 				const doubleEscapeAction = cfgDoubleEscapeAction.get(settings);

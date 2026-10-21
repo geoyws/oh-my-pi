@@ -542,8 +542,10 @@ including those made by the agent's `goal` tool.
 - `create` needs `goal.enabled`, a non-empty `objective`, and no active or paused
   goal. It is refused in plan mode, and `token_budget` must be a positive integer.
   It adds the `goal` tool to the active tools.
-- `resume` resumes a paused goal (refused in plan mode). `pause` and `drop` restore
-  the active tools from before the goal started.
+- `resume` resumes a paused goal (refused in plan mode). On a goal that is still
+  active but holding continuation after an `abort` or a process restart, it re-arms
+  continuation instead. `pause` and `drop` restore the active tools from before the
+  goal started.
 - Failures are ordinary `success: false` responses.
 
 Goals do not continue on their own over RPC unless `goal.continuationModes`
@@ -557,17 +559,19 @@ turn, sent as a hidden `goal-continuation` message.
 - While the turn is decided but not yet started, `get_state.isSettled`,
   `prompt_result.sessionSettled` and `session_settled` treat the session as busy.
   `session_settled` follows if the continuation is abandoned.
-- `abort` stops continuation before the abort takes effect and pauses the
-  interrupted goal, so a later prompt does not restart it; only `goal resume` does
-  (or `drop` and a new `create`).
+- New instructions never pause a goal (reins ADR-024, "Steering never pauses goal
+  mode"). `abort` stops continuation before the abort takes effect, but the goal
+  stays `active`: the next host prompt, steer or follow-up re-arms continuation, as
+  does `goal resume`. Only `goal pause` pauses it.
 - Continuation also stops after a goal turn with no new tool activity. The next
   turn that is not itself a goal continuation (a host prompt, steer or follow-up,
   for example) re-arms it.
 - A session change leaves the previous goal and its tool behind and restores a goal
   journaled in the target session. This covers `new_session`, `switch_session`,
   `branch`, `fork` and `open_session`, and the same changes made by extension commands. As
-  in the TUI, an active goal stays active across such a change and continues; a goal
-  restored when the process starts is paused until `goal resume`. A change is
+  in the TUI, an active goal stays active across such a change and continues; an
+  active goal restored when the process starts stays active but does not continue
+  until the next host prompt or `goal resume`. A change is
   detected by the transcript id, so a host-pinned `--provider-session-id` does not
   hide it. A goal turn that is waiting or becomes due while a change is in progress
   is held. If the change is cancelled, or leaves the session unchanged (tree
