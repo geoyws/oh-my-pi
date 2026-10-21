@@ -173,6 +173,8 @@ export function mapToolKind(toolName: string, args?: unknown): ToolKind {
 		case "exec":
 		case "eval":
 			return "execute";
+		case "search":
+		// Pre-merge names, replayed from sessions recorded before `search`.
 		case "grep":
 		case "glob":
 			return "search";

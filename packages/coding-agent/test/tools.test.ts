@@ -2484,7 +2484,8 @@ function b() {
 					{ command: "customcmd foo" },
 					undefined,
 					undefined,
-					createTestToolContext(["grep"]),
+					// A saved rule still naming `grep` routes to `search` in grep mode.
+					createTestToolContext(["search"]),
 				),
 			).rejects.toThrow(/Use the `grep` tool for customcmd\./);
 		});

@@ -9,6 +9,12 @@ export interface BashInterceptorRule {
 	pattern: string;
 	flags?: string;
 	tool: string;
+	/**
+	 * Mode of `tool` the rule redirects to (`search`: `regex`/`glob`/`semantic`);
+	 * the rule fires only while that mode is enabled. Pre-merge `tool` names
+	 * `grep`/`glob`/`find` imply `search` in the matching mode.
+	 */
+	mode?: string;
 	message: string;
 	allowSubcommands?: string[];
 }
@@ -22,13 +28,17 @@ export const DEFAULT_BASH_INTERCEPTOR_RULES: BashInterceptorRule[] = [
 	},
 	{
 		pattern: "^\\s*(grep|rg|ripgrep|ag|ack)\\s+",
-		tool: "grep",
-		message: "Use the `grep` tool instead of grep/rg. It respects .gitignore and provides structured output.",
+		tool: "search",
+		mode: "regex",
+		message:
+			"Use the `search` tool (regex mode) instead of grep/rg. It respects .gitignore and provides structured output.",
 	},
 	{
 		pattern: "^\\s*(find|fd|locate)\\s+.*(-name|-iname|-type|--type|-glob)",
-		tool: "glob",
-		message: "Use the `glob` tool instead of find/fd. It respects .gitignore and is faster for glob patterns.",
+		tool: "search",
+		mode: "glob",
+		message:
+			"Use the `search` tool (glob mode) instead of find/fd. It respects .gitignore and is faster for glob patterns.",
 	},
 	{
 		pattern: "^\\s*sed\\s+(-i|--in-place)",

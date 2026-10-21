@@ -729,22 +729,22 @@ describe("xd:// and top-level calls share the canonical tool map", () => {
 			expect(write).toBeDefined();
 			expect(read).toBeDefined();
 
-			// grep is kept top-level (XDEV_KEEP_TOP_LEVEL) and thus not a mounted
-			// device — the unified namespace must still dispatch it via xd://.
+			// search is essential and thus not a mounted device — the unified
+			// namespace must still dispatch it via xd://.
 			const mounted = [...session.xdev!.mountedNames];
-			expect(mounted).not.toContain("grep");
+			expect(mounted).not.toContain("search");
 
-			const dispatched = await write!.execute("write-xdev-fallback-grep", {
-				path: "xd://grep",
-				content: JSON.stringify({ pattern: "fallback-needle", path: tempDir }),
+			const dispatched = await write!.execute("write-xdev-fallback-search", {
+				path: "xd://search",
+				content: JSON.stringify({ mode: "regex", pattern: "fallback-needle", path: tempDir }),
 			});
 			expect(dispatched.isError).toBeUndefined();
-			expect(dispatched.details?.xdev?.tool).toBe("grep");
+			expect(dispatched.details?.xdev?.tool).toBe("search");
 			expect(dispatched.content.find(entry => entry.type === "text")?.text).toContain("fallback-needle");
 
 			// Docs resolve through the same fallback.
-			const docs = await read!.execute("read-xdev-fallback-grep", { path: "xd://grep" });
-			expect(docs.content.find(entry => entry.type === "text")?.text).toContain("# grep");
+			const docs = await read!.execute("read-xdev-fallback-search", { path: "xd://search" });
+			expect(docs.content.find(entry => entry.type === "text")?.text).toContain("# search");
 
 			// Genuinely unknown names still fail with the catalog error.
 			const unknown = await write!.execute("write-xdev-fallback-unknown", {

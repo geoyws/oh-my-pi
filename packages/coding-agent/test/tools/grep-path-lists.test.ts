@@ -127,8 +127,8 @@ describe("tool path arrays", () => {
 
 	it("search accepts a semicolon-delimited path list", async () => {
 		const tools = await createTools(createTestSession(tempDir));
-		const tool = tools.find(entry => entry.name === "grep");
-		if (!tool) throw new Error("Missing grep tool");
+		const tool = tools.find(entry => entry.name === "search");
+		if (!tool) throw new Error("Missing search tool");
 
 		const result = await tool.execute("search-path-array", {
 			pattern: "shared-needle",
@@ -148,8 +148,8 @@ describe("tool path arrays", () => {
 
 	it("search recurses into directories matched by a path glob", async () => {
 		const tools = await createTools(createTestSession(tempDir));
-		const tool = tools.find(entry => entry.name === "grep");
-		if (!tool) throw new Error("Missing grep tool");
+		const tool = tools.find(entry => entry.name === "search");
+		if (!tool) throw new Error("Missing search tool");
 
 		const braced = getText(
 			await tool.execute("search-dir-brace", { pattern: "shared-needle", path: `${tempDir}/{apps,phases}` }),
@@ -166,8 +166,8 @@ describe("tool path arrays", () => {
 
 	it("search accepts JSON-array string paths in direct execute", async () => {
 		const tools = await createTools(createTestSession(tempDir));
-		const tool = tools.find(entry => entry.name === "grep");
-		if (!tool) throw new Error("Missing grep tool");
+		const tool = tools.find(entry => entry.name === "search");
+		if (!tool) throw new Error("Missing search tool");
 
 		const result = await tool.execute("search-json-array-string-paths", {
 			pattern: "shared-needle",
@@ -186,8 +186,8 @@ describe("tool path arrays", () => {
 
 	it("search expands delimited path entries", async () => {
 		const tools = await createTools(createTestSession(tempDir));
-		const tool = tools.find(entry => entry.name === "grep");
-		if (!tool) throw new Error("Missing grep tool");
+		const tool = tools.find(entry => entry.name === "search");
+		if (!tool) throw new Error("Missing search tool");
 
 		for (const [name, entry] of [
 			["comma", "apps/grep.txt, packages/grep.txt"],
@@ -212,8 +212,8 @@ describe("tool path arrays", () => {
 
 	it("search keeps comma-delimited surviving entries when peers are missing", async () => {
 		const tools = await createTools(createTestSession(tempDir));
-		const tool = tools.find(entry => entry.name === "grep");
-		if (!tool) throw new Error("Missing grep tool");
+		const tool = tools.find(entry => entry.name === "search");
+		if (!tool) throw new Error("Missing search tool");
 
 		const result = await tool.execute("search-delimited-missing", {
 			pattern: "shared-needle",
@@ -232,8 +232,8 @@ describe("tool path arrays", () => {
 	it("records hashline snapshots for matched files", async () => {
 		const session = createTestSession(tempDir);
 		const tools = await createTools(session);
-		const tool = tools.find(entry => entry.name === "grep");
-		if (!tool) throw new Error("Missing grep tool");
+		const tool = tools.find(entry => entry.name === "search");
+		if (!tool) throw new Error("Missing search tool");
 
 		const result = await tool.execute("search-records-snapshot", {
 			pattern: "shared-needle",
@@ -249,14 +249,15 @@ describe("tool path arrays", () => {
 
 	it("search accepts a single string path through tool validation", async () => {
 		const tools = await createTools(createTestSession(tempDir));
-		const tool = tools.find(entry => entry.name === "grep");
-		if (!tool) throw new Error("Missing grep tool");
+		const tool = tools.find(entry => entry.name === "search");
+		if (!tool) throw new Error("Missing search tool");
 
 		const args = validateToolArguments(tool, {
 			type: "toolCall",
 			id: "search-single-string-path",
 			name: tool.name,
 			arguments: {
+				mode: "regex",
 				pattern: "space-needle",
 				path: "folder with spaces/",
 			},
@@ -278,8 +279,8 @@ describe("tool path arrays", () => {
 		await Bun.write(path.join(tmp, "apps", "[id]", "page.tsx"), "bracket-needle\n");
 
 		const tools = await createTools(createTestSession(tmp));
-		const tool = tools.find(entry => entry.name === "grep");
-		if (!tool) throw new Error("Missing grep tool");
+		const tool = tools.find(entry => entry.name === "search");
+		if (!tool) throw new Error("Missing search tool");
 
 		const single = await tool.execute("search-bracket-literal-single", {
 			pattern: "bracket-needle",
@@ -317,8 +318,8 @@ describe("tool path arrays", () => {
 						{
 							type: "toolCall",
 							id: "search-call-1",
-							name: "grep",
-							arguments: { pattern: "space-needle", paths: "folder with spaces/" },
+							name: "search",
+							arguments: { mode: "regex", pattern: "space-needle", path: "folder with spaces/" },
 						},
 					],
 					api: "test",
@@ -373,9 +374,8 @@ describe("tool path arrays", () => {
 		const rendered = Bun.stripANSI(viewer.render(120).join("\n"));
 		viewer.dispose();
 
-		// The hub chat now renders through grepToolRenderer.renderCall; the
-		// single-string `paths` arg shows up as the "in <paths>" scope meta on the
-		// pending call line (a completed result merges the call line away).
+		// The hub chat renders through the search dispatch to the grep renderer; the
+		// single-string `path` arg shows up as the "in <path>" scope meta on the
 		expect(rendered).toContain("in folder with spaces/");
 		await removeWithRetries(tmp);
 	});
@@ -431,9 +431,9 @@ describe("tool path arrays", () => {
 
 	it("search accepts quoted directory paths", async () => {
 		const tools = await createTools(createTestSession(tempDir));
-		const tool = tools.find(entry => entry.name === "grep");
+		const tool = tools.find(entry => entry.name === "search");
 		expect(tool).toBeDefined();
-		if (!tool) throw new Error("Missing grep tool");
+		if (!tool) throw new Error("Missing search tool");
 
 		const result = await tool.execute("search-quoted-path", {
 			pattern: "shared-needle",
@@ -450,9 +450,9 @@ describe("tool path arrays", () => {
 
 	it("search formats absolute in-cwd paths relative to cwd", async () => {
 		const tools = await createTools(createTestSession(tempDir));
-		const tool = tools.find(entry => entry.name === "grep");
+		const tool = tools.find(entry => entry.name === "search");
 		expect(tool).toBeDefined();
-		if (!tool) throw new Error("Missing grep tool");
+		if (!tool) throw new Error("Missing search tool");
 
 		const absoluteAppsPath = path.join(tempDir, "apps");
 		const result = await tool.execute("search-absolute-in-cwd", {
@@ -701,9 +701,9 @@ describe("tool path arrays", () => {
 
 	it("find accepts a semicolon-delimited path list", async () => {
 		const tools = await createTools(createTestSession(tempDir));
-		const tool = tools.find(entry => entry.name === "glob");
+		const tool = tools.find(entry => entry.name === "search");
 		expect(tool).toBeDefined();
-		if (!tool) throw new Error("Missing glob tool");
+		if (!tool) throw new Error("Missing search tool");
 
 		const result = await tool.execute("find-path-array", {
 			path: "apps/; packages/; phases/",
@@ -731,9 +731,9 @@ describe("tool path arrays", () => {
 
 	it("find expands delimited path entries", async () => {
 		const tools = await createTools(createTestSession(tempDir));
-		const tool = tools.find(entry => entry.name === "glob");
+		const tool = tools.find(entry => entry.name === "search");
 		expect(tool).toBeDefined();
-		if (!tool) throw new Error("Missing glob tool");
+		if (!tool) throw new Error("Missing search tool");
 
 		for (const [name, entry] of [
 			["comma", "apps/grep.txt, packages/grep.txt"],
@@ -758,9 +758,9 @@ describe("tool path arrays", () => {
 
 	it("find keeps comma-delimited surviving entries when peers are missing", async () => {
 		const tools = await createTools(createTestSession(tempDir));
-		const tool = tools.find(entry => entry.name === "glob");
+		const tool = tools.find(entry => entry.name === "search");
 		expect(tool).toBeDefined();
-		if (!tool) throw new Error("Missing glob tool");
+		if (!tool) throw new Error("Missing search tool");
 
 		const result = await tool.execute("find-delimited-missing", {
 			path: "missing.txt, packages/grep.txt",
@@ -778,9 +778,9 @@ describe("tool path arrays", () => {
 
 	it("find keeps a single path that contains spaces", async () => {
 		const tools = await createTools(createTestSession(tempDir));
-		const tool = tools.find(entry => entry.name === "glob");
+		const tool = tools.find(entry => entry.name === "search");
 		expect(tool).toBeDefined();
-		if (!tool) throw new Error("Missing glob tool");
+		if (!tool) throw new Error("Missing search tool");
 
 		const result = await tool.execute("find-space-directory", {
 			path: "folder with spaces/",
@@ -796,9 +796,9 @@ describe("tool path arrays", () => {
 
 	it("find accepts quoted directory patterns", async () => {
 		const tools = await createTools(createTestSession(tempDir));
-		const tool = tools.find(entry => entry.name === "glob");
+		const tool = tools.find(entry => entry.name === "search");
 		expect(tool).toBeDefined();
-		if (!tool) throw new Error("Missing glob tool");
+		if (!tool) throw new Error("Missing search tool");
 
 		const result = await tool.execute("find-quoted-pattern", {
 			path: '"packages/"',
@@ -818,9 +818,9 @@ describe("tool path arrays", () => {
 		try {
 			await Bun.write(path.join(outsideDir, "outside.txt"), "outside\n");
 			const tools = await createTools(createTestSession(tempDir));
-			const tool = tools.find(entry => entry.name === "glob");
+			const tool = tools.find(entry => entry.name === "search");
 			expect(tool).toBeDefined();
-			if (!tool) throw new Error("Missing glob tool");
+			if (!tool) throw new Error("Missing search tool");
 
 			const result = await tool.execute("find-outside-cwd", {
 				path: outsideDir,
@@ -841,9 +841,9 @@ describe("tool path arrays", () => {
 
 	it("grep accepts a bare semicolon-delimited directory list", async () => {
 		const tools = await createTools(createTestSession(tempDir));
-		const tool = tools.find(entry => entry.name === "grep");
+		const tool = tools.find(entry => entry.name === "search");
 		expect(tool).toBeDefined();
-		if (!tool) throw new Error("Missing grep tool");
+		if (!tool) throw new Error("Missing search tool");
 
 		const result = await tool.execute("grep-bare-path-array", {
 			pattern: "shared-needle",
@@ -869,9 +869,9 @@ describe("tool path arrays", () => {
 		await Bun.write(path.join(tmp, "nested", "beta.txt"), "exact-needle nested beta\n");
 
 		const tools = await createTools(createTestSession(tmp));
-		const tool = tools.find(entry => entry.name === "grep");
+		const tool = tools.find(entry => entry.name === "search");
 		expect(tool).toBeDefined();
-		if (!tool) throw new Error("Missing grep tool");
+		if (!tool) throw new Error("Missing search tool");
 
 		const result = await tool.execute("grep-exact-file-array", {
 			pattern: "exact-needle",
@@ -900,8 +900,8 @@ describe("tool path arrays", () => {
 		await Bun.write(path.join(tmp, "internal", "roles.go"), "depth-needle roles\n");
 
 		const tools = await createTools(createTestSession(tmp));
-		const tool = tools.find(entry => entry.name === "grep");
-		if (!tool) throw new Error("Missing grep tool");
+		const tool = tools.find(entry => entry.name === "search");
+		if (!tool) throw new Error("Missing search tool");
 
 		const dirGlob = getText(
 			await tool.execute("grep-dir-glob", { pattern: "depth-needle", path: "internal/awsapi/*.go" }),
@@ -955,9 +955,9 @@ describe("tool path arrays", () => {
 
 	it("grep renders only file headings that have child lines", async () => {
 		const tools = await createTools(createTestSession(tempDir));
-		const tool = tools.find(entry => entry.name === "grep");
+		const tool = tools.find(entry => entry.name === "search");
 		expect(tool).toBeDefined();
-		if (!tool) throw new Error("Missing grep tool");
+		if (!tool) throw new Error("Missing search tool");
 
 		const result = await tool.execute("grep-no-empty-headings", {
 			pattern: "shared-needle",
@@ -986,9 +986,9 @@ describe("tool path arrays", () => {
 				settings: Settings.isolated({ "grep.contextBefore": 1, "grep.contextAfter": 1 }),
 			}),
 		);
-		const tool = tools.find(entry => entry.name === "grep");
+		const tool = tools.find(entry => entry.name === "search");
 		expect(tool).toBeDefined();
-		if (!tool) throw new Error("Missing grep tool");
+		if (!tool) throw new Error("Missing search tool");
 
 		const result = await tool.execute("grep-context-label", {
 			pattern: "needle",

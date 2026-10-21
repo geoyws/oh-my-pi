@@ -131,13 +131,17 @@ function argumentsSummary(toolName: string, value: unknown): string {
 	switch (toolName) {
 		case "read":
 			return firstString(args, "path") ?? "Read resource";
-		case "grep": {
+		case "search":
+		// Pre-merge names, from transcripts recorded before `search`.
+		case "grep":
+		case "glob": {
+			const query = firstString(args, "query");
+			if (query) return query;
 			const pattern = firstString(args, "pattern");
 			const path = firstString(args, "path");
-			return [pattern, path].filter(Boolean).join(" · ") || "Search text";
+			if (pattern) return [pattern, path].filter(Boolean).join(" · ");
+			return path ?? (toolName === "grep" ? "Search text" : "Map files");
 		}
-		case "glob":
-			return firstString(args, "path") ?? "Map files";
 		case "bash":
 			return firstString(args, "command") ?? "Run command";
 		case "write":

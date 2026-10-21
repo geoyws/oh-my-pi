@@ -310,6 +310,7 @@ import { wrapToolWithMetaNotice } from "./tools/output-meta";
 import { isFilesystemSourcePath } from "./tools/path-utils";
 import { isAutoQaEnabled } from "./tools/report-tool-issue";
 import { queueResolveHandler } from "./tools/resolve";
+import { resolveSearchModes } from "./tools/search";
 import { USER_TODO_EDIT_CUSTOM_TYPE } from "./tools/todo";
 import { ttsTool } from "./tools/tts";
 import { resolveActiveRepoContext } from "./utils/active-repo-context";
@@ -3886,8 +3887,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// shared grep instance fixed at construction cannot express. Gated on
 			// the grant: the factory builds a fresh tool and `executeTool` prefers
 			// it over the registry, so installing it unconditionally would let a
-			// session without `grep` search anyway.
-			createGrepTool: toolRegistry.has("grep") ? createBridgeGrepFactory(toolSession, extensionRunner) : undefined,
+			// session without `search` search anyway. The factory itself declines
+			// while regex mode is off.
+			createGrepTool: toolRegistry.has("search") ? createBridgeGrepFactory(toolSession, extensionRunner) : undefined,
 			// Native delete and resource-download frames mutate files without a
 			// registry tool. Resolve both the transactional active predicate and
 			// live access mode: Agent.state.tools commits only after prompt rebuilding,
@@ -4118,6 +4120,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				taskBatch: cfgTaskBatch.get(settings),
 				taskMaxConcurrency: cfgTaskMaxConcurrency.get(settings),
 				scoutAvailable: isScoutSpawnable(cfgTaskDisabledAgents.get(settings), options.spawns ?? "*"),
+				searchModes: resolveSearchModes(toolSession),
 				delegationBias: sessionDelegationBias(toolSession),
 				taskIrcEnabled: !restrictToolNames && isIrcEnabled(settings, options.taskDepth ?? 0),
 				autoQaEnabled: !restrictToolNames && isAutoQaEnabled(settings),
@@ -4976,9 +4979,16 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				}
 			};
 			cfgSessionToolGates.listen(session, () => reconcileGatedTools());
-			// `find.enabled: auto` follows the judge role; a role change only touches
-			// the prompt when it actually adds or removes `find`.
-			cfgModelRoles.listen(session, () => reconcileGatedTools({ refreshPrompt: false }));
+			// `find.enabled: auto` follows the judge role, which toggles `search`
+			// semantic mode. A role change only touches the prompt when it adds or
+			// removes a tool or changes the search modes the prompt advertises.
+			let promptSearchModes = resolveSearchModes(toolSession).join(",");
+			cfgModelRoles.listen(session, () => {
+				const searchModes = resolveSearchModes(toolSession).join(",");
+				const searchModesChanged = searchModes !== promptSearchModes;
+				promptSearchModes = searchModes;
+				return reconcileGatedTools({ refreshPrompt: searchModesChanged });
+			});
 		}
 		// Backfill the resumed advisor spend without blocking startup: the scan
 		// runs after the session is live, so `--resume` no longer scales with the

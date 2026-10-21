@@ -17,7 +17,8 @@ function referenceItems(raw: string, tokenLimit: number): string {
 			messages.push(message);
 			continue;
 		}
-		if (role !== "toolResult" || !["bash", "eval", "read", "grep"].includes(message.toolName ?? "")) continue;
+		if (role !== "toolResult" || !["bash", "eval", "read", "search", "grep"].includes(message.toolName ?? ""))
+			continue;
 		const content = Array.isArray(message.content) ? (message.content as Array<{ type: string; text?: string }>) : [];
 		const text = content.map(item => (item.type === "text" ? (item.text ?? "") : "")).join("\n");
 		if (text.length > 0 && text.length <= 32_000) messages.push(message);
