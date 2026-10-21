@@ -81,9 +81,14 @@ const OPUS = "anthropic/claude-opus-5-5:medium";
  * `task` role chain (installed as the child's `subagent:<id>` chain) starts
  * with opus. `suppressed` selectors start on a sibling-recorded cooldown in
  * the shared registry, as when an earlier child's walk already found them
- * exhausted.
+ * exhausted. `fallbackOn` is `retry.fallbackOn`; `"usage-limit"` makes the
+ * walk depend on the error classifying as a usage limit.
  */
-async function runQuotaExhaustedTaskSubagent(suppressed: readonly string[], errorMessage = QUOTA_429) {
+async function runQuotaExhaustedTaskSubagent(
+	suppressed: readonly string[],
+	errorMessage = QUOTA_429,
+	fallbackOn: "any" | "usage-limit" = "any",
+) {
 	const cwd = path.join(root, "home", "work");
 	const artifactsDir = path.join(root, "artifacts");
 	await fs.mkdir(cwd, { recursive: true });
@@ -156,6 +161,7 @@ async function runQuotaExhaustedTaskSubagent(suppressed: readonly string[], erro
 				"todo.reminders": false,
 				"advisor.enabled": false,
 				"retry.baseDelayMs": 1,
+				"retry.fallbackOn": fallbackOn,
 				modelRoles: { default: OPUS, task: MUSE },
 				"retry.fallbackChains": {
 					"muse-code/muse-spark-1.3-contributor": [GLM, GROK],
@@ -193,8 +199,15 @@ it("falls through to the subagent's role chain when every model-keyed rung is un
 	expect(result.output).toContain("answered by opus");
 }, 20_000);
 
+// `retry.fallbackOn: usage-limit` admits only usage-limit errors to the walk, so
+// this passes only while the 402 body classifies as a billing cap; a non-quota
+// 402 ("A subscription is required for this endpoint.") ends the child instead.
 it("falls through to the subagent's role chain when the task role model dies on a 402 billing cap", async () => {
-	const { result, muse, glm, grok, opus } = await runQuotaExhaustedTaskSubagent([GLM, GROK], BILLING_CAP_402);
+	const { result, muse, glm, grok, opus } = await runQuotaExhaustedTaskSubagent(
+		[GLM, GROK],
+		BILLING_CAP_402,
+		"usage-limit",
+	);
 
 	expect(muse.calls.length).toBeGreaterThan(0);
 	expect(glm.calls).toHaveLength(0);
