@@ -389,12 +389,35 @@ function resolveStripTemplateKwargFallback(
 	return STRIP_TEMPLATE_KWARG_REASONING_EFFORT;
 }
 
-/** @internal */
+/**
+ * Effort-preserving policy facts refuse fallbacks and let the rejection
+ * surface (nothing is retried, so nothing is remembered):
+ * - `requiresEffort` (`thinking.requiresEffort`): dropping the field lets the
+ *   server pick its own default tier, so the delete-effort (`null`) outcome
+ *   is refused.
+ * - `pinnedEffort` (every tier maps to one wire value): the value is policy,
+ *   so remapping it to another tier is refused too.
+ * The kwargs strip keeps the effort value (hoisted onto the top-level field)
+ * and stays allowed.
+ * @internal
+ */
 export function resolveOpenAIReasoningEffortFallback(
 	error: unknown,
 	captured: CapturedHttpErrorResponse | undefined,
 	params: unknown,
-	options?: { explicitDisable?: boolean },
+	options?: { explicitDisable?: boolean; requiresEffort?: boolean; pinnedEffort?: boolean },
+): OpenAIReasoningEffortFallback | undefined {
+	const fallback = resolveReasoningEffortFallback(error, captured, params, options?.explicitDisable === true);
+	if (fallback === null && options?.requiresEffort) return undefined;
+	if (typeof fallback === "string" && options?.pinnedEffort) return undefined;
+	return fallback;
+}
+
+function resolveReasoningEffortFallback(
+	error: unknown,
+	captured: CapturedHttpErrorResponse | undefined,
+	params: unknown,
+	explicitDisable: boolean,
 ): OpenAIReasoningEffortFallback | undefined {
 	const strip = resolveStripTemplateKwargFallback(error, captured, params);
 	if (strip !== undefined) return strip;
@@ -405,7 +428,7 @@ export function resolveOpenAIReasoningEffortFallback(
 	const allowed = parseAllowedReasoningValues(message, currentEffort);
 	const normalizedCurrent = currentEffort.toLowerCase();
 	if (allowed === undefined) return null;
-	if (options?.explicitDisable) {
+	if (explicitDisable) {
 		if (normalizedCurrent !== "none" && allowed.has("none")) return "none";
 		const fallback = lowestEnabledAllowedValue(allowed);
 		return fallback && fallback !== normalizedCurrent ? fallback : null;

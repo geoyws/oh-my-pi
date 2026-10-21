@@ -3,7 +3,7 @@ import * as tls from "node:tls";
 import { isAnthropicSigningProxyUrl, isOfficialAnthropicApiUrl } from "@oh-my-pi/pi-catalog/compat/anthropic";
 import { hostMatchesUrl, isVertexRawPredictUrl, modelMatchesHost } from "@oh-my-pi/pi-catalog/hosts";
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
-import { mapEffortToAnthropicAdaptiveEffort } from "@oh-my-pi/pi-catalog/model-thinking";
+import { mapEffortToAnthropicAdaptiveEffort, minimumSupportedEffort } from "@oh-my-pi/pi-catalog/model-thinking";
 import { calculateCost, getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { isAnthropicOAuthToken } from "@oh-my-pi/pi-catalog/utils";
 import { parseGitHubCopilotApiKey } from "@oh-my-pi/pi-catalog/wire/github-copilot";
@@ -4399,7 +4399,7 @@ function disableThinkingIfToolChoiceForced(
 	// for injected SDK clients that bypass client-level beta construction.
 	if (isAdaptiveOnlyThinking(model) && model.compat.supportsOutputEffort) {
 		const outputConfig = (params.output_config as AnthropicOutputConfig | undefined) ?? {};
-		outputConfig.effort = "low";
+		outputConfig.effort = lowestAdaptiveOutputEffort(model);
 		params.output_config = outputConfig;
 		return;
 	}
@@ -4789,6 +4789,18 @@ function isAdaptiveOnlyThinking(model: Model<"anthropic-messages">): boolean {
 		!model.compat.disableAdaptiveThinking &&
 		!usesAdaptiveThinkingTagOnly(model)
 	);
+}
+
+/**
+ * The wire effort of the model's lowest supported tier, through its baked
+ * effort map: `low` for Claude adaptive ladders, the policy pin for rows
+ * whose map sends one value for every tier (MiniMax M3.1 → `medium`).
+ * The adaptive tag-only map has no wire effort, so it keeps `low`.
+ */
+function lowestAdaptiveOutputEffort(model: Model<"anthropic-messages">): AnthropicOutputEffort {
+	const floor = minimumSupportedEffort(model);
+	const mapped = floor === undefined ? undefined : mapEffortToAnthropicAdaptiveEffort(model, floor);
+	return mapped === undefined || mapped === "adaptive" ? "low" : mapped;
 }
 
 function resolveAnthropicAdaptiveEffort(
@@ -5414,11 +5426,12 @@ function buildParams(
 				// Adaptive-only Claude models (Opus 4.6+, Sonnet 4.6+, Fable/Mythos 5) reject
 				// `thinking.type: "disabled"` — adaptive thinking cannot be switched off.
 				// Omit the thinking field (the API defaults to adaptive) and pin the
-				// lowest effort so "thinking off" calls stay cheap instead of failing
+				// lowest effort (through the model's effort map, so a policy pin
+				// holds) so "thinking off" calls stay cheap instead of failing
 				// the request with a 400 (a hidden-thinking toggle must never break it).
 				// The effort field requires the `effort-2025-11-24` beta; it is attached
 				// at the request site, including per-request for injected SDK clients.
-				outputConfigEffort = "low";
+				outputConfigEffort = lowestAdaptiveOutputEffort(model);
 			} else {
 				thinking = { type: "disabled" };
 			}

@@ -166,10 +166,7 @@ describe.skipIf(!PYTHON_AVAILABLE)("EvalTool python timeout containment", () => 
 				language: "py",
 				// `__omp_emit_status` is the runtime's own status channel, so the cell
 				// can mint what looks exactly like a host bridge pause.
-				code: [
-					'__omp_emit_status("timeout-pause")',
-					uninterruptibleCell(markerFile, pidFile),
-				].join("\n"),
+				code: ['__omp_emit_status("timeout-pause")', uninterruptibleCell(markerFile, pidFile)].join("\n"),
 				timeout: 1,
 			});
 			const elapsedMs = Date.now() - startedAt;

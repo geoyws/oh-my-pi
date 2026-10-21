@@ -82,22 +82,42 @@ class "minimax" {
 		}
 	}
 	// MiniMax-M3.1-Flash (and its bundled `-Preview` id) always thinks
-	// (`thinking.type: "disabled"` and effort `none` 400 with error 2013) and
-	// tunes depth through `output_config.effort` from `low` to `max` (the
-	// default when omitted). The identity map replaces the M3 family's
-	// adaptive-tag-only map so each level reaches the wire. Like the M2 family,
-	// thinking cannot be turned off: `thinking-requires-effort` hides the off
-	// level and clamps forced-off requests to the lowest effort instead of
-	// sending `disabled`. The launch id also rejects sampling params
+	// (`thinking.type: "disabled"` and effort `none` 400 with error 2013).
+	// Effort is pinned to `medium` on every route by operator policy: every
+	// tier (and the default selection) serializes to wire `medium`, both as
+	// Anthropic `output_config.effort` and as OpenAI-compatible
+	// `reasoning_effort`, so no request carries `max`/another tier or omits
+	// the field and lets the server pick its own default (`max`). The ladder
+	// stays selectable; the maps make every pick land on `medium`, and the
+	// all-tiers-one-value map is also what refuses 400/422 effort remaps in
+	// pi-ai. Like the M2 family, thinking cannot be turned off:
+	// `thinking-requires-effort` hides the off level and clamps forced-off
+	// requests to an effort (wire `medium`) instead of sending `disabled`, and
+	// keeps the effort-retry fallback from dropping the field. Exact-model
+	// rank beats the class-wide `supports-reasoning-effort #false` on the
+	// minimax-code hosts below, so their OpenAI-compatible route sends the
+	// pinned field too. The launch id also rejects sampling params
 	// (`temperature`, `top_p`, `top_k`).
 	on "minimax" "minimax-cn" "minimax-code" "minimax-code-cn" {
 		models "MiniMax-M3.1-Flash" "MiniMax-M3.1-Flash-Preview" {
 			thinking-requires-effort #true
 			thinking-efforts "low" "medium" "high" "xhigh" "max"
+			thinking-default-level "medium"
 			thinking-effort-map {
-				low "low"
+				low "medium"
 				medium "medium"
-				high "high"
+				high "medium"
+				xhigh "medium"
+				max "medium"
+			}
+			supports-reasoning-effort #true
+			omit-reasoning-effort #false
+			reasoning-effort-map {
+				low "medium"
+				medium "medium"
+				high "medium"
+				xhigh "medium"
+				max "medium"
 			}
 		}
 		models "MiniMax-M3.1-Flash" {
