@@ -10,6 +10,7 @@
 - `packages/natives/package.json`
 - `packages/natives/native/index.js` and `index.d.ts`
 - `packages/natives/native/loader-state.js` and `loader-state.d.ts`
+- `packages/natives/native/required-surface.js` and `required-surface.d.ts`
 - `packages/natives/native/desktop.js` and `desktop.d.ts`
 - `packages/natives/native/clipboard.js` and `clipboard.d.ts`
 - `packages/natives/native/path.js` and `path.d.ts`

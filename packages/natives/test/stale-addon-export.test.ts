@@ -26,6 +26,7 @@ function status(overrides: Partial<NativeAddonStatus> = {}): NativeAddonStatus {
 		version: "18.1.18",
 		packageVersion: "18.2.6",
 		stale: true,
+		missing: [],
 		...overrides,
 	};
 }
@@ -62,7 +63,7 @@ describe("native exports missing from a stale addon", () => {
 		expect(loaded).not.toBeNull();
 		expect(loaded?.path.endsWith(".node")).toBe(true);
 		// Whatever the tree's build state, the flag the stubs branch on must be
-		// the one the reported release implies.
-		expect(loaded?.stale).toBe(loaded?.version !== loaded?.packageVersion);
+		// the one the reported release and the missing declared symbols imply.
+		expect(loaded?.stale).toBe(loaded?.version !== loaded?.packageVersion || (loaded?.missing.length ?? 0) > 0);
 	});
 });
