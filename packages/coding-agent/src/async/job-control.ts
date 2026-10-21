@@ -7,6 +7,7 @@
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 
 import type { AsyncJob, AsyncJobDetails, AsyncJobManager, AsyncJobType } from "./job-manager";
+import { asyncJobUsage, sumJobUsage } from "./job-manager";
 
 import { renderStructuredJson, structuredStatusLabel } from "../session/async-job-delivery";
 import { USER_INTERRUPT_LABEL } from "../session/messages";
@@ -43,17 +44,32 @@ export function visibleJobs(manager: AsyncJobManager, ids: string[], ownerId: st
 }
 
 /**
+ * A cancelled job whose body has not returned yet: `cancel` flips the status
+ * at once, but the result text and final partial usage exist only once the
+ * run settles. Same readiness predicate the manager applies before marking a
+ * result consumed; `wait` blocks on such jobs like running ones.
+ */
+export function isCancelPending(job: AsyncJob | undefined): boolean {
+	return job?.status === "cancelled" && job.resultText === undefined && job.errorText === undefined;
+}
+
+/**
  * Settled jobs owned by `ownerId` whose completion was accepted but has not
  * reached the owner yet: delivery queued or awaiting yield-queue injection,
- * dead-lettered, or skipped while a `wait` watched it. Consumed, acknowledged,
- * and currently watched results are excluded.
+ * dead-lettered, or skipped while a `wait` watched it. A settled cancelled
+ * job is a result too: without it a `wait` after a kill throws "nothing to
+ * wait for" and the job's partial usage (which `buildJobResult` bills on
+ * first `wait`-consume) is unreachable in a live session. Consumed,
+ * acknowledged, currently watched, and still-settling cancelled results are
+ * excluded.
  */
 export function undeliveredJobs(manager: AsyncJobManager, ownerId: string | undefined): AsyncJob[] {
 	return manager
 		.getAllJobs({ ownerId })
 		.filter(
 			job =>
-				(job.status === "completed" || job.status === "failed") &&
+				(job.status === "completed" || job.status === "failed" || job.status === "cancelled") &&
+				!isCancelPending(job) &&
 				!manager.isJobResultConsumed(job.id) &&
 				!manager.isDeliverySuppressed(job.id),
 		);
@@ -152,6 +168,7 @@ interface TrackedJobLike {
 	label: string;
 	startTime: number;
 	endTime?: number;
+	agentId?: string;
 	latestDetails?: AsyncJobDetails;
 	resultText?: string;
 	errorText?: string;
@@ -214,6 +231,7 @@ export function snapshotJobs(
 				}
 			}
 		}
+		const usage = asyncJobUsage(latest);
 		const widget = current ? session.asyncJobManager?.widgets?.view(current) : undefined;
 		return {
 			id: latest.id,
@@ -241,6 +259,7 @@ export function snapshotJobs(
 			...(!resultConsumed && options.includeResults !== false && latest.structured
 				? { structured: latest.structured }
 				: {}),
+			...(usage ? { usage } : {}),
 			...(latest.type === "task" ? { agentUrlId: current?.agentId ?? latest.id } : {}),
 		};
 	});
@@ -264,8 +283,26 @@ export function buildJobResult(
 	const jobResults = snapshotJobs(session, uniqueJobs, { includeResults: op !== "jobs" });
 	const alreadyConsumed = new Set(jobResults.filter(job => manager.isJobResultConsumed(job.id)).map(job => job.id));
 
-	if (op !== "jobs") {
-		manager.consumeJobResults(jobResults.filter(j => j.status !== "running").map(j => j.id));
+	let usage: CoordinationDetails["usage"];
+	// Only a recovering `wait` consumes and bills: a `cancel` kill often lands
+	// while the run is still settling, so consuming there would mark the
+	// settlement consumed before its result (and partial usage) exists — a
+	// later `wait` then finds nothing although the usage was never billed.
+	// `jobs` stays a read-only listing.
+	if (op === "wait") {
+		// A cancelled job still settling is left unacknowledged: consuming it
+		// now would suppress it before its result and partial usage exist, so
+		// no later wait could ever bill it.
+		manager.consumeJobResults(
+			jobResults.filter(j => j.status !== "running" && !isCancelPending(manager.getJob(j.id))).map(j => j.id),
+		);
+		// Bill only results this call recovered for the first time, so a job's
+		// usage is never summed twice across repeated waits or after delivery.
+		usage = sumJobUsage(
+			jobResults.flatMap(j =>
+				j.usage && !alreadyConsumed.has(j.id) && manager.isJobResultConsumed(j.id) ? [j.usage] : [],
+			),
+		);
 	}
 
 	const completed = jobResults.filter(j => j.status !== "running");
@@ -359,6 +396,7 @@ export function buildJobResult(
 		jobs: jobResults,
 		...(cancelOutcomes.length ? { cancelled: cancelOutcomes.map(({ id, status }) => ({ id, status })) } : {}),
 		...(agents.length ? { agents } : {}),
+		...(usage ? { usage } : {}),
 	};
 	return {
 		content: [{ type: "text", text: lines.join("\n").trimEnd() }],

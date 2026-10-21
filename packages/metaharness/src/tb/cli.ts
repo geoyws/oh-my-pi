@@ -22,7 +22,7 @@ const FLASH_POOL = [
 	"openrouter/stepfun/step-3.7-flash",
 ];
 
-const DEFAULT_TOOLS = ["bash", "read", "write", "edit", "grep", "glob"];
+const DEFAULT_TOOLS = ["bash", "read", "write", "edit", "search"];
 
 const OPENROUTER_VARIANTS: Record<OpenRouterVariant, true> = {
 	default: true,

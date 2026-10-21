@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -7,6 +7,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { resolveApproval } from "@oh-my-pi/pi-coding-agent/tools/approval";
 import { normalizeToolName } from "@oh-my-pi/pi-coding-agent/tools/builtin-names";
+import { FindTool } from "@oh-my-pi/pi-coding-agent/tools/jfind";
 import { SearchTool, searchCallMode } from "@oh-my-pi/pi-coding-agent/tools/search";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
@@ -61,7 +62,8 @@ describe("search tool modes", () => {
 		const tool = new SearchTool(createTestSession("/tmp/test", {}, { glob: false }));
 		const properties = asSchemaObject(toolWireSchema(tool).properties);
 		expect(Object.keys(properties).sort()).toEqual(["case", "gitignore", "path", "pattern", "skip"]);
-		expect(tool.description).toContain('Search file contents (`mode: "regex"`)');
+		expect(tool.description).toContain("Search file contents by regex.");
+		expect(tool.description).not.toContain("mode:");
 	});
 
 	it("advertises a modeless glob-only schema when other modes are off", () => {
@@ -98,7 +100,7 @@ describe("search tool mode mismatches", () => {
 		);
 	});
 
-	it("rejects semantic fields on regex and regex fields on semantic", async () => {
+	it("rejects semantic fields on regex and an unavailable semantic mode", async () => {
 		const tool = new SearchTool(createTestSession());
 		await expect(tool.execute("s2", { mode: "regex", pattern: "x", query: "y" })).rejects.toThrow(
 			"`query` and `grep_keywords` are semantic-only",
@@ -108,10 +110,37 @@ describe("search tool mode mismatches", () => {
 		);
 	});
 
-	it("requires pattern for regex and query for semantic", async () => {
+	it("requires pattern for regex and rejects pattern on glob", async () => {
 		const tool = new SearchTool(createTestSession());
 		await expect(tool.execute("s4", { mode: "regex" })).rejects.toThrow("regex mode requires `pattern`.");
 		await expect(tool.execute("s5", { mode: "glob", pattern: "x" })).rejects.toThrow("`pattern` is regex-only");
+	});
+
+	it("rejects pattern and an empty query in semantic mode", async () => {
+		const tool = new SearchTool(createTestSession("/tmp/test", {}, { semantic: true }));
+		await expect(tool.execute("s6", { mode: "semantic", query: "y", pattern: "x" })).rejects.toThrow(
+			"`pattern` is regex-only; semantic takes `query` and `grep_keywords`.",
+		);
+		await expect(tool.execute("s7", { mode: "semantic", query: "" })).rejects.toThrow(
+			"semantic mode requires `query`.",
+		);
+		await expect(tool.execute("s8", { mode: "semantic", query: "   " })).rejects.toThrow(
+			"semantic mode requires `query`.",
+		);
+	});
+
+	it("dispatches semantic mode to the semantic runner", async () => {
+		const result = { content: [{ type: "text" as const, text: "stubbed" }], details: undefined };
+		const spy = spyOn(FindTool.prototype, "execute").mockResolvedValue(result as never);
+		try {
+			const tool = new SearchTool(createTestSession("/tmp/test", {}, { semantic: true }));
+			const got = await tool.execute("s9", { query: "what renders the header", path: "src" });
+			expect(got).toBe(result as never);
+			expect(spy).toHaveBeenCalledTimes(1);
+			expect(spy.mock.calls[0]?.[1]).toEqual({ query: "what renders the header", grep_keywords: [], path: "src" });
+		} finally {
+			spy.mockRestore();
+		}
 	});
 });
 
@@ -169,7 +198,7 @@ describe("search execute", () => {
 		}
 	});
 
-	it("keeps only regex mode when createTools omits the other names", async () => {
+	it("advertises a modeless regex-only search from createTools when glob is disabled", async () => {
 		const tools = await createTools(createTestSession("/tmp/test", {}, { glob: false }), ["search"]);
 		const tool = tools.find(entry => entry.name === "search");
 		expect(tool).toBeDefined();

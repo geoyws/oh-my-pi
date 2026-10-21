@@ -36,6 +36,10 @@ export const HIDDEN_TOOL_NAMES = ["yield", "goal", "think"] as const;
 
 export type HiddenToolName = (typeof HIDDEN_TOOL_NAMES)[number];
 
+// Aliases grant the whole merged tool: a list naming only `glob` (or `grep`/`find`) yields
+// `search` with every enabled mode, and `createTools` then auto-adds `ast` (if ast-grep is
+// enabled) and, with `read` under context management, `context_notes`/`new_context` for
+// unrestricted sessions.
 const LEGACY_BUILTIN_TOOL_NAME_ALIASES: ReadonlyMap<string, BuiltinToolName> = new Map([
 	["ast_grep", "ast"],
 	["ast_edit", "ast"],

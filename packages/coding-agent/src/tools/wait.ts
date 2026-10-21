@@ -10,7 +10,7 @@ import { IrcBus } from "../irc/bus";
 import waitDescription from "../prompts/tools/wait.md" with { type: "text" };
 import type { ToolSession } from ".";
 import type { AsyncJob, AsyncJobManager } from "../async/job-manager";
-import { buildJobResult, snapshotJobs, undeliveredJobs } from "../async/job-control";
+import { buildJobResult, isCancelPending, snapshotJobs, undeliveredJobs } from "../async/job-control";
 import { hasLiveOwnedService, listServicesTolerant, waitForOwnedServiceCompletion } from "../launch/services";
 import { drainPendingInbox, messageResult } from "../irc/messaging";
 import type { AgentRegistry } from "../registry/agent-registry";
@@ -87,7 +87,15 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 			const queued = takeQueuedMessage(messaging);
 			if (queued && messaging) return messageResult(messaging.senderId, queued);
 		}
-		const jobs = manager?.getRunningJobs({ ownerId: senderId }) ?? [];
+		// A cancelled job still settling counts as pending work: its result and
+		// partial usage land only when the run returns, so the wait blocks on
+		// that settle and bills it then rather than returning it empty.
+		const jobs = manager
+			? [
+					...manager.getRunningJobs({ ownerId: senderId }),
+					...manager.getAllJobs({ ownerId: senderId }).filter(isCancelPending),
+				]
+			: [];
 		// An accepted completion whose delivery has not reached the transcript
 		// yet (queued, parked on the yield queue, or skipped while an earlier
 		// wait watched it) is exactly what this wait is for: return it now.
