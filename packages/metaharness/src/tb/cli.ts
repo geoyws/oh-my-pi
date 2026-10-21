@@ -3,6 +3,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { connect } from "@stencil-hq/vibemon";
+import { assertE2eHost } from "../../../../scripts/e2e-host-guard";
 import { prepareAgentBinaries } from "./agent";
 import { loadTasks, resolveDataset } from "./dataset";
 import { TbStore, type TbSummaryRow } from "./store";
@@ -361,6 +362,7 @@ export async function main(argv: string[]): Promise<void> {
 		console.log(HELP);
 		return;
 	}
+	assertE2eHost("e2e", "metaharness bench:tb");
 	fs.mkdirSync(config.jobsDir, { recursive: true });
 	const tasksDir = await resolveDataset(config.dataset, path.join(config.jobsDir, "_dataset"));
 	const tasks = await loadTasks(tasksDir, { include: config.include, exclude: config.exclude });

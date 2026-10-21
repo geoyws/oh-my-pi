@@ -2,6 +2,7 @@
 set -e
 
 cd "$(dirname "$0")/../.."
+bun scripts/e2e-host-guard.ts e2e install-tests/run-podman.sh || exit $?
 
 echo "=== Testing binary build ==="
 podman build -f scripts/install-tests/binary.dockerfile -t omp-test-binary .
