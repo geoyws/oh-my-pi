@@ -232,7 +232,7 @@ omp reads the working tree through git_overview, git_file_diff, and git_hunk, th
 
 ### 17 · Read PRs. _Walk skills._ Pull JSON out of subagents.
 
-Sixteen internal schemes — `pr://`, `issue://`, `agent://`, `skill://`, `ssh://`, and the rest — resolve transparently inside every FS-shaped tool the agent already calls. `read pr://1428` returns the same shape as `read src/foo.ts`. `grep` walks a diff like a directory. `agent://<id>/findings.0.path` pulls a field out of a subagent's output by path.
+Sixteen internal schemes — `pr://`, `issue://`, `agent://`, `skill://`, `ssh://`, and the rest — resolve transparently inside every FS-shaped tool the agent already calls. `read pr://1428` returns the same shape as `read src/foo.ts`. `search` regex mode walks a diff like a directory. `agent://<id>/findings.0.path` pulls a field out of a subagent's output by path.
 
 ### 18 · Conflict resolution, made easy.
 
@@ -268,8 +268,7 @@ Core tools live in the same namespace as `read` and `bash`. Pin the active set w
 - `write` — create or overwrite a file, archive entry, or SQLite row.
 - `edit` — hashline patches with content-hash anchors and stale-anchor recovery.
 - `ast` — structural code queries (`mode: "search"`) and structural rewrites previewed before apply (`mode: "edit"`), via ast-grep over 50+ tree-sitter grammars.
-- `grep` — regex over files, globs, and internal URLs.
-- `glob` — glob-based path lookup; reach for `grep` when you need content matches.
+- `search` — regex over files, globs, and internal URLs (`mode: "regex"`), glob-based path lookup (`mode: "glob"`), and semantic behavior search (`mode: "semantic"`).
 
 **Runtime**
 

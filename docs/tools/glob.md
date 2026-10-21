@@ -1,5 +1,7 @@
 # glob
 
+> **Now a mode of [`search`](./search.md):** the model-facing tool is `search` with `mode: "glob"`; `glob` survives as a legacy name alias. `GlobTool` below is the glob-mode runner.
+
 > Find filesystem paths by glob; use `grep` when you need content matches instead of path matches.
 
 ## Source

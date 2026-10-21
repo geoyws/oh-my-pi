@@ -251,7 +251,7 @@ describe("goal runtime", () => {
 		expect(harness.hiddenMessages).toHaveLength(2);
 	});
 
-	it("pauses an active goal when an interruption aborts the task", async () => {
+	it("keeps an active goal active on a bare interrupt but holds continuation until the next user message", async () => {
 		const harness = createHarness({
 			state: { enabled: true, mode: "active", goal: createGoal() },
 		});
@@ -259,27 +259,103 @@ describe("goal runtime", () => {
 		harness.runtime.onTurnStart("turn-1", createUsage());
 		harness.advance(1_000);
 		harness.setUsage({ output: 4 });
-		await harness.runtime.onTaskAborted({ reason: "interrupted" });
+		const generation = harness.runtime.beginTaskAbort({ reason: "interrupted" });
+		await harness.runtime.onTaskAborted({ reason: "interrupted", turnGeneration: generation });
 
 		const state = harness.getState();
-		expect(state?.enabled).toBe(false);
-		expect(state?.goal.status).toBe("paused");
+		expect(state?.enabled).toBe(true);
+		expect(state?.goal.status).toBe("active");
 		expect(state?.goal.tokensUsed).toBe(4);
 		expect(state?.goal.timeUsedSeconds).toBe(1);
-		expect(harness.persists.at(-1)?.mode).toBe("goal_paused");
+		expect(harness.persists.map(entry => entry.mode)).not.toContain("goal_paused");
+		expect(harness.runtime.continuationSuppressed).toBe(true);
+		expect(harness.runtime.buildContinuationPrompt()).toBeUndefined();
+
+		harness.runtime.rearmContinuation();
+		expect(harness.runtime.buildContinuationPrompt()).toBeDefined();
 	});
 
-	it("auto-pauses active goals when a thread resumes", async () => {
+	it("counts the steered turn after an interrupt toward the budget and re-arms continuation", async () => {
+		const harness = createHarness({
+			state: { enabled: true, mode: "active", goal: createGoal({ tokenBudget: 100 }) },
+		});
+
+		harness.runtime.onTurnStart("turn-1", createUsage());
+		harness.setUsage({ output: 3 });
+		const generation = harness.runtime.beginTaskAbort({ reason: "interrupted" });
+		await harness.runtime.onTaskAborted({ reason: "interrupted", turnGeneration: generation });
+
+		// The new instruction's message re-arms continuation, then its turn runs and is accounted.
+		harness.runtime.rearmContinuation();
+		harness.runtime.onTurnStart("turn-2", createUsage({ output: 3 }));
+		harness.setUsage({ output: 10 });
+		await harness.runtime.onAgentEnd();
+
+		const state = harness.getState();
+		expect(state?.enabled).toBe(true);
+		expect(state?.goal.status).toBe("active");
+		expect(state?.goal.tokensUsed).toBe(10);
+		expect(harness.runtime.buildContinuationPrompt()).toBeDefined();
+	});
+
+	it("a user turn that starts while an interrupt unwinds keeps continuation armed and its accounting", async () => {
+		const harness = createHarness({
+			state: { enabled: true, mode: "active", goal: createGoal({ tokenBudget: 100 }) },
+		});
+
+		harness.runtime.onTurnStart("turn-1", createUsage());
+		harness.setUsage({ output: 3 });
+		const generation = harness.runtime.beginTaskAbort({ reason: "interrupted" });
+		// Before abort() reaches its goal hook, the new message starts a turn.
+		harness.runtime.rearmContinuation();
+		harness.runtime.onTurnStart("turn-2", createUsage({ output: 3 }));
+		await harness.runtime.onTaskAborted({ reason: "interrupted", turnGeneration: generation });
+
+		expect(harness.runtime.continuationSuppressed).toBe(false);
+		expect(harness.runtime.snapshot.turnSnapshot?.turnId).toBe("turn-2");
+		harness.setUsage({ output: 10 });
+		await harness.runtime.onAgentEnd();
+
+		expect(harness.getState()?.goal.status).toBe("active");
+		expect(harness.getState()?.goal.tokensUsed).toBe(7);
+		expect(harness.runtime.buildContinuationPrompt()).toBeDefined();
+	});
+
+	it("still pauses through the explicit pause path after an interrupt left the goal active", async () => {
+		const harness = createHarness({
+			state: { enabled: true, mode: "active", goal: createGoal() },
+		});
+
+		const generation = harness.runtime.beginTaskAbort({ reason: "interrupted" });
+		await harness.runtime.onTaskAborted({ reason: "interrupted", turnGeneration: generation });
+		expect(harness.getState()?.goal.status).toBe("active");
+
+		await harness.runtime.pauseGoal();
+		expect(harness.getState()?.enabled).toBe(false);
+		expect(harness.getState()?.goal.status).toBe("paused");
+		expect(harness.persists.at(-1)?.mode).toBe("goal_paused");
+		expect(harness.runtime.buildContinuationPrompt()).toBeUndefined();
+
+		await harness.runtime.resumeGoal();
+		expect(harness.getState()?.goal.status).toBe("active");
+		expect(harness.runtime.buildContinuationPrompt()).toBeDefined();
+	});
+
+	it("keeps an active goal active on a cold thread resume without auto-continuing until the next user message", async () => {
 		const harness = createHarness({
 			state: { enabled: true, mode: "active", goal: createGoal() },
 		});
 
 		const resumed = await harness.runtime.onThreadResumed();
-		expect(resumed?.enabled).toBe(false);
-		expect(resumed?.goal.status).toBe("paused");
-		expect(harness.getState()?.enabled).toBe(false);
-		expect(harness.getState()?.goal.status).toBe("paused");
-		expect(harness.persists.at(-1)?.mode).toBe("goal_paused");
+		expect(resumed?.enabled).toBe(true);
+		expect(resumed?.goal.status).toBe("active");
+		expect(harness.getState()?.enabled).toBe(true);
+		expect(harness.getState()?.goal.status).toBe("active");
+		expect(harness.persists.map(entry => entry.mode)).not.toContain("goal_paused");
+		expect(harness.runtime.buildContinuationPrompt()).toBeUndefined();
+
+		harness.runtime.rearmContinuation();
+		expect(harness.runtime.buildContinuationPrompt()).toBeDefined();
 	});
 
 	it("preserves an active goal during internal session-switch reconciliation", async () => {

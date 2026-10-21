@@ -193,7 +193,7 @@ describe("seance startup contracts", () => {
 			for (const markerName of markerNames) expect(startupPrompt).not.toContain(markerName);
 			expect(await fs.readFile(sourceFile, "utf8")).toBe(sourceText);
 
-			expect(created.session.getActiveToolNames().toSorted()).toEqual(["glob", "grep", "read", "yield"]);
+			expect(created.session.getActiveToolNames().toSorted()).toEqual(["read", "search", "yield"]);
 			expect(await Bun.file(extensionMarker).exists()).toBe(false);
 		} finally {
 			try {
@@ -416,7 +416,7 @@ describe("seance startup contracts", () => {
 			expect(revived.systemPrompt).toEqual(warmPrompt);
 			for (const markerName of markerNames) expect(revived.systemPrompt.join("\n")).not.toContain(markerName);
 			expect(await fs.readFile(sourceFile, "utf8")).toBe(sourceText);
-			expect(warmToolNames).toEqual(["glob", "grep", "read", "yield"]);
+			expect(warmToolNames).toEqual(["read", "search", "yield"]);
 			expect(revived.getActiveToolNames().toSorted()).toEqual(warmToolNames);
 			expect(extensionLoaded).toBe(false);
 		} finally {

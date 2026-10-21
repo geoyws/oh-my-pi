@@ -1,3 +1,5 @@
+import type { RequiredNativeSurface } from "./required-surface.js";
+
 export interface EmbeddedAddonFile {
 	variant: "modern" | "baseline" | "default";
 	/** Basename of the extracted `.node` file. */
@@ -129,12 +131,39 @@ export interface NativeAddonStatus {
 	version: string | null;
 	/** `package.json#version` of the loader that loaded it. */
 	packageVersion: string;
-	/** True when the addon carries a different release than this package. */
+	/**
+	 * True when the addon carries a different release than this package, or
+	 * lacks part of the native API `index.d.ts` declares (workspace loads only;
+	 * other loads reject such an addon).
+	 */
 	stale: boolean;
+	/** Declared symbols the addon lacks: `fn`, `Class`, or `Class.method`. */
+	missing: string[];
 }
 
 /** The addon behind this process's exports; `null` before a successful load. */
 export function nativeAddonStatus(): NativeAddonStatus | null;
+
+/** Whether `value` is an addon-provided function rather than a loader stub for a missing symbol. */
+export function isProvidedNativeFunction(value: unknown): boolean;
+
+/**
+ * Declared symbols `bindings` lacks: function names, missing class names, and
+ * missing prototype methods as `Class.method`.
+ */
+export function missingNativeSurface(bindings: Record<string, unknown>, surface: RequiredNativeSurface): string[];
+
+/**
+ * Compare an addon to the declared native surface: throws outside workspace
+ * loads when anything is missing; in workspace loads marks the addon stale and
+ * installs throwing stand-ins for missing prototype methods.
+ */
+export function checkNativeSurface(
+	ctx: ValidateLoadedBindingsContext,
+	bindings: Record<string, unknown>,
+	candidate: string,
+	surface?: RequiredNativeSurface,
+): NativeAddonStatus;
 
 /**
  * Stub for an export the addon does not provide: `undefined` on a current

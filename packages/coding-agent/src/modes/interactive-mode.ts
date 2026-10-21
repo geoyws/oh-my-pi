@@ -3097,10 +3097,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.#pendingSubmittedInput) return;
 		if (this.editor.getText().trim().length > 0) return;
 		if ((this.editor.pendingImages?.length ?? 0) > 0) return;
-		const state = this.session.getGoalModeState();
-		if (!state?.enabled || state.goal.status !== "active") return;
-		const prompt = this.session.goalRuntime.buildContinuationPrompt();
-		if (!prompt) return;
+		if (!this.session.goalRuntime.buildContinuationPrompt()) return;
 		this.#goalContinuationTimer = setTimeout(() => {
 			this.#goalContinuationTimer = undefined;
 			if (!this.onInputCallback) return;
@@ -3116,8 +3113,10 @@ export class InteractiveMode implements InteractiveModeContext {
 			if (this.#pendingSubmittedInput) return;
 			if (this.editor.getText().trim().length > 0) return;
 			if ((this.editor.pendingImages?.length ?? 0) > 0) return;
-			const latestState = this.session.getGoalModeState();
-			if (!latestState?.enabled || latestState.goal.status !== "active") return;
+			// An interrupt during the 800ms window holds continuation without pausing the goal,
+			// so re-read the prompt instead of firing the one computed at schedule time.
+			const prompt = this.session.goalRuntime.buildContinuationPrompt();
+			if (!prompt) return;
 			if (this.#goalOpenWorkAllBlocked()) return;
 			this.#pendingGoalContinuationTurns++;
 			this.onInputCallback(
@@ -3149,8 +3148,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 	}
 
-	cancelGoalContinuation(): void {
+	/** Idle bare Esc: drop a pending continuation tick and hold continuation like an interrupt. */
+	holdGoalContinuation(): void {
 		this.#cancelGoalContinuation();
+		if (this.goalModeEnabled) this.session.goalRuntime.holdContinuation();
 	}
 
 	disableGoalMode(message = "Goal mode disabled."): void {
@@ -6842,6 +6843,14 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	async #resumeGoalAction(): Promise<void> {
+		// Esc and cold resume leave the goal `active` with continuation held; resume re-arms it.
+		if (this.goalModeEnabled && this.session.goalRuntime.continuationSuppressed) {
+			this.session.goalRuntime.rearmContinuation();
+			this.#resetGoalContinuationSuppression();
+			this.showStatus("Goal continuation resumed.");
+			this.#scheduleGoalContinuation();
+			return;
+		}
 		if (!this.#getPausedGoalState()) {
 			this.showWarning("No paused goal to resume.");
 			return;

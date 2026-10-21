@@ -2597,7 +2597,8 @@ async function handleExecServerMessage(
 			// `tool_execution_start`) and rebuilt transcript (from this block)
 			// display identical args.
 			const searchPath = args.glob ? `${args.path || "."}/${args.glob}` : args.path || ".";
-			synthesizeCursorExecToolCall(output, stream, state, args.toolCallId, "grep", {
+			synthesizeCursorExecToolCall(output, stream, state, args.toolCallId, "search", {
+				mode: "regex",
 				pattern: args.pattern,
 				path: searchPath,
 				case: args.caseInsensitive === true ? false : undefined,
@@ -2610,7 +2611,7 @@ async function handleExecServerMessage(
 				toolResult => buildGrepResultFromToolResult(args, toolResult),
 				reason => buildGrepErrorResult(reason),
 				error => buildGrepErrorResult(error),
-				{ toolCallId: args.toolCallId, toolName: "grep" },
+				{ toolCallId: args.toolCallId, toolName: "search" },
 			);
 			sendExecClientMessage(runTransport, execMsg, "grepResult", execResult);
 			return;
@@ -3109,11 +3110,12 @@ async function handleExecServerMessage(
 		case "piGrepArgs": {
 			const args = execMsg.message.value;
 			const toolCallId = crypto.randomUUID();
-			synthesizeCursorExecToolCall(output, stream, state, toolCallId, "grep", {
+			synthesizeCursorExecToolCall(output, stream, state, toolCallId, "search", {
+				mode: "regex",
 				pattern: args.literal === true ? piEscapeRegexLiteral(args.pattern) : args.pattern,
 				path: args.glob ? piJoinPath(args.path, args.glob) : args.path || ".",
 				case: args.ignoreCase === true ? false : undefined,
-				// Neither field exists in the model-facing `grep` schema — the bridge
+				// Neither field exists in the model-facing `search` schema — the bridge
 				// serves them by building a scoped tool instead. Recorded anyway, for
 				// the same reason `pi_read` renders its range into the displayed path:
 				// a capped or context-widened search is otherwise replayed as an
@@ -3128,7 +3130,7 @@ async function handleExecServerMessage(
 				buildPiGrepResult,
 				buildPiGrepError,
 				buildPiGrepError,
-				{ toolCallId, toolName: "grep" },
+				{ toolCallId, toolName: "search" },
 			);
 			sendExecClientMessage(runTransport, execMsg, "piGrepResult", execResult);
 			return;
@@ -3136,7 +3138,8 @@ async function handleExecServerMessage(
 		case "piFindArgs": {
 			const args = execMsg.message.value;
 			const toolCallId = crypto.randomUUID();
-			synthesizeCursorExecToolCall(output, stream, state, toolCallId, "glob", {
+			synthesizeCursorExecToolCall(output, stream, state, toolCallId, "search", {
+				mode: "glob",
 				path: piJoinPath(args.path, args.pattern),
 				limit: piLimit(args.limit),
 			});
@@ -3147,7 +3150,7 @@ async function handleExecServerMessage(
 				buildPiFindResult,
 				buildPiFindError,
 				buildPiFindError,
-				{ toolCallId, toolName: "glob" },
+				{ toolCallId, toolName: "search" },
 			);
 			sendExecClientMessage(runTransport, execMsg, "piFindResult", execResult);
 			return;
@@ -5793,8 +5796,12 @@ export function buildCursorRequestContextRules(systemPrompt: readonly string[] |
  * `definition`, `references`, `rename`, `code_actions`, `hover`,
  * `implementation`, `type_definition`, `symbols`, ... — have no native frame at
  * all, so filtering the whole tool out hid every one of them from the model.
+ *
+ * `search` is NOT here for the same reason: native `grep`/`pi_grep`/`pi_find`
+ * frames cover its regex and glob modes, but its semantic mode has no native
+ * frame.
  */
-const CURSOR_NATIVE_TOOL_NAMES = new Set(["bash", "read", "write", "delete", "ls", "grep", "todo"]);
+const CURSOR_NATIVE_TOOL_NAMES = new Set(["bash", "read", "write", "delete", "ls", "todo"]);
 
 function isJsonValue(value: unknown): value is JsonValue {
 	if (value === null || typeof value === "string" || typeof value === "boolean") return true;

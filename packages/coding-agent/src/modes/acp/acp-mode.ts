@@ -23,16 +23,27 @@ export type AcpSessionFactory = (
 	options?: { interactivePrompts?: boolean },
 ) => Promise<AgentSession | AcpSessionHandle>;
 
+/** Process-level ACP server configuration shared by every client connection. */
+export interface AcpModeOptions {
+	/** Session restored into the first connection instead of a lazily created one. */
+	initialSession?: AgentSession;
+	/**
+	 * Custom session directory (`--session-dir`). Stored-session lookups for
+	 * `session/load`, `session/resume` and `session/list` search it, matching
+	 * where the session factory writes new sessions.
+	 */
+	sessionDir?: string;
+}
+
 /** Creates an ACP connection and exposes its agent when process-level teardown must own it. */
 export function createAcpConnection(
 	transport: Stream,
 	createSession: AcpSessionFactory,
-	initialSession?: AgentSession,
-	onAgent?: (agent: AcpAgent) => void,
+	options: AcpModeOptions & { onAgent?: (agent: AcpAgent) => void } = {},
 ): AgentSideConnection {
 	return new AgentSideConnection(connection => {
-		const agent = new AcpAgent(connection, createSession, initialSession);
-		onAgent?.(agent);
+		const agent = new AcpAgent(connection, createSession, options.initialSession, options.sessionDir);
+		options.onAgent?.(agent);
 		return agent;
 	}, transport);
 }
@@ -71,7 +82,7 @@ function formatConsoleArgs(args: unknown[]): string {
 }
 
 /** Serves ACP over stdio until the peer disconnects, then awaits session teardown before exit. */
-export async function runAcpMode(createSession: AcpSessionFactory, initialSession?: AgentSession): Promise<void> {
+export async function runAcpMode(createSession: AcpSessionFactory, options: AcpModeOptions = {}): Promise<void> {
 	// Humans who run `omp acp` by hand see a silent process and assume it is
 	// broken (stdout is the JSON-RPC transport, so nothing may be printed
 	// there). When stdin is a TTY no ACP client is attached — say so on stderr
@@ -89,8 +100,11 @@ export async function runAcpMode(createSession: AcpSessionFactory, initialSessio
 	const input = stream.Writable.toWeb(isolateProtocolStdout());
 	const output = stream.Readable.toWeb(process.stdin);
 	const transport = ndJsonStream(input, output);
-	const connection = createAcpConnection(transport, createSession, initialSession, createdAgent => {
-		agent = createdAgent;
+	const connection = createAcpConnection(transport, createSession, {
+		...options,
+		onAgent: createdAgent => {
+			agent = createdAgent;
+		},
 	});
 	await connection.closed;
 	await postmortem.quit(0);

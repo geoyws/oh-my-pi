@@ -9,11 +9,9 @@ import { bashToolRenderer } from "./bash";
 import { debugToolRenderer } from "./debug";
 import { editToolRenderer } from "./edit";
 import { evalToolRenderer } from "./eval";
-import { findToolRenderer } from "./find";
+import { searchToolRenderer } from "./search";
 import { githubToolRenderer } from "./github";
-import { globToolRenderer } from "./glob";
 import { goalToolRenderer } from "./goal";
-import { grepToolRenderer } from "./grep";
 import { waitToolRenderer } from "./wait";
 import { lspToolRenderer } from "./lsp";
 import { recallToolRenderer, reflectToolRenderer, retainToolRenderer } from "./memory";
@@ -40,9 +38,11 @@ export const toolRenderers: Record<string, ToolRenderer> = {
 	eval: evalToolRenderer,
 	edit: editToolRenderer,
 	apply_patch: editToolRenderer,
-	find: findToolRenderer,
-	glob: globToolRenderer,
-	grep: grepToolRenderer,
+	search: searchToolRenderer,
+	// Pre-merge names, so transcripts recorded before `search` still render.
+	find: searchToolRenderer,
+	glob: searchToolRenderer,
+	grep: searchToolRenderer,
 	lsp: lspToolRenderer,
 	wait: waitToolRenderer,
 	read: readToolRenderer,

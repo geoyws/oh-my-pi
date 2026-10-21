@@ -1,3 +1,4 @@
+import type { Usage } from "@oh-my-pi/pi-ai";
 import type { Component } from "../tui";
 import { Text } from "../components/text";
 import { visibleWidth } from "../utils";
@@ -76,6 +77,13 @@ export interface JobSnapshot {
 	artifactError?: OutputMeta["artifactError"];
 	structured?: StructuredSubagentOutput;
 	/**
+	 * Child model usage for a task job (input/output/cacheRead/cacheWrite/
+	 * totalTokens and billed cost): live while running, final or partial once
+	 * settled. Status data — repeated on every snapshot of the job; consumers
+	 * summing spend use {@link CoordinationDetails.usage}.
+	 */
+	usage?: Usage;
+	/**
 	 * `agent://<id>` handle backing this job's artifacts — the job-row's
 	 * registry `agentId` when the manager disambiguated a requested job id
 	 * on collision, else the job id itself. See {@link AsyncJob.agentId}.
@@ -136,6 +144,19 @@ export interface CoordinationDetails {
 	agents?: AgentActivitySnapshot[];
 	/** `wait` was cut short by steering, a peer message, or a completion notice that injects next. */
 	interrupted?: boolean;
+	/**
+	 * Summed child usage of the settled jobs whose results THIS `wait`
+	 * consumed (recovered for the first time). A job counts once across the
+	 * surfaces that bill — `wait` results and `async-result` deliveries: a
+	 * result already auto-delivered or returned by an earlier `wait` is
+	 * excluded. Eval `agent()` handle waits consume results without surfacing
+	 * usage, so a job they consumed first is never billed here. `cancel` never
+	 * consumes; a cancelled job's partial usage is billed by the first `wait`
+	 * after its run settles (a `wait` issued while it is still settling blocks
+	 * on it). `jobs` listings never consume. Omitted when no consumed job
+	 * reported usage.
+	 */
+	usage?: Usage;
 }
 
 // =============================================================================

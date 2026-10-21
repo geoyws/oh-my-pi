@@ -14,25 +14,31 @@ import type { ExtensionAgentIdentity, ExtensionRunner } from "./extensibility/ex
 import { ExtensionToolWrapper } from "./extensibility/extensions";
 import type { GrepToolOptions, Tool, ToolSession } from "./tools";
 import { GrepTool } from "./tools";
+import { resolveSearchModes } from "./tools/search";
 
 /**
  * Build the bridge's `createGrepTool` factory for one tool session.
  *
  * A `pi_grep` frame carries its own context width and total match cap. Neither
- * is expressible in the model-facing `grep` schema — context comes from
+ * is expressible in the model-facing `search` schema — context comes from
  * `grep.contextBefore`/`grep.contextAfter`, fixed when the shared instance is
  * constructed — so honoring them needs a fresh tool per call.
  *
  * The result is wrapped exactly like a registry tool: the approval gate runs on
  * every call site, and a per-call instance is no exception. `agent` is the
  * `ctx.agent` its extension events report (see `ExtensionToolWrapper`).
+ *
+ * Returns `undefined` while `search` regex mode is off (`grep.enabled`), so
+ * the bridge falls back to the registry `search`, which refuses the call
+ * instead of a fresh tool running a search the session disabled.
  */
 export function createBridgeGrepFactory(
 	session: ToolSession,
 	extensionRunner: ExtensionRunner,
 	agent?: ExtensionAgentIdentity,
-): (options: GrepToolOptions) => AgentTool {
+): (options: GrepToolOptions) => AgentTool | undefined {
 	return options => {
+		if (!resolveSearchModes(session).includes("regex")) return undefined;
 		const grepTool: Tool = new GrepTool(session, options);
 		return new ExtensionToolWrapper(grepTool, extensionRunner, agent);
 	};

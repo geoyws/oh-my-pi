@@ -54,11 +54,9 @@ import { cfgIdaAvailable } from "../ida/install";
 import { EvalTool } from "./eval";
 import { resolveEvalBackends } from "./eval-backends";
 import { GithubTool } from "./gh";
-import { GlobTool } from "./glob";
-import { GrepTool } from "./grep";
+import { resolveSearchModes, SearchTool } from "./search";
 import { IdaTool } from "./ida";
 import { isIrcEnabled } from "../irc/messaging";
-import { FindTool, isFindEnabled } from "./jfind";
 import { LearnTool } from "./learn";
 import { ManageSkillTool } from "./manage-skill";
 import { MemoryEditTool } from "./memory-edit";
@@ -85,8 +83,6 @@ import {
 	cfgCheckpointEnabled,
 	cfgDebugEnabled,
 	cfgGithubEnabled,
-	cfgGlobEnabled,
-	cfgGrepEnabled,
 	cfgLaunchEnabled,
 	cfgSecurityEnabled,
 	cfgTodoEnabled,
@@ -565,9 +561,7 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	ida: IdaTool.createIf,
 	eval: s => new EvalTool(s),
 	github: GithubTool.createIf,
-	glob: s => new GlobTool(s, { rootPathAlias: true }),
-	grep: s => new GrepTool(s),
-	find: s => new FindTool(s),
+	search: SearchTool.createIf,
 	lsp: LspTool.createIf,
 	checkpoint: CheckpointTool.createIf,
 	rewind: RewindTool.createIf,
@@ -681,7 +675,7 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 		if (
 			cfgCompactionExperimentalContextManagement.get(session.settings) &&
 			requestedTools.includes("read") &&
-			requestedTools.includes("grep")
+			requestedTools.includes("search")
 		) {
 			if (!requestedTools.includes("context_notes")) requestedTools.push("context_notes");
 			if (!requestedTools.includes("new_context")) requestedTools.push("new_context");
@@ -690,7 +684,7 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 			requestedTools.push("goal");
 		}
 		if (
-			(requestedTools.includes("grep") && cfgAstGrepEnabled.get(session.settings)) ||
+			(requestedTools.includes("search") && cfgAstGrepEnabled.get(session.settings)) ||
 			(requestedTools.includes("edit") && cfgAstEditEnabled.get(session.settings))
 		) {
 			if (!requestedTools.includes("ast")) requestedTools.push("ast");
@@ -740,9 +734,7 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 		if (name === "ida") return cfgIdaAvailable.get(session.settings);
 		if (name === "todo")
 			return (!includeYield || session.prewalkArmed === true) && cfgTodoEnabled.get(session.settings);
-		if (name === "glob") return cfgGlobEnabled.get(session.settings);
-		if (name === "grep") return cfgGrepEnabled.get(session.settings);
-		if (name === "find") return isFindEnabled(session);
+		if (name === "search") return resolveSearchModes(session).length > 0;
 		if (name === "github") return cfgGithubEnabled.get(session.settings);
 		if (name === "ast") return cfgAstGrepEnabled.get(session.settings) || cfgAstEditEnabled.get(session.settings);
 		if (name === "web_search") return cfgWebSearchEnabled.get(session.settings);

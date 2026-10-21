@@ -2475,6 +2475,13 @@ export interface AgentProgress {
 	 * `extractedToolData.task` after that.
 	 */
 	inflightTaskDetails?: TaskToolDetails;
+	/**
+	 * Full cumulative usage breakdown for the run, set at completion (and
+	 * whenever a child reports one). Complements the scalar {@link tokens}
+	 * and {@link cost} counters with cacheRead/cacheWrite detail so callers
+	 * can compute cache-hit rates and billed cost exactly.
+	 */
+	usage?: Usage;
 }
 
 /** Result from a single agent execution */

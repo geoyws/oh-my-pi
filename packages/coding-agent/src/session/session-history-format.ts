@@ -190,15 +190,15 @@ function primaryArgText(name: string, args: Record<string, unknown> | undefined)
 		if (note) return note;
 		if (severity) return severity;
 	}
-	if (name === "grep") {
-		const pattern = primaryArgValue(args.pattern);
+	if (name === "search" || name === "grep") {
+		const pattern = primaryArgValue(args.pattern) || primaryArgValue(args.query);
 		const paths = primaryArgValue(args.path) || primaryArgValue(args.paths);
 		if (pattern && paths) return `${pattern} @ ${paths}`;
 		if (pattern) return pattern;
 		if (paths) return paths;
 	}
-	if (name === "glob") {
-		const paths = primaryArgValue(args.path) || primaryArgValue(args.paths);
+	if (name === "glob" || name === "find") {
+		const paths = primaryArgValue(args.path) || primaryArgValue(args.paths) || primaryArgValue(args.query);
 		if (paths) return paths;
 	}
 	if (name === "ast" || name === "ast_grep") {

@@ -292,7 +292,7 @@ describe("seance cold restore", () => {
 			await expect(restoreSeanceSession({ init, cwd, modelRegistry })).resolves.toEqual({
 				cwd,
 				modelPattern: "anthropic/claude-sonnet-4-5",
-				toolNames: ["read", "grep", "yield"],
+				toolNames: ["read", "search", "yield"],
 			});
 			await expect(
 				restoreSeanceSession({ init: { ...init, tools: ["grep", "glob", "yield"] }, cwd, modelRegistry }),

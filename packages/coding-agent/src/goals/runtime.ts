@@ -121,6 +121,14 @@ export class GoalRuntime {
 	#wallClock: GoalWallClockSnapshot;
 	#budgetReportedFor: string | undefined;
 	#accountingTail: Promise<void> = Promise.resolve();
+	/**
+	 * Set when a user interrupt begins (Esc, steer abort, abort-and-prompt) and by a cold thread
+	 * resume. Goal status stays `active`; only auto-continuation is held until
+	 * `rearmContinuation()` (next user message, `/goal resume`) or a new goal. In memory only.
+	 */
+	#continuationSuppressed = false;
+	/** Bumped on every turn start so an abort can tell whether a newer turn began while it unwound. */
+	#turnGeneration = 0;
 
 	constructor(host: GoalRuntimeHost) {
 		this.#host = host;
@@ -135,6 +143,20 @@ export class GoalRuntime {
 			wallClock: { ...this.#wallClock },
 			budgetReportedFor: this.#budgetReportedFor,
 		};
+	}
+
+	/** True while auto-continuation is held after an interrupt or cold resume. */
+	get continuationSuppressed(): boolean {
+		return this.#continuationSuppressed;
+	}
+
+	/**
+	 * Re-arms auto-continuation after an interrupt or cold resume. Called when a user-authored
+	 * message enters the transcript (typed prompt, flushed steer, follow-up, abort-and-prompt)
+	 * and by `/goal resume` on a goal that is still `active` but waiting for input.
+	 */
+	rearmContinuation(): void {
+		this.#continuationSuppressed = false;
 	}
 
 	#now(): number {
@@ -200,9 +222,11 @@ export class GoalRuntime {
 		this.#turnSnapshot = undefined;
 		this.#clearActiveAccounting();
 		this.#budgetReportedFor = undefined;
+		this.#continuationSuppressed = false;
 	}
 
 	onTurnStart(turnId: string, baselineUsage: GoalTokenUsage): void {
+		this.#turnGeneration++;
 		this.#turnSnapshot = { turnId, baselineUsage: { ...baselineUsage } };
 		const state = this.#host.getState();
 		if (state?.enabled && isAccountingStatus(state.goal)) {
@@ -241,38 +265,65 @@ export class GoalRuntime {
 		this.#turnSnapshot = undefined;
 	}
 
-	async onTaskAborted(options?: { reason?: "interrupted" | "internal" }): Promise<void> {
+	/**
+	 * Called synchronously when an abort starts, before any await. An interrupt never pauses the
+	 * goal: new user instructions (queued steer flushed by Enter, Esc followed by a message, RPC
+	 * abort_and_prompt) must leave it `active` so it continues after the steered turn. A user
+	 * interrupt only holds auto-continuation; holding here, not when the abort finishes, lets a
+	 * user message that starts while the abort is still unwinding re-arm it. Returns the turn
+	 * generation to hand back to `onTaskAborted`.
+	 */
+	beginTaskAbort(options?: { reason?: "interrupted" | "internal" }): number {
+		if (options?.reason !== "internal") {
+			this.holdContinuation();
+		}
+		return this.#turnGeneration;
+	}
+
+	/**
+	 * Bare Esc with no turn to abort (idle, continuation pending): same hold as an interrupt.
+	 * Status stays `active`; `rearmContinuation()` releases it.
+	 */
+	holdContinuation(): void {
+		this.#continuationSuppressed = true;
+	}
+
+	/**
+	 * Accounts the aborted turn once the agent is idle. Tokens spent so far still count. When
+	 * `turnGeneration` (from `beginTaskAbort`) is stale, a newer turn started during the abort;
+	 * its snapshot belongs to that turn and is left for its own tool/agent-end flushes.
+	 * Only explicit pause paths call `pauseGoal()`.
+	 */
+	async onTaskAborted(options?: { reason?: "interrupted" | "internal"; turnGeneration?: number }): Promise<void> {
+		if (options?.turnGeneration !== undefined && options.turnGeneration !== this.#turnGeneration) return;
 		const state = this.#host.getState();
-		const needsAccounting = state?.enabled && isAccountingStatus(state.goal);
-		const needsPause = options?.reason === "interrupted" && state?.enabled && state.goal.status === "active";
-		if (!needsAccounting && !needsPause) {
+		if (!state?.enabled || !isAccountingStatus(state.goal)) {
 			this.#turnSnapshot = undefined;
 			return;
 		}
 		await this.#withAccounting(async () => {
 			await this.#flushUsageLocked("suppressed", undefined, options?.reason === "internal");
 			this.#turnSnapshot = undefined;
-			if (options?.reason !== "interrupted") return;
-			const cloned = this.#getStateClone();
-			if (!cloned?.enabled || cloned.goal.status !== "active") return;
-			cloned.enabled = false;
-			cloned.goal.status = "paused";
-			cloned.goal.updatedAt = this.#now();
-			this.#clearActiveAccounting();
-			this.#budgetReportedFor = undefined;
-			await this.#commitState(cloned, { persist: "goal_paused" });
 		});
 	}
 
 	async onThreadResumed(options?: { preserveActiveGoal?: boolean }): Promise<GoalModeState | undefined> {
 		const state = this.#getStateClone();
 		if (!state) return undefined;
-		if (options?.preserveActiveGoal && state.enabled && state.goal.status === "active") {
+		if (state.enabled && state.goal.status === "active") {
+			if (!options?.preserveActiveGoal) {
+				// Cold resume keeps an active goal active (resuming must not silently pause it), but
+				// does not auto-continue: the operator may be reopening the session to read or
+				// redirect it. Continuation re-arms on the next user message or `/goal resume`.
+				// Internal session switches (`preserveActiveGoal`) keep continuing as before.
+				this.#continuationSuppressed = true;
+			}
 			this.#markActiveAccounting(state.goal, true);
 			await this.#commitState(state, { emit: true });
 			return state;
 		}
 		if (state.goal.status === "active") {
+			// Persisted as `goal_paused` but still marked active: normalize to the paused status.
 			state.enabled = false;
 			state.goal.status = "paused";
 			state.goal.updatedAt = this.#now();
@@ -401,6 +452,7 @@ export class GoalRuntime {
 			}
 			const state = this.#createGoalState(objective, input.tokenBudget);
 			this.#budgetReportedFor = undefined;
+			this.#continuationSuppressed = false;
 			this.#markActiveAccounting(state.goal);
 			await this.#commitState(state, { persist: "goal" });
 			return state;
@@ -419,6 +471,7 @@ export class GoalRuntime {
 			await this.#flushUsageLocked("suppressed");
 			const state = this.#createGoalState(objective, input.tokenBudget);
 			this.#budgetReportedFor = undefined;
+			this.#continuationSuppressed = false;
 			this.#markActiveAccounting(state.goal);
 			await this.#commitState(state, { persist: "goal" });
 			return state;
@@ -436,6 +489,7 @@ export class GoalRuntime {
 			state.goal.status = "active";
 			state.goal.updatedAt = this.#now();
 			this.#budgetReportedFor = undefined;
+			this.#continuationSuppressed = false;
 			this.#markActiveAccounting(state.goal);
 			await this.#commitState(state, { persist: "goal" });
 			return state;
@@ -511,9 +565,10 @@ export class GoalRuntime {
 			: undefined;
 	}
 
+	/** Undefined unless the goal is enabled, `active`, and not held by an interrupt or cold resume. */
 	buildContinuationPrompt(): string | undefined {
 		const state = this.#host.getState();
-		return state?.enabled && state.goal.status === "active"
+		return state?.enabled && state.goal.status === "active" && !this.#continuationSuppressed
 			? renderGoalPrompt("continuation", state.goal)
 			: undefined;
 	}

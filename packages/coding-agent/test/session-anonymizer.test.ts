@@ -367,6 +367,33 @@ describe("SessionAnonymizer", () => {
 		expect(anonymizer.command("grep -ecustomer=secret file")).not.toMatch(/customer|secret/);
 	});
 
+	test("keeps a legacy grep call's own argument schema instead of the merged search schema", () => {
+		const anonymizer = new SessionAnonymizer();
+		// `glob` and `context#` exist only in the pre-merge grep schema.
+		const [legacy, merged] = ["grep", "search"].map(name =>
+			JSON.stringify(
+				anonymizer.entry({
+					type: "message",
+					message: {
+						role: "assistant",
+						content: [
+							{
+								type: "toolCall",
+								id: "toolu_01abcdef",
+								name,
+								arguments: { pattern: "needle", glob: "*.ts", context: 3 },
+							},
+						],
+					},
+				}),
+			),
+		);
+		expect(legacy).toContain('"glob":');
+		expect(legacy).toContain('"context":3');
+		expect(merged).not.toContain('"glob":');
+		expect(merged).not.toContain('"context":3');
+	});
+
 	test("projects execution-log entries onto their schema, since extensions can spoof the custom type", () => {
 		const anonymizer = new SessionAnonymizer();
 		const json = JSON.stringify(

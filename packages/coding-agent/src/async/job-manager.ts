@@ -1,6 +1,6 @@
-import type { ImageContent } from "@oh-my-pi/pi-ai";
+import type { ImageContent, Usage } from "@oh-my-pi/pi-ai";
 import type { PipeStreams } from "@oh-my-pi/pi-natives";
-import { logger } from "@oh-my-pi/pi-utils";
+import { isRecord, logger } from "@oh-my-pi/pi-utils";
 import type { StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import type { OutputMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
 import type { JobWidgetInputs, JobWidgetRegistry } from "../job-widgets/types";
@@ -137,6 +137,77 @@ export interface AsyncJob {
 	 * outlive the job row it was kept alive for.
 	 */
 	retainedArtifactsCleanup?: () => Promise<void>;
+}
+
+function isFiniteNumber(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value);
+}
+
+function isUsage(value: unknown): value is Usage {
+	if (!isRecord(value) || !isRecord(value.cost)) return false;
+	const cost = value.cost;
+	return (
+		isFiniteNumber(value.input) &&
+		isFiniteNumber(value.output) &&
+		isFiniteNumber(value.cacheRead) &&
+		isFiniteNumber(value.cacheWrite) &&
+		isFiniteNumber(value.totalTokens) &&
+		isFiniteNumber(cost.input) &&
+		isFiniteNumber(cost.output) &&
+		isFiniteNumber(cost.cacheRead) &&
+		isFiniteNumber(cost.cacheWrite) &&
+		isFiniteNumber(cost.total)
+	);
+}
+
+/**
+ * Child model usage a task job's body published on its own `AgentProgress`
+ * row in {@link AsyncJob.latestDetails}: live while running, final once the
+ * run settles (partial for failed/cancelled runs). The row is matched by the
+ * job's agent id only — a batch's details also carry every sibling spawn's
+ * progress and the batch's inline (sync) aggregate `usage`, neither of which
+ * belongs to this job.
+ */
+export function asyncJobUsage(job: Pick<AsyncJob, "type" | "id" | "agentId" | "latestDetails">): Usage | undefined {
+	if (job.type !== "task") return undefined;
+	const progress = job.latestDetails?.progress;
+	if (!Array.isArray(progress)) return undefined;
+	const agentId = job.agentId ?? job.id;
+	for (const row of progress) {
+		if (!isRecord(row) || row.id !== agentId) continue;
+		return isUsage(row.usage) ? row.usage : undefined;
+	}
+	return undefined;
+}
+
+/**
+ * Sum per-job usages into one billed total (token buckets and cost). Returns
+ * undefined for an empty list so callers omit the field instead of reporting
+ * a fabricated zero.
+ */
+export function sumJobUsage(usages: readonly Usage[]): Usage | undefined {
+	if (usages.length === 0) return undefined;
+	const total: Usage = {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+	for (const usage of usages) {
+		total.input += usage.input;
+		total.output += usage.output;
+		total.cacheRead += usage.cacheRead;
+		total.cacheWrite += usage.cacheWrite;
+		total.totalTokens += usage.totalTokens;
+		total.cost.input += usage.cost.input;
+		total.cost.output += usage.cost.output;
+		total.cost.cacheRead += usage.cost.cacheRead;
+		total.cost.cacheWrite += usage.cost.cacheWrite;
+		total.cost.total += usage.cost.total;
+	}
+	return total;
 }
 
 /**

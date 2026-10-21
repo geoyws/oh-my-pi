@@ -320,7 +320,7 @@ Only after work capable of appending session entries has settled does disposal c
 
 ```ts
 const { session } = await createAgentSession({
-  toolNames: ["read", "grep", "glob", "write"],
+  toolNames: ["read", "search", "write"],
   restrictToolNames: true,
   requireYieldTool: true,
 });
@@ -460,7 +460,7 @@ const { session } = await createAgentSession({
   modelRegistry,
   settings,
   sessionManager: SessionManager.inMemory(),
-  toolNames: ["read", "grep", "glob", "edit", "write"],
+  toolNames: ["read", "search", "edit", "write"],
   restrictToolNames: true,
   enableMCP: false,
   enableLsp: true,

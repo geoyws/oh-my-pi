@@ -92,6 +92,8 @@ import type { ReadonlySessionManager, SessionManager } from "../../session/sessi
 import type { BashToolInput, GlobToolInput, GrepToolInput, ReadToolInput, WriteToolInput } from "../../tools";
 import type { GlobToolDetails } from "@oh-my-pi/pi-tui/tools/glob";
 import type { GrepToolDetails } from "@oh-my-pi/pi-tui/tools/grep";
+import type { SearchToolDetails } from "@oh-my-pi/pi-tui/tools/search";
+import type { SearchToolParams } from "../../tools/search";
 import type { ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
 import type { ApprovalMode } from "../../tools/approval";
 import type { BashToolDetails } from "@oh-my-pi/pi-tui/tools/bash";
@@ -1389,6 +1391,12 @@ export interface WriteToolCallEvent extends ToolCallEventBase {
 	input: WriteToolInput;
 }
 
+export interface SearchToolCallEvent extends ToolCallEventBase {
+	toolName: "search";
+	input: SearchToolParams;
+}
+
+/** Pre-merge `grep`; still emitted by tools registered under that name (Cursor per-call grep, legacy pi shims). */
 export interface GrepToolCallEvent extends ToolCallEventBase {
 	toolName: "grep";
 	input: GrepToolInput;
@@ -1410,6 +1418,7 @@ export type ToolCallEvent =
 	| ReadToolCallEvent
 	| EditToolCallEvent
 	| WriteToolCallEvent
+	| SearchToolCallEvent
 	| GrepToolCallEvent
 	| GlobToolCallEvent
 	| CustomToolCallEvent;
@@ -1442,6 +1451,11 @@ export interface WriteToolResultEvent extends ToolResultEventBase {
 	details: undefined;
 }
 
+export interface SearchToolResultEvent extends ToolResultEventBase {
+	toolName: "search";
+	details: SearchToolDetails | undefined;
+}
+
 export interface GrepToolResultEvent extends ToolResultEventBase {
 	toolName: "grep";
 	details: GrepToolDetails | undefined;
@@ -1463,6 +1477,7 @@ export type ToolResultEvent =
 	| ReadToolResultEvent
 	| EditToolResultEvent
 	| WriteToolResultEvent
+	| SearchToolResultEvent
 	| GrepToolResultEvent
 	| GlobToolResultEvent
 	| CustomToolResultEvent;
@@ -1491,6 +1506,7 @@ export function isToolCallEventType(toolName: "bash", event: ToolCallEvent): eve
 export function isToolCallEventType(toolName: "read", event: ToolCallEvent): event is ReadToolCallEvent;
 export function isToolCallEventType(toolName: "edit", event: ToolCallEvent): event is EditToolCallEvent;
 export function isToolCallEventType(toolName: "write", event: ToolCallEvent): event is WriteToolCallEvent;
+export function isToolCallEventType(toolName: "search", event: ToolCallEvent): event is SearchToolCallEvent;
 export function isToolCallEventType(toolName: "grep", event: ToolCallEvent): event is GrepToolCallEvent;
 export function isToolCallEventType(toolName: "glob", event: ToolCallEvent): event is GlobToolCallEvent;
 export function isToolCallEventType<TName extends string, TInput extends Record<string, unknown>>(
