@@ -13,7 +13,7 @@ import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 
 import { cfgBashEnabled } from "@oh-my-pi/pi-coding-agent/exec/settings";
-import { cfgGithubEnabled, cfgGrepEnabled } from "@oh-my-pi/pi-coding-agent/tools/settings";
+import { cfgFindEnabled, cfgGithubEnabled, cfgGrepEnabled } from "@oh-my-pi/pi-coding-agent/tools/settings";
 
 // Tool-gating settings (`grep.enabled`, `*.enabled`, ...) must reconcile a live
 // session's tools and prompt instead of waiting for the next session.
@@ -69,6 +69,7 @@ describe("settings-gated tools in a live session", () => {
 	}
 
 	const GREP_POLICY = "NEVER shell `grep`/`rg`/`awk`";
+	const SEMANTIC_POLICY = "semantic mode FIRST";
 
 	it("removes and restores regex mode in the request tools and system prompt", async () => {
 		const settings = Settings.isolated({});
@@ -87,11 +88,33 @@ describe("settings-gated tools in a live session", () => {
 		const searchAfter = session.getToolByName("search");
 		expect(searchAfter).toBeDefined();
 		expect(JSON.stringify(toolWireSchema(searchAfter as never))).not.toContain('"pattern"');
+		// Regex guidance leaves the prompt with the mode; glob guidance stays.
+		expect(session.systemPrompt.join("\n")).not.toContain(GREP_POLICY);
+		expect(session.systemPrompt.join("\n")).toContain("glob mode");
 		expect(session.getActiveToolNames()).toContain("read");
 
 		cfgGrepEnabled.set(settings, true);
 		await settle(session);
 		expect(JSON.stringify(toolWireSchema(session.getToolByName("search") as never))).toContain('"pattern"');
+		expect(session.systemPrompt.join("\n")).toContain(GREP_POLICY);
+	});
+
+	it("advertises semantic guidance only while semantic mode is available", async () => {
+		// Seeded through `set`: isolated constructor overrides would pin the value.
+		const settings = Settings.isolated({});
+		cfgFindEnabled.set(settings, "off");
+		const session = await startSession(settings);
+		expect(session.getActiveToolNames()).toContain("search");
+		expect(session.systemPrompt.join("\n")).not.toContain(SEMANTIC_POLICY);
+		expect(session.getToolByName("search")?.description).not.toContain('mode: "semantic"');
+
+		cfgFindEnabled.set(settings, "on");
+		await settle(session);
+		expect(session.systemPrompt.join("\n")).toContain(SEMANTIC_POLICY);
+
+		cfgFindEnabled.set(settings, "off");
+		await settle(session);
+		expect(session.systemPrompt.join("\n")).not.toContain(SEMANTIC_POLICY);
 	});
 
 	it("never widens an explicit tool list", async () => {

@@ -85,10 +85,20 @@ export function searchCallMode(args: unknown): SearchMode {
 	return "glob";
 }
 
+/**
+ * Multi-mode schemas by mode list. Shared across instances so sessions with the
+ * same modes advertise the identical schema object, as the single-mode
+ * constants already do (a subagent then presents its parent's exact tools).
+ */
+const multiModeSchemas = new Map<string, typeof searchSchema>();
+
 function buildSearchSchema(modes: readonly SearchMode[]): typeof searchSchema {
 	if (modes.length === 1 && modes[0] === "regex") return regexOnlySchema as unknown as typeof searchSchema;
 	if (modes.length === 1 && modes[0] === "glob") return globOnlySchema as unknown as typeof searchSchema;
 	if (modes.length === 1 && modes[0] === "semantic") return semanticOnlySchema as unknown as typeof searchSchema;
+	const key = modes.join(",");
+	const cached = multiModeSchemas.get(key);
+	if (cached) return cached;
 	// Multi-mode: advertise only the available modes' fields, so a disabled
 	// mode's parameters never reach the wire.
 	const fields: Record<string, unknown> = {
@@ -113,7 +123,9 @@ function buildSearchSchema(modes: readonly SearchMode[]): typeof searchSchema {
 		fields["query?"] = "string";
 		fields["grep_keywords?"] = "string[]";
 	}
-	return type(fields) as unknown as typeof searchSchema;
+	const schema = type(fields) as unknown as typeof searchSchema;
+	multiModeSchemas.set(key, schema);
+	return schema;
 }
 
 /**
@@ -126,6 +138,16 @@ export function resolveSearchModes(session: ToolSession): SearchMode[] {
 	if (cfgGlobEnabled.get(session.settings)) modes.push("glob");
 	if (isFindEnabled(session)) modes.push("semantic");
 	return modes;
+}
+
+/**
+ * Modes the model can call this turn: none when `search` is not in the active
+ * tool set, else {@link resolveSearchModes}. Sessions without an active-tool
+ * predicate (bare SDK `ToolSession`s) fall back to the settings alone.
+ */
+export function activeSearchModes(session: ToolSession): SearchMode[] {
+	if (session.isToolActive?.("search") === false) return [];
+	return resolveSearchModes(session);
 }
 
 const LEGACY_POLICY_KEYS: Record<SearchMode, string> = { regex: "grep", glob: "glob", semantic: "find" };
@@ -239,8 +261,8 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 		_toolCallId: string,
 		params: SearchToolParams,
 		signal?: AbortSignal,
-		_onUpdate?: AgentToolUpdateCallback<SearchToolDetails>,
-		_context?: AgentToolContext,
+		onUpdate?: AgentToolUpdateCallback<SearchToolDetails>,
+		context?: AgentToolContext,
 	): Promise<AgentToolResult<SearchToolDetails>> {
 		const modes = resolveSearchModes(this.session);
 		const mode = searchCallMode(params);
@@ -266,6 +288,8 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 					skip: params.skip,
 				},
 				signal,
+				onUpdate,
+				context,
 			) as Promise<AgentToolResult<SearchToolDetails>>;
 		}
 		if (mode === "glob") {
@@ -283,6 +307,8 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 					limit: params.limit,
 				},
 				signal,
+				onUpdate,
+				context,
 			) as Promise<AgentToolResult<SearchToolDetails>>;
 		}
 		if (params.pattern !== undefined) {
@@ -299,6 +325,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 				path: params.path,
 			},
 			signal,
+			onUpdate,
 		) as Promise<AgentToolResult<SearchToolDetails>>;
 	}
 }

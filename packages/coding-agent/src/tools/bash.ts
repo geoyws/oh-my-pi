@@ -44,7 +44,7 @@ import { canUseInteractiveBashPty } from "./bash-pty-selection";
 import { resolveEvalBackends } from "./eval-backends";
 import { invalidateGithubCacheForBashCommand } from "./gh-cache-invalidation";
 import { serviceLogs, startService, type ServiceReady } from "../launch/services";
-import { isFindEnabled } from "./jfind";
+import { activeSearchModes, resolveSearchModes } from "./search";
 import { formatArtifactErrorNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { formatOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { resolveInlineByteCapBudget } from "./output-meta";
@@ -59,8 +59,6 @@ import {
 	cfgAstEditEnabled,
 	cfgAstGrepEnabled,
 	cfgAsyncEnabled,
-	cfgGlobEnabled,
-	cfgGrepEnabled,
 	cfgLaunchEnabled,
 	cfgToolsMaxTimeout,
 } from "./settings";
@@ -604,6 +602,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	get description(): string {
 		const evalBackends = resolveEvalBackends(this.session);
 		const isToolActive = (name: string, fallback: boolean): boolean => this.session.isToolActive?.(name) ?? fallback;
+		const searchModes = activeSearchModes(this.session);
 		return prompt.render(bashDescription, {
 			asyncEnabled: cfgAsyncEnabled.get(this.session.settings),
 			// The deadline an omitted `timeout` resolves to, after the `tools.maxTimeout` cap.
@@ -612,9 +611,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			autoBackgroundSeconds: cfgBashAutoBackgroundThresholdMs.get(this.session.settings) / 1000,
 			hasAstGrep: isToolActive("ast", cfgAstGrepEnabled.get(this.session.settings)),
 			hasAstEdit: isToolActive("ast", cfgAstEditEnabled.get(this.session.settings)),
-			hasGrep: isToolActive("search", cfgGrepEnabled.get(this.session.settings)),
-			hasGlob: isToolActive("search", cfgGlobEnabled.get(this.session.settings)),
-			hasFind: this.session.isToolActive?.("search") ?? isFindEnabled(this.session),
+			hasGrep: searchModes.includes("regex"),
+			hasGlob: searchModes.includes("glob"),
+			hasFind: searchModes.includes("semantic"),
 			hasRead: isToolActive("read", true),
 			// Frozen at the last prompt rebuild (managed sessions). SDK consumers
 			// building a bare ToolSession lack the rebuild lifecycle, so fall back
@@ -1040,7 +1039,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				.filter(rule => !name || rule.tool !== "bash");
 			const commandsToCheck = rawCommand === command ? [command] : [rawCommand, command];
 			for (const commandToCheck of commandsToCheck) {
-				const interception = checkBashInterception(commandToCheck, ctx?.toolNames ?? [], rules, rawCommand);
+				const interception = checkBashInterception(commandToCheck, ctx?.toolNames ?? [], rules, rawCommand, {
+					search: resolveSearchModes(this.session),
+				});
 				if (interception.block) {
 					throw new ToolError(interception.message ?? "Command blocked");
 				}

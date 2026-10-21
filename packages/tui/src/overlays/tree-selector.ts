@@ -1230,6 +1230,19 @@ class TreeList implements Component {
 					.slice(0, 50);
 				return `[bash: ${cmd}${rawCmd.length > 50 ? "..." : ""}]`;
 			}
+			case "search": {
+				// Same mode rule as coding-agent `searchCallMode`.
+				const mode =
+					args.mode ?? (args.query !== undefined ? "semantic" : args.pattern !== undefined ? "regex" : "glob");
+				if (mode === "semantic") {
+					const query = String(args.query || "")
+						.replace(/\s+/g, " ")
+						.trim();
+					return `[search: "${query.slice(0, 50)}${query.length > 50 ? "..." : ""}"]`;
+				}
+				// Regex and glob render as their pre-merge tools, relabelled.
+				return `[search:${this.#formatToolCall(mode === "regex" ? "grep" : "glob", args).replace(/^\[\w+:/, "")}`;
+			}
 			case "grep": {
 				const pattern = String(args.pattern || "");
 				const searchPathsInput =

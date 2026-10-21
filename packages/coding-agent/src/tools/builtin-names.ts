@@ -1,3 +1,5 @@
+import type { SearchMode } from "./search";
+
 export const BUILTIN_TOOL_NAMES = [
 	"read",
 	"bash",
@@ -41,6 +43,18 @@ const LEGACY_BUILTIN_TOOL_NAME_ALIASES: ReadonlyMap<string, BuiltinToolName> = n
 	["glob", "search"],
 	["find", "search"],
 ]);
+
+/** `search` mode that replaced each pre-merge search tool name (`grep`, `glob`, `find`). */
+export const LEGACY_SEARCH_TOOL_MODES: Readonly<Record<string, SearchMode>> = {
+	grep: "regex",
+	glob: "glob",
+	find: "semantic",
+};
+
+/** The `search` mode a pre-merge search tool name maps to, or `undefined` for any other name. */
+export function legacySearchToolMode(name: string): SearchMode | undefined {
+	return Object.hasOwn(LEGACY_SEARCH_TOOL_MODES, name) ? LEGACY_SEARCH_TOOL_MODES[name] : undefined;
+}
 
 const CANONICAL_TOOL_NAMES: Record<string, true> = Object.fromEntries(
 	[...BUILTIN_TOOL_NAMES, ...HIDDEN_TOOL_NAMES].map(name => [name, true]),

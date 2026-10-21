@@ -39,6 +39,10 @@ export const toolRenderers: Record<string, ToolRenderer> = {
 	edit: editToolRenderer,
 	apply_patch: editToolRenderer,
 	search: searchToolRenderer,
+	// Pre-merge names, so transcripts recorded before `search` still render.
+	find: searchToolRenderer,
+	glob: searchToolRenderer,
+	grep: searchToolRenderer,
 	lsp: lspToolRenderer,
 	wait: waitToolRenderer,
 	read: readToolRenderer,

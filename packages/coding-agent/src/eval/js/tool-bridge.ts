@@ -3,6 +3,7 @@ import { type ImageContent, toolWireSchema } from "@oh-my-pi/pi-ai";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import type { ToolSession } from "../../tools";
+import { searchCallMode } from "../../tools/search";
 import { committedTodoPhases } from "../../tools/todo";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { schemaDeclaresIntentField } from "../../utils/tool-schema";
@@ -116,20 +117,24 @@ const summarizeToolResult: StatusSummarizer = (name, args, result, text, hasErro
 				path: record.path,
 				chars: typeof record.content === "string" ? record.content.length : 0,
 			});
-		case "grep":
+		case "search": {
+			const mode = searchCallMode(record);
+			if (mode === "semantic") return withError({ op: "find", query: record.query, chars: text.length });
+			if (mode === "glob") {
+				return withError({
+					op: "glob",
+					pattern: record.path,
+					count: details.fileCount ?? undefined,
+					matches: Array.isArray(details.files) ? details.files.slice(0, 20) : undefined,
+				});
+			}
 			return withError({
 				op: "grep",
 				pattern: record.pattern,
 				path: record.path,
 				count: details.matchCount ?? undefined,
 			});
-		case "glob":
-			return withError({
-				op: "glob",
-				pattern: record.pattern,
-				count: details.fileCount ?? undefined,
-				matches: Array.isArray(details.files) ? details.files.slice(0, 20) : undefined,
-			});
+		}
 		case "bash":
 			return withError({
 				op: "run",

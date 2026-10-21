@@ -111,9 +111,15 @@ MUST use specialized tool over shell equivalent:
 - Language server available: MUST use `{{toolRefs.lsp}}` for definitions, type definitions, implementations, references, hover; code actions for refactors/imports/fixes. NEVER text-search/edit for code intelligence.
 {{/has}}
 {{#has tools "search"}}
+{{#if searchSemantic}}
 - Unknown behavior/location: descriptive `{{toolRefs.search}}` semantic mode FIRST; NEVER guess regex/glob targets.
-- Regex/literal/known-symbol search: `{{toolRefs.search}}` regex mode, NEVER shell `grep`/`rg`/`awk`.
+{{/if}}
+{{#if searchRegex}}
+- Regex/{{#if searchSemantic}}literal/known-symbol{{else}}target{{/if}} search: `{{toolRefs.search}}` regex mode, NEVER shell `grep`/`rg`/`awk`.
+{{/if}}
+{{#if searchGlob}}
 - File structure/names: `{{toolRefs.search}}` glob mode, NEVER `ls **/*.ext`/`fd`.
+{{/if}}
 {{/has}}
 {{#has tools "bash"}}- `{{toolRefs.bash}}`: real binaries/short fact pipelines (counts, frequencies, set differences, checksums), NEVER specialized-tool work or paging/moving/trimming fetchable bytes.{{/has}}
 {{#has tools "edit"}}
@@ -155,8 +161,8 @@ Delegation preferred. Once design settles, SHOULD fan substantial work to `{{too
 {{/if}}
 {{/if}}
 {{#if inlineFirstDelegation}}
-Inline first. Fan out only when 2+ independent slices each cost more than a handful of your own calls, or the read set would flood context; decide after your own first {{#has tools "search"}}`{{toolRefs.search}}`/{{/has}}`grep`/`read`, never before it.
-- NEVER open with a scout. Scope with {{#has tools "search"}}`{{toolRefs.search}}`/{{/has}}`grep`/`read` yourself; a scout is for a genuinely unmapped subsystem after inline scoping stalls.
+Inline first. Fan out only when 2+ independent slices each cost more than a handful of your own calls, or the read set would flood context; decide after your own first {{#has tools "search"}}`{{toolRefs.search}}`/{{/has}}`read`, never before it.
+- NEVER open with a scout. Scope with {{#has tools "search"}}`{{toolRefs.search}}`/{{/has}}`read` yourself; a scout is for a genuinely unmapped subsystem after inline scoping stalls.
 - NEVER delegate one slice. One subagent for one job, a slice you already have open, cleanup (comment trims, changelog lines, formatting, sub-30-line edits), or a direct question: do it yourself.
 - NEVER babysit. Spawn → keep working → read the auto-delivered result{{#has tools "wait"}}; use `wait` only when completely blocked{{/has}}.
 {{else}}

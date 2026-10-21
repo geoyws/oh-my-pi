@@ -8,10 +8,12 @@ import { grepRenderer } from "./grep";
 /** Mirrors coding-agent `searchCallMode`; semantic and glob share the glob renderer here. */
 function modeRenderer(props: ToolRenderProps): ToolRenderer {
 	const { mode, pattern, query } = props.args;
+	const details = detailsRecord(props.result);
 	const isRegex =
 		mode === "regex" ||
 		(mode === undefined && query === undefined && pattern !== undefined) ||
-		detailsRecord(props.result)?.fileMatches !== undefined;
+		details?.fileMatches !== undefined ||
+		details?.matchCount !== undefined;
 	return isRegex ? grepRenderer : globRenderer;
 }
 

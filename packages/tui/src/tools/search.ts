@@ -22,11 +22,13 @@ function callMode(args: SearchRenderArgs | undefined): "regex" | "glob" | "seman
 	return "glob";
 }
 
-function detailsMode(details: SearchToolDetails | undefined): "regex" | "glob" | "semantic" | undefined {
+/** Mode a result payload proves; `undefined` when only the call args can tell (e.g. an error-only payload). */
+function detailsMode(details: SearchToolDetails | undefined): "regex" | "semantic" | undefined {
 	if (details === undefined) return undefined;
 	if ("hits" in details) return "semantic";
-	if ("fileMatches" in details) return "regex";
-	return "glob";
+	// Only regex results count matches or carry a match preview.
+	if ("fileMatches" in details || "matchCount" in details || "displayContent" in details) return "regex";
+	return undefined;
 }
 
 /** Render `search` calls through the matching mode renderer. */

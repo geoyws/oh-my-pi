@@ -13,6 +13,7 @@ import { evalRenderer } from "./tools/eval";
 import { fetchRenderer } from "./tools/fetch";
 import { generateImageRenderer } from "./tools/generate-image";
 import { githubRenderer } from "./tools/github";
+import { goalRenderer } from "./tools/goal";
 import { searchRenderer } from "./tools/search";
 import { waitRenderer } from "./tools/wait";
 import { lspRenderer } from "./tools/lsp";
@@ -45,6 +46,10 @@ const RENDERERS: Record<string, ToolRenderer> = {
 	fetch: fetchRenderer,
 	generate_image: generateImageRenderer,
 	github: githubRenderer,
+	// Pre-merge names, so transcripts recorded before `search` still render.
+	glob: searchRenderer,
+	find: searchRenderer,
+	grep: searchRenderer,
 	goal: goalRenderer,
 	wait: waitRenderer,
 	lsp: lspRenderer,
