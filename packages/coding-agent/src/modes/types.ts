@@ -382,12 +382,14 @@ export interface InteractiveModeContext {
 	 * dropped (a plan-origin one stays) and the status line already says so.
 	 * `statusPrefix` leads the queued/cancelled status line, so a caller that
 	 * also records something (the hub's role write) states both in one line.
+	 * `thinkingLevel`: the level `apply` configures, if it sets one; a replay
+	 * that finds the session already on `target` applies only that.
 	 */
 	routeUserModelSwitch(
 		session: AgentSession,
 		target: Model,
 		apply: () => Promise<boolean>,
-		options?: { role?: string; statusPrefix?: string },
+		options?: { role?: string; statusPrefix?: string; thinkingLevel?: ConfiguredThinkingLevel },
 	): "apply" | "queued" | "cancelled";
 	/** The user model switch waiting for the running turn to settle, if any. */
 	readonly pendingUserModelSwitch: { model: Model; role?: string } | undefined;

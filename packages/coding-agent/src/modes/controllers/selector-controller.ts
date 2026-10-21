@@ -818,7 +818,7 @@ export class SelectorController {
 			return switched;
 		};
 		// Mid-turn on the main session: hold the whole pick (compaction included) until the turn settles.
-		if (this.ctx.routeUserModelSwitch(target, model, () => run(switchModel)) !== "apply") return;
+		if (this.ctx.routeUserModelSwitch(target, model, () => run(switchModel), { thinkingLevel }) !== "apply") return;
 		await run(apply);
 	}
 
@@ -906,6 +906,7 @@ export class SelectorController {
 						};
 						const outcome = this.ctx.routeUserModelSwitch(target, entry.model, applyRole, {
 							role: entry.role,
+							thinkingLevel: entry.explicitThinkingLevel ? entry.thinkingLevel : undefined,
 						});
 						if (outcome === "apply") await applyRole();
 						this.ctx.showModelCycleTrack(
@@ -1039,6 +1040,12 @@ export class SelectorController {
 							} else {
 								const session = this.ctx.session;
 								const roleThinking = isAuto ? ThinkingLevel.Inherit : concreteThinking;
+								// The thinking level the live session takes on with this assignment.
+								const liveThinking = isAuto
+									? AUTO_THINKING
+									: concreteThinking && concreteThinking !== ThinkingLevel.Inherit
+										? concreteThinking
+										: undefined;
 								// Live half of the commit: switch the running model (and its thinking)
 								// without persisting. Runs under the default-role mutation lock even
 								// when it fires later, at the turn's settle.
@@ -1051,10 +1058,7 @@ export class SelectorController {
 											persist: false,
 										});
 										if (!switched) return false;
-										if (isAuto) session.setThinkingLevel(AUTO_THINKING);
-										else if (concreteThinking && concreteThinking !== ThinkingLevel.Inherit) {
-											session.setThinkingLevel(concreteThinking);
-										}
+										if (liveThinking) session.setThinkingLevel(liveThinking);
 										this.ctx.statusLine.invalidate();
 										this.ctx.updateEditorBorderColor();
 										return true;
@@ -1073,6 +1077,7 @@ export class SelectorController {
 								// status too: consecutive status lines replace each other.
 								const outcome = this.ctx.routeUserModelSwitch(session, model, switchLive, {
 									statusPrefix: `${defaultStatus}. `,
+									thinkingLevel: liveThinking,
 								});
 								if (outcome === "apply") {
 									const { switched } = await session.setModel(model, role, {
@@ -1087,10 +1092,8 @@ export class SelectorController {
 											formatModelSelectorValue(selectorValue, concreteThinking),
 										);
 									}
-									if (isAuto) {
-										session.setThinkingLevel(AUTO_THINKING, !this.ctx.settings.isGlobalConfigReadOnly());
-									} else if (concreteThinking && concreteThinking !== ThinkingLevel.Inherit) {
-										session.setThinkingLevel(concreteThinking);
+									if (liveThinking) {
+										session.setThinkingLevel(liveThinking, isAuto && !this.ctx.settings.isGlobalConfigReadOnly());
 									}
 									this.ctx.statusLine.invalidate();
 									this.ctx.updateEditorBorderColor();
@@ -1109,6 +1112,12 @@ export class SelectorController {
 									}
 									if (isAuto && !this.ctx.settings.isGlobalConfigReadOnly()) {
 										cfgDefaultThinkingLevel.set(this.ctx.settings, AUTO_THINKING);
+									}
+									// Already on the model mid-turn: no switch is queued, but the
+									// assignment's thinking level still applies, as it would idle.
+									if (outcome === "cancelled" && liveThinking) {
+										session.setThinkingLevel(liveThinking);
+										this.ctx.statusLine.invalidate();
 									}
 								}
 								return true;
@@ -1201,6 +1210,12 @@ export class SelectorController {
 									const effectiveIsAuto = isAuto || isAutoFromDefault;
 									const session = this.ctx.session;
 									const globalWritable = !this.ctx.settings.isGlobalConfigReadOnly();
+									// The thinking level the live session takes on with the fallback.
+									const liveThinking = effectiveIsAuto
+										? AUTO_THINKING
+										: concreteThinking && concreteThinking !== ThinkingLevel.Inherit
+											? concreteThinking
+											: undefined;
 									// Live half: the role is already cleared. Same contract as
 									// onAssign: auto applies live, but the global default is
 									// persisted only while global config is writable.
@@ -1212,11 +1227,7 @@ export class SelectorController {
 												: (concreteThinking ?? ThinkingLevel.Inherit),
 										});
 										if (!switched) return false;
-										if (effectiveIsAuto) {
-											session.setThinkingLevel(AUTO_THINKING, persistAuto);
-										} else if (concreteThinking && concreteThinking !== ThinkingLevel.Inherit) {
-											session.setThinkingLevel(concreteThinking);
-										}
+										if (liveThinking) session.setThinkingLevel(liveThinking, effectiveIsAuto && persistAuto);
 										this.ctx.statusLine.invalidate();
 										this.ctx.updateEditorBorderColor();
 										return true;
@@ -1235,14 +1246,22 @@ export class SelectorController {
 												release();
 											}
 										},
-										{ statusPrefix: `${defaultStatus}. ` },
+										{ statusPrefix: `${defaultStatus}. `, thinkingLevel: liveThinking },
 									);
 									if (outcome === "apply") {
 										if (!(await applyFallback(globalWritable))) return;
 										this.ctx.showStatus(defaultStatus);
-									} else if (effectiveIsAuto && globalWritable) {
-										// The clear is recorded now; so is its auto thinking default.
-										cfgDefaultThinkingLevel.set(this.ctx.settings, AUTO_THINKING);
+									} else {
+										if (effectiveIsAuto && globalWritable) {
+											// The clear is recorded now; so is its auto thinking default.
+											cfgDefaultThinkingLevel.set(this.ctx.settings, AUTO_THINKING);
+										}
+										// Already on the fallback mid-turn: nothing is queued, but
+										// its thinking level still applies, as it would idle.
+										if (outcome === "cancelled" && liveThinking) {
+											session.setThinkingLevel(liveThinking);
+											this.ctx.statusLine.invalidate();
+										}
 									}
 								}
 							}

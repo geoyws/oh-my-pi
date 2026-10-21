@@ -1,7 +1,8 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import { Agent } from "@oh-my-pi/pi-agent-core";
+import { Agent, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
+import { cfgModelRoleStorage } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
@@ -333,6 +334,39 @@ describe("queued user model switch", () => {
 		expect(session.model?.id).toBe(opus.id);
 	});
 
+	it("plan exit onto an absorbed switch whose model plan mode already runs applies only its thinking and role", async () => {
+		// ctrl+p's slow slot pins `high`; the plan role is the same opus model, without a level.
+		session.settings.setModelRole("slow", "anthropic/claude-opus-4-5:high");
+		const showStatus = vi.spyOn(mode, "showStatus");
+		await mode.cycleRoleModel("forward");
+		expect(mode.pendingUserModelSwitch).toEqual({ model: opus, role: "slow" });
+		vi.spyOn(session, "resolveRoleModelWithThinking").mockReturnValue({
+			model: opus,
+			thinkingLevel: undefined,
+			explicitThinkingLevel: false,
+			warning: undefined,
+		});
+		vi.spyOn(session, "sendPlanModeContext").mockResolvedValue(undefined);
+		const setModelTemporary = vi.spyOn(session, "setModelTemporary").mockImplementation(async model => {
+			session.agent.setModel(model);
+		});
+		await mode.handlePlanModeCommand();
+		isStreaming = false;
+		await mode.flushPendingModelSwitch();
+		expect(session.model?.id).toBe(opus.id);
+
+		vi.spyOn(mode, "showHookConfirm").mockResolvedValue(true);
+		await mode.handlePlanModeCommand();
+
+		expect(mode.planModeEnabled).toBe(false);
+		// No replay through setModel: that would reset the provider-side session.
+		expect(session.applyRoleModel).not.toHaveBeenCalled();
+		expect(setModelTemporary).toHaveBeenCalledTimes(1);
+		expect(session.configuredThinkingLevel()).toBe(ThinkingLevel.High);
+		expect(session.sessionManager.getLastModelChangeRole()).toBe("slow");
+		expect(statusLines(showStatus).some(line => line.startsWith("Model switched to"))).toBe(false);
+	});
+
 	it("picking the live model while only a plan switch is queued keeps it and does not claim a cancel", async () => {
 		await mode.init({ suppressWelcomeIntro: true });
 		mode.planModeEnabled = true;
@@ -344,7 +378,9 @@ describe("queued user model switch", () => {
 
 		await executeBuiltinSlashCommand(`/model ${selector(sonnet)}`, { ctx: mode } as never);
 
-		expect(statusLines(showStatus).at(-1)).toBe(`Already on ${selector(sonnet)}`);
+		expect(statusLines(showStatus).at(-1)).toBe(
+			`Already on ${selector(sonnet)}; plan switch to ${selector(haiku)} still queued for after this turn`,
+		);
 		expect(statusLines(showStatus).some(line => line.startsWith("Queued model switch cancelled"))).toBe(false);
 		isStreaming = false;
 		await mode.flushPendingModelSwitch();
@@ -427,17 +463,40 @@ describe("queued user model switch", () => {
 		expect(session.settings.getModelRole("default")).toContain(opus.id);
 	});
 
-	it("model hub default assignment back onto the live model mid-turn keeps the cancel notice visible", async () => {
+	it("model hub default assignment back onto the live model mid-turn keeps the cancel notice and applies its thinking", async () => {
 		const showStatus = vi.spyOn(mode, "showStatus");
+		const setModel = vi.spyOn(session, "setModel");
 		const callbacks = openHub();
 		expect(await callbacks.onAssign(opus, "default", undefined, selector(opus))).toBe(true);
-		expect(await callbacks.onAssign(sonnet, "default", undefined, selector(sonnet))).toBe(true);
+		expect(await callbacks.onAssign(sonnet, "default", ThinkingLevel.High, selector(sonnet))).toBe(true);
 
 		expect(mode.pendingUserModelSwitch).toBeUndefined();
 		expect(session.settings.getModelRole("default")).toContain(sonnet.id);
 		expect(statusLines(showStatus).at(-1)).toBe(
 			`Default model: ${selector(sonnet)}. Queued model switch cancelled; staying on ${selector(sonnet)}`,
 		);
+		// No model switch, but the assignment's thinking level lands now, as it would idle.
+		expect(setModel).not.toHaveBeenCalled();
+		expect(session.configuredThinkingLevel()).toBe(ThinkingLevel.High);
+	});
+
+	it("model hub unassign of the default role mid-turn onto the live model applies the fallback's thinking", async () => {
+		// Project-scoped roles: clearing the project opus default exposes the
+		// global `sonnet:high` the session already runs.
+		cfgModelRoleStorage.set(session.settings, "project");
+		session.settings.setModelRole("default", "anthropic/claude-sonnet-4-5:high");
+		session.settings.setProjectModelRole("default", "anthropic/claude-opus-4-5");
+		const setModel = vi.spyOn(session, "setModel");
+		const showStatus = vi.spyOn(mode, "showStatus");
+		const callbacks = openHub();
+
+		await callbacks.onUnassign("default");
+
+		expect(session.settings.getModelRoleProvenance("default")).toBe("global");
+		expect(setModel).not.toHaveBeenCalled();
+		expect(mode.pendingUserModelSwitch).toBeUndefined();
+		expect(session.configuredThinkingLevel()).toBe(ThinkingLevel.High);
+		expect(statusLines(showStatus).at(-1)).toBe(`Default model: ${selector(sonnet)}. Already on ${selector(sonnet)}`);
 	});
 
 	it("model hub default assignment mid-turn refuses a model without credentials and persists nothing", async () => {

@@ -2842,7 +2842,7 @@ export class InputController {
 						this.ctx.updateEditorBorderColor();
 						return true;
 					},
-					{ role: next.role },
+					{ role: next.role, thinkingLevel: next.explicitThinkingLevel ? next.thinkingLevel : undefined },
 				);
 				// Queued, or wrapped back onto the live model (queue cancelled).
 				if (outcome !== "apply") {

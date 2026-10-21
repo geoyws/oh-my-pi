@@ -61,7 +61,8 @@ export type UserModelSwitch =
 	| { kind: "queue"; from: Model | undefined; to: Model }
 	/**
 	 * Mid-stream pick of the model the turn already runs on: nothing to switch,
-	 * so any queued switch is cancelled instead of queueing `A -> A`.
+	 * so a queued user switch is cancelled instead of queueing `A -> A`; a
+	 * queued plan-mode switch is kept.
 	 */
 	| { kind: "cancel" };
 
