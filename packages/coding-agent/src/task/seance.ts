@@ -16,6 +16,7 @@ import { loadSessionFile } from "../session/session-loader";
 import type { ModelRegistry } from "../config/model-registry";
 import type { TaskItem, TaskParams } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "../tools";
+import { normalizeToolNames } from "../tools/builtin-names";
 import { resolveToCwd } from "../tools/path-utils";
 import { getBundledAgent } from "./agents";
 import { SEANCE_AGENT_NAME } from "./seance-policy";
@@ -151,7 +152,7 @@ export async function resolveSeanceSource(
 	const localMatch = chooseId(local, source);
 	if (localMatch) return validateSourceFile(localMatch.path, storage);
 	if (options.includeGlobal) {
-		const matchGlobal = chooseId(await SessionManager.listAll(storage), source);
+		const matchGlobal = chooseId(await SessionManager.listAll(undefined, storage), source);
 		if (matchGlobal) return validateSourceFile(matchGlobal.path, storage);
 	}
 	throw new Error(`Session "${label}" was not found.`);
@@ -326,6 +327,7 @@ export async function restoreSeanceSession(context: {
 	return {
 		cwd,
 		modelPattern,
-		toolNames: init.tools.filter(name => readOnlyTools.has(name)),
+		// Contracts persisted before the `search` merge still name `grep`/`glob`/`find`.
+		toolNames: normalizeToolNames(init.tools).filter(name => readOnlyTools.has(name)),
 	};
 }

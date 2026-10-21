@@ -310,6 +310,7 @@ import { wrapToolWithMetaNotice } from "./tools/output-meta";
 import { isFilesystemSourcePath } from "./tools/path-utils";
 import { isAutoQaEnabled } from "./tools/report-tool-issue";
 import { queueResolveHandler } from "./tools/resolve";
+import { resolveSearchModes } from "./tools/search";
 import { USER_TODO_EDIT_CUSTOM_TYPE } from "./tools/todo";
 import { ttsTool } from "./tools/tts";
 import { resolveActiveRepoContext } from "./utils/active-repo-context";
@@ -3886,8 +3887,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// shared grep instance fixed at construction cannot express. Gated on
 			// the grant: the factory builds a fresh tool and `executeTool` prefers
 			// it over the registry, so installing it unconditionally would let a
-			// session without `grep` search anyway.
-			createGrepTool: toolRegistry.has("grep") ? createBridgeGrepFactory(toolSession, extensionRunner) : undefined,
+			// session without `search` search anyway. The factory itself declines
+			// while regex mode is off.
+			createGrepTool: toolRegistry.has("search") ? createBridgeGrepFactory(toolSession, extensionRunner) : undefined,
 			// Native delete and resource-download frames mutate files without a
 			// registry tool. Resolve both the transactional active predicate and
 			// live access mode: Agent.state.tools commits only after prompt rebuilding,
@@ -3910,6 +3912,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// constructed) and refreshed on every later rebuild via
 		// `setAdvisorMemoryPrompt`.
 		let advisorMemoryPrompt: string | undefined;
+		// `search` modes the last built system prompt advertises (set by every
+		// rebuildSystemPrompt), so the role listener below refreshes only on a real change.
+		let promptSearchModes = "";
 		// The process agent dir uses the process-wide store; a session rooted in
 		// another agent dir keeps its own, closed when the session is disposed.
 		const ownedSkillDescriptionStore =
@@ -4094,6 +4099,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					? { mode: "compact", toolNames: [...toolNames, ...mountedPromptToolNames] }
 					: { mode: "full" },
 			);
+			const searchModes = resolveSearchModes(toolSession);
 			const defaultPrompt = await buildSystemPromptInternal({
 				cwd: promptCwd,
 				additionalWorkspaceRoots: sessionManager.getAdditionalDirectories(),
@@ -4118,6 +4124,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				taskBatch: cfgTaskBatch.get(settings),
 				taskMaxConcurrency: cfgTaskMaxConcurrency.get(settings),
 				scoutAvailable: isScoutSpawnable(cfgTaskDisabledAgents.get(settings), options.spawns ?? "*"),
+				searchModes,
 				delegationBias: sessionDelegationBias(toolSession),
 				taskIrcEnabled: !restrictToolNames && isIrcEnabled(settings, options.taskDepth ?? 0),
 				autoQaEnabled: !restrictToolNames && isAutoQaEnabled(settings),
@@ -4140,6 +4147,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				reactions: agentKind === "main" && options.hasUI === true && cfgTuiReactions.get(settings),
 				activeRepoContext,
 			});
+			promptSearchModes = searchModes.join(",");
 
 			if (typeof options.systemPrompt !== "function") {
 				return defaultPrompt;
@@ -4976,9 +4984,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				}
 			};
 			cfgSessionToolGates.listen(session, () => reconcileGatedTools());
-			// `find.enabled: auto` follows the judge role; a role change only touches
-			// the prompt when it actually adds or removes `find`.
-			cfgModelRoles.listen(session, () => reconcileGatedTools({ refreshPrompt: false }));
+			// `find.enabled: auto` follows the judge role, which toggles `search`
+			// semantic mode. A role change only touches the prompt when it adds or
+			// removes a tool or changes the search modes the prompt advertises.
+			cfgModelRoles.listen(session, () =>
+				reconcileGatedTools({ refreshPrompt: resolveSearchModes(toolSession).join(",") !== promptSearchModes }),
+			);
 		}
 		// Backfill the resumed advisor spend without blocking startup: the scan
 		// runs after the session is live, so `--resume` no longer scales with the

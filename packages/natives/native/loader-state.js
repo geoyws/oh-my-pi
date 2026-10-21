@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import packageJson from "../package.json" with { type: "json" };
 import { embeddedAddon } from "./embedded-addon.js";
+import { requiredNativeSurface } from "./required-surface.js";
 import { bindingsHaveReleaseIdentity, bindingsReleaseVersion, containsVersionStamp } from "./version-sentinel.js";
 
 /**
@@ -14,8 +15,8 @@ import { bindingsHaveReleaseIdentity, bindingsReleaseVersion, containsVersionSta
  * `pi_natives.<platform>-<arch>*.node` is required, validated, and returned":
  * platform/variant detection, candidate-path resolution, on-disk staging from
  * `node_modules` (Windows update safety), embedded-addon extraction (Bun
- * standalone binaries), release-stamp validation, and the aggregated error
- * surface for diagnostic-friendly failures.
+ * standalone binaries), release-stamp and native-surface validation, and the
+ * aggregated error surface for diagnostic-friendly failures.
  *
  * `native/index.js` is reduced to one `loadNative()` call plus the generated
  * surface-area exports between `MARKER_START`/`MARKER_END` (rewritten by
@@ -592,9 +593,10 @@ export function validateLoadedBindings(ctx, bindings, candidate) {
 	// the new release stamp after `bun --cwd=packages/natives run build`. Skip
 	// validation there so a stale post-pull dev tree boots while the rebuild
 	// completes; install and compiled-binary paths still validate. The mismatch
-	// is not swallowed silently: `native/index.js` exports `missingNativeExport`
-	// for every symbol the stale addon predates, so the first call through one
-	// reports the addon, both releases, and the rebuild command.
+	// is not swallowed silently: `checkNativeSurface` marks the addon stale and
+	// `native/index.js` exports `missingNativeExport` for every symbol it
+	// predates, so the first call through one reports the addon, both releases,
+	// and the rebuild command.
 	if (ctx.isWorkspaceLoad) return;
 	const residentVersion = bindingsReleaseVersion(bindings);
 	if (residentVersion === ctx.packageVersion) return;
@@ -635,33 +637,138 @@ export function validateLoadedBindings(ctx, bindings, candidate) {
 	);
 }
 
+/** Marks the throwing stand-ins this module installs, so a re-check still counts them as missing. */
+const MISSING_NATIVE_STUB = Symbol.for("pi-natives.missingNativeStub");
+
+/** How many missing symbols a load failure names before summarizing the rest. */
+const MISSING_SURFACE_REPORT_LIMIT = 10;
+
+/**
+ * Whether `value` is a function the addon itself provides, not a stand-in this
+ * module installed for a missing symbol of a stale addon.
+ * @param {unknown} value
+ */
+export function isProvidedNativeFunction(value) {
+	return typeof value === "function" && !value[MISSING_NATIVE_STUB];
+}
+
+/**
+ * Symbols of `surface` that `bindings` lacks: function names as-is, a missing
+ * class by its name, and a missing prototype method as `Class.method`.
+ * Stubs installed by this module count as missing.
+ * @param {Record<string, unknown>} bindings
+ * @param {import("./required-surface.js").RequiredNativeSurface} surface
+ * @returns {string[]}
+ */
+export function missingNativeSurface(bindings, surface) {
+	const missing = [];
+	for (const name of surface.functions) {
+		if (!isProvidedNativeFunction(bindings[name])) missing.push(name);
+	}
+	for (const [className, methods] of Object.entries(surface.classes)) {
+		const NativeClass = bindings[className];
+		if (typeof NativeClass !== "function") {
+			missing.push(className);
+			continue;
+		}
+		const prototype = NativeClass.prototype;
+		for (const method of methods) {
+			if (!isProvidedNativeFunction(prototype?.[method])) missing.push(`${className}.${method}`);
+		}
+	}
+	return missing;
+}
+
+/**
+ * Compare a loaded addon to the native API this package declares and return
+ * its identity for {@link nativeAddonStatus}.
+ *
+ * The release stamp names the release an addon was built for, not the sources
+ * it was built from: a fork or local build from older sources reports the
+ * current release and still lacks newer functions and methods, which then fail
+ * as a bare `x is not a function` after the work they finish has already run.
+ * Installs and compiled binaries reject such an addon here, naming what it
+ * lacks. Workspace loads keep booting (see `validateLoadedBindings`) but count
+ * the addon stale, so missing function exports get `missingNativeExport` stubs
+ * and missing prototype methods get the same throwing stand-in.
+ * @param {{ isWorkspaceLoad: boolean; packageVersion: string }} ctx
+ * @param {Record<string, unknown>} bindings
+ * @param {string} candidate
+ * @param {import("./required-surface.js").RequiredNativeSurface} [surface]
+ * @returns {NonNullable<ReturnType<typeof nativeAddonStatus>>}
+ */
+export function checkNativeSurface(ctx, bindings, candidate, surface = requiredNativeSurface) {
+	const missing = missingNativeSurface(bindings, surface);
+	const addon = describeLoadedAddon(bindings, candidate, ctx, missing);
+	if (missing.length === 0) return addon;
+	if (!ctx.isWorkspaceLoad) {
+		const shown = missing.slice(0, MISSING_SURFACE_REPORT_LIMIT).join(", ");
+		const more =
+			missing.length > MISSING_SURFACE_REPORT_LIMIT ? ` (+${missing.length - MISSING_SURFACE_REPORT_LIMIT} more)` : "";
+		const release = addon.version ? `@oh-my-pi/pi-natives@${addon.version}` : "no release version";
+		throw new Error(
+			`Loaded ${candidate} (reports ${release}), but it lacks ${missing.length} native symbol(s) ` +
+				`@oh-my-pi/pi-natives@${ctx.packageVersion} requires: ${shown}${more}. The addon was built from older ` +
+				"sources than this loader — rebuild it with `bun --cwd=packages/natives run build`, or reinstall " +
+				"@oh-my-pi/pi-natives.",
+		);
+	}
+	stubMissingNativeMethods(bindings, missing, addon);
+	return addon;
+}
+
+/**
+ * Give each missing prototype method of a stale addon a throwing stand-in, so
+ * `instance.method()` names the addon and the rebuild instead of failing as
+ * `instance.method is not a function`.
+ * @param {Record<string, unknown>} bindings
+ * @param {string[]} missing
+ * @param {NonNullable<ReturnType<typeof nativeAddonStatus>>} addon
+ */
+function stubMissingNativeMethods(bindings, missing, addon) {
+	for (const symbol of missing) {
+		const dot = symbol.indexOf(".");
+		if (dot === -1) continue;
+		const prototype = bindings[symbol.slice(0, dot)]?.prototype;
+		if (!prototype) continue;
+		Object.defineProperty(prototype, symbol.slice(dot + 1), {
+			value: missingNativeStub(symbol, addon),
+			writable: true,
+			configurable: true,
+			enumerable: false,
+		});
+	}
+}
+
 /**
  * Identity of the addon `loadNative()` returned, in the shape the
  * missing-export diagnostic reports. Null until a load succeeds.
- * @type {{ path: string; version: string | null; packageVersion: string; stale: boolean } | null}
+ * @type {{ path: string; version: string | null; packageVersion: string; stale: boolean; missing: string[] } | null}
  */
 let loadedAddon = null;
 
 /**
  * Describe a loaded addon so a symbol it predates can name the file, the
- * release the file came from, and the release this tree expects.
+ * release the file came from, the release this tree expects, and what it lacks.
  * @param {Record<string, unknown>} bindings
  * @param {string} candidate
  * @param {{ packageVersion: string }} ctx
+ * @param {string[]} missing
  */
-function describeLoadedAddon(bindings, candidate, ctx) {
+function describeLoadedAddon(bindings, candidate, ctx, missing) {
 	const version = bindingsReleaseVersion(bindings);
 	return {
 		path: candidate,
 		version,
 		packageVersion: ctx.packageVersion,
-		stale: version !== ctx.packageVersion,
+		stale: version !== ctx.packageVersion || missing.length > 0,
+		missing,
 	};
 }
 
 /**
  * The addon behind this process's `@oh-my-pi/pi-natives` exports.
- * @returns {{ path: string; version: string | null; packageVersion: string; stale: boolean } | null}
+ * @returns {{ path: string; version: string | null; packageVersion: string; stale: boolean; missing: string[] } | null}
  */
 export function nativeAddonStatus() {
 	return loadedAddon;
@@ -688,9 +795,15 @@ export function nativeAddonStatus() {
  */
 export function missingNativeExport(symbolName, addon = loadedAddon) {
 	if (!addon?.stale) return undefined;
-	return () => {
+	return missingNativeStub(symbolName, addon);
+}
+
+function missingNativeStub(symbolName, addon) {
+	const stub = () => {
 		throw new Error(missingNativeExportMessage(symbolName, addon));
 	};
+	stub[MISSING_NATIVE_STUB] = true;
+	return stub;
 }
 
 /**
@@ -705,6 +818,12 @@ export function missingNativeExportMessage(symbolName, addon = loadedAddon) {
 	if (!addon) return `@oh-my-pi/pi-natives does not export \`${symbolName}\`; ${rebuild}.`;
 	if (!addon.stale) {
 		return `@oh-my-pi/pi-natives export \`${symbolName}\` is missing from ${addon.path}; ${rebuild}.`;
+	}
+	if (addon.version && addon.version === addon.packageVersion) {
+		return (
+			`@oh-my-pi/pi-natives export \`${symbolName}\` is missing: ${addon.path} reports ` +
+			`@${addon.version} but was built from older sources than this tree — ${rebuild}.`
+		);
 	}
 	const loaded = addon.version
 		? `the @oh-my-pi/pi-natives@${addon.version} addon`
@@ -878,9 +997,10 @@ export function loadNative() {
 			startupMarker(`native:require:${path.basename(candidate)}`);
 			const bindings = require_(candidate);
 			validateLoadedBindings(ctx, bindings, candidate);
+			const addon = checkNativeSurface(ctx, bindings, candidate);
 			installNativeTokioRuntime(bindings);
 			configureGrammarDir(bindings, ctx.nativesDir);
-			loadedAddon = describeLoadedAddon(bindings, candidate, ctx);
+			loadedAddon = addon;
 	        cleanupStaleNativeVersions({ nativesDir: ctx.nativesDir, currentVersion: ctx.packageVersion });
 			startupMarker("native:loadNative:done");
 			return bindings;

@@ -7,9 +7,7 @@ import type { AgentDefinition } from "./types";
 export const READ_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
 	"read",
 	"wait",
-	"grep",
-	"glob",
-	"find",
+	"search",
 	"web_search",
 	"ast",
 	"yield",

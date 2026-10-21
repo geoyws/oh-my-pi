@@ -18,6 +18,7 @@ import type { BashToolDetails } from "@oh-my-pi/pi-tui/tools/bash";
 import type { GlobToolDetails } from "@oh-my-pi/pi-tui/tools/glob";
 import type { GrepToolDetails } from "@oh-my-pi/pi-tui/tools/grep";
 import type { ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
+import type { SearchToolDetails } from "@oh-my-pi/pi-tui/tools/search";
 import type {
 	AgentEndEvent,
 	AgentStartEvent,
@@ -356,13 +357,19 @@ export interface WriteToolResultEvent extends ToolResultEventBase {
 	details: undefined;
 }
 
-/** Tool result event for grep tool */
+/** Tool result event for search tool */
+export interface SearchToolResultEvent extends ToolResultEventBase {
+	toolName: "search";
+	details: SearchToolDetails | undefined;
+}
+
+/** Tool result event for tools registered as pre-merge `grep` */
 export interface GrepToolResultEvent extends ToolResultEventBase {
 	toolName: "grep";
 	details: GrepToolDetails | undefined;
 }
 
-/** Tool result event for glob tool */
+/** Tool result event for tools registered as pre-merge `glob` */
 export interface GlobToolResultEvent extends ToolResultEventBase {
 	toolName: "glob";
 	details: GlobToolDetails | undefined;
@@ -384,6 +391,7 @@ export type ToolResultEvent =
 	| ReadToolResultEvent
 	| EditToolResultEvent
 	| WriteToolResultEvent
+	| SearchToolResultEvent
 	| GrepToolResultEvent
 	| GlobToolResultEvent
 	| CustomToolResultEvent;

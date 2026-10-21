@@ -1,7 +1,7 @@
 ---
 name: reviewer
 description: "Code review specialist for quality/security analysis"
-tools: read, find, grep, glob, bash, lsp, web_search, ast
+tools: read, search, bash, lsp, web_search, ast
 spawns: scout
 model: "@slow"
 output:

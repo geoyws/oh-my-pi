@@ -60,7 +60,7 @@ describe("ssh:// tools are exec-gated through the production approval wrapper", 
 		}
 	});
 
-	function tool(name: "read" | "grep" | "glob" | "write") {
+	function tool(name: "read" | "search" | "write") {
 		const found = session.getToolByName(name);
 		if (!found) throw new Error(`Expected ${name} tool`);
 		return found;
@@ -86,20 +86,20 @@ describe("ssh:// tools are exec-gated through the production approval wrapper", 
 		expect(JSON.stringify(ok.content)).toContain("hello-local");
 	});
 
-	it("grep: a delimited ssh:// entry requires approval before path expansion", async () => {
+	it("search regex: a delimited ssh:// entry requires approval before path expansion", async () => {
 		// The wrapper sees `path` verbatim (pre-expansion), so the substring scan must trip exec here.
 		await expect(
-			tool("grep").execute(
+			tool("search").execute(
 				"s-ssh",
-				{ pattern: "x", path: "local.txt,ssh://localhost/etc/hosts" },
+				{ mode: "regex", pattern: "x", path: "local.txt,ssh://localhost/etc/hosts" },
 				undefined,
 				undefined,
 				ctx("always-ask"),
 			),
 		).rejects.toThrow(APPROVAL_RE);
-		const ok = await tool("grep").execute(
+		const ok = await tool("search").execute(
 			"s-local",
-			{ pattern: "hello", path: "." },
+			{ mode: "regex", pattern: "hello", path: "." },
 			undefined,
 			undefined,
 			ctx("always-ask"),
@@ -107,11 +107,23 @@ describe("ssh:// tools are exec-gated through the production approval wrapper", 
 		expect(ok).toBeDefined();
 	});
 
-	it("glob: an ssh:// path requires approval (exec), a local glob runs (read)", async () => {
+	it("search glob: an ssh:// path requires approval (exec), a local glob runs (read)", async () => {
 		await expect(
-			tool("glob").execute("g-ssh", { path: "ssh://localhost/etc" }, undefined, undefined, ctx("always-ask")),
+			tool("search").execute(
+				"g-ssh",
+				{ mode: "glob", path: "ssh://localhost/etc" },
+				undefined,
+				undefined,
+				ctx("always-ask"),
+			),
 		).rejects.toThrow(APPROVAL_RE);
-		const ok = await tool("glob").execute("g-local", { path: "*.txt" }, undefined, undefined, ctx("always-ask"));
+		const ok = await tool("search").execute(
+			"g-local",
+			{ mode: "glob", path: "*.txt" },
+			undefined,
+			undefined,
+			ctx("always-ask"),
+		);
 		expect(JSON.stringify(ok.content)).toContain("local.txt");
 	});
 

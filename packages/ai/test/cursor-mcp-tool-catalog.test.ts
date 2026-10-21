@@ -59,6 +59,16 @@ describe("cursor buildMcpToolDefinitions", () => {
 		expect(lspDef?.toolName).toBe("lsp");
 	});
 
+	it("advertises search, whose semantic mode Cursor has no native equivalent for", () => {
+		// Native grep frames cover only the regex and glob modes.
+		const defs = buildMcpToolDefinitions([tool("read"), tool("bash"), tool("search")]);
+
+		const searchDef = defs.find(def => def.name === "search");
+		expect(searchDef).toBeDefined();
+		expect(searchDef?.providerIdentifier).toBe("pi-agent");
+		expect(searchDef?.toolName).toBe("search");
+	});
+
 	it("advertises hashline edit, which Cursor has no native equivalent for", () => {
 		// Native StrReplace is `editToolCall`, not hashline. Filtering `edit`
 		// would leave the model with no way to apply a tagged section rewrite.

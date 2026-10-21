@@ -1,5 +1,7 @@
 # find
 
+> **Now a mode of [`search`](./search.md):** the model-facing tool is `search` with `mode: "semantic"`; `find` survives as a legacy name alias. `FindTool` below is the semantic-mode runner.
+
 > Semantic grep: describe what you are looking for and get back files and line ranges that implement it, each with a calibrated relevance score. Shown as `Find` in the UI.
 
 ## Source

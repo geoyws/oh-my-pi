@@ -14,7 +14,7 @@
  */
 import { logger } from "@oh-my-pi/pi-utils";
 import { getBundledAgentsMap } from "../task/agents";
-import { BUILTIN_TOOL_NAMES, isMCPToolName } from "../tools/builtin-names";
+import { BUILTIN_TOOL_NAMES, isMCPToolName, normalizeToolName } from "../tools/builtin-names";
 import { lexShellCommand } from "../tools/shell-tokenize";
 import type { SessionEntry, SessionHeader } from "./session-entries";
 import { collectSubSessions, type SubSession } from "./sub-sessions";
@@ -605,6 +605,7 @@ const ARG_SCHEMAS: Record<string, ArgSchema> = {
 		"path input old_string new_string replace_all edits old_text new_text oldText newText op rename file_path diff content",
 	),
 	bash: argSchema("command timeout# cwd pty async name ready log port# host description"),
+	search: argSchema("mode pattern query grep_keywords path case gitignore hidden limit# skip#"),
 	grep: argSchema("pattern path case gitignore skip# limit# hidden glob context#"),
 	glob: argSchema("path pattern hidden gitignore limit# skip#"),
 	find: argSchema("query path grep_keywords limit# hidden"),
@@ -1247,7 +1248,9 @@ function isObject(value: unknown): value is JsonObject {
 }
 
 function isBuiltinTool(name: unknown): boolean {
-	return typeof name === "string" && (BUILTIN_TOOL_NAMES as readonly string[]).includes(name);
+	// Legacy aliases of merged tools (grep/glob/find, ast_grep/ast_edit) still
+	// name built-in output in historical transcripts.
+	return typeof name === "string" && (BUILTIN_TOOL_NAMES as readonly string[]).includes(normalizeToolName(name));
 }
 
 function looksLikePath(value: string): boolean {
@@ -1582,7 +1585,11 @@ export class SessionAnonymizer {
 	/** Tool-call args: built-in tools walk their known schema; any other tool's args are opaque. */
 	#toolArgs(value: unknown, parent: JsonObject): unknown {
 		const toolName = typeof parent.name === "string" ? parent.name : parent.toolName;
-		const schema = typeof toolName === "string" && isBuiltinTool(toolName) ? ARG_SCHEMAS[toolName] : undefined;
+		// Exact names first so historical grep/glob/find and ast_grep/ast_edit calls
+		// keep their own field schemas; other legacy spellings resolve to the merged tool.
+		const schema = isBuiltinTool(toolName)
+			? (ARG_SCHEMAS[toolName as string] ?? ARG_SCHEMAS[normalizeToolName(toolName as string)])
+			: undefined;
 		if (!schema) return this.#opaque(value);
 		if (typeof value !== "string") return this.#argValue(value, undefined, schema);
 		// Wire payloads carry arguments as JSON text; partial streams may not parse.

@@ -6,10 +6,10 @@ This page defines the public JS/TS boundary between `@oh-my-pi/pi-natives` calle
 
 1. `crates/pi-natives/src/**/*.rs` defines `#[napi]` functions, classes, objects, and enums.
 2. `bun --cwd=packages/natives run build:bindings` runs napi-rs, installs the host addon and generated `native/index.d.ts`, then runs `gen-enums.ts`.
-3. `gen-enums.ts` reads the declarations, rewrites napi-rs `const enum` declarations to runtime-usable declarations, and replaces the marked block in `native/index.js` with explicit class/function exports and literal enum objects.
+3. `gen-enums.ts` reads the declarations, rewrites napi-rs `const enum` declarations to runtime-usable declarations, replaces the marked block in `native/index.js` with explicit class/function exports and literal enum objects, and writes `native/required-surface.js` (every declared function and class prototype method).
 4. `native/index.js` loads the addon and binds that generated root surface. `DesktopSession` is routed through `desktop-adapter.js` for compatibility with older desktop ABIs; current classes pass through unchanged.
 
-There is no `NativeBindings` declaration-merging lifecycle or `packages/natives/src/<module>` wrapper convention. The loader checks release identity for install/compiled loads (with a narrow pre-sentinel compatibility exception), not every public symbol; a function export the loaded addon omits is `missingNativeExport(name)` — `undefined` on a current addon, and on a stale workspace addon a throwing stub that names the addon and the rebuild command (`bun run build:native`).
+There is no `NativeBindings` declaration-merging lifecycle or `packages/natives/src/<module>` wrapper convention. The loader checks release identity for install/compiled loads (with a narrow pre-sentinel compatibility exception) and every declared function and class prototype method for all loads: install/compiled loads reject an addon missing any, workspace loads mark it stale. A function export the loaded addon omits is `missingNativeExport(name)` — `undefined` on a current addon (only undeclared symbols can be absent there), and on a stale workspace addon a throwing stub that names the addon and the rebuild command (`bun run build:native`); missing prototype methods of a stale workspace addon get the same stub.
 
 ## Public entrypoints
 

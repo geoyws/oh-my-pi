@@ -1,13 +1,15 @@
-/** Gallery fixtures for the search tools (grep, ast). */
+/** Gallery fixtures for the search tools (search, ast). */
 import type { GalleryFixture } from "./types";
 
 export const searchFixtures: Record<string, GalleryFixture> = {
-	grep: {
-		label: "Grep",
+	search: {
+		label: "Search",
 		streamingArgs: {
+			mode: "regex",
 			pattern: "useState",
 		},
 		args: {
+			mode: "regex",
 			pattern: "useState",
 			path: "packages/tui/src",
 		},
