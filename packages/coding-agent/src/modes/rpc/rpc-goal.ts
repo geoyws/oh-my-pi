@@ -44,6 +44,7 @@ export type RpcGoalSession = Pick<
 	| "sendGoalModeContext"
 	| "getTodoPhases"
 	| "promptCustomMessage"
+	| "gateUserMessage"
 	| "waitForIdle"
 	| "isStreaming"
 	| "isDisposed"
@@ -251,6 +252,9 @@ export class RpcGoalController {
 		if (current?.goal.status === "paused") {
 			throw new Error("Resume or drop the paused goal before creating another.");
 		}
+		// createGoal persists the objective and #enter steers it into the
+		// provider: gate it first, so a refusal writes and sends nothing.
+		await this.#session.gateUserMessage(objective, undefined, "rpc");
 		await this.#enter(() => this.#session.goalRuntime.createGoal({ objective, tokenBudget }));
 		return this.#state;
 	}

@@ -151,6 +151,29 @@ describe("task progress rendering", () => {
 		expect(recent).not.toContain("Searching the workspace");
 	});
 
+	it("shows the agent's probe stage on running rows only, sanitized to one line", async () => {
+		const theme = (await getThemeByName("dark"))!;
+		const render = (progress: AgentProgress) =>
+			Bun.stripANSI(
+				taskToolRenderer
+					.renderResult(
+						{ content: [], details: detailsFor(progress) },
+						{ expanded: false, isPartial: true },
+						theme,
+					)
+					.render(120)
+					.join("\n"),
+			);
+		const running = render(runningProgress({ stage: "benchmarking\tthe \x1b[31mdecoder" }));
+		expect(running).toContain("benchmarking");
+		expect(running).toContain("decoder");
+		expect(running).not.toContain("\t");
+		expect(running).not.toContain("[31m");
+		expect(render(runningProgress({ status: "completed", stage: "benchmarking the decoder" }))).not.toContain(
+			"benchmarking the decoder",
+		);
+	});
+
 	it("shortens home paths in keyless arguments and in each call's intent on the card", async () => {
 		const theme = (await getThemeByName("dark"))!;
 		const file = `${os.homedir()}/private/file`;
@@ -817,6 +840,46 @@ describe("task progress rendering", () => {
 				expect(visibleWidth(row)).toBeLessThanOrEqual(40);
 			}
 		}
+	});
+
+	it("badges a provider-internal retry wait like a retry and names the model", async () => {
+		const theme = (await getThemeByName("dark"))!;
+		const renderText = (progress: AgentProgress): string =>
+			Bun.stripANSI(
+				taskToolRenderer
+					.renderResult(
+						{ content: [], details: detailsFor(progress) },
+						{ expanded: false, isPartial: true },
+						theme,
+					)
+					.render(120)
+					.join("\n"),
+			);
+		const counted = renderText(
+			runningProgress({
+				id: "RetryWaitWorker",
+				providerRetryState: {
+					waitId: 2,
+					delayMs: 3_600_000,
+					model: "claude-sonnet-4-5",
+					startedAtMs: Date.now(),
+					attempt: 2,
+					maxAttempts: 10,
+				},
+			}),
+		);
+		expect(counted).toContain("retrying");
+		expect(counted).toContain("provider retrying 2/10 in");
+		expect(counted).toContain("claude-sonnet-4-5");
+		// Without a loop counter the label stays bare rather than inventing one.
+		const bare = renderText(
+			runningProgress({
+				id: "RetryWaitWorker",
+				providerRetryState: { waitId: 3, delayMs: 3_600_000, model: "gpt-5", startedAtMs: Date.now() },
+			}),
+		);
+		expect(bare).toContain("provider retrying in");
+		expect(bare).not.toMatch(/provider retrying \d/);
 	});
 });
 

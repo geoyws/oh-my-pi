@@ -55,6 +55,7 @@ function makeFakeSession(
 		model: { provider: "anthropic", id: "claude-sonnet-4-5" },
 		isStreaming: false,
 		runEphemeralTurn,
+		gateUserMessage: vi.fn(async () => {}),
 	} as unknown as InteractiveModeContext["session"];
 }
 

@@ -201,7 +201,7 @@ function primaryArgText(name: string, args: Record<string, unknown> | undefined)
 		const paths = primaryArgValue(args.path) || primaryArgValue(args.paths);
 		if (paths) return paths;
 	}
-	if (name === "ast_grep") {
+	if (name === "ast" || name === "ast_grep") {
 		const pattern = primaryArgValue(args.pat);
 		if (pattern) return pattern;
 	}

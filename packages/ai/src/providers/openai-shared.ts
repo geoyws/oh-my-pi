@@ -77,6 +77,7 @@ import {
 	sanitizeOpenAIResponsesAssistantHistoryItemsForReplay,
 	sanitizeOpenAIResponsesHistoryItemsForReplay,
 	stripUnpairedOpenAIResponsesComputerReasoningIdsForReplay,
+	truncateResponseItemId,
 } from "../utils";
 import {
 	clearStreamingPartialJson,
@@ -124,7 +125,7 @@ import type {
 	ResponseStreamEvent,
 } from "./openai-responses-wire";
 import { applyInferenceHeaders, applySessionHeader, setHeaderIfAbsent } from "./inference-headers";
-import { transformMessages } from "./transform-messages";
+import { isValidToolCallId, transformMessages } from "./transform-messages";
 import { joinTextWithImagePlaceholder, NON_VISION_IMAGE_PLACEHOLDER, partitionVisionContent } from "./vision-guard";
 
 export interface OpenAIModelIdentity {
@@ -938,6 +939,27 @@ export function mapOpenAIReasoningEffort(
 	return compat?.reasoningEffortMap?.[level] ?? model.thinking?.effortMap?.[level] ?? effort;
 }
 
+/**
+ * Effort facts that constrain the 400/422 reasoning-effort fallback, read
+ * from the resolved model policy (KDL `thinking-requires-effort` →
+ * `thinking.requiresEffort`; the effort maps). `pinnedEffort`: several
+ * supported tiers all serialize to one wire value, so that value is policy
+ * and must not be renegotiated to another tier. A lone tier is not a pin.
+ */
+export function resolveOpenAIEffortFallbackConstraints(
+	model: Pick<Model, "thinking">,
+	compat: { reasoningEffortMap?: Partial<Record<Effort, string>> } | undefined,
+): { requiresEffort: boolean; pinnedEffort: boolean } {
+	const efforts = model.thinking?.efforts ?? [];
+	const firstWire = efforts.length > 1 ? mapOpenAIReasoningEffort(model, compat, efforts[0]!) : undefined;
+	return {
+		requiresEffort: model.thinking?.requiresEffort === true,
+		pinnedEffort:
+			firstWire !== undefined &&
+			efforts.every(effort => mapOpenAIReasoningEffort(model, compat, effort) === firstWire),
+	};
+}
+
 function isImplicitDisableWhenNotRequested(disableMode: OpenAIReasoningDisableMode): boolean {
 	return (
 		disableMode === "zai-thinking-disabled" ||
@@ -1379,6 +1401,36 @@ interface StrictToolsRetryContext {
 	tools: Tool[] | undefined;
 }
 
+/**
+ * Read OpenRouter's `error.metadata.raw` from a captured non-2xx body.
+ *
+ * OpenRouter routes to a different upstream per request, so its top-level
+ * `error.message` is a generic policy sentence ("Access denied by security
+ * policy") and the only place the routed provider's own words appear is
+ * `error.metadata.raw`. Providers that proxy through OpenRouter also hang the
+ * upstream provider name there.
+ *
+ * The detail lives in the decoded body captured on the thrown
+ * {@link AIError.OpenAIHttpError}, not on the error object itself: no error
+ * class in this package carries an `error` property, so reading
+ * `error.error.metadata.raw` unconditionally yielded `undefined` and the
+ * upstream detail was dropped from every surfaced message.
+ */
+export function readOpenRouterRawMetadata(
+	capturedErrorResponse: CapturedHttpErrorResponse | undefined,
+): string | undefined {
+	const body = capturedErrorResponse?.bodyJson;
+	if (!body || typeof body !== "object" || !("error" in body)) return undefined;
+	const errorBody = body.error;
+	if (!errorBody || typeof errorBody !== "object" || !("metadata" in errorBody)) return undefined;
+	const metadata = errorBody.metadata;
+	if (!metadata || typeof metadata !== "object" || !("raw" in metadata)) return undefined;
+	const raw = metadata.raw;
+	if (typeof raw !== "string") return undefined;
+	const trimmed = raw.trim();
+	return trimmed.length > 0 ? trimmed : undefined;
+}
+
 /** Decide whether an OpenAI-family request should retry once with non-strict tools. */
 export function shouldRetryWithoutStrictTools(
 	error: unknown,
@@ -1487,7 +1539,7 @@ export function normalizeResponsesToolCallIdForTransform(
 	source?: AssistantMessage,
 ): string {
 	const sep = id.search(/[\n|]/);
-	if (sep < 0 && id.length <= 64 && /^[a-zA-Z0-9_-]+$/.test(id)) return id;
+	if (isValidToolCallId(id)) return id;
 	const isForeignToolCall =
 		source != null && model != null && (source.provider !== model.provider || source.api !== model.api);
 	if (isForeignToolCall || sep >= 0 || id.length > 64) {
@@ -1957,6 +2009,16 @@ export interface BuildResponsesInputOptions<TApi extends Api> {
 	 * message/function_call/output items still replay.
 	 */
 	currentCredentialId?: number;
+	/**
+	 * Drop every replayed `reasoning` item carrying `encrypted_content`,
+	 * regardless of recorded credential, and retire the thinking-signature
+	 * fallback (it embeds `encrypted_content` too). Single-shot recovery for
+	 * legacy turns stored before `credentialId` was recorded: the server
+	 * rejected the encrypted blob as foreign
+	 * ({@link isForeignEncryptedReasoningError}), so the retry replays the
+	 * surviving message/function_call/output items only.
+	 */
+	stripEncryptedReasoning?: boolean;
 	includeThinkingSignatures?: boolean;
 	developerStringContent?: boolean;
 	repairOrphanOutputs?: boolean;
@@ -2073,7 +2135,7 @@ export function escapeReplayedControlTokens(items: ResponseInput): ResponseInput
  * Summary-only reasoning keeps the rebuild: it is no evidence of a server that
  * returns plaintext reasoning.
  */
-function isColdReplayableResponsesTurn(items: ResponseInput): boolean {
+export function isColdReplayableResponsesTurn(items: ResponseInput): boolean {
 	let hasReasoning = false;
 	for (const item of items) {
 		if ("id" in item && typeof item.id === "string") return false;
@@ -2083,6 +2145,90 @@ function isColdReplayableResponsesTurn(items: ResponseInput): boolean {
 		hasReasoning = true;
 	}
 	return hasReasoning;
+}
+/**
+ * Whether `error` is the HTTP 400 Meta returns when replayed reasoning
+ * `encrypted_content` was issued to another caller (`reasoning
+ * 'encrypted_content' was not issued to this caller`). The per-credential
+ * drop ({@link BuildResponsesInputOptions.currentCredentialId}) prevents this
+ * for turns that recorded their credential; turns stored before that field
+ * existed still hit it, and the owning stream function retries those exactly
+ * once with {@link BuildResponsesInputOptions.stripEncryptedReasoning}.
+ * Both halves must match: 400 alone (or the caller wording without an
+ * `encrypted_content` blob) is some other rejection and must not retry.
+ */
+export function isForeignEncryptedReasoningError(error: unknown): boolean {
+	if (typeof error !== "object" || error === null) return false;
+	if (!("status" in error) || error.status !== 400) return false;
+	const texts: string[] = [];
+	if (error instanceof Error && typeof error.message === "string") texts.push(error.message);
+	if ("captured" in error && typeof error.captured === "object" && error.captured !== null) {
+		const captured = error.captured;
+		if ("bodyText" in captured && typeof captured.bodyText === "string") texts.push(captured.bodyText);
+		if ("bodyJson" in captured && captured.bodyJson !== undefined) {
+			try {
+				texts.push(JSON.stringify(captured.bodyJson));
+			} catch {}
+		}
+	}
+	return texts.some(text => text.includes("encrypted_content") && /not issued to this caller/i.test(text));
+}
+
+/**
+ * Whether `error` is the caller-bound-`encrypted_content` rejection delivered
+ * as an in-stream failure rather than an HTTP status. Codex WebSocket (and
+ * mid-stream SSE) failures arrive as `response.failed`/`error` frames whose
+ * `response.status` is the lifecycle enum (`"failed"`), never a numeric
+ * status — so the rejection is identified by the structured
+ * `response.error` the server actually sends for this case (`code:
+ * "invalid_request_error"`, message `reasoning encrypted_content was not
+ * issued to this caller`, t-af8e8aa4): the message text must match in full,
+ * and a present code must be the incident's code. The HTTP transports keep
+ * using {@link isForeignEncryptedReasoningError} with its status-400 gate.
+ */
+export function isForeignEncryptedReasoningStreamFailure(error: unknown): boolean {
+	if (typeof error !== "object" || error === null) return false;
+	if (!("message" in error) || typeof error.message !== "string") return false;
+	const message = error.message;
+	if (!(message.includes("encrypted_content") && /not issued to this caller/i.test(message))) return false;
+	if (!("code" in error) || error.code === undefined) return true;
+	return error.code === "invalid_request_error";
+}
+
+/**
+ * Whether a raw `response.failed`/`error` frame is the
+ * caller-bound-`encrypted_content` rejection, read off the structured
+ * `response.error` (or `error`) detail. Content deltas and unrelated failures
+ * never match: only failure frames are inspected, the message text must match
+ * in full, and a present code must be the incident's code.
+ */
+export function isForeignEncryptedReasoningFailureEvent(event: unknown): boolean {
+	if (typeof event !== "object" || event === null) return false;
+	if (!("type" in event) || (event.type !== "response.failed" && event.type !== "error")) return false;
+	let message: string | undefined;
+	let code: string | undefined;
+	const readDetail = (node: unknown): void => {
+		if (typeof node !== "object" || node === null) return;
+		if ("message" in node && typeof node.message === "string" && message === undefined) {
+			message = node.message;
+		}
+		if ("code" in node && typeof node.code === "string" && code === undefined) {
+			code = node.code;
+		}
+	};
+	if ("response" in event && typeof event.response === "object" && event.response !== null) {
+		const response = event.response;
+		if ("error" in response) readDetail(response.error);
+		readDetail(response);
+	}
+	if ("error" in event) readDetail(event.error);
+	readDetail(event);
+	return (
+		message !== undefined &&
+		message.includes("encrypted_content") &&
+		/not issued to this caller/i.test(message) &&
+		(code === undefined || code === "invalid_request_error")
+	);
 }
 
 export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInputOptions<TApi>): ResponseInput {
@@ -2170,7 +2316,16 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 				}) ??
 					false);
 			if (historyItems && shouldReplayPayloadItems) {
-				const sanitizedItems = sanitizeOpenAIResponsesHistoryItemsForReplay(filterReasoning(historyItems), {
+				// The strip-everything recovery covers user/developer history
+				// too: same reasoning-only drop, every other native item
+				// (messages, compaction summaries, tool calls) still replays.
+				const replaySourceItems =
+					options.stripEncryptedReasoning === true
+						? historyItems.filter(
+								item => item?.type !== "reasoning" || typeof item?.encrypted_content !== "string",
+							)
+						: historyItems;
+				const sanitizedItems = sanitizeOpenAIResponsesHistoryItemsForReplay(filterReasoning(replaySourceItems), {
 					supportsImageDetailOriginal,
 					supportsComputerUse: options.model.supportsComputerUse === true,
 				});
@@ -2229,8 +2384,12 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 				options.currentCredentialId !== undefined &&
 				assistantMsg.credentialId !== undefined &&
 				assistantMsg.credentialId !== options.currentCredentialId;
+			// Single-shot recovery after a foreign-`encrypted_content` 400:
+			// legacy turns predate `credentialId`, so strip every replayed
+			// reasoning blob instead of comparing callers.
+			const stripEncryptedReasoning = options.stripEncryptedReasoning === true;
 			const historyItems =
-				credentialMismatch && providerPayload?.items
+				(credentialMismatch || stripEncryptedReasoning) && providerPayload?.items
 					? providerPayload.items.filter(
 							item => item?.type !== "reasoning" || typeof item?.encrypted_content !== "string",
 						)
@@ -2288,12 +2447,15 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 
 			// A credential switch also retires the thinking-signature fallback:
 			// its embedded `encrypted_content` was issued to the old caller too.
+			// The strip-everything recovery retires it for the same reason.
 			const convertedOutputItems = convertResponsesAssistantMessage(
 				assistantMsg,
 				options.model,
 				msgIndex,
 				knownCallIds,
-				suppressHiddenEmptyFallback || credentialMismatch ? false : includeThinkingSignatures,
+				suppressHiddenEmptyFallback || credentialMismatch || stripEncryptedReasoning
+					? false
+					: includeThinkingSignatures,
 				customCallIds,
 				options.preserveAssistantMessageIds,
 				supportsCustomToolCalls,
@@ -2542,8 +2704,8 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 				// legacy plain-string signatures that would otherwise fall into
 				// the >64-char hash branch and fabricate a bogus msg_ id.
 				msgId = undefined;
-			} else if (msgId.length > 64) {
-				msgId = `msg_${Bun.hash(msgId).toString(36)}`;
+			} else {
+				msgId = truncateResponseItemId(msgId, "msg");
 			}
 			const messageItem: ResponsesReplayAssistantMessage = {
 				type: "message",

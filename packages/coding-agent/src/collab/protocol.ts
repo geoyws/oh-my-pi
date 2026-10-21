@@ -93,7 +93,8 @@ export type CollabFrame =
 	/** Targeted reply to fetch-transcript; `error` marks a terminal read failure that guests must surface without hot retrying. */
 	| { t: "transcript"; reqId: number; text: string; newSize: number; error?: string }
 	| { t: "bye"; reason: string }
-	| { t: "error"; message: string };
+	/** `refused`: see the wire `HostFrame` error variant (guest prompt refused by `before_user_message`). */
+	| { t: "error"; message: string; refused?: { text: string; images?: ImageContent[] } };
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Pre-serialized frames: the host bounds replicated payloads by serializing

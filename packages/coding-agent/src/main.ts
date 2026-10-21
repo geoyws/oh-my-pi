@@ -32,6 +32,8 @@ import {
 	reportUnrecognizedFlags,
 	validateGoalLaunch,
 	validateGoalStartup,
+	validateRestoreLaunch,
+	validateRestorePrompt,
 	validateToolNames,
 } from "./cli/args";
 import { applyExtensionFlags, type ExtensionFlagSink } from "./cli/extension-flags";
@@ -102,6 +104,7 @@ import {
 	resolvePrewalkTarget,
 } from "./sdk";
 import type { AgentSession } from "./session/agent-session";
+import { UserMessageRefusedError } from "./session/user-message-refused-error";
 import { createAuthStorageSettingsSync, describeAuthBrokerStartupError } from "./session/auth-broker-config";
 import type { AuthStorage } from "./session/auth-storage";
 import { describePendingToolCalls } from "./session/exit-diagnostics";
@@ -112,6 +115,7 @@ import {
 	persistForeignSession,
 } from "./session/foreign-session-import";
 import type { ForeignSessionInfo, ForeignSessionSource, ForeignSessionStore } from "./session/foreign-session-store";
+import { loadRuntimeIdentity } from "./session/runtime-identity";
 import { resolveResumableSession, type SessionInfo } from "./session/session-listing";
 import { ForkSourceNotFoundError, SessionManager, SessionMoveRefusedError } from "./session/session-manager";
 import { forkIfMovedAway } from "./session/session-transfer";
@@ -123,10 +127,11 @@ import {
 	resolvePromptInput,
 } from "./system-prompt";
 import { createPersistedSubagentReviverFactory } from "./task/persisted-revive";
+import { type RestoreOutcome, restoreSession } from "./task/restore";
 import { createTelemetryExportConfig, initTelemetryExport, isTelemetryExportEnabled } from "./telemetry-export";
 import { cfgTelemetryOtlpExportEnabled } from "./telemetry-settings";
 import { registerLocalInferenceApi } from "./tiny/local-inference-api";
-import { concreteThinkingLevel, parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
+import { automaticThinkingLevel, concreteThinkingLevel, parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { LspStartupServerInfo } from "./tools";
 import { sanitizeDisplayWarnings } from "@oh-my-pi/pi-tui/render/render-utils";
 import {
@@ -163,6 +168,7 @@ import {
 	cfgSymbolPreset,
 	cfgThemeDark,
 	cfgThemeLight,
+	cfgTuiCompleteScrollback,
 	cfgTuiImeSafeCursor,
 	cfgTuiMaxInlineImages,
 	cfgTuiResizeScrollback,
@@ -396,7 +402,7 @@ export async function submitInteractiveInput(
 		| "clearOptimisticSkillMessage"
 		| "optimisticSkillMessagePending"
 	> &
-		Partial<Pick<InteractiveMode, "loopPrompt" | "pauseLoop">>,
+		Partial<Pick<InteractiveMode, "loopPrompt" | "pauseLoop" | "restoreRefusedPrompt">>,
 	session: Pick<AgentSession, "prompt" | "promptCustomMessage" | "isStreaming">,
 	input: SubmittedUserInput,
 ): Promise<void> {
@@ -456,18 +462,37 @@ export async function submitInteractiveInput(
 			});
 		} else if (isKnownSkillCommand(skillHost, input.text)) {
 			// Resubmitted skill text must dispatch through the skill path, or the
-			// model receives a literal `/skill:` token.
-			await invokeSkillCommandFromText(skillHost, input.text, streamingBehavior, {
-				images: input.images,
-				imageLinks: input.imageLinks,
-				optimistic: true,
-				propagateErrors: true,
-			});
+			// model receives a literal `/skill:` token. A refusal hands the raw
+			// invocation back for editing, like a refused plain prompt.
+			try {
+				await invokeSkillCommandFromText(skillHost, input.text, streamingBehavior, {
+					images: input.images,
+					imageLinks: input.imageLinks,
+					optimistic: true,
+					propagateErrors: true,
+					source: "interactive",
+				});
+			} catch (error: unknown) {
+				if (error instanceof UserMessageRefusedError) {
+					mode.restoreRefusedPrompt?.({ text: input.text, images: input.images, imageLinks: input.imageLinks });
+				}
+				mode.showError(error instanceof Error ? error.message : "Unknown error occurred");
+			}
 		} else {
 			let forwarded = false;
 			try {
-				forwarded = await session.prompt(input.text, { images: input.images, streamingBehavior });
+				forwarded = await session.prompt(input.text, {
+					images: input.images,
+					streamingBehavior,
+					source: "interactive",
+				});
 			} catch (error: unknown) {
+				// A refused submission never reached the agent: hand the draft
+				// back (never clobbering a newer draft) and show only the
+				// handler's safe notice.
+				if (error instanceof UserMessageRefusedError) {
+					mode.restoreRefusedPrompt?.({ text: input.text, images: input.images, imageLinks: input.imageLinks });
+				}
 				mode.showError(error instanceof Error ? error.message : "Unknown error occurred");
 			}
 			// Dispatch consumed the body locally (void custom command) or rejected
@@ -630,6 +655,8 @@ async function runInteractiveMode(
 	startDeferredStartupWork?: () => void,
 	startupLease?: ComposerLease,
 	startupGoal?: string,
+	startupRestore?: () => Promise<RestoreOutcome>,
+	refreshScopedModelsAfterLogin?: () => Promise<void>,
 ): Promise<void> {
 	const InteractiveModeConstructor = await loadInteractiveModeConstructor();
 	let mode: InteractiveMode;
@@ -644,6 +671,7 @@ async function runInteractiveMode(
 			eventBus,
 			startupLease?.composer,
 			subagentEventBus,
+			refreshScopedModelsAfterLogin,
 		);
 		startupLease?.adopt();
 	} catch (error) {
@@ -769,6 +797,25 @@ async function runInteractiveMode(
 		}
 	}
 
+	if (startupRestore) {
+		try {
+			using _keepalive = new EventLoopKeepalive();
+			const { turn, subagents } = await startupRestore();
+			const agents = subagents.length === 1 ? "1 subagent" : `${subagents.length} subagents`;
+			mode.showStatus(
+				turn && subagents.length > 0
+					? `Restored: going on with the interrupted turn and ${agents}.`
+					: turn
+						? "Restored: going on with the interrupted turn."
+						: subagents.length > 0
+							? `Restored: ${agents} going on with their interrupted turns.`
+							: "Restored: nothing was left unfinished.",
+			);
+		} catch (error: unknown) {
+			mode.showError(error instanceof Error ? error.message : "Unknown error occurred");
+		}
+	}
+
 	if (initialMessage !== undefined) {
 		try {
 			using _keepalive = new EventLoopKeepalive();
@@ -776,8 +823,15 @@ async function runInteractiveMode(
 			// before this dispatch runs (the composer accepts input as soon as the
 			// first turn starts): the CLI message queues into that turn instead of
 			// dying with AgentBusyError.
-			await session.prompt(initialMessage, { images: initialImages, streamingBehavior: "steer" });
+			await session.prompt(initialMessage, {
+				images: initialImages,
+				streamingBehavior: "steer",
+				source: "interactive",
+			});
 		} catch (error: unknown) {
+			if (error instanceof UserMessageRefusedError) {
+				mode.restoreRefusedPrompt({ text: initialMessage, images: initialImages });
+			}
 			const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 			mode.showError(errorMessage);
 		}
@@ -786,8 +840,11 @@ async function runInteractiveMode(
 	for (const message of initialMessages) {
 		try {
 			using _keepalive = new EventLoopKeepalive();
-			await session.prompt(message, { streamingBehavior: "steer" });
+			await session.prompt(message, { streamingBehavior: "steer", source: "interactive" });
 		} catch (error: unknown) {
+			if (error instanceof UserMessageRefusedError) {
+				mode.restoreRefusedPrompt({ text: message, images: undefined });
+			}
 			const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 			mode.showError(errorMessage);
 		}
@@ -1029,12 +1086,13 @@ export function toSessionScopedModels(
 	const defaultThinkingLevel = concreteThinkingLevel(
 		parseConfiguredThinkingLevel(cfgDefaultThinkingLevel.get(activeSettings)),
 	);
-	return scopedModels.map(scopedModel => ({
-		model: scopedModel.model,
-		thinkingLevel: scopedModel.explicitThinkingLevel
-			? (scopedModel.thinkingLevel ?? defaultThinkingLevel)
-			: defaultThinkingLevel,
-	}));
+	return scopedModels.map(scopedModel => {
+		const fallback = automaticThinkingLevel(scopedModel.model, defaultThinkingLevel);
+		return {
+			model: scopedModel.model,
+			thinkingLevel: scopedModel.explicitThinkingLevel ? (scopedModel.thinkingLevel ?? fallback) : fallback,
+		};
+	});
 }
 
 /** Whether two scope lists reference the same set of models (order-independent). */
@@ -1071,19 +1129,39 @@ export async function rebuildScopedModelsAfterDiscovery(
 	modelRegistry: Pick<ModelRegistry, "getAvailable" | "awaitBackgroundRefresh">,
 	activeSettings: Settings,
 ): Promise<void> {
-	const patterns = parsed.models ?? cfgEnabledModels.get(activeSettings);
-	if (!patterns || patterns.length === 0) return;
 	await modelRegistry.awaitBackgroundRefresh();
-	if (session.isDisposed) return;
+	await rebuildScopedModels(session, parsed, modelRegistry, activeSettings);
+}
+
+/**
+ * Re-resolve the `--models`/`enabledModels` scope against the registry as it is
+ * now and, when the set changed, push it into the session. Returns the new scope,
+ * or `undefined` when the session keeps its current one. Extension providers
+ * register inside `createSession`, after the startup snapshot, so the CLI calls
+ * this right after the session is built: their models then join the scoped
+ * `/models` list and Ctrl+P cycle before the first frame instead of after the
+ * background catalog refresh. Issue #6694.
+ */
+export async function rebuildScopedModels(
+	session: ScopedModelSink,
+	parsed: Args,
+	modelRegistry: Pick<ModelRegistry, "getAvailable">,
+	activeSettings: Settings,
+): Promise<ScopedModel[] | undefined> {
+	const patterns = parsed.models ?? cfgEnabledModels.get(activeSettings);
+	if (!patterns || patterns.length === 0) return undefined;
+	if (session.isDisposed) return undefined;
 	const rebuilt = await resolveModelScope(
 		patterns,
 		modelRegistry,
 		getModelMatchPreferences(activeSettings),
 		activeSettings,
 	);
+	if (session.isDisposed) return undefined;
 	const mapped = toSessionScopedModels(rebuilt, activeSettings);
-	if (mapped.length === 0 || sameScopedModelSet(session.scopedModels, mapped)) return;
+	if (mapped.length === 0 || sameScopedModelSet(session.scopedModels, mapped)) return undefined;
 	session.setScopedModels(mapped);
+	return rebuilt;
 }
 
 /** Settings the scoped model list follows (see {@link watchScopedModelSettings}). */
@@ -1528,14 +1606,16 @@ export async function buildSessionOptions(
 		// provider for resolveScopedModels' pre-refresh. Defer the choice to the
 		// SDK's post-extension resolution — the same `modelPattern` path a deferred
 		// `--model` uses — so the initial model is picked from the requested scope
-		// instead of an unrelated fallback. The fire-and-forget rebuild then
-		// activates the scoped list once discovery settles (issue #9220).
+		// instead of an unrelated fallback. The rebuild right after createSession
+		// then activates the scoped list for extension providers (issue #6694), and
+		// the fire-and-forget one once discovery settles (issue #9220).
 		options.modelPattern = parsed.models;
 	}
 
 	if (parsed.noPrewalk && (parsed.prewalk || parsed.prewalkInto !== undefined)) {
 		throw new Error("--no-prewalk cannot be combined with --prewalk or --prewalk-into");
 	}
+	options.suppressAutoPrewalk = parsed.noPrewalk;
 	const explicitPrewalk = parsed.prewalk === true || parsed.prewalkInto !== undefined;
 	const prewalkEnabled = parsed.noPrewalk
 		? false
@@ -1829,6 +1909,7 @@ export async function runRootCommand(
 		// startup-parse flags, so rejecting later would leave forked or imported
 		// transcripts (or an opened picker) behind a usage error.
 		validateGoalLaunch(parsedArgs, isInteractive);
+		validateRestoreLaunch(parsedArgs, isInteractive);
 		// Without piped text the prompt must come from argv, which only the
 		// post-extension reparse can settle: an extension string flag's value
 		// (`--spawn-peer reviewer`) looks like a prompt here, and a boolean flag
@@ -1905,6 +1986,9 @@ export async function runRootCommand(
 		const credentialScopedCacheHydration = logger.time("hydrateCredentialScopedModelCaches", () =>
 			modelRegistry.hydrateCredentialScopedModelCaches(),
 		);
+		// A source checkout's uncommitted diff is read off-thread; it overlaps model setup and is
+		// awaited before any session entry is written.
+		const runtimeIdentityLoad = logger.time("loadRuntimeIdentity", loadRuntimeIdentity);
 		if (parsedArgs.noPty || parsedArgs.mode === "rpc-ui") {
 			Bun.env.PI_NO_PTY = "1";
 		}
@@ -1968,6 +2052,7 @@ export async function runRootCommand(
 			showHardwareCursor: cfgShowHardwareCursor.get(settingsInstance),
 			maxInlineImages: cfgTuiMaxInlineImages.get(settingsInstance),
 			resizeScrollback: cfgTuiResizeScrollback.get(settingsInstance),
+			completeScrollback: cfgTuiCompleteScrollback.get(settingsInstance),
 			imeSafeCursor: cfgTuiImeSafeCursor.get(settingsInstance),
 			autocompleteMaxVisible: cfgAutocompleteMaxVisible.get(settingsInstance),
 			spellingTypoDetection: cfgSpellingTypoDetection.get(settingsInstance),
@@ -1994,6 +2079,7 @@ export async function runRootCommand(
 		// Reading the token immediately after `--continue` distinguishes the session
 		// id from UUID-shaped values owned by later extension flags.
 		normalizeContinueSessionArgs(parsedArgs, rawArgs);
+		await runtimeIdentityLoad;
 
 		// Resolve native resume/fork flags or import one foreign transcript into a
 		// fresh persisted OMP session before constructing the AgentSession.
@@ -2365,6 +2451,7 @@ export async function runRootCommand(
 				process.exit(2);
 			}
 			rejectNoUiWithoutRpc(parsedArgs);
+			validateRestorePrompt(initialArgs);
 			if (initialArgs.goal !== undefined) {
 				validateGoalStartup(
 					initialArgs,
@@ -2445,9 +2532,12 @@ export async function runRootCommand(
 				eventBus,
 				subagentEventBus,
 				preloadedExtensions: extensionsResult,
-				// runInteractiveMode validates once init has painted the first frame.
-				deferRetryFallbackValidation: isInteractive,
+				// Validated once the background refresh is in flight, so selectors it
+				// may still supply defer instead of warning; interactive mode also
+				// waits for the first frame (`startDeferredStartupWork`).
+				deferRetryFallbackValidation: true,
 			});
+			if (!isInteractive) session.validateRetryFallbackChains();
 
 			const sessionToolNames = session.getAllToolNames();
 			try {
@@ -2486,20 +2576,35 @@ export async function runRootCommand(
 				authStorage.keys.setRuntime(session.model.provider, parsedArgs.apiKey);
 			}
 
+			const configuredScope = parsedArgs.models ?? cfgEnabledModels.get(settingsInstance);
+			// Extension providers registered inside createSession, after the scope was
+			// snapshotted. Pick their models up now so the startup scope notice, the
+			// scoped /models list and the Ctrl+P cycle include them from the first frame
+			// instead of after the background catalog refresh (issue #6694).
+			if (configuredScope.length > 0) {
+				const rebuilt = await logger.time(
+					"rebuildScopedModels",
+					rebuildScopedModels,
+					session,
+					parsedArgs,
+					modelRegistry,
+					settingsInstance,
+				);
+				if (rebuilt) scopedModels = rebuilt;
+			}
 			// Runtime provider discovery (opencode-go, models.yml `discovery:`, proxies)
 			// populates the registry AFTER the scope was snapshotted at startup; re-resolve
 			// once it settles so newly-discovered configured models join the scoped
 			// /models list and Ctrl+P cycle, including scopes that initially resolved
 			// empty (issue #9220). Fire-and-forget: the prompt must never block on the
 			// background pass.
-			const configuredScope = parsedArgs.models ?? cfgEnabledModels.get(settingsInstance);
 			// Interactive-only work that must not delay the first session-bound frame:
 			// runInteractiveMode calls it once init has painted. Neither feeds the first
 			// prompt: fallback-chain validation only produces header warnings, and the
 			// background refresh already raced the first prompt when it ran earlier.
 			const startDeferredStartupWork = (): void => {
-				session.validateRetryFallbackChains();
 				modelRegistry.refreshInBackground();
+				session.validateRetryFallbackChains();
 				if (configuredScope.length > 0) {
 					// Must follow refreshInBackground: it waits on the in-flight refresh.
 					void rebuildScopedModelsAfterDiscovery(session, parsedArgs, modelRegistry, settingsInstance).catch(
@@ -2507,6 +2612,9 @@ export async function runRootCommand(
 					);
 				}
 				void startBackgroundModelDiscovery?.();
+			};
+			const refreshScopedModelsAfterLogin = async () => {
+				await rebuildScopedModels(session, parsedArgs, modelRegistry, settingsInstance);
 			};
 			watchScopedModelSettings(session, parsedArgs, modelRegistry, settingsInstance);
 
@@ -2626,6 +2734,8 @@ export async function runRootCommand(
 						startDeferredStartupWork,
 						startupLease,
 						initialArgs.goal,
+						parsedArgs.restore ? () => restoreSession(session, { eventBus, subagentEventBus }) : undefined,
+						refreshScopedModelsAfterLogin,
 					);
 				} finally {
 					startupLease?.dispose();

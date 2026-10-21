@@ -2,8 +2,7 @@ export const BUILTIN_TOOL_NAMES = [
 	"read",
 	"bash",
 	"edit",
-	"ast_grep",
-	"ast_edit",
+	"ast",
 	"ask",
 	"debug",
 	"ida",
@@ -37,7 +36,11 @@ export const HIDDEN_TOOL_NAMES = ["yield", "goal", "think"] as const;
 
 export type HiddenToolName = (typeof HIDDEN_TOOL_NAMES)[number];
 
-const LEGACY_BUILTIN_TOOL_NAME_ALIASES: ReadonlyMap<string, BuiltinToolName> = new Map([["search", "grep"]]);
+const LEGACY_BUILTIN_TOOL_NAME_ALIASES: ReadonlyMap<string, BuiltinToolName> = new Map([
+	["search", "grep"],
+	["ast_grep", "ast"],
+	["ast_edit", "ast"],
+]);
 
 const CANONICAL_TOOL_NAMES: Record<string, true> = Object.fromEntries(
 	[...BUILTIN_TOOL_NAMES, ...HIDDEN_TOOL_NAMES].map(name => [name, true]),

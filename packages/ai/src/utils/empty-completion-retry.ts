@@ -14,8 +14,15 @@
  * classifier and are separately bounded by the caller's policy.
  */
 import * as AIError from "../error";
-import type { AssistantMessage, AssistantMessageEvent, Context } from "../types";
+import type {
+	AssistantMessage,
+	AssistantMessageEvent,
+	Context,
+	ProviderRetryAttemptInfo,
+	ProviderRetryWaitFn,
+} from "../types";
 import { AssistantMessageEventStream } from "./event-stream";
+import { type OperationDeadlineOptions, markOperationProgress, operationDeadlineExceeded } from "./operation-deadline";
 import { waitForRetry } from "./retry-wait";
 
 export const MAX_EMPTY_COMPLETION_RETRIES = 2;
@@ -57,9 +64,9 @@ function isMeaningfulCompletionEvent(event: AssistantMessageEvent): boolean {
 	}
 }
 
-interface StreamRetryOptions {
+interface StreamRetryOptions extends OperationDeadlineOptions {
 	signal?: AbortSignal;
-	providerRetryWait?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
+	providerRetryWait?: ProviderRetryWaitFn;
 	acceptEmptyResponse?: boolean;
 }
 
@@ -123,6 +130,9 @@ export function withReplaySafeStreamRetry<M, O extends StreamRetryOptions>(
 						buffered.push(event);
 						continue;
 					}
+					// First meaningful event commits the attempt — and re-bases the
+					// operation deadline, so the budget bounds silence, not work.
+					if (!committed) markOperationProgress(options);
 					committed = true;
 					flush();
 					outer.push(event);
@@ -159,17 +169,31 @@ export function withReplaySafeStreamRetry<M, O extends StreamRetryOptions>(
 				);
 
 			let delayMs: number | undefined;
+			// Two independent budgets share one sleep; report whichever one is
+			// spending an attempt so a UI can show the right counter.
+			let retryInfo: ProviderRetryAttemptInfo | undefined;
 			if (retryEmpty) {
 				delayMs = EMPTY_COMPLETION_BASE_DELAY_MS * 2 ** emptyRetries;
 				emptyRetries++;
+				retryInfo = { attempt: emptyRetries, maxAttempts: MAX_EMPTY_COMPLETION_RETRIES };
 			} else if (retryProviderError) {
 				delayMs = EMPTY_COMPLETION_BASE_DELAY_MS * 2 ** providerErrorRetries;
 				providerErrorRetries++;
+				retryInfo = { attempt: providerErrorRetries, maxAttempts: policy.maxProviderErrorRetries ?? 0 };
 			}
 
 			if (delayMs !== undefined && !signal?.aborted) {
+				// The operation budget covers this sleep and every nested retry that
+				// preceded it: once it is spent, another attempt only prolongs the
+				// silence, so surface the exhaustion instead of waiting it out.
+				const deadlineError = operationDeadlineExceeded(options, delayMs);
+				if (deadlineError) {
+					flush();
+					outer.fail(deadlineError);
+					return;
+				}
 				try {
-					await waitForRetry(options?.providerRetryWait, delayMs, signal);
+					await waitForRetry(options?.providerRetryWait, delayMs, signal, retryInfo);
 				} catch (waitError) {
 					flush();
 					if (signal?.aborted) {

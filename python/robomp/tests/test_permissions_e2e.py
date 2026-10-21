@@ -21,10 +21,35 @@ from robomp.natives_cache import NativesCache
 from robomp.natives_cache import compute_key as natives_compute_key
 from robomp.sandbox import LocalGitTransport, SandboxManager, Workspace
 
+PERMISSION_E2E = os.environ.get("ROBOMP_PERMISSION_E2E") == "1"
+
 pytestmark = pytest.mark.skipif(
-    os.environ.get("ROBOMP_PERMISSION_E2E") != "1",
+    not PERMISSION_E2E,
     reason="set ROBOMP_PERMISSION_E2E=1 to run slot-permission e2e tests",
 )
+
+
+def _assert_e2e_host() -> None:
+    """Refuse the permission e2e run on hosts barred from omp e2e (kb rule g-ca3365d2)."""
+    repo_root = Path(__file__).resolve().parents[3]
+    guard = repo_root / "scripts" / "e2e-host-guard.ts"
+    try:
+        result = subprocess.run(
+            ["bun", str(guard), "e2e", "robomp permission e2e"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+        )
+    except OSError as err:
+        pytest.fail(f"robomp permission e2e: cannot run e2e host guard ({err})", pytrace=False)
+    if result.returncode != 0:
+        pytest.fail(result.stderr.strip() or f"e2e host guard exited {result.returncode}", pytrace=False)
+
+
+# Before any fixture, temp repo or uid switch: a Linux guest on the Mac is
+# refused here even as root.
+if PERMISSION_E2E:
+    _assert_e2e_host()
 
 _SLOT_ONE = 2001
 _SLOT_TWO = 2002

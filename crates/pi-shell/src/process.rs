@@ -51,6 +51,11 @@ mod platform {
 			self.pid
 		}
 
+		/// `starttime` clock ticks since boot.
+		pub const fn start_time(&self) -> u64 {
+			self.start_time
+		}
+
 		pub fn children(&self) -> Vec<Self> {
 			if !self.live_identity() {
 				return Vec::new();
@@ -277,6 +282,14 @@ mod platform {
 
 		pub const fn pid(&self) -> i32 {
 			self.pid
+		}
+
+		/// Start time in microseconds since the Unix epoch.
+		pub const fn start_time(&self) -> u64 {
+			self
+				.start_tvsec
+				.saturating_mul(1_000_000)
+				.saturating_add(self.start_tvusec)
 		}
 
 		pub fn children(&self) -> Vec<Self> {
@@ -520,6 +533,11 @@ mod platform {
 			self.pid
 		}
 
+		/// Creation time as a `FILETIME` tick count.
+		pub const fn start_time(&self) -> u64 {
+			self.creation_time
+		}
+
 		pub fn parent_pid(&self) -> Option<i32> {
 			sys::parent_pid(&self.handle)
 		}
@@ -676,6 +694,16 @@ impl Process {
 		self.inner.pid()
 	}
 
+	/// Platform start-time token for this process. Together with the pid it
+	/// identifies one process across pid reuse: a recycled pid reports a
+	/// different value. The unit is platform-specific (clock ticks since boot on
+	/// Linux, microseconds since the epoch on macOS, `FILETIME` ticks on
+	/// Windows), so compare values for equality only.
+	#[must_use]
+	pub const fn start_time(&self) -> u64 {
+		self.inner.start_time()
+	}
+
 	/// Parent process id for this process, when available.
 	#[must_use]
 	pub fn ppid(&self) -> Option<i32> {
@@ -740,8 +768,10 @@ impl Process {
 	/// Sends `TERM_SIGNAL` to the optional process group, every live descendant,
 	/// and the root, then optionally waits up to `graceful_ms` for the tree to
 	/// exit before escalating to `KILL_SIGNAL`. Pass `graceful_ms < 0` to skip
-	/// the wait entirely (the polite signal is still emitted). Returns `true`
-	/// when the tree has exited by the end of the hard wave's wait window.
+	/// the wait entirely (the polite signal is still emitted). With `group`, the
+	/// hard wave always runs, since a reparented group member is invisible to
+	/// the descendant walk. Returns `true` when the tree has exited by the end
+	/// of the hard wave's wait window.
 	pub async fn terminate_tree(
 		&self,
 		group: bool,
@@ -848,11 +878,15 @@ impl Process {
 		let process_group = if group { self.group_id() } else { None };
 		let protected = host_protected_pids();
 
+		// Snapshot the tree before any signal: once a TERM-handling leader dies,
+		// its children are reparented away and a later walk can no longer find
+		// them, while a group member that ignores TERM keeps running.
+		let mut descendants = self.signalable_descendants(&protected);
+
 		// Polite wave: SIGTERM the group, every live descendant, then the root.
 		if let Some(pgid) = process_group {
 			let _ = kill_process_group(pgid, TERM_SIGNAL);
 		}
-		let mut descendants = self.signalable_descendants(&protected);
 		for child in &descendants {
 			let _ = child.inner.kill(TERM_SIGNAL);
 		}
@@ -862,7 +896,9 @@ impl Process {
 
 		// Optional grace wait. A negative `graceful_ms` skips the wait entirely
 		// (we still emit the polite signal so cleanup handlers can run before
-		// KILL).
+		// KILL). With a process group, polite exit of the walked tree does not
+		// prove the group is empty — a reparented member that ignores TERM is
+		// invisible to the walk — so the hard group wave always runs.
 		if graceful_ms >= 0 {
 			let exited = wait_for_exit(
 				self,
@@ -871,17 +907,19 @@ impl Process {
 				ct.clone(),
 			)
 			.await?;
-			if exited {
+			if exited && process_group.is_none() {
 				return Ok(true);
 			}
 		}
 
 		// Hard wave. Re-walk the tree so any grandchild spawned during the grace
-		// period — or any process re-parented to the root — is signalled too.
+		// period — or any process re-parented to the root — is signalled too,
+		// and keep the pre-TERM snapshot so descendants reparented away from a
+		// dead root are still killed and awaited.
 		if let Some(pgid) = process_group {
 			let _ = kill_process_group(pgid, KILL_SIGNAL);
 		}
-		descendants = self.signalable_descendants(&protected);
+		descendants.extend(self.signalable_descendants(&protected));
 		for child in &descendants {
 			let _ = child.inner.kill(KILL_SIGNAL);
 		}
@@ -1130,6 +1168,25 @@ impl TerminationTargets {
 		for process in &self.processes {
 			let _ = process.signal_tree(signal);
 		}
+	}
+
+	/// True when every recorded target has exited: no pinned process is still
+	/// running and no recorded group still has members. Bounds the post-KILL
+	/// wait so a caller that just signalled can treat return as "the group is
+	/// dead" instead of racing still-dying processes.
+	#[must_use]
+	pub fn all_exited(&self) -> bool {
+		if self
+			.processes
+			.iter()
+			.any(|process| process.status() == ProcessStatus::Running)
+		{
+			return false;
+		}
+		if self.pgids.iter().any(|pgid| process_group_alive(*pgid)) {
+			return false;
+		}
+		true
 	}
 }
 

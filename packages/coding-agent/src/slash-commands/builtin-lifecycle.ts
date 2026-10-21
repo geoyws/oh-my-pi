@@ -1,4 +1,6 @@
-import { clearSubmittedText } from "./helpers/draft";
+import { SEANCE_SLASH_COMMAND } from "./seance";
+import { admitTuiSlashText, clearSubmittedText, restoreRefusedLine } from "./helpers/draft";
+import { UserMessageRefusedError } from "../session/user-message-refused-error";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { CompactionCancelledError } from "@oh-my-pi/pi-agent-core/compaction";
@@ -161,7 +163,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		description: "Start a new session",
 		handleTui: async (_command, runtime) => {
 			clearSubmittedText(runtime);
-			await runtime.ctx.handleClearCommand();
+			await runtime.ctx.handleNewCommand();
 		},
 	},
 	{
@@ -225,6 +227,13 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		handle: async (command, runtime) => {
 			const parsed = parseCompactArgs(command.args);
 			if ("error" in parsed) return usage(parsed.error, runtime);
+			// RPC prompt and ACP session/prompt reach this shared path: the
+			// user-authored focus goes to the summarizer provider and is persisted
+			// with the compaction entry, so gate it before anything runs. A refusal
+			// throws with only the handler's notice and compacts nothing.
+			if (parsed.instructions?.trim()) {
+				await runtime.session.gateUserMessage(parsed.instructions, undefined, runtime.userMessageSource);
+			}
 			const runCompact = async (): Promise<void> => {
 				const before = runtime.session.getContextUsage?.();
 				const beforeTokens = before?.tokens;
@@ -269,7 +278,22 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				runtime.ctx.showWarning(parsed.error);
 				return;
 			}
-			await runtime.ctx.handleCompactCommand(parsed.instructions, parsed.mode);
+			try {
+				await runtime.ctx.handleCompactCommand(parsed.instructions, parsed.mode);
+			} catch (error) {
+				// A `before_user_message` refusal carries only the safe notice.
+				// The composer text is already empty on production Enter, but the
+				// line's images stay in the editor: hand the exact original slash
+				// line back ahead of any newer draft, keeping each `[Image #N]`
+				// marker on its own image.
+				if (error instanceof UserMessageRefusedError) {
+					restoreRefusedLine(runtime.ctx.editor, command.text, runtime.input?.images, runtime.input?.imageLinks);
+					runtime.ctx.showError(error.notice);
+					runtime.ctx.ui.requestRender();
+					return;
+				}
+				throw error;
+			}
 		},
 	},
 	{
@@ -314,6 +338,11 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 			}
 			if (runtime.session.isGeneratingHandoff) {
 				return usage("Handoff generation is already in progress.", runtime);
+			}
+			// Same contract as `/compact`: the focus reaches the handoff summarizer
+			// and the committed compaction entry, so gate it first.
+			if (command.args?.trim()) {
+				await runtime.session.gateUserMessage(command.args, undefined, runtime.userMessageSource);
 			}
 			const runHandoff = async (): Promise<void> => {
 				let result: HandoffResult | undefined;
@@ -365,9 +394,22 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		handleTui: async (command, runtime) => {
 			const customInstructions = command.args || undefined;
 			clearSubmittedText(runtime);
-			await runtime.ctx.handleHandoffCommand(customInstructions);
+			try {
+				await runtime.ctx.handleHandoffCommand(customInstructions);
+			} catch (error) {
+				// Same refusal-restore contract as /compact above: hand the exact
+				// original slash line back with its image markers aligned.
+				if (error instanceof UserMessageRefusedError) {
+					restoreRefusedLine(runtime.ctx.editor, command.text, runtime.input?.images, runtime.input?.imageLinks);
+					runtime.ctx.showError(error.notice);
+					runtime.ctx.ui.requestRender();
+					return;
+				}
+				throw error;
+			}
 		},
 	},
+	SEANCE_SLASH_COMMAND,
 	{
 		name: "resume",
 		icon: "history",
@@ -456,6 +498,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		handleTui: async (command, runtime) => {
 			const work = command.text.slice(`/${command.name}`.length).trim();
 			clearSubmittedText(runtime);
+			if (!(await admitTuiSlashText(command, runtime, work))) return;
 			await runtime.ctx.handleTanCommand(work);
 		},
 	},
@@ -468,6 +511,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		handleTui: async (command, runtime) => {
 			const complaint = command.text.slice(`/${command.name}`.length).trim();
 			clearSubmittedText(runtime);
+			if (!(await admitTuiSlashText(command, runtime, complaint))) return;
 			await runtime.ctx.handleOmfgCommand(complaint);
 		},
 	},
@@ -480,6 +524,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		handleTui: async (command, runtime) => {
 			const args = command.text.slice(`/${command.name}`.length).trim();
 			clearSubmittedText(runtime);
+			if (!(await admitTuiSlashText(command, runtime, args))) return;
 			await runtime.ctx.handleCleanseCommand(args);
 		},
 	},
@@ -562,6 +607,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				case "view": {
 					const payload = await backend.buildDeveloperInstructions(
 						runtime.settings.getAgentDir(),
+						runtime.cwd,
 						runtime.settings,
 						runtime.session,
 					);

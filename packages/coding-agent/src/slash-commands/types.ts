@@ -1,5 +1,6 @@
 import type { Settings } from "../config/settings";
 import type { SlashCommandIconName } from "@oh-my-pi/pi-tui/theme/symbols";
+import type { UserMessageSource } from "../extensibility/extensions/types";
 import type { InteractiveModeContext, SubmittedUserInput } from "../modes/types";
 import type { AgentSession } from "../session/agent-session";
 import type { SessionManager } from "../session/session-manager";
@@ -103,6 +104,12 @@ export interface SlashCommandRuntime {
 	 * return immediately and leave the serialized queue free for `abort`.
 	 */
 	runCommandInBackground?: (task: () => Promise<void>) => void;
+	/**
+	 * Ingress reported to `before_user_message` when a builtin's `handle()`
+	 * forwards user-authored text (the `/compact` or `/handoff` focus) to a
+	 * provider. RPC sets `"rpc"`, ACP sets `"acp"`; absent means `"unknown"`.
+	 */
+	userMessageSource?: UserMessageSource;
 	notifyTitleChanged?: () => Promise<void> | void;
 	/**
 	 * Push the host's view of the session config (model, thinking level, mode).

@@ -1,4 +1,5 @@
 import { DEFAULT_MAX_BYTES, type OutputArtifactError, OutputSink } from "@oh-my-pi/pi-tui/tools/streaming-output";
+import { logger } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "../../tools";
 import {
 	resolveOutputMaxColumns,
@@ -7,7 +8,8 @@ import {
 } from "../../tools/output-meta";
 import { isEvalTimeoutControlEvent, withBridgeTimeoutPause } from "../bridge-timeout";
 import { DisplayOutputCollector } from "../executor-base";
-import { executeInVmContext, type JsDisplayOutput } from "./context-manager";
+import type { EvalDisplayOutput } from "../types";
+import { executeInVmContext } from "./context-manager";
 import { installJsPackages } from "./package-installer";
 import type { JsPackageEnvironmentMode } from "./package-installer";
 import type { JsStatusEvent } from "./shared/types";
@@ -58,7 +60,7 @@ export interface JsResult {
 	totalBytes: number;
 	outputLines: number;
 	outputBytes: number;
-	displayOutputs: JsDisplayOutput[];
+	displayOutputs: EvalDisplayOutput[];
 }
 
 function getExecutionTimeoutMs(options: Pick<JsExecutorOptions, "deadlineMs" | "timeoutMs">): number | undefined {
@@ -85,10 +87,12 @@ function isTimeoutReason(reason: unknown): boolean {
 const JS_PACKAGE_INSTALL_TIMEOUT_MS = 10 * 60_000;
 
 function formatJsTimeoutAnnotation(timeoutMs: number | undefined): string {
-	// Timeout cancellation force-kills the worker (the only way to interrupt
-	// synchronous user code), which discards the persistent VM state. Say so,
-	// or the model will keep referencing variables that no longer exist.
-	const reset = "The JS worker was force-killed and its VM state was reset; variables from earlier cells are gone.";
+	// Timeout cancellation kills the worker (the only way to interrupt
+	// synchronous user code) and discards the retained runtime, so the next cell
+	// starts from an empty VM. State loss is what the model must be told, and it
+	// is guaranteed by the session being dropped — unlike the kill itself, whose
+	// confirmation is logged by `terminate()`.
+	const reset = "The JS worker was terminated and its VM state was reset; variables from earlier cells are gone.";
 	if (timeoutMs === undefined) return `Command timed out. ${reset}`;
 	const secs = Math.max(1, Math.round(timeoutMs / 1000));
 	return `Command timed out after ${secs} seconds. ${reset}`;
@@ -105,7 +109,7 @@ function formatPackageInstallTimeoutAnnotation(installDeadlineReached: boolean):
 }
 
 export async function executeJs(code: string, options: JsExecutorOptions): Promise<JsResult> {
-	const display = new DisplayOutputCollector<JsDisplayOutput>();
+	const display = new DisplayOutputCollector();
 	const displayOutputs = display.outputs;
 	const outputSink = new OutputSink({
 		artifactPath: options.artifactPath,
@@ -177,13 +181,28 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 				signal,
 				onText: chunk => outputSink.push(chunk),
 				onDisplay: output => {
+					// Runtime-origin output only. The IPC boundary already drops
+					// forged timeout control; this second guard keeps a control
+					// event out of rendered cell output if one ever arrives here.
 					if (output.type === "status") {
-						// Timeout-control events drive the eval watchdog only; never
-						// store or render them as cell output.
-						options.onStatus?.(output.event);
 						if (isEvalTimeoutControlEvent(output.event)) return;
+						options.onStatus?.(output.event);
 					}
 					display.push(output);
+				},
+				// Host-owned watchdog control: only this process's bridge wrapper
+				// can pause or resume the cell deadline. Observer fanout is
+				// best-effort so a throwing consumer cannot unwind the control
+				// channel; the applied pause/resume state stands.
+				onTimeoutControl: event => {
+					try {
+						options.onStatus?.(event);
+					} catch (error) {
+						logger.warn("eval timeout control observer failed; keeping the applied pause/resume state", {
+							op: event.op,
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
 				},
 			},
 		});

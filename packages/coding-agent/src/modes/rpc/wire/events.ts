@@ -15,7 +15,13 @@ export const eventDefs = {
 	CacheWarmingOutcome: "'hit' | 'miss' | 'error' | 'aborted'",
 	NotifyType: "'info' | 'warning' | 'error'",
 
-	AgentStartEvent: { type: "'agent_start'" },
+	AgentStartEvent: {
+		type: "'agent_start'",
+		"resumedToolCallIds?": doc(
+			"string[]",
+			"Calls of an unpaired assistant tail a continued run executes before its first model request.",
+		),
+	},
 	AgentEndEvent: {
 		type: "'agent_end'",
 		messages: doc(
@@ -101,6 +107,22 @@ export const eventDefs = {
 			[],
 		),
 	},
+	ProviderRetryWaitStartEvent: {
+		type: "'provider_retry_wait_start'",
+		waitId: "number.integer",
+		role: "'main' | 'advisor' | 'side'",
+		delayMs: "number.integer",
+		model: "string",
+		provider: "string",
+		api: "string",
+		"attempt?": "number.integer",
+		"maxAttempts?": "number.integer",
+	},
+	ProviderRetryWaitEndEvent: {
+		type: "'provider_retry_wait_end'",
+		aborted: "boolean",
+		waitId: "number.integer",
+	},
 	CacheWarmingStartEvent: doc(
 		{ type: "'cache_warming_start'", phase: "CacheWarmingPhase", provider: "string", model: "string" },
 		"A prompt-cache refresh was handed to the provider.",
@@ -185,6 +207,8 @@ export const eventDefs = {
 			"AutoCompactionEndEvent",
 			"AutoRetryStartEvent",
 			"AutoRetryEndEvent",
+			"ProviderRetryWaitStartEvent",
+			"ProviderRetryWaitEndEvent",
 			"CacheWarmingStartEvent",
 			"CacheWarmingEndEvent",
 			"RetryFallbackAppliedEvent",

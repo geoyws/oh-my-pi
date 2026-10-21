@@ -185,6 +185,8 @@ pub struct ThinkingContent {
 	pub thinking: Option<String>,
 	pub thinking_signature: Option<String>,
 	pub item_id: Option<String>,
+	/// Prose the model addressed to the user, returned by the provider as thinking; present it as answer text.
+	pub narration: Option<bool>,
 	/// Every key not decoded into a declared field.
 	pub extra: Map<String, Value>,
 }
@@ -201,11 +203,15 @@ impl Serialize for ThinkingContent {
 		if let Some(value) = &self.item_id {
 			map.serialize_entry("itemId", value)?;
 		}
+		if let Some(value) = &self.narration {
+			map.serialize_entry("narration", value)?;
+		}
 		for (key, value) in &self.extra {
 			match key.as_str() {
 				"thinking" if self.thinking.is_some() => continue,
 				"thinkingSignature" if self.thinking_signature.is_some() => continue,
 				"itemId" if self.item_id.is_some() => continue,
+				"narration" if self.narration.is_some() => continue,
 				_ => {}
 			}
 			map.serialize_entry(key, value)?;
@@ -221,6 +227,7 @@ impl<'de> Deserialize<'de> for ThinkingContent {
 			thinking: take(&mut extra, "thinking"),
 			thinking_signature: take(&mut extra, "thinkingSignature"),
 			item_id: take(&mut extra, "itemId"),
+			narration: take(&mut extra, "narration"),
 			extra,
 		})
 	}
@@ -3153,6 +3160,8 @@ pub struct CompactionResult {
 	pub details: Option<Value>,
 	#[serde(rename = "preserveData", default, skip_serializing_if = "Option::is_none")]
 	pub preserve_data: Option<Map<String, Value>>,
+	#[serde(rename = "providerReplayThroughEntryId", default, skip_serializing_if = "Option::is_none")]
+	pub provider_replay_through_entry_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3591,7 +3600,11 @@ impl NotifyType {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AgentStartEvent {}
+pub struct AgentStartEvent {
+	/// Calls of an unpaired assistant tail a continued run executes before its first model request.
+	#[serde(rename = "resumedToolCallIds", default, skip_serializing_if = "Option::is_none")]
+	pub resumed_tool_call_ids: Option<Vec<String>>,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentEndEvent {
@@ -3742,6 +3755,29 @@ pub struct AutoRetryEndEvent {
 	pub retry_errors: Vec<Map<String, Value>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderRetryWaitStartEvent {
+	#[serde(rename = "waitId")]
+	pub wait_id: i64,
+	pub role: ProviderRetryWaitStartEventRole,
+	#[serde(rename = "delayMs")]
+	pub delay_ms: i64,
+	pub model: String,
+	pub provider: String,
+	pub api: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub attempt: Option<i64>,
+	#[serde(rename = "maxAttempts", default, skip_serializing_if = "Option::is_none")]
+	pub max_attempts: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderRetryWaitEndEvent {
+	pub aborted: bool,
+	#[serde(rename = "waitId")]
+	pub wait_id: i64,
+}
+
 /// A prompt-cache refresh was handed to the provider.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CacheWarmingStartEvent {
@@ -3872,6 +3908,8 @@ pub enum RpcAgentEvent {
 	AutoCompactionEnd(AutoCompactionEndEvent),
 	AutoRetryStart(AutoRetryStartEvent),
 	AutoRetryEnd(AutoRetryEndEvent),
+	ProviderRetryWaitStart(ProviderRetryWaitStartEvent),
+	ProviderRetryWaitEnd(ProviderRetryWaitEndEvent),
 	/// A prompt-cache refresh was handed to the provider.
 	CacheWarmingStart(CacheWarmingStartEvent),
 	/// Outcome of the refresh announced by the matching `cache_warming_start`.
@@ -3914,6 +3952,8 @@ impl RpcAgentEvent {
 			Some("auto_compaction_end") => |value| serde_json::from_value(value).map(Self::AutoCompactionEnd),
 			Some("auto_retry_start") => |value| serde_json::from_value(value).map(Self::AutoRetryStart),
 			Some("auto_retry_end") => |value| serde_json::from_value(value).map(Self::AutoRetryEnd),
+			Some("provider_retry_wait_start") => |value| serde_json::from_value(value).map(Self::ProviderRetryWaitStart),
+			Some("provider_retry_wait_end") => |value| serde_json::from_value(value).map(Self::ProviderRetryWaitEnd),
 			Some("cache_warming_start") => |value| serde_json::from_value(value).map(Self::CacheWarmingStart),
 			Some("cache_warming_end") => |value| serde_json::from_value(value).map(Self::CacheWarmingEnd),
 			Some("retry_fallback_applied") => |value| serde_json::from_value(value).map(Self::RetryFallbackApplied),
@@ -3956,6 +3996,8 @@ impl Serialize for RpcAgentEvent {
 			Self::AutoCompactionEnd(member) => serialize_tagged(member, &[("type", "auto_compaction_end")], serializer),
 			Self::AutoRetryStart(member) => serialize_tagged(member, &[("type", "auto_retry_start")], serializer),
 			Self::AutoRetryEnd(member) => serialize_tagged(member, &[("type", "auto_retry_end")], serializer),
+			Self::ProviderRetryWaitStart(member) => serialize_tagged(member, &[("type", "provider_retry_wait_start")], serializer),
+			Self::ProviderRetryWaitEnd(member) => serialize_tagged(member, &[("type", "provider_retry_wait_end")], serializer),
 			Self::CacheWarmingStart(member) => serialize_tagged(member, &[("type", "cache_warming_start")], serializer),
 			Self::CacheWarmingEnd(member) => serialize_tagged(member, &[("type", "cache_warming_end")], serializer),
 			Self::RetryFallbackApplied(member) => serialize_tagged(member, &[("type", "retry_fallback_applied")], serializer),
@@ -4937,7 +4979,7 @@ impl RpcNotification {
 			Some("session_info_update") => |value| serde_json::from_value(value).map(Self::SessionInfoUpdate),
 			Some("config_update") => |value| serde_json::from_value(value).map(Self::ConfigUpdate),
 			Some("rpc_frame_error") => |value| serde_json::from_value(value).map(Self::RpcFrameError),
-			Some("agent_start" | "agent_end" | "turn_start" | "turn_end" | "message_start" | "message_update" | "message_end" | "tool_execution_start" | "tool_execution_update" | "tool_stream_update" | "tool_execution_end" | "auto_compaction_start" | "auto_compaction_end" | "auto_retry_start" | "auto_retry_end" | "cache_warming_start" | "cache_warming_end" | "retry_fallback_applied" | "retry_fallback_succeeded" | "model_changed" | "config_warnings_changed" | "advisor_cost_changed" | "advisor_yielded" | "ttsr_triggered" | "todo_reminder" | "todo_auto_clear" | "irc_message" | "notice" | "thinking_level_changed" | "goal_updated" | "queue_update") => |value| serde_json::from_value(value).map(Self::RpcAgentEvent),
+			Some("agent_start" | "agent_end" | "turn_start" | "turn_end" | "message_start" | "message_update" | "message_end" | "tool_execution_start" | "tool_execution_update" | "tool_stream_update" | "tool_execution_end" | "auto_compaction_start" | "auto_compaction_end" | "auto_retry_start" | "auto_retry_end" | "provider_retry_wait_start" | "provider_retry_wait_end" | "cache_warming_start" | "cache_warming_end" | "retry_fallback_applied" | "retry_fallback_succeeded" | "model_changed" | "config_warnings_changed" | "advisor_cost_changed" | "advisor_yielded" | "ttsr_triggered" | "todo_reminder" | "todo_auto_clear" | "irc_message" | "notice" | "thinking_level_changed" | "goal_updated" | "queue_update") => |value| serde_json::from_value(value).map(Self::RpcAgentEvent),
 			_ => |value| Ok(Self::Unknown(value)),
 		};
 		decode(value)
@@ -4997,7 +5039,7 @@ impl RpcServerFrame {
 		let decode: fn(Value) -> Result<Self, serde_json::Error> = match value.get("type").and_then(Value::as_str) {
 			Some("response") => |value| serde_json::from_value(value).map(Self::Response),
 			Some("host_tool_call" | "host_tool_cancel" | "host_uri_request" | "host_uri_cancel") => |value| serde_json::from_value(value).map(Self::RpcHostRequest),
-			Some("ready" | "prompt_result" | "session_settled" | "extension_error" | "extension_ui_request" | "available_commands_update" | "subagent_lifecycle" | "subagent_progress" | "subagent_event" | "live_phase" | "live_levels" | "live_transcript" | "live_end" | "btw_delta" | "btw_record" | "command_output" | "session_info_update" | "config_update" | "rpc_frame_error" | "agent_start" | "agent_end" | "turn_start" | "turn_end" | "message_start" | "message_update" | "message_end" | "tool_execution_start" | "tool_execution_update" | "tool_stream_update" | "tool_execution_end" | "auto_compaction_start" | "auto_compaction_end" | "auto_retry_start" | "auto_retry_end" | "cache_warming_start" | "cache_warming_end" | "retry_fallback_applied" | "retry_fallback_succeeded" | "model_changed" | "config_warnings_changed" | "advisor_cost_changed" | "advisor_yielded" | "ttsr_triggered" | "todo_reminder" | "todo_auto_clear" | "irc_message" | "notice" | "thinking_level_changed" | "goal_updated" | "queue_update") => |value| serde_json::from_value(value).map(Self::RpcNotification),
+			Some("ready" | "prompt_result" | "session_settled" | "extension_error" | "extension_ui_request" | "available_commands_update" | "subagent_lifecycle" | "subagent_progress" | "subagent_event" | "live_phase" | "live_levels" | "live_transcript" | "live_end" | "btw_delta" | "btw_record" | "command_output" | "session_info_update" | "config_update" | "rpc_frame_error" | "agent_start" | "agent_end" | "turn_start" | "turn_end" | "message_start" | "message_update" | "message_end" | "tool_execution_start" | "tool_execution_update" | "tool_stream_update" | "tool_execution_end" | "auto_compaction_start" | "auto_compaction_end" | "auto_retry_start" | "auto_retry_end" | "provider_retry_wait_start" | "provider_retry_wait_end" | "cache_warming_start" | "cache_warming_end" | "retry_fallback_applied" | "retry_fallback_succeeded" | "model_changed" | "config_warnings_changed" | "advisor_cost_changed" | "advisor_yielded" | "ttsr_triggered" | "todo_reminder" | "todo_auto_clear" | "irc_message" | "notice" | "thinking_level_changed" | "goal_updated" | "queue_update") => |value| serde_json::from_value(value).map(Self::RpcNotification),
 			_ => |value| Ok(Self::Unknown(value)),
 		};
 		decode(value)
@@ -5719,6 +5761,27 @@ impl LogoutAccountType {
 		match self {
 			Self::ApiKey => "api_key",
 			Self::Oauth => "oauth",
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ProviderRetryWaitStartEventRole {
+	#[serde(rename = "main")]
+	Main,
+	#[serde(rename = "advisor")]
+	Advisor,
+	#[serde(rename = "side")]
+	Side,
+}
+
+impl ProviderRetryWaitStartEventRole {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Main => "main",
+			Self::Advisor => "advisor",
+			Self::Side => "side",
 		}
 	}
 }

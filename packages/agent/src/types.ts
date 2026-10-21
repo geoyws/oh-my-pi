@@ -38,10 +38,14 @@ export interface QueuedMessagePreparation {
 	commit(): readonly AgentMessage[] | undefined;
 }
 
+/** Which agent queue a batch came from: steering amends the running task, follow-ups start the next one. */
+export type QueuedMessageQueue = "steering" | "followUp";
+
 /** Prepare an exclusively claimed batch. Undefined delivers unchanged; the signal also aborts when the claim is cancelled. */
 export type PrepareQueuedMessages = (
 	messages: readonly AgentMessage[],
 	signal: AbortSignal,
+	queue: QueuedMessageQueue,
 ) => QueuedMessagePreparation | undefined | Promise<QueuedMessagePreparation | undefined>;
 
 /** Called once an aside has been inserted into the agent's live context. */
@@ -160,7 +164,38 @@ export interface SteeringQueueState {
 	queued: boolean;
 	/** Best-effort origin used only to word synthetic skipped-tool results. */
 	source?: SteeringInterruptSource;
+	/**
+	 * Number of messages currently sitting in the steering queue.
+	 *
+	 * Occupancy, NOT the batch size a boundary dequeue would take: a host in
+	 * one-at-a-time steering mode still reports every queued message here. The
+	 * provider-wait watcher snapshots this count when it arms and only cancels
+	 * the request once a later peek reports a strictly larger count, so a
+	 * message left queued from an earlier turn cannot pass for a new arrival
+	 * and cannot blind the watcher to the steer typed after it.
+	 *
+	 * Omit it when the queue cannot count itself; the watcher then degrades to
+	 * the boolean edge (empty once, then occupied).
+	 */
+	pending?: number;
 }
+
+/**
+ * What the loop would do, right now, with a steering message queued at this
+ * instant. Reported through {@link AgentLoopConfig.onQueuedSteerOutcome} as
+ * the loop moves between windows, from the same gates the interrupt machinery
+ * uses, so a host can tell the user what will actually happen.
+ * - "interrupt-model-call": a model call (or its preparation) has produced no
+ *   output and the steer watch is armed; the call is cancelled and re-issued
+ *   with the steer folded in.
+ * - "interrupt-wait": a tool batch still has an unfinished interruptible wait
+ *   that queued steering cuts short; the steer injects once the batch's other
+ *   tools finish.
+ * - "after-tools": a tool batch is running with nothing steering would cut
+ *   short; the steer injects at the batch boundary.
+ * - "after-response": the steer waits for the current response to finish.
+ */
+export type QueuedSteerOutcome = "interrupt-model-call" | "interrupt-wait" | "after-tools" | "after-response";
 
 /**
  * Configuration for the agent loop.
@@ -169,9 +204,12 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model;
 
 	/**
-	 * When to interrupt tool execution for steering messages.
+	 * When a queued steering message may cut the current work short.
 	 * - "immediate" = cut interruptible waits short and raise the cooperative
-	 *   `steeringSignal` for other running tools (default)
+	 *   `steeringSignal` for other running tools, and cancel a provider request
+	 *   that has not streamed anything yet — still waiting or in retry backoff —
+	 *   so the loop re-issues it with the steer in context instead of parking
+	 *   the message (default)
 	 * - "wait" = let non-interruptible tools finish undisturbed; interruptible
 	 *   waits are still cut short, since they have no work to complete
 	 */
@@ -261,10 +299,12 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	/**
 	 * Returns steering messages to inject into the conversation mid-run.
 	 *
-	 * Called at injection boundaries only (loop start and after a tool batch
-	 * fully settles), so dequeued messages are immediately injected. The
-	 * mid-batch interrupt poll uses {@link hasSteeringMessages} instead and
-	 * never consumes the queue.
+	 * Called at injection boundaries (loop start and after a tool batch fully
+	 * settles) and, additionally, right after steering cancelled a model call
+	 * that had streamed nothing — that drain empties the queue before the call
+	 * is re-issued, so the message cannot interrupt its own replacement. The
+	 * mid-batch interrupt poll and the provider-wait watch use
+	 * {@link hasSteeringMessages} instead and never consume the queue.
 	 */
 	getSteeringMessages?: (signal?: AbortSignal) => Promise<AgentMessage[]>;
 
@@ -275,15 +315,27 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * interruptible tool) to decide whether to abort in-flight and skip
 	 * not-yet-started *interruptible* waits;
 	 * every other already-emitted call still executes and the message injects
-	 * at the batch boundary. The queue keeps
-	 * owning its messages until the loop reaches the next injection boundary and
-	 * dequeues via {@link getSteeringMessages} — so callers can still cancel or
-	 * restore queued messages while in-flight tools settle, and an external
-	 * abort in that window leaves the queue intact for a post-abort continue.
+	 * at the batch boundary. Watched the same way while a model call is still
+	 * waiting on its first stream event: a request that has produced no output
+	 * is cancelled and re-issued with the steer folded in. The queue keeps
+	 * owning its messages until the loop reaches an injection boundary (or that
+	 * cancellation) and dequeues via {@link getSteeringMessages} — so callers
+	 * can still cancel or restore queued messages while in-flight tools settle,
+	 * and an external abort in either window leaves the queue intact for a
+	 * post-abort continue.
 	 *
 	 * Returning `true` is treated as user-originated steering for compatibility.
 	 * Return a {@link SteeringQueueState} when the queue can distinguish system
-	 * advisories from real user messages.
+	 * advisories from real user messages, and populate its
+	 * {@link SteeringQueueState.pending} occupancy count so the provider-wait
+	 * watch can tell a new arrival from a message that was already queued when
+	 * the request was issued.
+	 *
+	 * An asynchronous implementation must report the queue as it stood when it
+	 * was called (read it before the first `await`). The provider-wait watch
+	 * holds the request until this first answer arrives and uses it as the
+	 * baseline, so an answer read later would count a steer that arrived in the
+	 * meantime as already queued, and that steer would wait for the boundary.
 	 *
 	 * When omitted, steering never interrupts a running tool batch; queued
 	 * messages are still delivered at the next injection boundary.
@@ -291,10 +343,17 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	hasSteeringMessages?: () => boolean | SteeringQueueState | Promise<boolean | SteeringQueueState>;
 
 	/**
-	 * Wakes the in-flight tool interrupt watcher when a steering message is queued.
-	 * The callback must not consume the queue; the loop still calls
-	 * {@link hasSteeringMessages} before aborting and injects through
+	 * Wakes the loop's steering watchers — the in-flight tool interrupt watch and
+	 * the provider-wait watch — when a steering message is queued. The callback
+	 * must not consume the queue; the loop still calls
+	 * {@link hasSteeringMessages} before cancelling anything and injects through
 	 * {@link getSteeringMessages}.
+	 *
+	 * Implementations may (and the built-in `Agent` does) resolve *immediately*
+	 * while the queue is merely non-empty, so a resolution is not proof that
+	 * anything arrived. The provider-wait watch therefore re-peeks after every
+	 * resolution and throttles itself to the poll cadence when the count did
+	 * not grow, instead of resubscribing to an already-settled waiter.
 	 */
 	waitForSteeringMessages?: (signal?: AbortSignal) => Promise<void>;
 
@@ -305,6 +364,13 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * unrecorded for the host to requeue.
 	 */
 	onLiveSteeringTaken?: (messages: AgentMessage[]) => void;
+
+	/**
+	 * Notified whenever the outcome a newly queued steer would get changes
+	 * (see {@link QueuedSteerOutcome}). Synchronous and side-effect free on the
+	 * loop's side; hosts store the latest value for their queue acknowledgement.
+	 */
+	onQueuedSteerOutcome?: (outcome: QueuedSteerOutcome) => void;
 
 	/**
 	 * Peeks whether IRC messages should interrupt an interruptible waiting tool.
@@ -338,6 +404,13 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * tools finish first.
 	 */
 	hasQueuedAsides?: () => boolean | Promise<boolean>;
+	/**
+	 * Receives a tool's `onUpdate` frames that arrive after this run's event
+	 * stream ended: a call that returned while its background job keeps
+	 * reporting (`details.async`), whose run yielded before the job settled.
+	 * Without it those frames are dropped.
+	 */
+	onDetachedToolUpdate?: (event: Extract<AgentEvent, { type: "tool_execution_update" }>) => void;
 
 	/**
 	 * Returns follow-up messages to process after the agent would otherwise stop.
@@ -1136,6 +1209,11 @@ export interface AgentTool<
 	/** Short one-line summary used for tool discovery indexes. */
 	summary?: string;
 	/**
+	 * Instructions a same-name extension replacement inherits in its description, because results it
+	 * obtains by delegating to this native tool through `ctx.invokeTool` follow this tool's contract.
+	 */
+	readonly delegationGuidance?: string;
+	/**
 	 * On-demand documentation topics (`topic → markdown`), readable as
 	 * `xd://<tool>/<topic>`. Lets a tool keep large sub-surfaces out of its
 	 * description and advertise only a one-line pointer per topic.
@@ -1154,7 +1232,7 @@ export interface AgentTool<
 	 * before ordinary dispatch commits its result.
 	 */
 	speculation?: ToolSpeculationPolicy;
-	/** If true, schema validation errors are non-fatal: raw args are passed to execute() instead of returning an error to the LLM. Malformed argument JSON still returns the parse error. */
+	/** If true, schema validation errors are non-fatal: raw args are passed to execute() instead of returning an error to the LLM, and unknown root keys a closed schema would drop stay on the args. Malformed argument JSON still returns the parse error. */
 	lenientArgValidation?: boolean;
 	/**
 	 * Whether the agent loop may abort this tool mid-execution — or skip it
@@ -1213,6 +1291,13 @@ export interface AgentTool<
 	/** Lines appended after the standard approval prompt header. */
 	formatApprovalDetails?: (args: unknown) => string | string[] | undefined;
 
+	/**
+	 * Remembered-approval keys for `tools.approvalMode: always-ask-cached`: the files (or URL
+	 * targets) this call touches. When every key is already granted the call skips its prompt;
+	 * approving the call can record them. Omit it (or return `undefined`) and the call prompts by tier.
+	 */
+	approvalCacheTargets?: (args: unknown) => readonly string[] | undefined;
+
 	/** The main execution callback for this tool. */
 	execute: AgentToolExecFn<TParameters, TDetails, TTheme>;
 
@@ -1240,7 +1325,14 @@ export interface AgentContext {
  */
 export type AgentEvent =
 	// Agent lifecycle
-	| { type: "agent_start" }
+	| {
+			type: "agent_start";
+			/**
+			 * Calls of the unpaired assistant tail a continued run executes before its
+			 * first model request. They run without a new assistant `message_end`.
+			 */
+			resumedToolCallIds?: string[];
+	  }
 	| {
 			type: "agent_end";
 			messages: AgentMessage[];

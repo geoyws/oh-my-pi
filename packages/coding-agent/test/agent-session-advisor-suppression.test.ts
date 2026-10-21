@@ -22,6 +22,7 @@ import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { ToolCall } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
+import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -49,8 +50,7 @@ interface ParkedHarness {
 	session: AgentSession;
 	sessionManager: SessionManager;
 	mock: MockModel;
-	/** Resolves the moment the first turn's model stream begins (deterministic
-	 *  "now streaming" signal — no wall-clock polling). */
+	/** Resolves after the agent consumes visible output from the parked first stream. */
 	streamStarted: Promise<void>;
 }
 
@@ -90,27 +90,42 @@ describe("AgentSession advisor auto-resume suppression", () => {
 	});
 
 	/**
-	 * First turn parks open (a 60s mock delay that abort cancels) so a steer/park
-	 * + interrupt can be sequenced while the agent is genuinely streaming. The
-	 * `streamStarted` promise resolves from the mock handler, before the delay, so
-	 * tests await the real stream-begin signal rather than a timer.
+	 * Park after visible model output, not in a pre-output provider delay: new
+	 * steering deliberately cancels and reissues a silent provider request. Hold
+	 * the first stream open before its terminal event, so abort settles that same
+	 * request rather than completing a tool batch and entering its next model call.
 	 */
 	async function createParkedSession(tailResponses: MockResponse[] = []): Promise<ParkedHarness> {
 		const started = Promise.withResolvers<void>();
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
-		const mock = createMockModel({
-			responses: [
-				() => {
-					started.resolve();
-					return { content: ["working"], delayMs: 60_000 };
-				},
-				...tailResponses,
-			],
-		});
+		const mock = createMockModel({ responses: [{ content: ["working"] }, ...tailResponses] });
 		const agent = new Agent({
 			getApiKey: () => "test-key",
 			initialState: { model, systemPrompt: ["Test"], tools: [] },
-			streamFn: mock.stream,
+			streamFn: (model, context, options) => {
+				const source = mock.stream(model, context, options);
+				if (mock.calls.length !== 1) return source;
+				const stream = new AssistantMessageEventStream();
+				void (async () => {
+					for await (const event of source) {
+						if (event.type !== "done") {
+							stream.push(event);
+							continue;
+						}
+						const signal = options?.signal;
+						if (!signal) throw new Error("Parked stream requires an abort signal");
+						const aborted = Promise.withResolvers<void>();
+						if (signal.aborted) aborted.resolve();
+						else signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+						await aborted.promise;
+						stream.push({ type: "error", reason: "aborted", error: { ...event.message, stopReason: "aborted" } });
+					}
+				})().catch(error => stream.fail(error));
+				return stream;
+			},
+		});
+		agent.subscribe(event => {
+			if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") started.resolve();
 		});
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated({ "compaction.enabled": false });
@@ -167,10 +182,15 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		};
 	}
 
+	/** Completed one-answer session whose advisor raises one `severity` note (default `nit`, below the default continue threshold). */
 	async function createCompletedAdvisorSession(
-		severity: "concern" | "blocker" = "concern",
-		extensionRunner?: AdvisorTestExtensionRunner,
+		opts: {
+			severity?: "nit" | "concern" | "blocker";
+			continueSeverity?: "nit" | "concern" | "blocker";
+			extensionRunner?: AdvisorTestExtensionRunner;
+		} = {},
 	): Promise<CompletedAdvisorHarness> {
+		const { severity = "nit", continueSeverity, extensionRunner } = opts;
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({
 			responses: [
@@ -200,7 +220,11 @@ describe("AgentSession advisor auto-resume suppression", () => {
 			streamFn: mock.stream,
 		});
 		const sessionManager = SessionManager.inMemory();
-		const settings = Settings.isolated({ "compaction.enabled": false, "retry.enabled": false });
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.enabled": false,
+			...(continueSeverity ? { "advisor.continueSeverity": continueSeverity } : {}),
+		});
 		settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
 		const authStorage = await AuthStorage.create(":memory:");
 		authStorages.push(authStorage);
@@ -313,8 +337,11 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		expect(advisorCards[0].content).toContain("Final yield needs correction");
 	});
 
-	it("preserves a late advisor concern after a terminal answer without waking the primary", async () => {
-		const { session, sessionManager, mock, advisorMock } = await createCompletedAdvisorSession();
+	it("preserves a late advisor concern below advisor.continueSeverity without waking the primary", async () => {
+		const { session, sessionManager, mock, advisorMock } = await createCompletedAdvisorSession({
+			severity: "concern",
+			continueSeverity: "blocker",
+		});
 		const persisted = capturePersistedAdvice(sessionManager);
 
 		await session.prompt("read five fixture files and answer with exactly one line");
@@ -347,7 +374,7 @@ describe("AgentSession advisor auto-resume suppression", () => {
 				await releaseHook.promise;
 			},
 		};
-		const { session, sessionManager, mock } = await createCompletedAdvisorSession("concern", extensionRunner);
+		const { session, sessionManager, mock } = await createCompletedAdvisorSession({ extensionRunner });
 		const persisted = capturePersistedAdvice(sessionManager);
 
 		expect(session.setAdvisorEnabled(true)).toBe(true);
@@ -385,7 +412,7 @@ describe("AgentSession advisor auto-resume suppression", () => {
 				await releaseHook.promise;
 			},
 		};
-		const { session, mock } = await createCompletedAdvisorSession("concern", extensionRunner);
+		const { session, mock } = await createCompletedAdvisorSession({ extensionRunner });
 
 		expect(session.setAdvisorEnabled(true)).toBe(true);
 		await session.prompt("answer with exactly one line");
@@ -404,24 +431,27 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		expect(mock.calls).toHaveLength(1);
 	});
 
-	it("steers a late advisor blocker after a terminal answer so the primary corrects it", async () => {
-		const { session, mock } = await createCompletedAdvisorSession("blocker");
+	it.each([{ severity: "concern" }, { severity: "blocker", continueSeverity: "blocker" }] as const)(
+		"steers late advice at advisor.continueSeverity after a terminal answer %j",
+		async opts => {
+			const { session, mock } = await createCompletedAdvisorSession(opts);
 
-		await session.prompt("read five fixture files and answer with exactly one line");
-		await session.waitForIdle();
-		expect(mock.calls.length).toBe(1);
+			await session.prompt("read five fixture files and answer with exactly one line");
+			await session.waitForIdle();
+			expect(mock.calls.length).toBe(1);
 
-		expect(session.setAdvisorEnabled(true)).toBe(true);
-		const advisor = session.getAdvisorAgent();
-		if (!advisor) throw new Error("Expected advisor agent to be live");
+			expect(session.setAdvisorEnabled(true)).toBe(true);
+			const advisor = session.getAdvisorAgent();
+			if (!advisor) throw new Error("Expected advisor agent to be live");
 
-		await advisor.prompt("inspect the completed turn");
-		await session.waitForIdle();
+			await advisor.prompt("inspect the completed turn");
+			await session.waitForIdle();
 
-		expect(mock.calls.length).toBe(2);
-	});
+			expect(mock.calls.length).toBe(2);
+		},
+	);
 
-	it("preserves another late advisor concern after an existing advisor card", async () => {
+	it("preserves another late advisor note after an existing advisor card", async () => {
 		const { session, mock } = await createCompletedAdvisorSession();
 
 		await session.prompt("answer with exactly one line");

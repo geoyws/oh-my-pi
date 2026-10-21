@@ -598,6 +598,7 @@ export function createAcpExtensionUiContext(
 		},
 		addAutocompleteProvider: () => {},
 		setEditorComponent: () => {},
+		getEditorComponent: () => undefined,
 		get theme() {
 			return theme;
 		},
@@ -979,6 +980,7 @@ export class AcpAgent implements Agent {
 			output: output => this.#emitCommandOutput(record, output),
 			refreshCommands: () => this.#emitAvailableCommandsUpdate(record),
 			reloadPlugins: () => this.#reloadPluginState(record),
+			userMessageSource: "acp",
 			keepTurnOpenUntilIdle: async () => {
 				await record.session.waitForIdle();
 				// `AgentSession.#emit()` does not await listeners, so the retried
@@ -1016,7 +1018,7 @@ export class AcpAgent implements Agent {
 		if (builtinResult !== false) {
 			if ("prompt" in builtinResult) {
 				const residualBaseline = new Set(record.extensionUserMessageTasks);
-				const residualAgentInvoked = await record.session.prompt(builtinResult.prompt, { images });
+				const residualAgentInvoked = await record.session.prompt(builtinResult.prompt, { images, source: "acp" });
 				// A residual prompt can itself resolve locally (extension command,
 				// custom-TS command, file prompt template). No agent turn means no
 				// `agent_end`, so the prompt turn must be settled here — same pairing
@@ -1041,7 +1043,7 @@ export class AcpAgent implements Agent {
 		}
 
 		const extensionPromptBaseline = new Set(record.extensionUserMessageTasks);
-		const agentInvoked = await record.session.prompt(text, { images });
+		const agentInvoked = await record.session.prompt(text, { images, source: "acp" });
 		// Extension and custom-TS commands are handled locally inside session.prompt().
 		// An ACP extension command can still call pi.sendUserMessage(), which starts
 		// an async nested prompt through the extension runtime. Keep the ACP turn
@@ -1075,7 +1077,7 @@ export class AcpAgent implements Agent {
 				details: built.details,
 				attribution: "user",
 			},
-			{ streamingBehavior: "steer" },
+			{ streamingBehavior: "steer", source: "acp" },
 		);
 		return true;
 	}
@@ -2408,7 +2410,7 @@ export class AcpAgent implements Agent {
 					notifications.push({
 						sessionId,
 						update: {
-							sessionUpdate: "agent_thought_chunk",
+							sessionUpdate: item.narration ? "agent_message_chunk" : "agent_thought_chunk",
 							content: { type: "text", text: thinking },
 							messageId,
 						},

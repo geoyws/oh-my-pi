@@ -53,7 +53,13 @@ import {
 	MarketplaceManager,
 } from "../../extensibility/plugins/marketplace";
 import { getAvailableThemes, getSymbolTheme, previewTheme, theme } from "@oh-my-pi/pi-tui/theme";
-import type { AgentHubOpenOptions, InteractiveModeContext } from "../../modes/types";
+import type {
+	AgentHubOpenOptions,
+	InteractiveModeContext,
+	SelectOnlyModelSelectorOptions,
+	SessionPickHandler,
+} from "../../modes/types";
+import { UserMessageRefusedError } from "../../session/user-message-refused-error";
 import type { SessionOAuthAccountList } from "../../session/agent-session-types";
 import type { ResetCreditAccountStatus, ResetCreditRedeemOutcome } from "../../session/auth-storage";
 import {
@@ -92,6 +98,7 @@ import type { ToolSession } from "../../tools";
 import { AskTool, type AskToolInput } from "../../tools/ask";
 import { type AskToolDetails } from "@oh-my-pi/pi-tui/tools/ask";
 import { sanitizeDisplayWarnings, shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
+import { sanitizeErrorLine } from "@oh-my-pi/pi-tui/chrome/error-block";
 import { ToolAbortError } from "../../tools/tool-errors";
 import { captureBrowserSession } from "../../utils/browser-session";
 import { copyToClipboard } from "../../utils/clipboard";
@@ -135,7 +142,7 @@ import type { SessionObserverRegistry } from "@oh-my-pi/pi-tui/overlays/session-
 
 import { cfgAdvisorSyncBacklog } from "../../advisor/settings";
 import { cfgBranchSummaryEnabled } from "../../session/context-settings";
-import { cfgCycleOrder, cfgDisabledProviders, cfgModelRoleStorage } from "../../config/model-settings";
+import { cfgCycleOrder, cfgDisabledProviders } from "../../config/model-settings";
 import { cfgDefaultThinkingLevel, cfgRetryFallbackChains } from "../../session/settings";
 import {
 	cfgStatusLineCompactThinkingLevel,
@@ -188,7 +195,14 @@ function loadProviderAuthUi(): ProviderAuthUiModules {
 }
 
 /** Menus that open at most once: a repeat request focuses the open one. */
-type MenuKind = "settings" | "model-picker" | "model-hub" | "agents-dashboard" | "agent-hub" | "usage-dashboard";
+type MenuKind =
+	| "settings"
+	| "model-picker"
+	| "model-picker-select"
+	| "model-hub"
+	| "agents-dashboard"
+	| "agent-hub"
+	| "usage-dashboard";
 
 /** An open menu: registered when the request runs, filled once its component mounts. */
 interface OpenMenu {
@@ -719,8 +733,17 @@ export class SelectorController {
 		this.ctx.session.setThinkingLevel(level);
 	}
 
-	showModelSelector(options?: { temporaryOnly?: boolean }): void {
-		if (options?.temporaryOnly) {
+	/**
+	 * Open a model selector. A focused subagent always gets the session-only
+	 * picker: the hub assigns persistent roles, which configure the main session
+	 * and future spawns rather than the agent being viewed.
+	 */
+	showModelSelector(options?: { temporaryOnly?: boolean; selectOnly?: SelectOnlyModelSelectorOptions }): void {
+		if (options?.selectOnly) {
+			this.#showModelPicker({ selectOnly: options.selectOnly });
+			return;
+		}
+		if (options?.temporaryOnly || this.ctx.focusedAgentId) {
 			this.#showModelPicker();
 			return;
 		}
@@ -728,13 +751,13 @@ export class SelectorController {
 	}
 
 	/**
-	 * Session-only model switch (`/switch <selector>`): applies the resolved
-	 * model without persisting it. Compacts first when the transcript exceeds
-	 * the target's context window, mirroring an over-context pick in the alt+p
-	 * picker. Failures surface as status errors.
+	 * Session-only model switch (`/switch <selector>`) for the viewed session:
+	 * applies the resolved model without persisting it. Compacts first when the
+	 * transcript exceeds the target's context window, mirroring an over-context
+	 * pick in the alt+p picker. Failures surface as status errors.
 	 */
 	async switchSessionModel(model: Model, thinkingLevel?: ConfiguredThinkingLevel): Promise<void> {
-		const contextTokens = this.ctx.session.getContextUsage()?.tokens ?? 0;
+		const contextTokens = this.ctx.viewSession.getContextUsage()?.tokens ?? 0;
 		const contextWindow = model.contextWindow ?? 0;
 		const overContext = contextWindow > 0 && contextTokens > contextWindow;
 		try {
@@ -745,13 +768,15 @@ export class SelectorController {
 	}
 
 	/**
-	 * Apply a session-only model: update agent state but never persist to
-	 * settings. `compactFirst` runs compaction with the current model before
-	 * switching (the target cannot fit the transcript); the switch runs in the
-	 * before-flush hook so any prompt queued during compaction executes on the
-	 * target model, and the idempotent post-return call covers the early
-	 * "nothing to compact" return that skips the hook. A cancelled or failed
-	 * compaction keeps the current model.
+	 * Apply a session-only model to the viewed session: update agent state but
+	 * never persist to settings. `compactFirst` runs compaction with the current
+	 * model before switching (the target cannot fit the transcript); the switch
+	 * runs in the before-flush hook so any prompt queued during compaction
+	 * executes on the target model, and the idempotent post-return call covers
+	 * the early "nothing to compact" return that skips the hook. A cancelled or
+	 * failed compaction keeps the current model. A focused subagent switches
+	 * directly: `/compact` drives the main session, and the agent's own context
+	 * maintenance recovers an oversized transcript on its next turn.
 	 */
 	async #applySessionModel(
 		model: Model,
@@ -759,15 +784,21 @@ export class SelectorController {
 		thinkingLevel: ConfiguredThinkingLevel | undefined,
 		compactFirst: boolean,
 	): Promise<void> {
+		const target = this.ctx.viewSession;
+		const focusedAgentId = this.ctx.focusedAgentId;
 		const apply = async () => {
-			const level = thinkingLevel ?? this.ctx.session.resolveTemporaryModelThinkingLevel(model);
-			await this.ctx.session.setModelTemporary(model, level);
+			const level = thinkingLevel ?? target.resolveTemporaryModelThinkingLevel(model);
+			await target.setModelTemporary(model, level);
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorBorderColor();
+			if (focusedAgentId) {
+				this.ctx.showStatus(`Agent ${focusedAgentId} model: ${selector}`);
+				return;
+			}
 			const roleSelectorHint = appKey(this.ctx.keybindings, "app.model.select") || formatKeyHint("alt+m");
 			this.ctx.showStatus(`Session-only model: ${selector}. Use ${roleSelectorHint} or /model for roles.`);
 		};
-		if (!compactFirst) {
+		if (!compactFirst || focusedAgentId) {
 			await apply();
 			return;
 		}
@@ -786,34 +817,63 @@ export class SelectorController {
 	 * bottom-anchored overlay over the transcript. The current model is
 	 * highlighted and preselected; a leading `@` searches ctrl+p quick roles.
 	 */
-	#showModelPicker(): void {
-		if (this.#focusOpenMenu("model-picker")) return;
+	#showModelPicker(options?: { selectOnly?: SelectOnlyModelSelectorOptions }): void {
+		const selectOnly = options?.selectOnly;
+		const menuKind = selectOnly ? "model-picker-select" : "model-picker";
+		const closeOpenMenu = (kind: MenuKind) => {
+			const open = this.#openMenus.get(kind);
+			if (!open) return;
+			open.handle?.hide();
+			this.#releaseMenu(kind, open);
+		};
+		if (selectOnly) {
+			closeOpenMenu("model-picker");
+			closeOpenMenu("model-picker-select");
+		} else {
+			closeOpenMenu("model-picker-select");
+			if (this.#focusOpenMenu("model-picker")) return;
+		}
 		const { ModelPickerComponent } = loadModelOverlayComponents();
-		const currentContextTokens = this.ctx.session.getContextUsage()?.tokens ?? 0;
-		const current = this.ctx.session.model;
+		const viewed = this.ctx.viewSession;
+		const currentContextTokens = viewed.getContextUsage()?.tokens ?? 0;
+		const current = viewed.model;
 		const quickRoleOrder = cfgCycleOrder.get(this.ctx.settings);
-		const quickRoleCycle = this.ctx.session.getRoleModelCycle(quickRoleOrder);
-		const currentSelector = current ? `${current.provider}/${current.id}` : undefined;
+		const quickRoleCycle = viewed.getRoleModelCycle(quickRoleOrder);
+		const currentSelector = selectOnly
+			? selectOnly.currentSelector
+			: current
+				? `${current.provider}/${current.id}`
+				: undefined;
 		// Preselect the effective Task model in task mode: the configured override,
 		// else the session model (the bundled task agent inherits it by default).
 		const taskOverride = cfgTaskAgentModelOverrides.get(this.ctx.settings).task;
 		const taskSelector = (Array.isArray(taskOverride) ? taskOverride[0] : taskOverride) ?? currentSelector;
-		let closed = false;
+		const menu = this.#claimMenu(menuKind);
 		const done = () => {
-			if (closed) return;
-			closed = true;
+			if (this.#openMenus.get(menuKind) !== menu) return;
 			menu.handle?.hide();
-			this.#releaseMenu("model-picker", menu);
+			this.#releaseMenu(menuKind, menu);
 			this.focusActiveEditorArea();
 			this.ctx.ui.requestRender();
 		};
+		const isCurrent = () => this.#openMenus.get(menuKind) === menu;
 		const picker = new ModelPickerComponent(
 			this.ctx.ui,
-			createModelBrowserSource(this.ctx.settings, model => this.ctx.session.effectiveServiceTier(model)),
+			createModelBrowserSource(this.ctx.settings, model => viewed.effectiveServiceTier(model)),
 			this.ctx.session.modelRegistry,
 			this.ctx.session.scopedModels,
 			{
 				onPick: async (model, selector, { overContext }) => {
+					if (!isCurrent()) return;
+					if (selectOnly) {
+						done();
+						try {
+							await selectOnly.onSelect(selector);
+						} catch (error) {
+							this.ctx.showError(sanitizeErrorLine(error));
+						}
+						return;
+					}
 					try {
 						// Over-context pick: close the picker first so the compaction
 						// loader is visible.
@@ -825,8 +885,9 @@ export class SelectorController {
 					}
 				},
 				onPickRole: async entry => {
+					if (!isCurrent() || selectOnly) return;
 					try {
-						await this.ctx.session.applyRoleModel(entry);
+						await this.ctx.viewSession.applyRoleModel(entry);
 						this.ctx.statusLine.invalidate();
 						this.ctx.updateEditorBorderColor();
 						this.ctx.showModelCycleTrack(
@@ -839,6 +900,7 @@ export class SelectorController {
 					}
 				},
 				onPickTask: (_model, selector) => {
+					if (!isCurrent() || selectOnly) return;
 					// Session-only: layer the Task override onto the runtime settings
 					// layer so it is never persisted, mirroring the session-model pick.
 					cfgTaskAgentModelOverrides.override(this.ctx.settings, {
@@ -858,9 +920,9 @@ export class SelectorController {
 				quickRoles: quickRoleCycle?.models,
 				quickRoleOrder,
 				currentQuickRole: quickRoleCycle?.models[quickRoleCycle.currentIndex]?.role,
+				selectOnly: selectOnly !== undefined,
 			},
 		);
-		const menu = this.#claimMenu("model-picker");
 		this.#mountMenu(menu, picker, () => {
 			const handle = this.ctx.ui.showOverlay(picker, {
 				anchor: "bottom-center",
@@ -903,13 +965,18 @@ export class SelectorController {
 			{
 				onAssign: async (model, role, thinkingLevel, selector, scope?: ModelRoleSelectionScope) => {
 					const releaseDefaultMutation = role === "default" ? await this.#acquireDefaultRoleMutation() : undefined;
-					const configuredStorage = cfgModelRoleStorage.get(this.ctx.settings);
-					const targetScope = configuredStorage === "project" ? (scope ?? "project") : "global";
+					const configuredStorage = this.ctx.settings.getModelRoleStorage();
+					const targetScope = this.ctx.settings.isGlobalConfigReadOnly()
+						? "project"
+						: configuredStorage === "project"
+							? (scope ?? "project")
+							: "global";
 					const selectorValue = selector ?? `${model.provider}/${model.id}`;
 					const scopeLabel =
 						configuredStorage === "project" ? `${targetScope === "project" ? "Project" : "Global"} ` : "";
 					const defaultStatusLabel = configuredStorage === "project" ? `${scopeLabel}default` : "Default";
 					try {
+						this.ctx.settings.assertModelRoleWritable(role);
 						if (role === "default") {
 							// `auto` on the default role configures the active session. Other roles
 							// persist an explicit `:auto` suffix and must not mutate the current model.
@@ -933,7 +1000,11 @@ export class SelectorController {
 									formatModelSelectorValue(selectorValue, concreteThinking),
 								);
 								if (isAuto) {
-									cfgDefaultThinkingLevel.set(this.ctx.settings, AUTO_THINKING);
+									if (this.ctx.settings.isGlobalConfigReadOnly()) {
+										cfgDefaultThinkingLevel.override(this.ctx.settings, AUTO_THINKING);
+									} else {
+										cfgDefaultThinkingLevel.set(this.ctx.settings, AUTO_THINKING);
+									}
 								}
 							} else if (shadowedProject) {
 								this.ctx.settings.setProjectModelRole(
@@ -941,7 +1012,11 @@ export class SelectorController {
 									formatModelSelectorValue(selectorValue, concreteThinking),
 								);
 								if (isAuto) {
-									cfgDefaultThinkingLevel.set(this.ctx.settings, AUTO_THINKING);
+									if (this.ctx.settings.isGlobalConfigReadOnly()) {
+										cfgDefaultThinkingLevel.override(this.ctx.settings, AUTO_THINKING);
+									} else {
+										cfgDefaultThinkingLevel.set(this.ctx.settings, AUTO_THINKING);
+									}
 								}
 							} else {
 								const { switched } = await this.ctx.session.setModel(model, role, {
@@ -957,7 +1032,10 @@ export class SelectorController {
 									);
 								}
 								if (isAuto) {
-									this.ctx.session.setThinkingLevel(AUTO_THINKING, true);
+									this.ctx.session.setThinkingLevel(
+										AUTO_THINKING,
+										!this.ctx.settings.isGlobalConfigReadOnly(),
+									);
 								} else if (concreteThinking && concreteThinking !== ThinkingLevel.Inherit) {
 									this.ctx.session.setThinkingLevel(concreteThinking);
 								}
@@ -989,8 +1067,12 @@ export class SelectorController {
 				},
 				onUnassign: async (role, scope?: ModelRoleSelectionScope) => {
 					const releaseDefaultMutation = role === "default" ? await this.#acquireDefaultRoleMutation() : undefined;
-					const configuredStorage = cfgModelRoleStorage.get(this.ctx.settings);
-					const targetScope = configuredStorage === "project" ? (scope ?? "project") : "global";
+					const configuredStorage = this.ctx.settings.getModelRoleStorage();
+					const targetScope = this.ctx.settings.isGlobalConfigReadOnly()
+						? "project"
+						: configuredStorage === "project"
+							? (scope ?? "project")
+							: "global";
 					const scopeLabel =
 						configuredStorage === "project" ? `${targetScope === "project" ? "Project" : "Global"} ` : "";
 					try {
@@ -1054,7 +1136,13 @@ export class SelectorController {
 									});
 									if (!switched) return;
 									if (effectiveIsAuto) {
-										this.ctx.session.setThinkingLevel(AUTO_THINKING, true);
+										// Same contract as onAssign: auto applies live, but the global
+										// default is persisted only while global config is writable —
+										// the role was already cleared and the model already switched.
+										this.ctx.session.setThinkingLevel(
+											AUTO_THINKING,
+											!this.ctx.settings.isGlobalConfigReadOnly(),
+										);
 									} else if (concreteThinking && concreteThinking !== ThinkingLevel.Inherit) {
 										this.ctx.session.setThinkingLevel(concreteThinking);
 									}
@@ -1529,6 +1617,33 @@ export class SelectorController {
 						// User made a complete choice
 						break;
 					}
+					// User-authored summarization focus reaches the summarizer
+					// provider: gate it before navigation mutates anything.
+					// Recovery choice (boring on purpose): a refusal reopens
+					// the same hook editor prefilled with the refused text, so
+					// the operator edits the flagged content out and resubmits
+					// in place instead of retyping it. The modal flow needs no
+					// composer interplay and no extra render juggling; each
+					// refusal still reports only the handler's notice, and
+					// cancelling the editor returns to the tree selector.
+					while (customInstructions?.trim()) {
+						try {
+							await this.ctx.session.gateUserMessage(customInstructions, undefined, "interactive");
+							break;
+						} catch (error) {
+							if (!(error instanceof UserMessageRefusedError)) throw error;
+							this.ctx.showError(error.notice);
+							const retry = await this.ctx.showHookEditor(
+								"Custom summarization instructions",
+								customInstructions,
+							);
+							if (retry === undefined) {
+								this.showTreeSelector();
+								return;
+							}
+							customInstructions = retry;
+						}
+					}
 
 					// Set up escape handler and loader if summarizing
 					let summaryLoader: Loader | undefined;
@@ -1722,7 +1837,7 @@ export class SelectorController {
 		return result;
 	}
 
-	async showSessionSelector(source?: ForeignSessionSource): Promise<void> {
+	async showSessionSelector(source?: ForeignSessionSource, onSelect?: SessionPickHandler): Promise<void> {
 		let sessions: SessionInfo[];
 		let onSelectSession: (session: SessionInfo) => Promise<boolean>;
 		let selectorOptions: SessionSelectorOptions<SessionInfo>;
@@ -1782,21 +1897,30 @@ export class SelectorController {
 				: undefined;
 			onSelectSession = session => this.handleResumeSession(session.path);
 			selectorOptions = {
-				onDelete: async (session: SessionInfo) => {
-					if (!(await this.#detachActiveSessionBeforeDeletion(session.path))) {
-						return false;
-					}
-					const storage = new FileSessionStorage();
-					try {
-						await storage.deleteSessionWithArtifacts(session.path);
-						return true;
-					} catch (error) {
-						throw new Error(
-							`Failed to delete session: ${error instanceof Error ? error.message : String(error)}`,
-							{ cause: error },
-						);
-					}
-				},
+				...(!onSelect
+					? {
+							onDelete: async (session: SessionInfo) => {
+								if (!(await this.#detachActiveSessionBeforeDeletion(session.path))) {
+									return false;
+								}
+								const storage = new FileSessionStorage();
+								try {
+									await storage.deleteSessionWithArtifacts(session.path);
+									return true;
+								} catch (error) {
+									throw new Error(
+										`Failed to delete session: ${error instanceof Error ? error.message : String(error)}`,
+										{ cause: error },
+									);
+								}
+							},
+						}
+					: {
+							title: "Select a Session to Consult",
+							actionLabel: "Select",
+							scopeLabel: false,
+							showCwd: true,
+						}),
 				historyMatcher,
 				loadAllSessions: () => SessionManager.listAllForPicker(),
 				pinnedIds,
@@ -1817,6 +1941,17 @@ export class SelectorController {
 			sessions,
 			async (session: SessionInfo) => {
 				selector.lockInput();
+				if (onSelect) {
+					// Selection-only callers may open a follow-up picker; remove this
+					// fullscreen overlay before invoking them.
+					done();
+					try {
+						await onSelect(session);
+					} catch (error) {
+						this.ctx.showError(sanitizeErrorLine(error));
+					}
+					return;
+				}
 				let keepOpen = false;
 				try {
 					const success = await onSelectSession(session);
@@ -2079,6 +2214,11 @@ export class SelectorController {
 			// are left untouched. `refreshProvider` swallows discovery failures, so
 			// awaiting cannot reject the login.
 			await this.ctx.session.modelRegistry.refreshProvider(getOAuthCredentialProvider(providerId), "online");
+			try {
+				await this.ctx.refreshScopedModelsAfterLogin?.();
+			} catch (error) {
+				logger.warn("Scoped model refresh after login failed", { error: String(error) });
+			}
 			const block = new TranscriptBlock();
 			// Name the account (and Anthropic organization) that was stored so a
 			// login that lands on an unintended account/subscription is visible
@@ -2386,16 +2526,18 @@ export class SelectorController {
 		});
 	}
 
+	/** Open the `/effort` picker for the viewed session (the focused subagent's, else main). */
 	showThinkingSelector(): void {
-		const configured = this.ctx.session.configuredThinkingLevel();
+		const viewed = this.ctx.viewSession;
+		const configured = viewed.configuredThinkingLevel();
 		this.showSelector(done => {
 			const selector = new ThinkingSelectorComponent(
 				configured === ThinkingLevel.Inherit ? ThinkingLevel.Off : configured,
-				this.ctx.session.getAvailableEffortSelectors(),
+				viewed.getAvailableEffortSelectors(),
 				level => {
 					done();
 					// thinking_level_changed refreshes the status line and editor border.
-					this.ctx.session.setThinkingLevel(level);
+					this.ctx.viewSession.setThinkingLevel(level);
 					this.ctx.ui.requestRender();
 				},
 				() => {

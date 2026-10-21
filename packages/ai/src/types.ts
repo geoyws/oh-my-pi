@@ -40,7 +40,7 @@ import type { ApiKey } from "./auth-retry";
 import type { OAuthRequestIdentity } from "./auth/types";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
-import type { FallbackParam, StopDetails } from "./providers/anthropic-wire";
+import type { FallbackParam, MessageCreateParamsStreaming, StopDetails } from "./providers/anthropic-wire";
 import type { AzureOpenAIResponsesOptions } from "./providers/azure-openai-responses";
 import type { CursorOptions } from "./providers/cursor";
 import type { AppleFoundationModelsOptions } from "./providers/apple-foundation-models";
@@ -476,6 +476,29 @@ export type OpenAIResponseInclude =
 	| "reasoning.encrypted_content"
 	| "message.output_text.logprobs";
 
+/** Position of the retry a {@link ProviderRetryWaitFn} is about to sleep before. */
+export interface ProviderRetryAttemptInfo {
+	/** 1-based index of the retry being awaited. */
+	attempt: number;
+	/** Retry budget of the loop doing the waiting. */
+	maxAttempts: number;
+}
+
+/**
+ * Retry delay hook. `info` is omitted by retry loops with no attempt counter to
+ * report, so a UI must degrade to "no count" rather than assume one.
+ *
+ * Contract: the hook MUST sleep for the full `delayMs` (honoring `signal`)
+ * and MUST reject/throw when `signal` aborts. A hook that returns early
+ * silently removes all provider backoff; one that swallows the abort turns a
+ * cancelled turn into a retried one.
+ */
+export type ProviderRetryWaitFn = (
+	delayMs: number,
+	signal?: AbortSignal,
+	info?: ProviderRetryAttemptInfo,
+) => Promise<void>;
+
 export interface StreamOptions {
 	temperature?: number;
 	topP?: number;
@@ -497,6 +520,11 @@ export interface StreamOptions {
 	frequencyPenalty?: number;
 	maxTokens?: number;
 	signal?: AbortSignal;
+	/**
+	 * OpenAI chat-completions HTTP attempt budget. When set, transient provider
+	 * errors are not replayed above the transport, so retries share this limit.
+	 */
+	maxHttpAttempts?: number;
 	apiKey?: string;
 	/** @internal Stored credential row serving this request, when known. */
 	credentialId?: number;
@@ -534,6 +562,32 @@ export interface StreamOptions {
 	 * Default: 60000 (60 seconds). Set to 0 to disable the cap.
 	 */
 	maxRetryDelayMs?: number;
+	/**
+	 * Aggregate wall-clock budget in milliseconds for one logical provider
+	 * operation, spanning every nested pi-ai retry of that request. Checked
+	 * before each retry sleep: a retry that would land past the budget fails
+	 * immediately with `ProviderOperationDeadlineError` instead of sleeping.
+	 * Omitted or `0` disables the budget.
+	 *
+	 * Honored by the replay-safe stream retry shared by every provider, the
+	 * Anthropic provider and client retry loops, the OpenAI Responses transient
+	 * stream retry, all five Codex Responses websocket/provider/whitespace
+	 * retries, and the Google and Gemini CLI empty-stream retries. Provider
+	 * loops not listed here sleep unbudgeted.
+	 *
+	 * Unrelated to `streamIdleTimeoutMs`, which bounds silence *within* one live
+	 * stream and never sees retries: this budget never interrupts a stream that
+	 * is producing output.
+	 */
+	operationTimeoutMs?: number;
+	/**
+	 * Absolute deadline (epoch ms) derived from `operationTimeoutMs` at the
+	 * pi-ai entry point (`streamSimple`'s request builder, or `stream`'s
+	 * dispatcher). Internal plumbing — callers set the budget, not this — but it
+	 * must be forwarded verbatim by any layer that rebuilds inner options, so
+	 * nested providers share one budget instead of restarting it.
+	 */
+	operationDeadlineAt?: number;
 	/**
 	 * Optional metadata to include in API requests.
 	 * Providers extract the fields they understand and ignore the rest.
@@ -628,8 +682,6 @@ export interface StreamOptions {
 	liveSteering?: LiveSteering;
 	/** Canonical Codex compaction classification; ignored by other providers. */
 	codexCompaction?: CodexCompactionRequestContext;
-	/** Codex Code Mode tool exposure snapshot emitted as `tool_namespaces_info` turn metadata; ignored by other providers. */
-	toolNamespacesInfo?: unknown;
 	/**
 	 * Optional per-provider concurrent request cap for LLM stream calls. Keys are
 	 * provider ids (`model.provider`); positive numeric values cap in-flight
@@ -701,8 +753,11 @@ export interface StreamOptions {
 	codexSseMaxAttempts?: number;
 	/**
 	 * Optional retry delay hook for tests and transports that need custom scheduling.
+	 * A custom hook takes over the backoff entirely, so it inherits the
+	 * {@link ProviderRetryWaitFn} contract: sleep the full `delayMs` and
+	 * rethrow on abort.
 	 */
-	providerRetryWait?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
+	providerRetryWait?: ProviderRetryWaitFn;
 	/**
 	 * Accept a normal provider stop with no visible text or tool call as a
 	 * successful completion. Passive callers and zero-output cache refreshes use
@@ -893,6 +948,13 @@ export interface ThinkingContent {
 	 * replay natively on another host.
 	 */
 	summary?: boolean;
+	/**
+	 * `true`: the block is narration — prose the model addressed to the user
+	 * between tool calls, which the provider returned as a signed thinking block
+	 * (Anthropic connector-text summarization). It stays a thinking block for
+	 * replay; user-facing surfaces present it as answer text.
+	 */
+	narration?: boolean;
 }
 
 export interface RedactedThinkingContent {
@@ -902,11 +964,12 @@ export interface RedactedThinkingContent {
 
 /**
  * Anthropic server-side-fallback boundary marker persisted on assistant
- * turns whose provider request opted into
- * `AnthropicOptions.fallbacks`. Consumers other than the Anthropic
- * provider MUST ignore it — `transformMessages` strips the block on any
- * cross-provider hop and on non-official Anthropic replays, so downstream
- * converters never see it.
+ * turns whose response switched models mid-stream, whether the request
+ * opted into `AnthropicOptions.fallbacks` or a gateway opted in on its
+ * behalf. Consumers other than the Anthropic provider MUST ignore it —
+ * `transformMessages` strips the block on any non-Anthropic hop, and
+ * `convertAnthropicMessages` only puts it on the wire for an opted-in
+ * request to the official endpoint.
  */
 export interface AnthropicFallbackContent {
 	type: "fallback";
@@ -1230,6 +1293,12 @@ export type AssistantRetryRecovery =
 export interface ContextSnapshot {
 	promptTokens: number; // authoritative provider prompt/input tokens
 	nonMessageTokens: number; // estimated non-message total at send time
+	/**
+	 * Estimated tool-schema tokens included in `nonMessageTokens` (0 when the
+	 * model defers schemas server-side). Lets a later model whose schema policy
+	 * differs rebase the provider anchor instead of inheriting its schemas.
+	 */
+	toolSchemaTokens?: number;
 	/** Estimated prompt tokens removed by local history rewrites after this provider snapshot was recorded. */
 	historyRewriteTokensRemoved?: number;
 	/**
@@ -1287,6 +1356,12 @@ export interface AssistantMessage {
 	 */
 	serviceTier?: ServiceTier;
 	usage: Usage;
+	/**
+	 * Visible output tokens a history rewrite (shake) has since removed from
+	 * `content`. `usage.output` still counts them, so a replay estimate subtracts
+	 * them to keep the turn's reasoning without recharging the removed text.
+	 */
+	elidedOutputTokens?: number;
 	stopReason: StopReason;
 	stopDetails?: StopDetails | null;
 	errorMessage?: string;
@@ -1661,7 +1736,8 @@ export type AssistantMessageEvent =
 export interface AnthropicFallbackCreditHandle {
 	token: string;
 	prefillClaim?: boolean | null;
-	params: unknown;
+	/** The refused request's body, replayed with the credit token on the fallback model. */
+	params: MessageCreateParamsStreaming;
 	betas?: readonly string[];
 	betaHeader?: string;
 	expiresAt: number;

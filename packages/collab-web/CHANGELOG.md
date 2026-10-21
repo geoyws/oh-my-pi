@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the browser guest's composer staying empty after the host refused a prompt (its `before_user_message` gate, e.g. a secret): the refused text comes back into the composer, ahead of anything typed since
+
 ## [18.8.0] - 2026-10-07
 
 ### Changed

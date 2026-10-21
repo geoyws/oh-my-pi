@@ -38,7 +38,9 @@ import {
 	iterateWithIdleTimeout,
 } from "../utils/idle-iterator";
 import { OpenAIHttpError, postOpenAIStream } from "../utils/openai-http";
+import { markOperationProgress, operationDeadlineExceeded } from "../utils/operation-deadline";
 import { notifyProviderResponse } from "../utils/provider-response";
+import { wrapFetchForRequestCompression } from "../utils/request-compression";
 import { waitForRetry } from "../utils/retry-wait";
 import {
 	adaptSchemaForStrict,
@@ -101,13 +103,16 @@ import {
 	getOpenAIStrictToolsScope,
 	getOpenRouterResponsesSessionId,
 	isCompiledGrammarTooLargeStrictError,
+	isForeignEncryptedReasoningError,
 	isOpenAIResponsesProgressEvent,
 	isStrictToolsDisabledForScope,
+	readOpenRouterRawMetadata,
 	type OpenAIPromptCacheOptions,
 	type OpenAIStrictToolsScope,
 	type OpenAIStrictToolsState,
 	processResponsesStream,
 	resolveOpenAICompatPolicy,
+	resolveOpenAIEffortFallbackConstraints,
 	resolveOpenAIOutputTokenParam,
 	resolveOpenAIRequestSetup,
 	resolveOpenAIResponsesOutputClamp,
@@ -449,6 +454,16 @@ interface OpenAIResponsesChainState {
 	staleFailures: number;
 	/** Set once chaining is judged unsupported for this session (circuit breaker). */
 	disabled: boolean;
+	/**
+	 * The stored history holds `encrypted_content` blobs foreign to the
+	 * serving credential below, learned from a foreign-caller 400: keep
+	 * stripping on every rebuild while it serves the session, or every
+	 * turn pays a 400 and chaining can never re-engage (rebuilt inputs
+	 * would keep diverging from the stripped baseline).
+	 */
+	stripForeignEncryptedReasoning?: boolean;
+	/** Credential row the history blobs are foreign to, when known. */
+	strippedForeignReasoningCredentialId?: number;
 }
 
 function createOpenAIResponsesProviderSessionState(
@@ -494,6 +509,27 @@ function getOpenAIResponsesProviderSessionState(
 	const created = createOpenAIResponsesProviderSessionState(model);
 	providerSessionState.set(key, created);
 	return created;
+}
+
+/**
+ * Whether the next request for `model` replays native Responses history items
+ * (encrypted reasoning, item ids), as {@link buildParams} decides it. A session
+ * is cold, rebuilding turns from message content, from the first request on a
+ * connection-bound host (`compat.connectionBoundNativeHistory`, GitHub Copilot)
+ * and after `close()` on any host, until a response succeeds. Without session
+ * state every request replays.
+ */
+export function openAIResponsesReplaysNativeHistory(
+	model: Pick<Model, "api" | "provider" | "compat"> | null | undefined,
+	providerSessionState: Map<string, ProviderSessionState> | undefined,
+): boolean {
+	if (model?.api !== "openai-responses" || !providerSessionState) return true;
+	const state = providerSessionState.get(`${OPENAI_RESPONSES_PROVIDER_SESSION_STATE_PREFIX}${model.provider}`) as
+		| OpenAIResponsesProviderSessionState
+		| undefined;
+	if (state) return state.nativeHistoryReplayWarmed;
+	const compat = model.compat;
+	return !(compat && "connectionBoundNativeHistory" in compat && compat.connectionBoundNativeHistory);
 }
 
 /** Host per-provider storage defaults; see {@link configureProviderStoreResponses}. */
@@ -777,6 +813,13 @@ const streamOpenAIResponsesOnce = (
 					resetOpenAIResponsesChainState(chainState);
 				}
 			}
+			// A prior stripped retry in this session proved the stored history
+			// holds blobs foreign to the serving credential: keep stripping on
+			// every rebuild while it serves, so later turns neither re-400 nor
+			// diverge from the stripped chain baseline.
+			const stripForeignEncryptedForSession =
+				chainState?.stripForeignEncryptedReasoning === true &&
+				chainState.strippedForeignReasoningCredentialId === options?.credentialId;
 			const builtParams = buildParams(
 				model,
 				context,
@@ -785,6 +828,7 @@ const streamOpenAIResponsesOnce = (
 				strictToolsScope,
 				false,
 				chainState?.canAppend ? chainState.lastParams?.input : undefined,
+				stripForeignEncryptedForSession,
 			);
 			const { params, trailingScaffoldingItems } = builtParams;
 			let activeParams = params;
@@ -872,7 +916,7 @@ const streamOpenAIResponsesOnce = (
 						body: requestParams,
 						signal: requestSignal,
 						fetch: wrapFetchForCopilotFallback(
-							options?.fetch,
+							wrapFetchForRequestCompression(options?.fetch ?? fetch, model),
 							model.provider === "github-copilot",
 							resolveCopilotRequestIdentity(options?.headers),
 							copilotCacheKey,
@@ -898,6 +942,8 @@ const streamOpenAIResponsesOnce = (
 			let strictRetryAvailable = true;
 			let activeStrictToolsApplied = builtParams.strictToolsApplied;
 			let forceDisableStrictTools = false;
+			let foreignEncryptedReasoningRetryAvailable = true;
+			let strippedForeignEncryptedRetryAttempted = false;
 			const openResponsesStreamWithFallbacks = async (): Promise<AsyncIterable<ResponseStreamEvent>> => {
 				let openaiStream: AsyncIterable<ResponseStreamEvent>;
 				while (true) {
@@ -929,6 +975,7 @@ const streamOpenAIResponsesOnce = (
 								? resolveOpenAIReasoningEffortFallback(error, capturedErrorResponse, activeRequestParams, {
 										explicitDisable:
 											options?.forceReasoningOff === true || options?.disableReasoning === true,
+										...resolveOpenAIEffortFallbackConstraints(model, model.compat),
 									})
 								: undefined;
 						if (reasoningEffortFallback !== undefined && activeReasoningEffortFallbackKey) {
@@ -961,6 +1008,11 @@ const streamOpenAIResponsesOnce = (
 							strictRetryAvailable = false;
 							forceDisableStrictTools = true;
 							disableStrictToolsForScope(providerSessionState, strictToolsScope);
+							// A stripped retry proved the history holds blobs foreign
+							// to this credential: the fallback must neither replay
+							// them nor re-chain onto a server-held prefix that may
+							// hold them (decision seq 289).
+							const mustStayStripped = stripForeignEncryptedForSession || strippedForeignEncryptedRetryAttempted;
 							const fallbackBuilt = buildParams(
 								model,
 								context,
@@ -969,11 +1021,12 @@ const streamOpenAIResponsesOnce = (
 								strictToolsScope,
 								true,
 								chainState?.canAppend ? chainState.lastParams?.input : undefined,
+								mustStayStripped,
 							);
 							const fallbackParams = fallbackBuilt.params;
 							if (chainState && !chainState.disabled) fallbackParams.store = true;
 							let fallbackChained: OpenAIResponsesChainedParams =
-								chainState && !chainState.disabled
+								!mustStayStripped && chainState && !chainState.disabled
 									? buildOpenAIResponsesChainedParams(
 											fallbackParams,
 											fallbackBuilt.trailingScaffoldingItems,
@@ -989,6 +1042,51 @@ const streamOpenAIResponsesOnce = (
 							activeRawRequestDump.body = chained.params;
 							activeParams = fallbackParams;
 							activeTrailingScaffoldingItems = fallbackBuilt.trailingScaffoldingItems;
+							continue;
+						}
+						// Legacy turns stored before `credentialId` was recorded
+						// replay caller-bound `encrypted_content` no credential
+						// comparison can drop. On the server's foreign-caller 400,
+						// rebuild once with every encrypted reasoning blob
+						// stripped; other 400s fall through untouched. The flag
+						// makes a second failure surface normally — no loop.
+						if (
+							foreignEncryptedReasoningRetryAvailable &&
+							!requestSignal.aborted &&
+							isForeignEncryptedReasoningError(error)
+						) {
+							foreignEncryptedReasoningRetryAvailable = false;
+							strippedForeignEncryptedRetryAttempted = true;
+							logger.debug(
+								"OpenAI responses foreign encrypted reasoning rejected; retrying with encrypted reasoning stripped",
+								{ provider: model.provider, model: model.id },
+							);
+							const strippedBuilt = buildParams(
+								model,
+								context,
+								options,
+								providerSessionState,
+								strictToolsScope,
+								forceDisableStrictTools,
+								undefined,
+								true,
+							);
+							const strippedParams = strippedBuilt.params;
+							if (chainState && !chainState.disabled) strippedParams.store = true;
+							// Deliberately no `previous_response_id`: the
+							// server-held prefix may itself hold the foreign
+							// blob, so only a full stripped transcript is a
+							// safe retry. `store: true` keeps the retry
+							// chainable, so the next turn chains again.
+							const strippedChained = {
+								params: await applyPayloadReplacement(strippedParams),
+							};
+							sentPreviousResponseId = undefined;
+							chained = strippedChained;
+							activeRawRequestDump.body = strippedChained.params;
+							activeParams = strippedParams;
+							activeTrailingScaffoldingItems = strippedBuilt.trailingScaffoldingItems;
+							activeStrictToolsApplied = strippedBuilt.strictToolsApplied;
 							continue;
 						}
 						if (!chainState || !sentPreviousResponseId || requestSignal.aborted) {
@@ -1023,6 +1121,8 @@ const streamOpenAIResponsesOnce = (
 							providerSessionState,
 							strictToolsScope,
 							forceDisableStrictTools,
+							undefined,
+							stripForeignEncryptedForSession,
 						);
 						const currentParams = currentBuilt.params;
 						// Only ZDR forces `store: false` (the org never persists responses). A
@@ -1070,6 +1170,9 @@ const streamOpenAIResponsesOnce = (
 					for await (const event of timedOpenaiStream) {
 						if (isOpenAIResponsesReplayUnsafeEvent(event)) {
 							sawReplayUnsafeOutput = true;
+							// Producing output re-bases the operation deadline,
+							// so the budget bounds silence, not work.
+							markOperationProgress(options);
 							if (!forwardAttemptLive) {
 								forwardAttemptEvents();
 								forwardAttemptLive = true;
@@ -1267,10 +1370,21 @@ const streamOpenAIResponsesOnce = (
 					firstTokenTime = undefined;
 					nativeOutputItems.length = 0;
 
+					// Whole-operation budget: a retry whose sleep would land past it is
+					// refused now, with its own error, instead of adding to the silence.
+					const deadlineError = operationDeadlineExceeded(
+						options,
+						OPENAI_RESPONSES_TRANSIENT_STREAM_RETRY_DELAY_MS,
+					);
+					if (deadlineError) throw deadlineError;
 					await waitForRetry(
 						options?.providerRetryWait,
 						OPENAI_RESPONSES_TRANSIENT_STREAM_RETRY_DELAY_MS,
 						options?.signal,
+						{
+							attempt: transientStreamRetryAttempt,
+							maxAttempts: OPENAI_RESPONSES_MAX_TRANSIENT_STREAM_RETRIES,
+						},
 					);
 					if (abortTracker.wasCallerAbort()) throw new AIError.AbortError();
 					openaiStream = await openResponsesStreamWithFallbacks();
@@ -1299,6 +1413,14 @@ const streamOpenAIResponsesOnce = (
 							: activeParams,
 					);
 					chainState.lastPromptCacheBreakpointPolicy = promptCacheBreakpointPolicy;
+					// A stripped retry just proved the stored history holds
+					// blobs foreign to the serving credential: remember to
+					// keep stripping while it serves, or every later turn
+					// re-400s and chaining can never re-engage.
+					if (strippedForeignEncryptedRetryAttempted) {
+						chainState.stripForeignEncryptedReasoning = true;
+						chainState.strippedForeignReasoningCredentialId = options?.credentialId;
+					}
 					if (output.responseId && replayableResponseItems.length === nativeOutputItems.length) {
 						chainState.lastResponseId = output.responseId;
 						chainState.lastResponseItems = replayableResponseItems;
@@ -1355,7 +1477,7 @@ const streamOpenAIResponsesOnce = (
 				output.requestBodyReadTimeoutFullReplay = true;
 			}
 			// Some providers via OpenRouter include extra details here.
-			const rawMetadata = (error as { error?: { metadata?: { raw?: string } } })?.error?.metadata?.raw;
+			const rawMetadata = readOpenRouterRawMetadata(capturedErrorResponse);
 			if (rawMetadata) output.errorMessage += `\n${rawMetadata}`;
 			output.duration = performance.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
@@ -1568,6 +1690,7 @@ export function buildParams(
 	strictToolsScope?: OpenAIStrictToolsScope,
 	disableStrictToolsOverride = false,
 	statefulCacheBaseline?: ResponseInput,
+	stripEncryptedReasoning = false,
 ): { params: OpenAIResponsesSamplingParams; trailingScaffoldingItems: number; strictToolsApplied: boolean } {
 	const policy = resolveOpenAICompatPolicy(model, {
 		endpoint: "responses",
@@ -1594,6 +1717,7 @@ export function buildParams(
 		// Per-attempt credential: stream.ts rebuilds the input for every auth
 		// retry, so a mid-session failover drops caller-bound reasoning.
 		currentCredentialId: options?.credentialId,
+		stripEncryptedReasoning,
 		nativeHistory: {
 			replay: shouldReplayNativeHistory,
 			filterReasoning: policy.reasoning.filterReasoningHistory,

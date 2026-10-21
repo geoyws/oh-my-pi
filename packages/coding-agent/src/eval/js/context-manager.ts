@@ -10,15 +10,21 @@ import type { ToolSession } from "../../tools";
 import { ToolAbortError } from "../../tools/tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { safeSend as safeSendIpc } from "../../utils/ipc";
-import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP } from "../bridge-timeout";
+import {
+	EVAL_TIMEOUT_PAUSE_OP,
+	EVAL_TIMEOUT_RESUME_OP,
+	rejectRuntimeTimeoutControl,
+	rejectTimeoutControlCollision,
+} from "../bridge-timeout";
 import { getEnabledEvalPreludes } from "../preludes";
 import { attachSessionOwner, EvalKernelNotRunningError, type SessionOwners } from "../executor-base";
+import { KernelIdleTimer, ReapedKernelNotices, resolveKernelIdleTimeoutMs } from "../kernel-idle-reaper";
 import { shouldDetachKernel } from "../py/spawn-options";
 import { updateEvalState } from "../state";
 import type { EvalShadowCellSession } from "../speculation/cell-session";
 import { getActiveEvalShadowCell } from "../speculation/runtime-context";
 import type { ShadowPlan } from "../speculation/types";
-import type { EvalToolDescriptor, EvalToolInvokeResult } from "../types";
+import type { EvalDisplayOutput, EvalToolDescriptor, EvalToolInvokeResult } from "../types";
 import { type ShadowSnapshot, shadowSnapshotDigest } from "./shared/runtime";
 import { projectJavaScriptShadowPlan } from "./speculation";
 import { callSessionTool, type JsStatusEvent } from "./tool-bridge";
@@ -26,7 +32,6 @@ import { callSessionTool, type JsStatusEvent } from "./tool-bridge";
 // hidden argv mode, so compiled/npm builds only need one JavaScript entry.
 import type {
 	EvalPreludeSource,
-	JsDisplayOutput,
 	JsToolRequest,
 	RunErrorPayload,
 	SessionSnapshot,
@@ -35,12 +40,18 @@ import type {
 } from "./worker-protocol";
 
 export { rewriteImports, wrapCode } from "./shared/rewrite-imports";
-export type { JsDisplayOutput } from "./worker-protocol";
 
 export interface VmRunState {
 	signal?: AbortSignal;
 	onText?: (chunk: string) => void;
-	onDisplay?: (output: JsDisplayOutput) => void;
+	onDisplay?: (output: EvalDisplayOutput) => void;
+	/**
+	 * Host-owned control channel for the cell watchdog. Only the parent-side
+	 * bridge wrapper writes to it, so the evaluated cell cannot pause its own
+	 * deadline through the status data channel it *can* reach
+	 * (`__omp_emit_status__` → {@link handleSessionMessage}).
+	 */
+	onTimeoutControl?: (event: JsStatusEvent) => void;
 }
 
 /** Isolated runtime transport used by the context manager and startup regression fixtures. */
@@ -50,6 +61,10 @@ export interface JsEvalWorkerHandle {
 	onMessage(handler: (msg: WorkerOutbound) => void): () => void;
 	onError(handler: (error: Error) => void): () => void;
 	close(): Promise<boolean>;
+	/**
+	 * SIGKILL the runtime. Bounded: it waits for the exit to be observed and
+	 * logs an unconfirmed kill instead of blocking on it.
+	 */
 	terminate(): Promise<void>;
 }
 
@@ -105,6 +120,10 @@ interface JsSession {
 	pendingShadowRuns: Map<string, PromiseWithResolvers<Extract<WorkerOutbound, { type: "shadow-run" }>>>;
 	ownerIds: Set<string>;
 	hasFallbackOwner: boolean;
+	/** Shuts the runtime down after `idleMs` with no run in flight; created on first schedule. */
+	idleTimer?: KernelIdleTimer;
+	/** Window from the latest cell's `eval.kernelIdleTimeoutSeconds`; `undefined` disables reaping. */
+	idleMs?: number;
 }
 
 interface StartingJsSession extends SessionOwners {
@@ -114,6 +133,7 @@ interface StartingJsSession extends SessionOwners {
 const sessions = new Map<string, JsSession>();
 const startingSessions = new Map<string, StartingJsSession>();
 const resettingSessions = new Map<string, Promise<void>>();
+const reapedNotices = new ReapedKernelNotices("JavaScript");
 // Worker startup (module-graph import + WorkerCore construction) is infrastructure
 // cost, not user compute. Floor it independently of Bun's 5s default per-test timeout
 // so a slow cold-start under load isn't aborted mid-init — terminating a still-
@@ -164,6 +184,8 @@ export async function executeInVmContext(options: {
 }): Promise<{ value: unknown }> {
 	const { sessionKey } = options;
 	if (options.reset) {
+		// An explicit reset already tells the caller the state is gone.
+		reapedNotices.forget(sessionKey);
 		// Coalesce concurrent resets: an existing in-flight reset already
 		// produces a fresh context, so a follow-up `reset: true` cell should
 		// just wait for it rather than failing the user-visible call.
@@ -200,6 +222,10 @@ export async function executeInVmContext(options: {
 		options.timeoutMs,
 		options.ownerId,
 	);
+	// A reap removes the session, so a pending note means this cell runs in a fresh runtime. The text
+	// lands in the cell's output sink, which every executeJs outcome (result, error, abort) dumps.
+	const restartNotice = reapedNotices.take(sessionKey);
+	if (restartNotice) options.runState.onText?.(restartNotice.text);
 	const result = await runOnce(session, options);
 	if (session.state === "alive" && path.isAbsolute(options.filename)) {
 		updateEvalState(options.session, {
@@ -233,12 +259,7 @@ export async function invokeJsTool(
 	let envelope: unknown;
 	const pending: PendingRun = {
 		runId,
-		runState: {
-			signal: options.signal,
-			onDisplay: output => {
-				if (output.type === "json") envelope = output.data;
-			},
-		},
+		runState: { signal: options.signal },
 		toolSession: options.session,
 		resolve,
 		reject,
@@ -262,12 +283,13 @@ export async function invokeJsTool(
 
 	try {
 		if (!pending.settled) safeSend(session, { type: "tool", runId, ...request });
-		await promise;
+		envelope = (await promise).value;
 	} catch (error) {
 		return { ok: false, error: error instanceof Error ? error.message : String(error) };
 	} finally {
 		options.signal?.removeEventListener("abort", onAbort);
 		session.pending.delete(runId);
+		scheduleIdleReap(session);
 	}
 
 	if (!isUnknownRecord(envelope) || envelope.ok !== true) {
@@ -328,6 +350,7 @@ export async function snapshotVmContext(options: {
 		return reply.eligible ? (reply.snapshot ?? null) : null;
 	} finally {
 		session.pendingSnapshots.delete(id);
+		scheduleIdleReap(session);
 	}
 }
 
@@ -405,6 +428,7 @@ export async function disposeAllVmContexts(): Promise<void> {
 		if (!all.includes(result.value)) all.push(result.value);
 	}
 	sessions.clear();
+	reapedNotices.clear();
 	await Promise.all(all.map(session => killSession(session, new ToolError("JS context disposed"), { force: false })));
 }
 
@@ -413,6 +437,7 @@ export async function disposeAllVmContexts(): Promise<void> {
  * owners (e.g. an in-memory session keyed only by cwd) just drop the registration.
  */
 export async function disposeVmContextsByOwner(ownerId: string): Promise<void> {
+	reapedNotices.forgetOwner(ownerId);
 	const toKill: JsSession[] = [];
 	for (const session of Array.from(sessions.values())) {
 		if (!session.ownerIds.has(ownerId)) continue;
@@ -550,6 +575,7 @@ async function runOnce(
 	}
 
 	try {
+		session.idleMs = resolveKernelIdleTimeoutMs(options.session.settings);
 		if (options.packageRoot !== undefined) session.packageRoot = options.packageRoot;
 		if (options.packageEnvironment !== undefined) session.packageEnvironment = options.packageEnvironment;
 		const snapshot = {
@@ -591,6 +617,7 @@ async function runOnce(
 	} finally {
 		options.runState.signal?.removeEventListener("abort", onAbort);
 		session.pending.delete(runId);
+		scheduleIdleReap(session);
 	}
 }
 
@@ -676,6 +703,9 @@ async function acquireSession(
 		// and publishing here would resurrect a context that was just torn down.
 		if (startingSessions.get(sessionKey) === startingSession) {
 			sessions.set(sessionKey, session);
+			// A caller that gave up waiting still leaves a published runtime; reap it like any idle one.
+			session.idleMs = resolveKernelIdleTimeoutMs(toolSession.settings);
+			scheduleIdleReap(session);
 		}
 		return session;
 	})();
@@ -747,6 +777,11 @@ function handleSessionMessage(session: JsSession, msg: WorkerOutbound): void {
 		}
 		case "display": {
 			const pending = session.pending.get(msg.runId);
+			// Everything on this channel is runtime output, including whatever
+			// evaluated code passes to `__omp_emit_status__`. Timeout control is
+			// host-owned, so a forged pause/resume dies here instead of reaching
+			// the cell watchdog.
+			if (msg.output.type === "status" && rejectRuntimeTimeoutControl(msg.output.event, "JS eval")) return;
 			pending?.runState.onDisplay?.(msg.output);
 			return;
 		}
@@ -821,9 +856,28 @@ async function handleToolCall(session: JsSession, msg: Extract<WorkerOutbound, {
 			signal: ctrl.signal,
 			identity: msg.identity,
 			shadowCell: pending.shadowCell,
+			// Generic tool status: `op` is a tool name, so a name colliding with
+			// timeout control is not authority. Drop the collision and render the
+			// rest; real control arrives on `onTimeoutControl` below.
 			emitStatus: (event: JsStatusEvent) => {
-				trackDeferPhase(pending, event);
+				if (rejectTimeoutControlCollision(event, `JS eval tool ${JSON.stringify(msg.name)}`)) return;
 				pending.runState.onDisplay?.({ type: "status", event });
+			},
+			// This process's own bridge lifecycle. Nothing the runtime can send
+			// reaches this channel, which is what makes it the deadline authority.
+			// Atomic-sink contract: the defer depth above is applied first and the
+			// observer fanout below is best-effort — a throwing status observer is
+			// logged and the applied state stands, so nesting stays balanced.
+			onTimeoutControl: (event: JsStatusEvent) => {
+				trackDeferPhase(pending, event);
+				try {
+					pending.runState.onTimeoutControl?.(event);
+				} catch (error) {
+					logger.warn("eval timeout control observer failed; keeping the applied pause/resume state", {
+						op: event.op,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
 			},
 		});
 		safeSend(session, { type: "tool-reply", id: msg.id, reply: { ok: true, value } });
@@ -844,7 +898,7 @@ function finishPending(pending: PendingRun, msg: Extract<WorkerOutbound, { type:
 	pending.settled = true;
 	pending.heldResult = undefined;
 	if (msg.ok) {
-		pending.resolve({ value: undefined });
+		pending.resolve({ value: msg.value });
 		return;
 	}
 	pending.reject(errorFromPayload(msg.error));
@@ -877,6 +931,7 @@ async function killSessionFor(session: JsSession, error: Error, options: { force
 
 async function killSession(session: JsSession, error: Error, options: { force: boolean }): Promise<void> {
 	if (session.state === "dead") return;
+	session.idleTimer?.disarm();
 	session.state = "dead";
 	for (const toolSession of session.stateSessions) {
 		updateEvalState(toolSession, { language: "js", kernelId: session.kernelId, alive: false });
@@ -898,6 +953,34 @@ async function killSession(session: JsSession, error: Error, options: { force: b
 	}
 	if (await session.worker.close().catch(() => false)) return;
 	await session.worker.terminate().catch(() => undefined);
+}
+
+function isJsSessionBusy(session: JsSession): boolean {
+	return session.pending.size > 0 || session.pendingSnapshots.size > 0 || session.pendingShadowRuns.size > 0;
+}
+
+/** (Re)start the idle window of a published, idle runtime. */
+function scheduleIdleReap(session: JsSession): void {
+	if (session.state !== "alive" || sessions.get(session.sessionKey) !== session || isJsSessionBusy(session)) return;
+	session.idleTimer ??= new KernelIdleTimer(idleMs => reapIdleSession(session, idleMs));
+	session.idleTimer.arm(session.idleMs);
+}
+
+function reapIdleSession(session: JsSession, idleMs: number): void {
+	if (session.state !== "alive" || sessions.get(session.sessionKey) !== session) return;
+	// Never cut work: a run, tool request, snapshot or reset still in flight restarts the window.
+	if (isJsSessionBusy(session) || resettingSessions.has(session.sessionKey)) {
+		session.idleTimer?.arm(session.idleMs);
+		return;
+	}
+	sessions.delete(session.sessionKey);
+	reapedNotices.record(session.sessionKey, idleMs, session.ownerIds);
+	logger.debug("JS eval runtime idle; shutting it down", {
+		sessionId: session.sessionId,
+		sessionKey: session.sessionKey,
+		idleMs,
+	});
+	void killSession(session, new ToolError("JS eval runtime shut down after idle timeout"), { force: false });
 }
 
 function markJsSessionAlive(session: JsSession, toolSession: ToolSession, environment: string | undefined): void {
@@ -1096,7 +1179,22 @@ function wrapBunWorker(worker: Worker): JsEvalWorkerHandle {
 			return await closed;
 		},
 		async terminate() {
-			worker.terminate();
+			// `Worker.terminate()` is fire-and-forget in Bun; the thread's real
+			// exit arrives as a `close` event. Confirm it under a bound so a
+			// caller is never told the runtime is gone without evidence.
+			const exited = Promise.withResolvers<boolean>();
+			const onClose = (): void => exited.resolve(true);
+			worker.addEventListener("close", onClose, { once: true });
+			const timeout = setTimeout(() => exited.resolve(false), WORKER_CLOSE_TIMEOUT_MS);
+			timeout.unref?.();
+			try {
+				worker.terminate();
+				const confirmed = await exited.promise;
+				if (!confirmed) logger.warn("JS eval worker thread did not confirm exit after terminate()");
+			} finally {
+				clearTimeout(timeout);
+				worker.removeEventListener("close", onClose);
+			}
 		},
 	};
 }

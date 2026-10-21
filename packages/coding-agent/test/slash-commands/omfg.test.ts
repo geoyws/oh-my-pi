@@ -14,6 +14,8 @@ function createRuntime() {
 			ctx: {
 				editor: { setText, addToHistory } as unknown as InteractiveModeContext["editor"],
 				handleOmfgCommand,
+				// Admitting `before_user_message` gate: refusal is covered in user-message-refusal.test.ts.
+				session: { gateUserMessage: async () => {} },
 			} as unknown as InteractiveModeContext,
 		},
 	};

@@ -1,16 +1,21 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage, ToolResultMessage, Usage } from "@oh-my-pi/pi-ai";
+import { Effort, type AssistantMessage, type ToolResultMessage, type Usage } from "@oh-my-pi/pi-ai";
+import * as autoThinkingClassifier from "@oh-my-pi/pi-coding-agent/auto-thinking/classifier";
+import { AUTO_THINKING } from "@oh-my-pi/pi-tui/thinking";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { cfgStatusLineCompactThinkingLevel } from "@oh-my-pi/pi-coding-agent/modes/settings";
 import { Composer } from "@oh-my-pi/pi-tui/prompt/composer";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
-import { initTheme } from "@oh-my-pi/pi-tui/theme";
+import { initTheme, theme } from "@oh-my-pi/pi-tui/theme";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { statusLineHost } from "@oh-my-pi/pi-coding-agent/modes/status-line-host";
+import { createAssistantMessage } from "./helpers/agent-session-setup";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal";
 
 function plainRows(rows: readonly string[]): string[] {
@@ -336,5 +341,143 @@ describe("libkitty end-to-end", () => {
 		expect(mode.hideToolActivity).toBe(true);
 		expect(plainRows(term.getScrollBuffer()).some(row => row.includes(TOOL_MARKER))).toBe(false);
 		expect(plainRows(term.getViewport()).some(row => row.includes("LIVE_EDITOR_DRAFT"))).toBe(true);
+	});
+	it("replaces retired history after /shake without obscuring a long reply beside the Todo HUD", async () => {
+		const usage: Usage = {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		const answer = Array.from({ length: 35 }, (_, index) => `Answer marker ${index + 1}`);
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: "SHAKE_RETIRED_REASONING" },
+				{ type: "text", text: answer.join("\n") },
+			],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet",
+			usage,
+			stopReason: "stop",
+			timestamp: 1,
+		};
+		term = new VirtualTerminal(120, 16);
+		mode = new InteractiveMode(
+			session,
+			"test",
+			undefined,
+			() => {},
+			undefined,
+			undefined,
+			undefined,
+			new Composer({ terminal: term }),
+		);
+		session.sessionManager.appendMessage({ role: "user", content: "Show the answer", timestamp: 0 });
+		session.sessionManager.appendMessage(message);
+		await mode.init({ suppressWelcomeIntro: true });
+		mode.noteDisplayableThinkingContent(message);
+		mode.setTodos([{ content: "Review answer", status: "in_progress" }]);
+		await mode.renderInitialMessages({ clearTerminalHistory: true });
+		await term.waitForRender(() =>
+			plainRows(term.getScrollBuffer()).some(row => row.includes("SHAKE_RETIRED_REASONING")),
+		);
+
+		const buffer = () => plainRows(term.getScrollBuffer());
+		expect(buffer().some(row => row.includes("SHAKE_RETIRED_REASONING"))).toBe(true);
+		await mode.handleShakeCommand("thinking");
+		await term.waitForRender();
+
+		const rows = buffer();
+		expect(rows.some(row => row.includes("SHAKE_RETIRED_REASONING"))).toBe(false);
+		expect(rows.filter(row => row.trim() === "Answer marker 1")).toHaveLength(1);
+		expect(rows.filter(row => row.trim() === "Answer marker 35")).toHaveLength(1);
+		expect(plainRows(term.getViewport()).some(row => row.includes("Review answer"))).toBe(true);
+
+		for (const errorMessage of [undefined, "Auto-shake only partially reclaimed context"]) {
+			await mode.eventController.handleEvent({
+				type: "auto_compaction_end",
+				action: "shake",
+				result: undefined,
+				aborted: false,
+				willRetry: true,
+				skipped: false,
+				...(errorMessage ? { errorMessage } : {}),
+			});
+			await term.waitForRender();
+			expect(buffer().filter(row => row.trim() === "Answer marker 1")).toHaveLength(1);
+			expect(plainRows(term.getViewport()).some(row => row.includes("Review answer"))).toBe(true);
+		}
+	});
+
+	it("paints requested auto apart from an explicit pin and repaints when only its resolution clears", async () => {
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		// The default compact mode swaps the model icon for the level glyph and
+		// drops the ` · <level>` text this test reads; show the text form. The bar
+		// captured its settings when beforeEach built the mode, and the mode's live
+		// settings listener watches the session's isolated Settings, not this
+		// global override, so hand the bar the overridden settings directly.
+		cfgStatusLineCompactThinkingLevel.override(settings, false);
+		mode.statusLine.updateSettings(statusLineHost.getSettings());
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		const classifierSpy = vi.spyOn(autoThinkingClassifier, "classifyDifficulty");
+		try {
+			await mode.init({ suppressWelcomeIntro: true });
+			void mode.getUserInput();
+			await term.waitForRender();
+			// The painted row carrying a given thinking display (the model
+			// segment's level text), found by that display rather than the model
+			// name, whose painted shape varies with the layout.
+			const rows = () => plainRows(term.getViewport());
+			const rowWith = (display: string) => rows().find(row => row.includes(display)) ?? "";
+			const settle = async (painted: () => boolean) => {
+				await term.waitForRender(painted);
+				if (!painted()) dump("viewport while waiting for the thinking display", rows());
+			};
+
+			session.setThinkingLevel(Effort.High);
+			// A fresh session paints no model segment until history exists. Warm
+			// up with one turn under the explicit pin (no classification, since
+			// auto is off; agent.prompt is mocked, so it records no reply), then
+			// seed that reply into the transcript, agent state and chat the way the
+			// other viewport tests here do.
+			await session.prompt("Warm up the status line");
+			const warm = createAssistantMessage("warm");
+			session.sessionManager.appendMessage(warm);
+			session.agent.replaceMessages([...session.agent.state.messages, warm]);
+			mode.addMessageToChat(warm);
+			mode.ui.requestRender(true);
+			await settle(() => rowWith(theme.thinking.high) !== "");
+			expect(classifierSpy).not.toHaveBeenCalled();
+			expect(rowWith(theme.thinking.high)).toContain(theme.thinking.high);
+			expect(rowWith(theme.thinking.high)).not.toContain("auto");
+
+			session.setThinkingLevel(AUTO_THINKING);
+			const provisional = session.thinkingLevel as Effort;
+			const pending = `${theme.thinking.autoPending} auto`;
+			await settle(() => rowWith(pending) !== "");
+			expect(rowWith(pending)).toContain(pending);
+
+			classifierSpy.mockResolvedValue(provisional);
+			await session.prompt("Implement a focused parser fix");
+			const resolved = `auto (${provisional})`;
+			await settle(() => rowWith(resolved) !== "");
+			expect(rowWith(resolved)).toContain(resolved);
+
+			// Re-selecting auto keeps the same concrete effort but drops the
+			// resolution: the painted bar must return to pending, not stay stale.
+			session.setThinkingLevel(AUTO_THINKING);
+			expect(session.thinkingLevel).toBe(provisional);
+			await settle(() => rowWith(resolved) === "" && rowWith(pending) !== "");
+			expect(rowWith(pending)).toContain(pending);
+			expect(rowWith(resolved)).toBe("");
+		} finally {
+			promptSpy.mockRestore();
+			classifierSpy.mockRestore();
+			cfgStatusLineCompactThinkingLevel.clearOverride(settings);
+		}
 	});
 });

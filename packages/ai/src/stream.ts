@@ -3,7 +3,6 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
-import { isOfficialAnthropicApiUrl } from "@oh-my-pi/pi-catalog/compat/anthropic";
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { isVertexExpressOpenAIUrl, isVertexRawPredictUrl, resolveVertexEndpointHost } from "@oh-my-pi/pi-catalog/hosts";
 import {
@@ -12,8 +11,8 @@ import {
 	mapEffortToGoogleThinkingLevel,
 	requireSupportedEffort,
 	resolveWireModelId,
+	withoutUnverifiedThinking,
 } from "@oh-my-pi/pi-catalog/model-thinking";
-import { CODEX_BASE_URL } from "@oh-my-pi/pi-catalog/wire/codex";
 import { $env, getProviderInFlightRoot, isEnoent, logger, untilAborted } from "@oh-my-pi/pi-utils";
 import { getCustomApi } from "./api-registry";
 import { createAuthRetryKeyState, isApiKeyResolver, resolvedApiKeyBearer, resolveNextAuthRetryKey } from "./auth-retry";
@@ -23,6 +22,7 @@ import * as AIError from "./error";
 import { ProviderHttpError } from "./error";
 import { isConcurrencyCapExclusion, isUsageLimitOutcome } from "./error/rate-limit";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
+import { reachesOfficialEndpoint } from "./providers/anthropic-state";
 import type { AnthropicOptions } from "./providers/anthropic";
 import type { AppleFoundationModelsOptions } from "./providers/apple-foundation-models";
 import type { CursorOptions } from "./providers/cursor";
@@ -63,6 +63,7 @@ import type {
 	FetchImpl,
 	Model,
 	OptionsForApi,
+	ProviderRetryWaitFn,
 	SimpleStreamOptions,
 	StreamOptions,
 	ThinkingBudgets,
@@ -70,9 +71,9 @@ import type {
 } from "./types";
 import { getHeaderCaseInsensitive, resolveCacheRetention } from "./utils";
 import { AssistantMessageEventStream } from "./utils/event-stream";
-import { isFoundryEnabled } from "./utils/foundry";
 import { applyGlyphCodec } from "./utils/glyph-codec";
 import { wrapLeakedThinkingStream } from "./utils/leaked-thinking-stream";
+import { operationDeadlineExceeded, withOperationDeadline } from "./utils/operation-deadline";
 import { withThinkingLoopGuard } from "./utils/thinking-loop";
 import { withTransportFetch } from "./utils/transport-fetch";
 
@@ -85,77 +86,12 @@ function isGoogleVertexAuthenticatedModel(model: Model<Api>): boolean {
 }
 
 /**
- * Whether {@link model} is an official first-party endpoint whose stream needs
- * no leaked-thinking healing — the official Anthropic API and the official
- * OpenAI / OpenAI-Codex endpoints return structured thinking blocks and never
- * leak reasoning idioms into the visible text channel.
- *
- * The gate is provider id **and** official endpoint URL: pointing
- * `provider: "anthropic"` (or `openai`) at a custom proxy via `models.yml`
- * still routes through {@link wrapLeakedThinkingStream}, since a third-party
- * gateway may well leak. URL checks are strict (exact origin / path boundary
- * or parsed hostname) — a substring match would accept lookalikes like
- * `https://api.openai.com.evil/`. Anthropic Foundry (`CLAUDE_CODE_USE_FOUNDRY`)
- * redirects an empty `baseUrl` to `FOUNDRY_BASE_URL`, so the check runs against
- * that effective endpoint — exempt only when it resolves to the official host.
- */
-function isLeakedThinkingHealExempt(model: Model<Api>): boolean {
-	switch (model.provider) {
-		case "anthropic": {
-			// Mirror resolveAnthropicBaseUrl's effective endpoint: Foundry redirects
-			// an empty baseUrl to FOUNDRY_BASE_URL; otherwise an explicit non-official
-			// model.baseUrl wins, then the ANTHROPIC_BASE_URL gateway fallback, then
-			// the official default. Exempt only when the effective endpoint is official.
-			if (isFoundryEnabled()) {
-				const foundry = $env.FOUNDRY_BASE_URL?.trim();
-				if (foundry) return isOfficialAnthropicApiUrl(foundry);
-			}
-			if (model.baseUrl && !isOfficialAnthropicApiUrl(model.baseUrl)) return false;
-			return isOfficialAnthropicApiUrl($env.ANTHROPIC_BASE_URL?.trim() || model.baseUrl);
-		}
-		case "openai":
-			return isOfficialOpenAIApiUrl(model.baseUrl);
-		case "openai-codex":
-			return isOfficialCodexApiUrl(model.baseUrl);
-		default:
-			return false;
-	}
-}
-
-/** Strict official-OpenAI endpoint check; missing baseUrl defaults to `api.openai.com`. */
-function isOfficialOpenAIApiUrl(baseUrl: string | undefined): boolean {
-	if (!baseUrl) return true;
-	try {
-		return new URL(baseUrl).hostname === "api.openai.com";
-	} catch {
-		return false;
-	}
-}
-
-const OFFICIAL_CODEX_URL = new URL(CODEX_BASE_URL);
-
-/** Strict official-Codex endpoint check; exact origin or a path boundary after {@link CODEX_BASE_URL}. */
-export function isOfficialCodexApiUrl(baseUrl: string | undefined): boolean {
-	if (!baseUrl) return true;
-	try {
-		const candidate = new URL(baseUrl);
-		const candidatePath = candidate.pathname.replace(/\/+$/, "");
-		return (
-			candidate.origin === OFFICIAL_CODEX_URL.origin &&
-			(candidatePath === OFFICIAL_CODEX_URL.pathname || candidatePath.startsWith(`${OFFICIAL_CODEX_URL.pathname}/`))
-		);
-	} catch {
-		return false;
-	}
-}
-
-/**
- * Apply live leaked-thinking healing unless {@link model} is an official
- * first-party endpoint ({@link isLeakedThinkingHealExempt}), which emits
- * structured thinking and needs no healing.
+ * Apply live leaked-thinking healing unless the request reaches the model's official endpoint
+ * ({@link reachesOfficialEndpoint}): official Anthropic / OpenAI / Codex endpoints return structured
+ * thinking blocks and never leak reasoning idioms into the visible text channel.
  */
 function healLeakedThinking(model: Model<Api>, inner: AssistantMessageEventStream): AssistantMessageEventStream {
-	return isLeakedThinkingHealExempt(model) ? inner : wrapLeakedThinkingStream(inner);
+	return reachesOfficialEndpoint(model) ? inner : wrapLeakedThinkingStream(inner);
 }
 
 type ProviderInFlightLease = {
@@ -921,9 +857,13 @@ function streamDispatch<TApi extends Api>(
 	options: OptionsForApi<TApi> | undefined,
 	limited: boolean,
 ): AssistantMessageEventStream {
-	const requestOptions = withSupportedSamplingParams(
-		model,
-		withTransportFetch(model, (options || {}) as StreamOptions),
+	// One stamp per operation, at whichever pi-ai entry the caller used: the
+	// budget starts when the request enters pi-ai and covers everything after,
+	// including any wait for a provider in-flight slot, because that wait is
+	// silence too. `withOperationDeadline` keeps the first stamp, so the
+	// `streamSimpleRequest` entry above does not restart the clock here.
+	const requestOptions = withOperationDeadline(
+		withSupportedSamplingParams(model, withTransportFetch(model, (options || {}) as StreamOptions)),
 	) as OptionsForApi<TApi>;
 	assertExplicitOpenAIResponsesPromptCacheSupport(model, requestOptions);
 
@@ -1090,6 +1030,7 @@ async function resolveWithThinkingLoopRetries(
 	signal: AbortSignal | undefined,
 	dispatch: () => AssistantMessageEventStream,
 	onAttempt?: (message: AssistantMessage) => void,
+	providerRetryWait?: ProviderRetryWaitFn,
 ): Promise<AssistantMessage> {
 	const dispatchAttempt = async (): Promise<AssistantMessage> => {
 		const response = dispatch();
@@ -1106,9 +1047,21 @@ async function resolveWithThinkingLoopRetries(
 		// A caller abort surfaces as a thrown abort (never the stall, which would
 		// misclassify as a 502): throwIfAborted before backoff, and scheduler.wait
 		// rejects if the abort lands mid-delay.
+		// Not gated by the operation deadline: each `dispatch()` is a NEW operation
+		// that stamps its own budget, and these three attempts add at most 12s of
+		// backoff, so there is no nested-retry product to bound here.
 		signal?.throwIfAborted();
 		const delay = Math.min(THINKING_LOOP_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1), THINKING_LOOP_RETRY_MAX_DELAY_MS);
-		await scheduler.wait(delay, { signal });
+		// Each attempt re-issues the whole request, so from the caller's side of
+		// `complete`/`completeSimple` this sleep is as invisible as a provider's
+		// own retry sleep. The hook only observes: same delay, same signal.
+		if (providerRetryWait)
+			await providerRetryWait(delay, signal, {
+				attempt,
+				// The budget counts dispatches; the retry budget is one fewer.
+				maxAttempts: THINKING_LOOP_MAX_ATTEMPTS - 1,
+			});
+		else await scheduler.wait(delay, { signal });
 		message = await dispatchAttempt();
 		thinkingLoopRetry = isRetryableThinkingLoop(message);
 	}
@@ -1121,7 +1074,12 @@ export async function complete<TApi extends Api>(
 	context: Context,
 	options?: OptionsForApi<TApi>,
 ): Promise<AssistantMessage> {
-	return resolveWithThinkingLoopRetries(options?.signal, () => stream(model, context, options));
+	return resolveWithThinkingLoopRetries(
+		options?.signal,
+		() => stream(model, context, options),
+		undefined,
+		options?.providerRetryWait,
+	);
 }
 
 type AuthRetryFailure = {
@@ -1237,6 +1195,11 @@ export function streamSimple<TApi extends Api>(
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
 	const sessionOptions = withInferenceSessionId(options);
+	// Unverified thinking is opt-in: without a requested effort the request is
+	// byte-identical to a non-reasoning model's.
+	const effortRequested =
+		sessionOptions.reasoning !== undefined && !sessionOptions.disableReasoning && !sessionOptions.forceReasoningOff;
+	if (!effortRequested) model = withoutUnverifiedThinking(model);
 	if (!model.requiresGlyphTokenization) {
 		return streamSimpleRequest(model, context, sessionOptions);
 	}
@@ -1279,9 +1242,12 @@ function streamSimpleRequest<TApi extends Api>(
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
-	const requestOptions = withSupportedSamplingParams(
-		model,
-		withTransportFetch(model, (options || {}) as SimpleStreamOptions),
+	// Stamp the operation budget before any branch below: pi-native, custom
+	// APIs, GitLab Duo, Kimi Code and Synthetic dispatch without ever reaching
+	// `streamDispatch`, and the auth-retry wrapper re-enters this function per
+	// credential — all of those must share ONE budget, not restart it.
+	const requestOptions = withOperationDeadline(
+		withSupportedSamplingParams(model, withTransportFetch(model, (options || {}) as SimpleStreamOptions)),
 	);
 
 	const apiKeyResolver = isApiKeyResolver(requestOptions?.apiKey) ? requestOptions.apiKey : undefined;
@@ -1418,6 +1384,15 @@ function streamSimpleRequest<TApi extends Api>(
 					},
 				);
 				if (nextKey === undefined) break;
+				// The resolver may have yielded while refreshing or rotating credentials.
+				// Preserve caller-abort precedence, then refuse a replay whose shared
+				// operation budget expired while the resolver was working.
+				if (signal?.aborted) break;
+				const deadlineError = operationDeadlineExceeded(requestOptions, 0);
+				if (deadlineError) {
+					outer.fail(deadlineError);
+					return;
+				}
 				const next = await runAttempt(nextKey, nextCredentialId, nextOAuthIdentity);
 				if (!next) return;
 				failure = next;
@@ -1581,6 +1556,7 @@ export async function completeSimple<TApi extends Api>(
 		options?.signal,
 		() => streamSimple(model, context, sessionOptions),
 		onAttempt,
+		options?.providerRetryWait,
 	);
 }
 
@@ -1827,6 +1803,7 @@ function mapOptionsForApi<TApi extends Api>(
 		repetitionPenalty: options?.repetitionPenalty,
 		maxTokens: options?.maxTokens ?? model.maxTokens ?? undefined,
 		signal: options?.signal,
+		maxHttpAttempts: options?.maxHttpAttempts,
 		apiKey: apiKey ?? (typeof options?.apiKey === "string" ? options.apiKey : undefined),
 		credentialId: options?.credentialId,
 		oauthIdentity: options?.oauthIdentity,
@@ -1834,6 +1811,12 @@ function mapOptionsForApi<TApi extends Api>(
 		headers: options?.headers,
 		initiatorOverride: options?.initiatorOverride,
 		maxRetryDelayMs: options?.maxRetryDelayMs,
+		operationTimeoutMs: options?.operationTimeoutMs,
+		operationDeadlineAt: options?.operationDeadlineAt,
+		// Without this the hook is silently dropped here: every provider reads it
+		// off its own `OptionsForApi`, so a caller-supplied retry-wait observer
+		// never reached the retry loops that honour it.
+		providerRetryWait: options?.providerRetryWait,
 		metadata: options?.metadata,
 		taskBudget: options?.taskBudget,
 		sessionId: options?.sessionId,
@@ -1846,7 +1829,6 @@ function mapOptionsForApi<TApi extends Api>(
 		minimizeEffort: options?.minimizeEffort,
 		liveSteering: options?.liveSteering,
 		maxInFlightRequests: options?.maxInFlightRequests,
-		toolNamespacesInfo: options?.toolNamespacesInfo,
 		onPayload: options?.onPayload,
 		onResponse: options?.onResponse,
 		onSseEvent: options?.onSseEvent,
@@ -2122,6 +2104,7 @@ function mapOptionsForApi<TApi extends Api>(
 				codexCompaction: options?.codexCompaction,
 				reasoningSummary: options?.hideThinkingSummary ? null : undefined,
 				textVerbosity: options?.textVerbosity,
+				disableReasoning: options?.disableReasoning,
 				forceReasoningOff: options?.forceReasoningOff,
 			});
 

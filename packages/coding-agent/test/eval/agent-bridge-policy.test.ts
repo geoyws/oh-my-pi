@@ -5,7 +5,11 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 import { AsyncJobManager } from "../../src/async";
 import { Settings } from "../../src/config/settings";
 import { runEvalAgent, type EvalAgentBridgeOptions, type EvalAgentResult } from "../../src/eval/agent-bridge";
-import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP } from "../../src/eval/bridge-timeout";
+import {
+	EVAL_TIMEOUT_PAUSE_OP,
+	EVAL_TIMEOUT_RESUME_OP,
+	type EvalTimeoutControlSink,
+} from "../../src/eval/bridge-timeout";
 import { runEvalWait } from "../../src/eval/handle-bridge";
 import { IdleTimeout } from "../../src/eval/idle-timeout";
 import { disposeAllVmContexts } from "../../src/eval/js/context-manager";
@@ -24,6 +28,7 @@ import { AgentOutputManager } from "../../src/task/output-manager";
 import type { AgentDefinition } from "../../src/task/types";
 import type { AgentProgress, SingleResult, StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "../../src/tools";
+import { EvalTool } from "../../src/tools/eval";
 
 const taskAgent = {
 	name: "task",
@@ -56,7 +61,10 @@ function isEvalAgentResult(value: unknown): value is EvalAgentResult {
 	);
 }
 
-async function runEvalAgentAndWait(args: unknown, options: EvalAgentBridgeOptions): Promise<EvalAgentResult> {
+async function runEvalAgentAndWait(
+	args: unknown,
+	options: EvalAgentBridgeOptions & { onTimeoutControl?: EvalTimeoutControlSink },
+): Promise<EvalAgentResult> {
 	const handle = await runEvalAgent(args, options);
 	const waited = await runEvalWait({ items: [{ kind: "agent", id: handle.id }] }, options);
 	const snapshot = waited.items[0];
@@ -291,7 +299,7 @@ describe("runEvalAgent", () => {
 			text: "ok",
 		});
 		expect(runSpy).toHaveBeenCalledTimes(1);
-		expect(runSpy.mock.calls[0]?.[0].agent.tools).toEqual(["read", "grep", "glob", "web_search", "ast_grep"]);
+		expect(runSpy.mock.calls[0]?.[0].agent.tools).toEqual(["read", "grep", "glob", "web_search", "ast"]);
 		expect(runSpy.mock.calls[0]?.[0].agent.spawns).toBeUndefined();
 		await expect(
 			runEvalAgentAndWait({ prompt: "unsafe", isolated: true }, { session: makeSession({ planMode: true }) }),
@@ -333,6 +341,9 @@ describe("runEvalAgent", () => {
 		expect(firstOptions.parentActiveModelPattern).toBe("p/current");
 		expect(firstOptions.outputSchema).toBe(schema);
 		expect(firstOptions.outputSchemaOverridesAgent).toBe(true);
+		// task.structured is off (default); eval agents keep yield + schemas regardless.
+		expect(firstOptions.structured).toBe(true);
+		expect(secondOptions.structured).toBe(true);
 		expect(firstOptions.assignment).toBe("hello");
 		expect(firstOptions.description).toBe("My Agent");
 		// No per-call override: the agent's own frontmatter model applies.
@@ -864,7 +875,7 @@ describe("agent() through eval runtimes", () => {
 			{
 				session,
 				signal: idle.signal,
-				emitStatus: event => {
+				onTimeoutControl: event => {
 					ops.push(event.op);
 					if (event.op === EVAL_TIMEOUT_PAUSE_OP) idle.pause();
 					if (event.op === EVAL_TIMEOUT_RESUME_OP) idle.resume();
@@ -946,10 +957,15 @@ describe("agent() through eval runtimes", () => {
 			{
 				session,
 				signal: idle.signal,
-				emitStatus: event => {
+				onTimeoutControl: event => {
 					ops.push(event.op);
 					if (event.op === EVAL_TIMEOUT_PAUSE_OP) idle.pause();
 					if (event.op === EVAL_TIMEOUT_RESUME_OP) idle.resume();
+				},
+				// Progress snapshots arrive on the generic status sink and must not
+				// re-arm the watchdog; only the control channel above may.
+				emitStatus: event => {
+					ops.push(event.op);
 				},
 			},
 		);
@@ -969,6 +985,66 @@ describe("agent() through eval runtimes", () => {
 		expect(ops).toContain("agent");
 		expect(ops.at(-1)).toBe(EVAL_TIMEOUT_RESUME_OP);
 		expect(idle.signal.aborted).toBe(false);
+	});
+
+	// Real timers on purpose: this drives the real eval worker's wall-clock timeout, which runs in
+	// a separate worker and cannot be advanced with fake timers.
+	it("does not extend compute time for an unwaited agent's progress and keeps its handle usable", async () => {
+		using tempDir = TempDir.createSync("@omp-eval-agent-background-progress-");
+		const { session, sessionId } = makeEvalSession(
+			tempDir,
+			"agent-background-progress",
+			Settings.isolated({ "task.isolation.enabled": false, "eval.autoBackground.enabled": false }),
+		);
+		session.getEvalSessionId = () => sessionId;
+		mockAgents();
+		const release = Promise.withResolvers<void>();
+		let progressCount = 0;
+		vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => {
+			const interval = setInterval(() => {
+				progressCount++;
+				options.onProgress?.({
+					...singleResult(options),
+					status: "running",
+					recentTools: [],
+					recentOutput: [],
+					toolCount: progressCount,
+					cost: 0,
+				});
+			}, 50);
+			try {
+				await release.promise;
+				return singleResult(options, { output: "background survived" });
+			} finally {
+				clearInterval(interval);
+			}
+		});
+		const tool = new EvalTool(session);
+		try {
+			await tool.execute("seed", { language: "js", code: "print('ready');" });
+			const result = await tool.execute("unwaited-agent", {
+				language: "js",
+				code: 'const handle = await agent("background"); print(handle.id); while (true) {}',
+				timeout: 1,
+			});
+			const text = result.content
+				.filter(block => block.type === "text")
+				.map(block => block.text)
+				.join("\n");
+			expect(text).toContain("timed out after 1 seconds");
+			expect(progressCount).toBeGreaterThan(1);
+			const jobs = session.asyncJobManager!.getRunningJobs({ ownerId: "Main" });
+			expect(jobs).toHaveLength(1);
+			const job = jobs[0]!;
+			expect(text).toContain(job.id);
+			release.resolve();
+			await job.promise;
+			const recovered = await runEvalWait({ items: [{ kind: "agent", id: job.id }] }, { session });
+			expect(recovered.items[0]?.text).toBe("background survived");
+		} finally {
+			release.resolve();
+			await session.asyncJobManager!.dispose({ timeoutMs: 5000 });
+		}
 	});
 
 	it("interrupting a JavaScript agent() aborts it at once but waits out its critical phase", async () => {
@@ -1099,8 +1175,11 @@ describe("runEvalAgent isolation", () => {
 		expect(defaultResult.details.changesApplied).toBeUndefined();
 		expect(mergeSpy).not.toHaveBeenCalled();
 
-		// Explicit isolated=true — opt-in turns it on and surfaces merge details.
-		const explicitOn = await runEvalAgentAndWait({ prompt: "on", isolated: true }, { session: isolatedSession() });
+		// Explicit isolated=true with apply=true — opt-in turns it on and surfaces merge details.
+		const explicitOn = await runEvalAgentAndWait(
+			{ prompt: "on", isolated: true, apply: true },
+			{ session: isolatedSession() },
+		);
 		expect(isolatedSpy).toHaveBeenCalledTimes(1);
 		expect(plainSpy).toHaveBeenCalledTimes(1);
 		expect(explicitOn.details.isolated).toBe(true);
@@ -1125,7 +1204,10 @@ describe("runEvalAgent isolation", () => {
 
 		// Branch is the configured merge mode, but `merge: false` must demote to patch.
 		const session = isolatedSession({ "task.isolation.merge": "branch" });
-		const result = await runEvalAgentAndWait({ prompt: "migration", isolated: true, merge: false }, { session });
+		const result = await runEvalAgentAndWait(
+			{ prompt: "migration", isolated: true, apply: true, merge: false },
+			{ session },
+		);
 
 		expect(isolatedSpy).toHaveBeenCalledTimes(1);
 		const isolatedCall = isolatedSpy.mock.calls[0]?.[0];
@@ -1156,10 +1238,10 @@ describe("runEvalAgent isolation", () => {
 		});
 
 		await runEvalAgentAndWait(
-			{ prompt: "migration", isolated: true },
+			{ prompt: "migration", isolated: true, apply: true },
 			{
 				session: isolatedSession(),
-				emitStatus: event => {
+				onTimeoutControl: event => {
 					if (event.op === EVAL_TIMEOUT_PAUSE_OP || event.op === EVAL_TIMEOUT_RESUME_OP) ops.push(event.op);
 				},
 			},
@@ -1208,7 +1290,7 @@ describe("runEvalAgent isolation", () => {
 			{ prompt: "scout", isolated: true },
 			{
 				session: isolatedSession(),
-				emitStatus: event => {
+				onTimeoutControl: event => {
 					if (event.op === EVAL_TIMEOUT_PAUSE_OP || event.op === EVAL_TIMEOUT_RESUME_OP) ops.push(event.op);
 				},
 			},
@@ -1220,6 +1302,71 @@ describe("runEvalAgent isolation", () => {
 		expect(pauseIdx).toBeGreaterThanOrEqual(0);
 		expect(prepareIdx).toBeGreaterThan(pauseIdx);
 		expect(prepareIdx).toBeLessThan(resumeIdx);
+	});
+
+	// Real timers on purpose: slow phases must outlast the real eval worker's 1s wall-clock budget,
+	// which runs in a separate worker and cannot be advanced with fake timers.
+	it("waits through slow isolation baseline capture and patch application", async () => {
+		using tempDir = TempDir.createSync("@omp-eval-isolation-budget-");
+		const { session, sessionId } = makeEvalSession(
+			tempDir,
+			"isolation-budget",
+			Settings.isolated({
+				"task.isolation.enabled": true,
+				"task.isolation.merge": "patch",
+				"eval.autoBackground.enabled": false,
+			}),
+		);
+		session.getEvalSessionId = () => sessionId;
+		mockAgents();
+		const baseline = {
+			repoRoot: "/repo-root",
+			baseline: {
+				root: {
+					repoRoot: "/repo-root",
+					headCommit: "HEAD",
+					staged: "",
+					unstaged: "",
+					untracked: [],
+					untrackedPatch: "",
+				},
+				nested: [],
+			},
+		};
+		vi.spyOn(isolationRunner, "prepareIsolationContext").mockImplementation(async () => {
+			await Bun.sleep(1250);
+			return baseline;
+		});
+		vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockImplementation(async opts =>
+			singleResult(opts.baseOptions, { output: "isolated result", patchPath: "/artifacts/result.patch" }),
+		);
+		vi.spyOn(isolationRunner, "mergeIsolatedChanges").mockImplementation(async () => {
+			await Bun.sleep(1250);
+			return {
+				summary: "\n\nApplied patches: yes",
+				changesApplied: true,
+				hadAnyChanges: true,
+				mergedBranchForNestedPatches: false,
+			};
+		});
+		const tool = new EvalTool(session);
+		try {
+			await tool.execute("seed", { language: "js", code: "print('ready');" });
+			const result = await tool.execute("isolated-wait", {
+				language: "js",
+				code: 'print(await agent("migration", { isolated: true, apply: true }).wait());',
+				timeout: 1,
+			});
+			const text = result.content
+				.filter(block => block.type === "text")
+				.map(block => block.text)
+				.join("\n");
+			expect(text).toContain("isolated result");
+			expect(text).toContain("Applied patches: yes");
+			expect(result.details?.cells?.[0]?.status).toBe("complete");
+		} finally {
+			await session.asyncJobManager!.dispose({ timeoutMs: 5000 });
+		}
 	});
 
 	it("keeps schema-backed isolated output parseable by moving merge text into details", async () => {
@@ -1243,6 +1390,7 @@ describe("runEvalAgent isolation", () => {
 			{
 				prompt: "structured",
 				isolated: true,
+				apply: true,
 				schema: {
 					type: "object",
 					properties: { status: { type: "string" } },
@@ -1279,6 +1427,7 @@ describe("runEvalAgent isolation", () => {
 				{
 					prompt: "structured",
 					isolated: true,
+					apply: true,
 					schema: {
 						type: "object",
 						properties: { status: { type: "string" } },
@@ -1326,7 +1475,7 @@ describe("runEvalAgent isolation", () => {
 		});
 
 		const session = isolatedSession({ "task.isolation.merge": "branch" });
-		await expect(runEvalAgentAndWait({ prompt: "scout", isolated: true }, { session })).rejects.toThrow(
+		await expect(runEvalAgentAndWait({ prompt: "scout", isolated: true, apply: true }, { session })).rejects.toThrow(
 			/isolated apply failed.*Branch merge failed.*Captured branch preserved as omp\/task\//s,
 		);
 	});
@@ -1351,7 +1500,7 @@ describe("runEvalAgent isolation", () => {
 
 		let caught: Error | undefined;
 		try {
-			await runEvalAgentAndWait({ prompt: "scout", isolated: true }, { session: isolatedSession() });
+			await runEvalAgentAndWait({ prompt: "scout", isolated: true, apply: true }, { session: isolatedSession() });
 		} catch (err) {
 			caught = err as Error;
 		}
@@ -1391,6 +1540,7 @@ describe("runEvalAgent isolation", () => {
 				{
 					prompt: "structured",
 					isolated: true,
+					apply: true,
 					schema: {
 						type: "object",
 						properties: { status: { type: "string" } },
@@ -1529,7 +1679,7 @@ describe("runEvalAgent isolation", () => {
 			mergedBranchForNestedPatches: false,
 		});
 
-		await runEvalAgentAndWait({ prompt: "scout", isolated: true }, { session: isolatedSession() });
+		await runEvalAgentAndWait({ prompt: "scout", isolated: true, apply: true }, { session: isolatedSession() });
 
 		const removedArtifactsDir = rmSpy.mock.calls.some(
 			([target]) => typeof target === "string" && target.includes("omp-eval-agent-"),

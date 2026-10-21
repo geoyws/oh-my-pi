@@ -12,7 +12,9 @@ function acpRuntime() {
 	const compact = vi.fn(async (_instructions?: string, _options?: CompactOptions) => {});
 	const getContextUsage = vi.fn(() => undefined);
 	const output = vi.fn();
-	const runtime = { session: { compact, getContextUsage }, output } as unknown as SlashCommandRuntime;
+	// Admitting `before_user_message` gate: refusal is covered in user-message-refusal.test.ts.
+	const gateUserMessage = vi.fn(async () => {});
+	const runtime = { session: { compact, getContextUsage, gateUserMessage }, output } as unknown as SlashCommandRuntime;
 	return { compact, output, runtime };
 }
 

@@ -1,12 +1,16 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { connectToServer } from "@oh-my-pi/pi-coding-agent/mcp/client";
 import { MCPTransportError } from "@oh-my-pi/pi-coding-agent/mcp/errors";
+import { analyzeAuthError } from "@oh-my-pi/pi-coding-agent/mcp/oauth-discovery";
 import { HttpTransport } from "@oh-my-pi/pi-coding-agent/mcp/transports/http";
 import { postmortem } from "@oh-my-pi/pi-utils";
 
 const encoder = new TextEncoder();
 const REQUEST_TIMEOUT_MS = 50;
-const GUARD_TIMEOUT_MS = 500;
+// Load-robust deadline for tests that are not about timeouts: a busy runner
+// must not turn a healthy (but slow) response into a timeout failure.
+const NON_TIMEOUT_TEST_TIMEOUT_MS = 5_000;
+const GUARD_TIMEOUT_MS = 5_000;
 
 let server: Bun.Server<undefined> | null = null;
 
@@ -19,7 +23,7 @@ afterEach(() => {
 	server = null;
 });
 
-async function connectedTransport(timeout = REQUEST_TIMEOUT_MS): Promise<HttpTransport> {
+async function connectedTransport(timeout = NON_TIMEOUT_TEST_TIMEOUT_MS): Promise<HttpTransport> {
 	if (!server) throw new Error("Test server was not started");
 	const transport = new HttpTransport({
 		type: "http",
@@ -262,6 +266,30 @@ describe("MCP Streamable HTTP failure diagnostics", () => {
 		expect(error.data).toContain("[redacted]");
 		expect(error.data).not.toContain("server-secret");
 	});
+
+	it("keeps a bare Bearer resource_metadata challenge while redacting echoed credentials", async () => {
+		const metadataUrl = "https://auth.example.test/prm/probe";
+		server = Bun.serve({
+			port: 0,
+			fetch() {
+				return new Response("rejected Authorization: Bearer server-secret", {
+					status: 401,
+					headers: { "WWW-Authenticate": `Bearer resource_metadata="${metadataUrl}"` },
+				});
+			},
+		});
+		const transport = await connectedTransport();
+		const error = await transport.request("initialize").then(
+			() => undefined,
+			reason => reason,
+		);
+		if (!(error instanceof MCPTransportError)) throw error;
+
+		expect(error.message).not.toContain("server-secret");
+		const auth = analyzeAuthError(error, `http://127.0.0.1:${server.port}/mcp`);
+		expect(auth.requiresAuth).toBe(true);
+		expect(auth.resourceMetadataUrl).toBe(metadataUrl);
+	});
 });
 
 describe("MCP Streamable HTTP transport timeouts", () => {
@@ -274,7 +302,7 @@ describe("MCP Streamable HTTP transport timeouts", () => {
 				});
 			},
 		});
-		const transport = await connectedTransport();
+		const transport = await connectedTransport(REQUEST_TIMEOUT_MS);
 
 		await expect(withPendingGuard(transport.request("tools/list"), "request")).rejects.toMatchObject({
 			transport: "http",
@@ -407,7 +435,7 @@ describe("MCP Streamable HTTP transport timeouts", () => {
 				});
 			},
 		});
-		const transport = await connectedTransport();
+		const transport = await connectedTransport(REQUEST_TIMEOUT_MS);
 
 		await expect(withPendingGuard(transport.notify("notifications/initialized"), "notify")).rejects.toThrow(
 			`Notify timeout after ${REQUEST_TIMEOUT_MS}ms`,
@@ -560,7 +588,7 @@ describe("MCP Streamable HTTP transport timeouts", () => {
 				);
 			},
 		});
-		const transport = await connectedTransport();
+		const transport = await connectedTransport(REQUEST_TIMEOUT_MS);
 		transport.onNotification = method => {
 			if (method === "notifications/progress") notificationReceived.resolve();
 		};
@@ -589,7 +617,7 @@ describe("MCP Streamable HTTP transport timeouts", () => {
 				});
 			},
 		});
-		const transport = await connectedTransport();
+		const transport = await connectedTransport(REQUEST_TIMEOUT_MS);
 		const unhandled: unknown[] = [];
 		const onUnhandled = (reason: unknown) => unhandled.push(reason);
 		process.on("unhandledRejection", onUnhandled);
@@ -623,7 +651,7 @@ describe("MCP Streamable HTTP protocol version header", () => {
 		const transport = new HttpTransport({
 			type: "http",
 			url: `http://127.0.0.1:${server.port}/mcp`,
-			timeout: REQUEST_TIMEOUT_MS,
+			timeout: NON_TIMEOUT_TEST_TIMEOUT_MS,
 			headers: { "MCP-Protocol-Version": "1999-01-01" },
 		});
 		await transport.connect();
@@ -658,7 +686,7 @@ describe("MCP Streamable HTTP POST response resumption", () => {
 				return stalledBodyResponse("unavailable", { status: 503 });
 			},
 		});
-		const transport = await connectedTransport();
+		const transport = await connectedTransport(REQUEST_TIMEOUT_MS);
 		try {
 			await expect(
 				withPendingGuard(transport.request("tools/call"), "stalled resume error body"),
@@ -687,7 +715,7 @@ describe("MCP Streamable HTTP POST response resumption", () => {
 				return new Response("expired", { status: 401 });
 			},
 		});
-		const transport = await connectedTransport();
+		const transport = await connectedTransport(REQUEST_TIMEOUT_MS);
 		transport.onAuthError = () => refresh.promise;
 		try {
 			await expect(

@@ -104,6 +104,9 @@ function session(cwd: string): ToolSession {
 		settings: Settings.isolated({
 			"task.maxRecursionDepth": 2,
 			"task.isolation.enabled": true,
+			// These cases exercise merge-back into the named checkout, which
+			// requires explicit acceptance (the default retains artifacts).
+			"task.isolation.apply": true,
 			"isolation.backend": "rcopy",
 			"task.enableLsp": true,
 		}),

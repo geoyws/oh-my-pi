@@ -1,6 +1,10 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import puppeteer from "puppeteer-core";
+import { assertE2eHost } from "../../../../scripts/e2e-host-guard";
+
+// Browser e2e: refused on the physical Mac before Chrome or any page loads (kb rule g-ca3365d2).
+assertE2eHost("e2e", "robomp web verify-live");
 
 const VIEWPORT = { width: 1280, height: 720, deviceScaleFactor: 1 } as const;
 

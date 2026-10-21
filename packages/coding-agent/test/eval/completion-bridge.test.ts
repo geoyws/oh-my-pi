@@ -22,6 +22,7 @@ import { disposeAllVmContexts } from "../../src/eval/js/context-manager";
 import { executeJs } from "../../src/eval/js/executor";
 import { disposeAllKernelSessions, type PythonResult } from "../../src/eval/py/executor";
 import type { ToolSession } from "../../src/tools";
+import { EvalTool } from "../../src/tools/eval";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
 import { cfgRetryFallbackChains, cfgRetryMaxRetries } from "@oh-my-pi/pi-coding-agent/session/settings";
@@ -968,7 +969,7 @@ describe("runEvalCompletion", () => {
 				{
 					session: makeSession(),
 					signal: idle.signal,
-					emitStatus: event => {
+					onTimeoutControl: event => {
 						ops.push(event.op);
 						if (event.op === EVAL_TIMEOUT_PAUSE_OP) idle.pause();
 						if (event.op === EVAL_TIMEOUT_RESUME_OP) idle.resume();
@@ -1021,6 +1022,119 @@ describe("completion() through eval runtimes", () => {
 			plain: "hello from smol",
 			structured: { ok: true, n: 3 },
 		});
+	});
+
+	it("waits for a completion started in an earlier JavaScript cell", async () => {
+		using tempDir = TempDir.createSync("@omp-eval-completion-cells-");
+		const options = {
+			cwd: tempDir.path(),
+			sessionId: `js-completion-cells:${crypto.randomUUID()}`,
+			session: makeSession({ cwd: tempDir.path() }),
+			sessionFile: path.join(tempDir.path(), "session.jsonl"),
+		};
+		vi.spyOn(ai, "completeSimple").mockResolvedValue(assistant({ text: "hello from the next cell" }));
+
+		const started = await executeJs(
+			'var handles = [completion("hi", { model: "smol" })]; print("started");',
+			options,
+		);
+		expect(started.exitCode).toBe(0);
+		expect(started.output.trim()).toBe("started");
+
+		const result = await executeJs("print((await wait(handles))[0]);", options);
+		expect(result.exitCode).toBe(0);
+		expect(result.output.trim()).toBe("hello from the next cell");
+	});
+
+	it("times out waiting on a running completion started in an earlier JavaScript cell", async () => {
+		using tempDir = TempDir.createSync("@omp-eval-completion-cells-timeout-");
+		const options = {
+			cwd: tempDir.path(),
+			sessionId: `js-completion-cells-timeout:${crypto.randomUUID()}`,
+			session: makeSession({ cwd: tempDir.path() }),
+			sessionFile: path.join(tempDir.path(), "session.jsonl"),
+		};
+		// The model call stays running until afterEach releases (aborts) the handle.
+		vi.spyOn(ai, "completeSimple").mockImplementation((_model, _context, opts) => {
+			const { promise, reject } = Promise.withResolvers<AssistantMessage>();
+			opts?.signal?.addEventListener("abort", () => reject(opts.signal?.reason), { once: true });
+			return promise;
+		});
+
+		const started = await executeJs('var handles = [completion("hi", { model: "smol" })];', options);
+		expect(started.exitCode).toBe(0);
+
+		// Real clock: the timeout is enforced by the host `__wait__` bridge across the worker boundary.
+		const result = await executeJs(
+			"try { await wait(handles, { timeout: 0.05 }); } catch (error) { print(error.name); }",
+			options,
+		);
+		expect(result.exitCode).toBe(0);
+		expect(result.output.trim()).toBe("TimeoutError");
+	});
+
+	// Real timers on purpose: the slow completion must outlast the real eval worker's 1s wall-clock
+	// budget, which runs in a separate worker and cannot be advanced with fake timers.
+	it("waits for a slow completion and resumes a fresh compute window in the same cell", async () => {
+		using tempDir = TempDir.createSync("@omp-eval-completion-budget-");
+		const session = {
+			...makeSession(),
+			cwd: tempDir.path(),
+			getSessionId: () => "completion-budget",
+			getSessionFile: () => path.join(tempDir.path(), "session.jsonl"),
+		};
+		const tool = new EvalTool(session);
+		vi.spyOn(ai, "completeSimple").mockImplementation(async () => {
+			await Bun.sleep(2500);
+			return assistant({ text: "slow answer" });
+		});
+		await tool.execute("seed", { language: "js", code: "print('ready');" });
+		const result = await tool.execute("slow-completion", {
+			language: "js",
+			code: `const answer = await completion("q", { model: "smol" }).wait();
+await Bun.sleep(600);
+print(answer);
+while (true) {}`,
+			timeout: 1,
+		});
+		const text = result.content
+			.filter(block => block.type === "text")
+			.map(block => block.text)
+			.join("\n");
+		expect(text).toContain("slow answer");
+		expect(text).toContain("timed out after 1 seconds");
+	});
+
+	it("cancels a completion-only wait without waiting for the provider to settle", async () => {
+		using tempDir = TempDir.createSync("@omp-eval-completion-cancel-");
+		const entered = Promise.withResolvers<void>();
+		const waiting = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const controller = new AbortController();
+		vi.spyOn(ai, "completeSimple").mockImplementation(async () => {
+			entered.resolve();
+			await release.promise;
+			return assistant({ text: "late answer" });
+		});
+		const cell = executeJs('return await completion("q", { model: "smol" }).wait();', {
+			cwd: tempDir.path(),
+			sessionId: "completion-cancel",
+			session: makeSession(),
+			signal: controller.signal,
+			onStatus: event => {
+				if (event.op === EVAL_TIMEOUT_PAUSE_OP) waiting.resolve();
+			},
+		});
+		try {
+			await Promise.all([entered.promise, waiting.promise]);
+			controller.abort(new Error("external interrupt"));
+			const result = await cell;
+			expect(result.cancelled).toBe(true);
+			expect(result.output).not.toContain("late answer");
+		} finally {
+			release.resolve();
+			await cell;
+		}
 	});
 
 	it("exposes plain and structured completion() in the Python runtime", async () => {

@@ -78,7 +78,7 @@ export type SchemeWriteScope = "workspace" | "sandbox" | "coordination" | "devic
 export interface SchemeWritePolicy {
 	/**
 	 * Who performs the write.
-	 * - `file`: tools (`write`, `edit`, `ast_edit`) write the file {@link ProtocolHandler.locate}
+	 * - `file`: tools (`write`, `edit`, `ast` edit mode) write the file {@link ProtocolHandler.locate}
 	 *   returns with `{ create: true }`; the handler has no `write` hook.
 	 * - `handler`: {@link ProtocolHandler.write} performs it (messages, stdin, settings, remote
 	 *   hosts, devices); file-editing tools refuse the URL even when it locates a backing file.
@@ -91,7 +91,7 @@ export interface SchemeWritePolicy {
 	 */
 	payload: "text" | "verbatim";
 	scope: SchemeWriteScope;
-	/** Approval tier for `write`/`edit`/`ast_edit` targeting this URL. `session` is absent when approval is evaluated outside a tool session. */
+	/** Approval tier for `write`/`edit`/`ast` edit mode targeting this URL. `session` is absent when approval is evaluated outside a tool session. */
 	tier(url: InternalUrl, content: string | undefined, session: ToolSession | undefined): ToolApprovalDecision;
 	/** True when `write` may omit `content` for this URL (`proc://<id>/kill`). */
 	contentOptional?(url: InternalUrl): boolean;
@@ -272,6 +272,12 @@ export interface ResolveContext {
 	 * as a second exact identity alongside {@link sessionFile}.
 	 */
 	sessionId?: string;
+	/**
+	 * Source artifacts dir of a seance caller (editor completion binding).
+	 * History completions may use this scalar without constructing a tool
+	 * session; tool resolution reads {@link session}.seanceSourceArtifactsDir.
+	 */
+	seanceSourceArtifactsDir?: string;
 	/** Registry that owns the calling session; defaults to the process-wide registry. */
 	agentRegistry?: AgentRegistry;
 	/** Settings of the calling session (used by `issue://`/`pr://` for cache TTLs). */

@@ -14,7 +14,6 @@ import type {
 	Model,
 	ModelUsageHealth,
 	TextContent,
-	ThinkingContent,
 	ToolChoice,
 	AnthropicFallbackCreditHandle,
 } from "@oh-my-pi/pi-ai";
@@ -31,6 +30,7 @@ import { formatModelStringWithRouting, resolveModelOverride } from "../config/mo
 
 import type { Settings } from "../config/settings";
 import type { RetryErrorUpdate } from "../extensibility/shared-events";
+import { isEvalStateContext } from "../eval/state";
 import emptyStopRetryTemplate from "../prompts/system/empty-stop-retry.md" with { type: "text" };
 import malformedFunctionCallRetryTemplate from "../prompts/system/malformed-function-call-retry.md" with { type: "text" };
 import streamStallContinueTemplate from "../prompts/system/stream-stall-continue.md" with { type: "text" };
@@ -51,7 +51,7 @@ import type {
 	UsageFallbackConfirmation,
 	UsageFallbackConfirmer,
 } from "./agent-session-types";
-import { assistantTurnProducedOutput, isEmptyAssistantStop, isEmptyErrorTurn } from "./messages";
+import { assistantTurnProducedOutput, isEmptyAssistantStop, isEmptyErrorTurn, operatorTitleText } from "./messages";
 import {
 	type ActiveRetryFallbackState,
 	calculateRetryBackoffDelayMs,
@@ -99,6 +99,8 @@ const UNEXPECTED_STOP_MAX_RETRIES = 3;
 const UNEXPECTED_STOP_TIMEOUT_MS = 15_000;
 const EMPTY_STOP_MAX_RETRIES = 3;
 const MALFORMED_FUNCTION_CALL_MAX_RETRIES = 3;
+/** Session-level replays allowed for an exhausted provider-operation budget; each one costs a full budget. */
+const OPERATION_DEADLINE_MAX_RETRIES = 2;
 const STREAM_STALL_CONTINUE_MAX_RETRIES = 3;
 const SIBLING_UNBLOCK_BUFFER_MS = 1_000;
 const NON_WHITESPACE_RE = /\S/;
@@ -114,8 +116,6 @@ const HTTP2_STREAM_RESET_ERROR_RE =
 // eligible for preserved-turn continuation on resolved tool turns.
 const PREMATURE_STREAM_CLOSE_ERROR_RE =
 	/(?:stream closed before a (?:finish_reason|terminal response event)|Codex stream ended before terminal completion event|Cursor stream ended before turnEnded)/i;
-const IMMUTABLE_ANTHROPIC_THINKING_ERROR_PATTERN =
-	/messages\.\d+\.content\.\d+.*\b(?:thinking|redacted_thinking)\b.*\blatest assistant message cannot be modified\b/is;
 
 /**
  * Bare abort sentinels with no provider reason: our own `"Request was aborted"`
@@ -133,8 +133,19 @@ function hasNonWhitespace(value: string): boolean {
 	return NON_WHITESPACE_RE.test(value);
 }
 
+/**
+ * End of the conversation in `messages`, before trailing eval runtime snapshots.
+ * A session appends one at startup — right after the turn resume recovery closed
+ * — and on display-context rebuilds, so it trails a failed turn without ending it.
+ */
+function conversationEnd(messages: readonly AgentMessage[]): number {
+	let end = messages.length;
+	while (end > 0 && isEvalStateContext(messages[end - 1])) end--;
+	return end;
+}
+
 function syntheticToolResultTailStart(messages: readonly AgentMessage[]): number {
-	let index = messages.length;
+	let index = conversationEnd(messages);
 	while (index > 0 && isSyntheticToolResultMessage(messages[index - 1])) {
 		index--;
 	}
@@ -153,7 +164,7 @@ function abortedToolCallTail(messages: readonly AgentMessage[]): boolean {
 	const turnEnd = retryableAssistantTurnEnd(messages);
 	if (turnEnd === undefined) return false;
 	// Synthetic tool results only ever trail a turn that emitted tool calls.
-	if (turnEnd < messages.length) return true;
+	if (isSyntheticToolResultMessage(messages[turnEnd])) return true;
 	const beforeTurn = messages[turnEnd - 2];
 	return beforeTurn?.role === "toolResult" && beforeTurn.isError === true;
 }
@@ -173,7 +184,7 @@ function abortedToolCallTail(messages: readonly AgentMessage[]): boolean {
  * truncated, so those are re-generated via a fresh model call instead.
  */
 function toolReplayStart(messages: readonly AgentMessage[]): number | undefined {
-	let end = messages.length;
+	let end = conversationEnd(messages);
 	const tail = messages[end - 1];
 	if (tail?.role === "assistant") {
 		if (tail.stopReason !== "aborted" && tail.stopReason !== "error") return undefined;
@@ -341,6 +352,11 @@ export class TurnRecovery {
 	readonly #unexpectedStopJudgeTimeoutMs: number;
 	#retryAbortController: AbortController | undefined;
 	#retryAttempt = 0;
+	// Exhausted-budget replays spent in this saga. Unlike #retryAttempt this
+	// is NOT reset by a model switch: each replay costs another whole budget,
+	// so the OPERATION_DEADLINE_MAX_RETRIES bound applies across the whole
+	// fallback chain, not per model.
+	#operationDeadlineRetries = 0;
 	/**
 	 * Selectors a classifier refusal has already moved off in the current retry saga; see the walk
 	 * bound below. Cleared in `resolveRetry()`, which every end of a saga goes through (an answer,
@@ -578,7 +594,7 @@ export class TurnRecovery {
 	async onErrorSettledWithoutRetry(message: AssistantMessage, compaction: RecoveryCompactionResult): Promise<void> {
 		if (message.stopReason !== "error" || this.#retryAttempt === 0 || compaction.continuationScheduled) return;
 		const attempt = this.#retryAttempt;
-		this.#retryAttempt = 0;
+		this.#resetSagaRetryCounters();
 		await this.#host.emitSessionEvent({
 			type: "auto_retry_end",
 			success: false,
@@ -671,7 +687,9 @@ export class TurnRecovery {
 	 * reminder to pick up where the text stopped, and continue. Honors
 	 * `retry.enabled`; bounded per prompt, past the cap the error surfaces as before.
 	 * A socket close counts here but not for tool turns: without tool calls there
-	 * is no executed side effect whose resumption policy it could change.
+	 * is no executed side effect whose resumption policy it could change. So does a
+	 * Codex native-lane steer rejection: the server dropped the response over our
+	 * own `response.steer`, and the rejected steer drains as ordinary input next.
 	 */
 	handleCommittedTextStreamStall(message: AssistantMessage): boolean {
 		const id = this.#classifyRetryMessage(message);
@@ -680,7 +698,7 @@ export class TurnRecovery {
 			AIError.retriable(id) &&
 			!this.#host.streamingEditAbortTriggered() &&
 			isUnexpectedSocketCloseMessage(message.errorMessage ?? "");
-		if (!socketClosed && !this.#isMidStreamTransportFailure(message, id)) {
+		if (!socketClosed && !AIError.isCodexSteerRejection(message) && !this.#isMidStreamTransportFailure(message, id)) {
 			this.#streamStallContinueCount = 0;
 			return false;
 		}
@@ -865,10 +883,21 @@ export class TurnRecovery {
 				});
 			} finally {
 				this.#clearPendingRetryErrors();
-				this.#retryAttempt = 0;
+				this.#resetSagaRetryCounters();
 				this.resolveRetry();
 			}
 		}
+	}
+
+	/**
+	 * Closes a retry saga: restarts both the per-model attempt counter and
+	 * the saga-wide exhausted-budget replay counter. Every saga end goes
+	 * through here so a later prompt starts with a full deadline bound; a
+	 * model switch mid-saga deliberately does NOT come through here.
+	 */
+	#resetSagaRetryCounters(): void {
+		this.#retryAttempt = 0;
+		this.#operationDeadlineRetries = 0;
 	}
 
 	#clearPendingRetryErrors(): void {
@@ -1073,7 +1102,7 @@ export class TurnRecovery {
 				finalError,
 			});
 			this.#clearPendingRetryErrors();
-			this.#retryAttempt = 0;
+			this.#resetSagaRetryCounters();
 			this.resolveRetry();
 			// A turn with no actionable output carries no transcript value, while its
 			// provider usage can anchor the next prompt at the full failed-request size
@@ -1116,28 +1145,28 @@ export class TurnRecovery {
 			return false;
 		}
 
-		let text = assistantMessage.content
+		const text = assistantMessage.content
 			.filter((content): content is TextContent => content.type === "text")
 			.map(content => content.text)
 			.join("\n");
-		const hasTextContent = hasNonWhitespace(text);
 
 		// A thinking-only terminal turn has no visible assistant message, so both
-		// mechanical and smart modes retry it directly. Tool-call turns never reach
-		// this path: isUnexpectedStopCandidate excludes them, including forced tools.
-		if (!hasTextContent) {
-			text = assistantMessage.content
-				.filter((content): content is ThinkingContent => content.type === "thinking")
-				.map(content => content.thinking)
-				.join("\n");
-			if (!hasNonWhitespace(text)) {
+		// mechanical and smart modes retry it directly, whether or not the provider
+		// exposed its reasoning text. Only a turn with visible text is gated on the
+		// mode and the judge. Tool-call turns never reach this path:
+		// isUnexpectedStopCandidate excludes them, including forced tools.
+		if (hasNonWhitespace(text)) {
+			if (mode === "mechanical") {
 				this.#unexpectedStopRetryCount = 0;
 				return false;
 			}
-		} else if (mode === "mechanical") {
-			this.#unexpectedStopRetryCount = 0;
-			return false;
-		} else {
+			// This turn answers a stop nudge, which demands the next tool call or
+			// the final answer. Visible text without a tool call is that final
+			// answer; judging it again only chains no-op "nothing more to add" turns.
+			if (this.#unexpectedStopRetryCount > 0) {
+				this.#unexpectedStopRetryCount = 0;
+				return false;
+			}
 			const controller = new AbortController();
 			const timeout = setTimeout(() => controller.abort(), this.#unexpectedStopJudgeTimeoutMs);
 			// Esc/session teardown must interrupt the extended judge wait: link the
@@ -1146,9 +1175,10 @@ export class TurnRecovery {
 			const sessionSignal = this.#host.unexpectedStopAbortSignal?.();
 			const onSessionAbort = (): void => controller.abort();
 			sessionSignal?.addEventListener("abort", onSessionAbort, { once: true });
+			const stop = { message: text, request: this.#latestOperatorRequest() };
 			let classification: boolean | undefined;
 			try {
-				classification = await classifyUnexpectedStop(text, {
+				classification = await classifyUnexpectedStop(stop, {
 					settings: this.#host.settings,
 					registry: this.#host.modelRegistry,
 					sessionId: this.#host.sessionId(),
@@ -1193,6 +1223,16 @@ export class TurnRecovery {
 			generation: this.#host.promptGeneration(),
 		});
 		return true;
+	}
+
+	/** The operator's latest typed request, which a text-only stop is judged against. */
+	#latestOperatorRequest(): string | undefined {
+		const messages = this.#host.agent.state.messages;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const request = operatorTitleText(messages[i]!);
+			if (request !== undefined) return request;
+		}
+		return undefined;
 	}
 
 	#unexpectedStopRetryReminder(): string {
@@ -1420,7 +1460,11 @@ export class TurnRecovery {
 	isRetryableReasonlessAbort(message: AssistantMessage): boolean {
 		if (
 			(message.stopReason !== "aborted" && message.stopReason !== "error") ||
-			message.content.length !== 0 ||
+			// A `fallback` boundary is bookkeeping, not output: a stream aborted
+			// right after a mid-turn server-side fallback persists `[fallback]`,
+			// which is as replay-safe to retry as an empty turn (`isEmptyErrorTurn`
+			// already counts the marker as no output).
+			message.content.some(block => block.type !== "fallback") ||
 			this.#host.abortInProgress() ||
 			this.#host.isDisposed() ||
 			this.#host.streamingEditAbortTriggered()
@@ -1494,7 +1538,7 @@ export class TurnRecovery {
 			(message.errorStatus === 400 ||
 				message.errorId === 400 ||
 				message.errorMessage?.startsWith("400 ") === true) &&
-			IMMUTABLE_ANTHROPIC_THINKING_ERROR_PATTERN.test(message.errorMessage ?? "");
+			AIError.isImmutableLatestThinkingText(message.errorMessage ?? "");
 		if (immutableAnthropicThinkingError) return false;
 
 		const id = this.#classifyRetryMessage(message);
@@ -1854,9 +1898,18 @@ export class TurnRecovery {
 	 * (`anthropic/claude-opus-5 -> … -> runinfra/deepseek-v4-pro`, whose own
 	 * `runinfra/deepseek-v4-pro -> openrouter/deepseek/…` chain was unreachable).
 	 *
-	 * Two keys is the whole walk per attempt. Chains that point at each other
-	 * alternate models instead of looping in place, and every hop still spends a
-	 * retry attempt, so the budget terminates either way.
+	 * Chains that point at each other alternate models instead of looping in
+	 * place, and every hop still spends a retry attempt, so the budget
+	 * terminates either way.
+	 *
+	 * The session's owning role chain comes last when a more specific key
+	 * shadows it. A model-selector key outranks every role in
+	 * {@link resolveRetryFallbackChainKey}, so a task subagent pinned to
+	 * `subagent:<id>` on a model with its own model-keyed chain would otherwise
+	 * see only that chain: once its rungs are all unusable (parked on a cooldown
+	 * a sibling's walk recorded, or out of credentials), a quota-exhausted 429
+	 * would end the child while its role chain still has a usable rung. The model
+	 * key keeps precedence; the owning role only appends the rungs it lists.
 	 *
 	 * An exhaustive installed chain (`subagent:<id>` from an explicit
 	 * multi-entry override list) walks alone: when either the pinned or the
@@ -1871,10 +1924,15 @@ export class TurnRecovery {
 		const pinned = options?.pinnedRole ?? this.#activeRetryFallback?.role;
 		const exhaustive = getExhaustiveRetryFallbackRoles(this.#host.settings);
 		if (pinned && exhaustive.has(pinned)) return [pinned];
-		const current = this.resolveRetryFallbackRole(currentSelector, currentModel, options?.roleHint);
-		if (!pinned) return current ? [current] : [];
-		if (current && current !== pinned) return exhaustive.has(current) ? [current] : [pinned, current];
-		return [pinned];
+		const roleHint = options?.roleHint ?? this.#liveRetryRoleHint(currentModel);
+		const current = this.resolveRetryFallbackRole(currentSelector, currentModel, roleHint);
+		if (current && exhaustive.has(current) && current !== pinned) return [current];
+		const keys = pinned ? [pinned] : [];
+		if (current && current !== pinned) keys.push(current);
+		if (roleHint && !keys.includes(roleHint) && Array.isArray(this.#getRetryFallbackChains()[roleHint])) {
+			keys.push(roleHint);
+		}
+		return keys;
 	}
 
 	/** Live session role for chain lookup, provided its assignment still matches the active model. */
@@ -2204,7 +2262,8 @@ export class TurnRecovery {
 					(message): message is AssistantMessage => message.role === "assistant" && message !== failedMessage,
 				);
 		// Permitted redemption targets are catalog policy on the refused model.
-		const failedModel = failedMessage.fallbackCreditHandle
+		const creditHandle = failedMessage.fallbackCreditHandle;
+		const failedModel = creditHandle
 			? this.#host.modelRegistry.find(failedMessage.provider, failedMessage.model)
 			: undefined;
 		const creditTargets = failedModel ? fallbackCreditTargets(failedModel) : [];
@@ -2236,11 +2295,11 @@ export class TurnRecovery {
 				// Exception: when redeeming Anthropic fallback credit on refusal, the server
 				// validates thinking blocks across the boundary itself using the credit token.
 				const canRedeemFallbackCredit =
-					failedMessage.fallbackCreditHandle !== undefined &&
+					creditHandle !== undefined &&
 					candidate.api === "anthropic-messages" &&
 					candidate.provider === failedMessage.provider &&
 					creditTargets.includes(candidate.id) &&
-					Date.now() < failedMessage.fallbackCreditHandle.expiresAt;
+					Date.now() < creditHandle.expiresAt;
 				if (
 					!canRedeemFallbackCredit &&
 					candidate.api === "anthropic-messages" &&
@@ -2264,18 +2323,42 @@ export class TurnRecovery {
 				if (!this.#host.contextFitsModel(candidate, options?.preserveFailedTurn ? undefined : failedMessage)) {
 					continue;
 				}
-				const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
+				// A session restricted to an OAuth account pool throws for a provider
+				// none of its pooled accounts can serve; that candidate is unavailable,
+				// exactly like one without a credential.
+				let apiKey: string | undefined;
+				try {
+					apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
+				} catch (error) {
+					if (!(error instanceof AIError.MissingApiKeyError)) throw error;
+				}
 				if (!apiKey) continue;
 				const previousEditMode = this.#host.resolveActiveEditMode();
+				const previousSystemPrompt = [...this.#host.agent.state.systemPrompt];
+				const previousTools = [...this.#host.agent.state.tools];
 				const applied = await this.applyRetryFallbackCandidate(role, selector, currentSelector, {
 					...options,
 					reason: `Request failed: ${failedMessage.errorMessage ?? "provider returned an error without details"}`,
 				});
-				const editModeChanged = this.#host.resolveActiveEditMode() !== previousEditMode;
-				if (applied && options?.pinFallback === true && canRedeemFallbackCredit && !editModeChanged) {
+				// Redemption replays the refused request's frozen `system` and `tools`. If the
+				// swap rebuilt either, the fallback model would be prompted with, and call tools
+				// through, a surface the agent no longer runs: send a fresh request instead.
+				const { systemPrompt, tools } = this.#host.agent.state;
+				const requestSurfaceUnchanged =
+					this.#host.resolveActiveEditMode() === previousEditMode &&
+					Bun.deepEquals(systemPrompt, previousSystemPrompt) &&
+					tools.length === previousTools.length &&
+					tools.every((tool, index) => tool === previousTools[index]);
+				if (
+					applied &&
+					options?.pinFallback === true &&
+					creditHandle !== undefined &&
+					canRedeemFallbackCredit &&
+					requestSurfaceUnchanged
+				) {
 					this.#activeFallbackCreditRedemption = {
 						targetSelector: `${candidate.provider}/${candidate.id}`,
-						handle: failedMessage.fallbackCreditHandle!,
+						handle: creditHandle,
 					};
 				}
 				return applied;
@@ -2342,7 +2425,7 @@ export class TurnRecovery {
 			(message.errorStatus === 400 ||
 				message.errorId === 400 ||
 				message.errorMessage?.startsWith("400 ") === true) &&
-			IMMUTABLE_ANTHROPIC_THINKING_ERROR_PATTERN.test(message.errorMessage ?? "");
+			AIError.isImmutableLatestThinkingText(message.errorMessage ?? "");
 		if (immutableAnthropicThinkingError) return false;
 		const retrySettings = cfgRetry.get(this.#host.settings);
 		if (!retrySettings.enabled || !retrySettings.modelFallback) return false;
@@ -2506,6 +2589,12 @@ export class TurnRecovery {
 
 		const generation = this.#host.promptGeneration();
 		this.#retryAttempt++;
+		// An exhausted budget is identified by its persisted text (the original
+		// error instance is gone once the turn is re-driven). Count these
+		// replays separately: the generic counter resets on a model switch,
+		// but a replay on a new model still costs a whole budget.
+		const isOperationDeadlineError = AIError.isProviderOperationDeadlineText(message.errorMessage);
+		if (isOperationDeadlineError) this.#operationDeadlineRetries++;
 
 		// Create retry promise on first attempt so waitForRetry() can await it
 		// Ensure only one promise exists (avoid orphaned promises from concurrent calls)
@@ -2523,8 +2612,20 @@ export class TurnRecovery {
 		// configured chain.
 		const maxRetries = this.#isBoundedThinkingStreamClose(message)
 			? Math.min(retrySettings.maxRetries, 1)
-			: retrySettings.maxRetries;
-		const retryBudgetExhausted = this.#retryAttempt > maxRetries;
+			: AIError.isProviderOperationDeadlineText(message.errorMessage)
+				? // An exhausted operation budget is transient — a fresh request may
+					// well succeed — but each replay costs another whole budget, so the
+					// generic ten-attempt ladder would turn a 15-minute ceiling back
+					// into a multi-hour silence. Retry it, briefly.
+					Math.min(retrySettings.maxRetries, OPERATION_DEADLINE_MAX_RETRIES)
+				: retrySettings.maxRetries;
+		// Budget exhaustion is gated on the saga-wide deadline counter, not the
+		// per-model attempt counter: a model switch must not refund replays.
+		const deadlineRetriesCap = Math.min(retrySettings.maxRetries, OPERATION_DEADLINE_MAX_RETRIES);
+		const deadlineRetriesExhausted = isOperationDeadlineError && this.#operationDeadlineRetries > deadlineRetriesCap;
+		const retryBudgetExhausted = isOperationDeadlineError
+			? deadlineRetriesExhausted
+			: this.#retryAttempt > maxRetries;
 
 		const errorMessage = message.errorMessage || "Unknown error";
 		const id = this.#classifyRetryMessage(message);
@@ -2741,7 +2842,13 @@ export class TurnRecovery {
 			/\bGoUsageLimitError\b/.test(errorMessage) &&
 			(!this.#hasReplayUnsafeOutput(message) || this.#unexecutedToolCallsReplaySafe(message));
 
-		if (!staleOpenAIResponsesReplayError && !switchedCredential && currentSelector) {
+		// A spent operation-budget bound suppresses the fallback consult below:
+		// every replay costs another whole budget, so letting an exhausted
+		// error fail over would refund the bound once per fallback-chain
+		// entry. Non-exhausted deadline errors still consult and switch
+		// normally. (The Fireworks Fast degrade is intrinsic to the Fast
+		// contract, not a retry-loop hop, and is unaffected.)
+		if (!staleOpenAIResponsesReplayError && !switchedCredential && currentSelector && !deadlineRetriesExhausted) {
 			// The retry budget bounds same-model retries against a failing provider. A
 			// classifier refusal is not that: retrying the same model reproduces it, and
 			// the next model in the chain is one request away and often answers. Stopping
@@ -2808,9 +2915,12 @@ export class TurnRecovery {
 				);
 				return false;
 			}
-			// A fallback model gets a fresh retry budget. Credential rotation
+			// A fallback model gets a fresh generic retry budget. Credential rotation
 			// instead keeps the cumulative attempt count while bypassing the
 			// same-route budget: every distinct account must be tried first.
+			// Exhausted-budget replays are the exception: #operationDeadlineRetries
+			// is deliberately NOT reset here, so the deadline bound holds across
+			// the whole fallback chain (each replay costs another whole budget).
 			if (switchedModel) this.#retryAttempt = 1;
 		}
 		if ((classifierRefusal || accountPolicyDenial) && !switchedCredential && !switchedModel) {
@@ -2827,7 +2937,7 @@ export class TurnRecovery {
 					{ terminalTurn: message },
 				);
 			}
-			this.#retryAttempt = 0;
+			this.#resetSagaRetryCounters();
 			this.resolveRetry();
 			return false;
 		}
@@ -2848,7 +2958,7 @@ export class TurnRecovery {
 					{ terminalTurn: message },
 				);
 			}
-			this.#retryAttempt = 0;
+			this.#resetSagaRetryCounters();
 			this.resolveRetry();
 			return false;
 		}
@@ -2880,7 +2990,7 @@ export class TurnRecovery {
 			delayMs <= effectiveUsageLimitWaitMs;
 		if (maxDelayMs > 0 && delayMs > maxDelayMs && !switchedCredential && !switchedModel && !waitForUsageReset) {
 			const attempt = this.#retryAttempt;
-			this.#retryAttempt = 0;
+			this.#resetSagaRetryCounters();
 			await this.#closeRetrySaga(
 				{
 					success: false,
@@ -2974,7 +3084,7 @@ export class TurnRecovery {
 	/** Closes a retry saga whose credential wait or backoff sleep was aborted. */
 	async #endCancelledRetry(): Promise<false> {
 		const attempt = this.#retryAttempt;
-		this.#retryAttempt = 0;
+		this.#resetSagaRetryCounters();
 		this.#retryAbortController = undefined;
 		await this.#host.emitSessionEvent({
 			type: "auto_retry_end",
@@ -3016,7 +3126,7 @@ export class TurnRecovery {
 	async #failRetryAfterLocalContinueError(message: AssistantMessage, error: unknown): Promise<void> {
 		if (this.#retryAttempt === 0) return;
 		const attempt = this.#retryAttempt;
-		this.#retryAttempt = 0;
+		this.#resetSagaRetryCounters();
 		const localError = error instanceof Error ? error.message : String(error);
 		await this.#closeRetrySaga(
 			{
@@ -3121,7 +3231,7 @@ export class TurnRecovery {
 		if (abortedToolCallTail(active)) return true;
 		// A trailing assistant message is authoritative for a live session: a
 		// settled successful turn leaves nothing to retry.
-		if (active.at(-1)?.role === "assistant") return false;
+		if (active[conversationEnd(active) - 1]?.role === "assistant") return false;
 		// A restored session omits the failed turn (and its synthetic results)
 		// from provider context, so — mirroring retry() — the persisted display
 		// transcript decides whether a retryable tool-call tail exists.
@@ -3165,8 +3275,12 @@ export class TurnRecovery {
 				await this.#stripForToolReplay(messages, replayStart);
 			} else {
 				// Remove the failed/aborted assistant message plus its synthetic tool
-				// results (same as auto-retry does before re-attempting).
-				this.#host.agent.replaceMessages(messages.slice(0, activeTurnEnd - 1));
+				// results (same as auto-retry does before re-attempting), keeping the
+				// trailing eval snapshot the continuation is sent with.
+				this.#host.agent.replaceMessages([
+					...messages.slice(0, activeTurnEnd - 1),
+					...messages.slice(conversationEnd(messages)),
+				]);
 			}
 		} else {
 			// A restored session already dropped the failed assistant turn (and its
@@ -3181,7 +3295,7 @@ export class TurnRecovery {
 		}
 
 		// Reset retry budget for a fresh attempt
-		this.#retryAttempt = 0;
+		this.#resetSagaRetryCounters();
 
 		// Re-attempt the turn
 		this.#host.scheduleAgentContinue({ source: "manual-retry", delayMs: 1 });
@@ -3192,10 +3306,11 @@ export class TurnRecovery {
 	 * Strip the failed tool batch (and any aborted boundary) for a tool replay:
 	 * reparent the persisted leaf onto the anchor assistant entry — so the
 	 * dropped results cannot resurface on reload or pair duplicate toolCallIds
-	 * on replay — then cut the active context to the same point.
+	 * on replay — then cut the active context to the same point. Trailing eval
+	 * snapshots go too: none may sit between the calls and their re-run results.
 	 */
 	async #stripForToolReplay(messages: readonly AgentMessage[], replayStart: number): Promise<void> {
-		const tail = messages[messages.length - 1];
+		const tail = messages[conversationEnd(messages) - 1];
 		if (tail?.role === "assistant") {
 			try {
 				await this.#host.waitForSessionMessagePersistence(tail);

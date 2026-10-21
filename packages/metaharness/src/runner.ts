@@ -20,6 +20,7 @@ import { type GeneratedProvider, getBundledModel } from "@oh-my-pi/pi-catalog/mo
  *   metaharness harbor --help
  */
 import type { Server } from "bun";
+import { assertE2eHost } from "../../../scripts/e2e-host-guard";
 import { defaultJobName, harborRunnerArgs, type LaunchRequest } from "./launch-args";
 
 // ────────────────────────────────────────────────────────────────────── config
@@ -1609,6 +1610,7 @@ interface BenchmarkRun {
 }
 
 async function runBenchmark(cfg: Config): Promise<BenchmarkRun> {
+	assertE2eHost(cfg.envType === "docker" ? "container" : "e2e", "metaharness harbor");
 	if (!which("harbor")) {
 		throw new Error("harbor not found on PATH. Install with: uv tool install harbor");
 	}

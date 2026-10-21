@@ -7,7 +7,8 @@
  * OpenRouter sticky-routing / response caching behaves the same on advisor turns
  * (can1357/oh-my-pi#3639).
  */
-import { describe, expect, it } from "bun:test";
+import { scheduler } from "node:timers/promises";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { StreamFn } from "@oh-my-pi/pi-agent-core";
 import { type Context, type Model, type SimpleStreamOptions, streamSimple } from "@oh-my-pi/pi-ai";
 import { configureProviderStoreResponses } from "@oh-my-pi/pi-ai/providers/openai-responses";
@@ -17,7 +18,11 @@ import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream"
 import { bindEffects } from "@oh-my-pi/pi-coding-agent/config/registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { cfgProvidersMuseCodeStoreResponses } from "@oh-my-pi/pi-coding-agent/session/settings";
-import { createSettingsAwareStreamFn } from "@oh-my-pi/pi-coding-agent/session/settings-stream-fn";
+import {
+	createSettingsAwareStreamFn,
+	type ProviderRetryWaitInfo,
+} from "@oh-my-pi/pi-coding-agent/session/settings-stream-fn";
+import { mockSchedulerWaitWithClock } from "./helpers/mock-scheduler-clock";
 
 function captureBase(): { fn: StreamFn; calls: Array<{ options?: SimpleStreamOptions }> } {
 	const calls: Array<{ options?: SimpleStreamOptions }> = [];
@@ -32,6 +37,58 @@ const stubModel = {} as unknown as Model;
 const stubCodexModel = { api: "openai-codex-responses" } as unknown as Model;
 const stubResponsesModel = { api: "openai-responses" } as unknown as Model;
 const stubContext = { messages: [], tools: [], systemPrompt: [] } as unknown as Context;
+
+/** Base64 PNG whose IHDR declares `width`x`height`; the pixel data is irrelevant to sizing. */
+function pngWithSize(width: number, height: number): string {
+	const bytes = Buffer.alloc(64);
+	Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(bytes, 0);
+	bytes.writeUInt32BE(13, 8);
+	bytes.write("IHDR", 12, "ascii");
+	bytes.writeUInt32BE(width, 16);
+	bytes.writeUInt32BE(height, 20);
+	bytes[24] = 8;
+	bytes[25] = 6;
+	return bytes.toString("base64");
+}
+
+/** A rebuilt history holding one `producer` turn whose native payload replays 5,000 reasoning tokens. */
+function replayedReasoningContext(producer: Model): Context {
+	const reasoningItem = { type: "reasoning", id: "rs_1", summary: [], encrypted_content: "e".repeat(16_000) };
+	return {
+		messages: [
+			// A rewrite marker newer than the turn makes its usage stale, so every
+			// request is counted locally (a rebuilt history).
+			{ role: "user", content: "summary", historyRewriteAt: 10, timestamp: 10 },
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "Done." }],
+				api: producer.api,
+				provider: producer.provider,
+				model: producer.id,
+				providerPayload: {
+					type: "openaiResponsesHistory",
+					provider: producer.provider,
+					dt: true,
+					items: [
+						reasoningItem,
+						{ type: "message", role: "assistant", content: [{ type: "output_text", text: "Done." }] },
+					],
+				},
+				usage: {
+					input: 9_000,
+					output: 6_000,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 15_000,
+					reasoningTokens: 5_000,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: 1,
+			},
+		],
+	} as unknown as Context;
+}
 
 describe("createSettingsAwareStreamFn", () => {
 	it("applies provider settings to the forwarded options when caller omits them", () => {
@@ -108,6 +165,44 @@ describe("createSettingsAwareStreamFn", () => {
 		expect(calls[0]?.options?.streamIdleTimeoutMs).toBe(300_000);
 		expect(calls[1]?.options?.streamFirstEventTimeoutMs).toBe(15_000);
 		expect(calls[1]?.options?.streamIdleTimeoutMs).toBe(10_000);
+	});
+
+	it("forwards the provider operation budget, its disabled form, and caller overrides", () => {
+		const { fn: base, calls } = captureBase();
+		createSettingsAwareStreamFn(Settings.isolated({}), base)(stubModel, stubContext, undefined);
+		createSettingsAwareStreamFn(Settings.isolated({ "providers.operationTimeoutSeconds": 300 }), base)(
+			stubModel,
+			stubContext,
+			undefined,
+		);
+		createSettingsAwareStreamFn(Settings.isolated({ "providers.operationTimeoutSeconds": 0 }), base)(
+			stubModel,
+			stubContext,
+			undefined,
+		);
+		createSettingsAwareStreamFn(Settings.isolated({ "providers.operationTimeoutSeconds": 300 }), base)(
+			stubModel,
+			stubContext,
+			{ operationTimeoutMs: 45_000 },
+		);
+
+		// Default is a bounded budget, not "off".
+		expect(calls[0]?.options?.operationTimeoutMs).toBe(900_000);
+		expect(calls[1]?.options?.operationTimeoutMs).toBe(300_000);
+		expect(calls[2]?.options?.operationTimeoutMs).toBe(0);
+		expect(calls[3]?.options?.operationTimeoutMs).toBe(45_000);
+	});
+
+	it("treats a negative operation budget as off instead of silently disabling it", () => {
+		const { fn: base, calls } = captureBase();
+		createSettingsAwareStreamFn(Settings.isolated({ "providers.operationTimeoutSeconds": -1 }), base)(
+			stubModel,
+			stubContext,
+			undefined,
+		);
+
+		// Explicitly 0 (off): a negative must not slip through as undefined.
+		expect(calls[0]?.options?.operationTimeoutMs).toBe(0);
 	});
 
 	it("forwards retry.maxDelayMs while preserving caller overrides", () => {
@@ -199,6 +294,90 @@ describe("createSettingsAwareStreamFn", () => {
 		expect(fitted).toBeGreaterThan(0);
 		expect(promptTokens + (fitted ?? Number.POSITIVE_INFINITY)).toBeLessThanOrEqual(1_000_000);
 		// A prompt that leaves room keeps the transport's own default.
+		expect(calls[1]?.options?.maxTokens).toBeUndefined();
+	});
+
+	it("fits the output cap at the called model's prices, not an earlier model's", () => {
+		// Gemini bills any image a flat 1,120 tokens; GPT-6.1 bills this one 4,763.
+		const gemini = getBundledModel("google", "gemini-3-pro-preview") as Model;
+		const codex: Model = { ...getBundledModel("openai-codex", "gpt-6.1-sol"), contextWindow: 10_000 };
+		const image = { type: "image", data: pngWithSize(2000, 2000), mimeType: "image/png", detail: "original" };
+		const context = { messages: [{ role: "user", content: [image], timestamp: 0 }] } as unknown as Context;
+		const { fn: base, calls } = captureBase();
+		const wrapped = createSettingsAwareStreamFn(Settings.isolated({}), base);
+		const fresh = captureBase();
+
+		wrapped(gemini, stubContext, { maxTokens: 8_000 });
+		wrapped(codex, context, { maxTokens: 8_000 });
+		createSettingsAwareStreamFn(Settings.isolated({}), fresh.fn)(codex, context, { maxTokens: 8_000 });
+
+		const fitted = calls[1]?.options?.maxTokens ?? Number.POSITIVE_INFINITY;
+		expect(fitted).toBe(fresh.calls[0]?.options?.maxTokens ?? Number.NaN);
+		expect(4_763 + fitted).toBeLessThanOrEqual(10_000);
+	});
+
+	it("recounts replayed reasoning for a model it does not replay to", () => {
+		// Same encoding, different Responses reader: only the producing model
+		// replays the turn's 5,000 reasoning tokens.
+		const sol: Model = { ...getBundledModel("openai-codex", "gpt-6.1-sol"), contextWindow: 10_000, maxTokens: 9_000 };
+		const other: Model = { ...getBundledModel("openai-codex", "gpt-6-sol"), contextWindow: 10_000, maxTokens: 9_000 };
+		const context = replayedReasoningContext(sol);
+		const { fn: base, calls } = captureBase();
+		const wrapped = createSettingsAwareStreamFn(Settings.isolated({}), base);
+
+		wrapped(sol, context, { apiKey: "k" });
+		wrapped(other, context, { apiKey: "k" });
+
+		// The producing model's prompt carries the reasoning, so its cap is fitted.
+		expect(calls[0]?.options?.maxTokens).toBeLessThan(9_000);
+		// The other model's prompt is a few tokens, so it keeps the transport default.
+		expect(calls[1]?.options?.maxTokens).toBeUndefined();
+	});
+
+	it("does not fit the output cap over reasoning a cold Responses session leaves out", () => {
+		const copilot: Model = {
+			...getBundledModel("github-copilot", "gpt-5.4"),
+			contextWindow: 10_000,
+			maxTokens: 9_000,
+		};
+		const context = replayedReasoningContext(copilot);
+		const { fn: base, calls } = captureBase();
+		const wrapped = createSettingsAwareStreamFn(Settings.isolated({}), base);
+
+		// Fresh session state on a connection-bound host: the first request rebuilds
+		// the turn from its text, so its prompt is a few tokens.
+		wrapped(copilot, context, { apiKey: "k", providerSessionState: new Map() });
+		// Without session state the request replays the reasoning.
+		wrapped(copilot, context, { apiKey: "k" });
+
+		expect(calls[0]?.options?.maxTokens).toBeUndefined();
+		expect(calls[1]?.options?.maxTokens).toBeLessThan(9_000);
+	});
+
+	it("fits a cold request that may wait for a provider slot as replaying", () => {
+		const copilot: Model = {
+			...getBundledModel("github-copilot", "gpt-5.4"),
+			contextWindow: 10_000,
+			maxTokens: 9_000,
+		};
+		const context = replayedReasoningContext(copilot);
+		const { fn: base, calls } = captureBase();
+		const queued = createSettingsAwareStreamFn(
+			Settings.isolated({ "providers.maxInFlightRequests": { "github-copilot": 1 } }),
+			base,
+		);
+
+		// The request is built when it gets a slot, after a concurrent response may
+		// have warmed the session, so the cap leaves room for the replayed reasoning.
+		queued(copilot, context, { apiKey: "k", providerSessionState: new Map() });
+		// Control: a limit on another provider does not hold this request back.
+		const elsewhere = createSettingsAwareStreamFn(
+			Settings.isolated({ "providers.maxInFlightRequests": { openrouter: 1 } }),
+			base,
+		);
+		elsewhere(copilot, context, { apiKey: "k", providerSessionState: new Map() });
+
+		expect(calls[0]?.options?.maxTokens).toBeLessThan(9_000);
 		expect(calls[1]?.options?.maxTokens).toBeUndefined();
 	});
 
@@ -387,6 +566,146 @@ describe("createSettingsAwareStreamFn", () => {
 				release();
 				configureProviderStoreResponses(undefined);
 			}
+		});
+	});
+
+	describe("provider retry wait observer", () => {
+		const stubAnthropicModel = {
+			api: "anthropic-messages",
+			provider: "anthropic",
+			id: "claude-sonnet-4-5",
+		} as unknown as Model;
+
+		// The first case mocks `scheduler.wait`; the abort case needs the real one.
+		afterEach(() => {
+			vi.restoreAllMocks();
+		});
+
+		function captureObserver() {
+			const starts: ProviderRetryWaitInfo[] = [];
+			const ends: Array<{ aborted: boolean; waitId: number }> = [];
+			let nextWaitId = 0;
+			return {
+				starts,
+				ends,
+				observer: {
+					onStart: (info: ProviderRetryWaitInfo) => {
+						starts.push(info);
+						nextWaitId += 1;
+						return nextWaitId;
+					},
+					onEnd: (result: { aborted: boolean; waitId: number }) => ends.push(result),
+				},
+			};
+		}
+
+		it("installs a providerRetryWait that reports the wait around the real sleep", async () => {
+			const settings = Settings.isolated({});
+			const { fn: base, calls } = captureBase();
+			const { starts, ends, observer } = captureObserver();
+			const wrapped = createSettingsAwareStreamFn(settings, base, undefined, observer);
+
+			wrapped(stubAnthropicModel, stubContext, { apiKey: "k" });
+			const installed = calls[0]?.options?.providerRetryWait;
+			expect(installed).toBeDefined();
+
+			const waitSpy = mockSchedulerWaitWithClock();
+			await installed!(1234);
+
+			expect(waitSpy).toHaveBeenCalledTimes(1);
+			expect(waitSpy.mock.calls[0]?.[0]).toBe(1234);
+			expect(starts).toEqual([
+				{ delayMs: 1234, model: "claude-sonnet-4-5", provider: "anthropic", api: "anthropic-messages" },
+			]);
+			expect(ends).toEqual([{ aborted: false, waitId: 1 }]);
+		});
+
+		it("reports a jittered fractional delay as whole milliseconds while sleeping the exact delay", async () => {
+			const settings = Settings.isolated({});
+			const { fn: base, calls } = captureBase();
+			const { starts, observer } = captureObserver();
+			const wrapped = createSettingsAwareStreamFn(settings, base, undefined, observer);
+
+			wrapped(stubAnthropicModel, stubContext, { apiKey: "k" });
+			const waitSpy = mockSchedulerWaitWithClock();
+			// Anthropic backoff jitter: `sleepSeconds * jitter * 1000`.
+			await calls[0]!.options!.providerRetryWait!(437.5021);
+
+			expect(waitSpy.mock.calls[0]?.[0]).toBe(437.5021);
+			// The RPC wire declares `delayMs` an integer (Go int64, Rust i64,
+			// Python decode_int); rounding up never shows less wait than remains.
+			expect(starts[0]?.delayMs).toBe(438);
+		});
+
+		it("leaves a caller-supplied providerRetryWait untouched", async () => {
+			const settings = Settings.isolated({});
+			const { fn: base, calls } = captureBase();
+			const { starts, ends, observer } = captureObserver();
+			const wrapped = createSettingsAwareStreamFn(settings, base, undefined, observer);
+			const callerWaits: number[] = [];
+			const callerWait = async (delayMs: number) => {
+				callerWaits.push(delayMs);
+			};
+
+			wrapped(stubAnthropicModel, stubContext, { apiKey: "k", providerRetryWait: callerWait });
+
+			expect(calls[0]?.options?.providerRetryWait).toBe(callerWait);
+			await calls[0]?.options?.providerRetryWait?.(42);
+			expect(callerWaits).toEqual([42]);
+			// The caller owns the wait: our observer must not be told about it.
+			expect(starts).toEqual([]);
+			expect(ends).toEqual([]);
+		});
+
+		it("reports aborted:true and rethrows when the signal aborts during the wait", async () => {
+			const settings = Settings.isolated({});
+			const { fn: base, calls } = captureBase();
+			const { starts, ends, observer } = captureObserver();
+			const wrapped = createSettingsAwareStreamFn(settings, base, undefined, observer);
+
+			wrapped(stubAnthropicModel, stubContext, { apiKey: "k" });
+			const installed = calls[0]?.options?.providerRetryWait;
+			const abort = new AbortController();
+			// `scheduler.wait` has already registered its abort listener by the time
+			// the call returns, so aborting here lands mid-wait without a real timer.
+			const pending = installed!(60_000, abort.signal);
+			abort.abort();
+
+			await expect(pending).rejects.toThrow();
+			expect(starts).toHaveLength(1);
+			expect(ends).toEqual([{ aborted: true, waitId: 1 }]);
+		});
+
+		it("threads each wait's own id to its end when waits overlap", async () => {
+			const settings = Settings.isolated({});
+			const { fn: base, calls } = captureBase();
+			const { starts, ends, observer } = captureObserver();
+			const wrapped = createSettingsAwareStreamFn(settings, base, undefined, observer);
+
+			wrapped(stubAnthropicModel, stubContext, { apiKey: "k" });
+			const installed = calls[0]?.options?.providerRetryWait;
+			expect(installed).toBeDefined();
+
+			// Hold both sleeps open so the two waits overlap: the second wait
+			// starts before the first ends.
+			const releases = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+			let waitCalls = 0;
+			vi.spyOn(scheduler, "wait").mockImplementation(async () => {
+				await releases.at(waitCalls++)?.promise;
+			});
+
+			const first = installed!(1000);
+			const second = installed!(2000);
+			expect(starts).toHaveLength(2);
+			// Resolve out of order: each end must still carry its own wait's id.
+			releases.at(1)?.resolve();
+			await second;
+			releases.at(0)?.resolve();
+			await first;
+			expect(ends).toEqual([
+				{ aborted: false, waitId: 2 },
+				{ aborted: false, waitId: 1 },
+			]);
 		});
 	});
 });

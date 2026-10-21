@@ -56,11 +56,25 @@ describe("Windows release binary target", () => {
 	});
 });
 
-it("runs compiled bytecode containing dependency import.meta.resolve calls", async () => {
+/**
+ * Bytecode compilation is only observable in the artifact: Bun annotates each
+ * bytecode-compiled module in the embedded bundle with a `// @bun @bytecode`
+ * pragma, and a bundle of the same graph without `bytecode: true` carries no
+ * such module record. Comparing the two executables therefore proves real
+ * precompiled bytecode rather than merely a working ESM bundle. Counts are
+ * compared instead of matched absolutely because the embedded standalone
+ * runtime itself carries a fixed number of copies of the marker.
+ */
+it("compiles dependency import.meta.resolve calls into runnable precompiled bytecode", async () => {
 	using temp = TempDir.createSync("@omp-bytecode-");
-	const entrypoint = temp.join("entry.ts");
-	const outfile = temp.join(process.platform === "win32" ? "probe.exe" : "probe");
-	await Bun.write(entrypoint, 'console.log(import.meta.resolve("node:fs"));\n');
+	const entryName = "bytecode-probe-entry";
+	const executableSuffix = process.platform === "win32" ? ".exe" : "";
+	const dependency = temp.join("bytecode-probe-dep.ts");
+	const entrypoint = temp.join(`${entryName}.ts`);
+	const outfile = temp.join(`probe${executableSuffix}`);
+	const plainOutfile = temp.join(`probe-without-bytecode${executableSuffix}`);
+	await Bun.write(dependency, 'export const resolved = import.meta.resolve("node:fs");\n');
+	await Bun.write(entrypoint, 'import { resolved } from "./bytecode-probe-dep.ts";\nconsole.log(resolved);\n');
 	await compileCodingAgent({
 		repoRoot: temp.path(),
 		entrypoint,
@@ -68,9 +82,39 @@ it("runs compiled bytecode containing dependency import.meta.resolve calls", asy
 		transformersVersion: "unused",
 		native: null,
 	});
+	// Same module graph minus `bytecode`. The fixture imports no external or
+	// legacy-Pi module, so the remaining compile options cannot account for the
+	// artifact difference measured below.
+	const plain = await Bun.build({
+		entrypoints: [entrypoint],
+		root: temp.path(),
+		format: "esm",
+		compile: {
+			outfile: plainOutfile,
+			autoloadBunfig: false,
+			autoloadDotenv: false,
+			autoloadTsconfig: false,
+			autoloadPackageJson: false,
+		},
+		throw: false,
+	});
+	expect(plain.success).toBe(true);
 	const result = await $`${outfile}`.quiet().nothrow();
 	expect(result.exitCode).toBe(0);
 	expect(result.text().trim()).toBe("node:fs");
+	const countBytecodePragmas = (artifact: Buffer): number => {
+		const pragma = "// @bun @bytecode";
+		let count = 0;
+		let index = artifact.indexOf(pragma);
+		while (index >= 0) {
+			count++;
+			index = artifact.indexOf(pragma, index + pragma.length);
+		}
+		return count;
+	};
+	const withBytecode = Buffer.from(await Bun.file(outfile).arrayBuffer());
+	const withoutBytecode = Buffer.from(await Bun.file(plainOutfile).arrayBuffer());
+	expect(countBytecodePragmas(withBytecode)).toBeGreaterThan(countBytecodePragmas(withoutBytecode));
 }, 30_000);
 
 it("runs code behind a lazy import() from a split chunk of the compiled binary", async () => {

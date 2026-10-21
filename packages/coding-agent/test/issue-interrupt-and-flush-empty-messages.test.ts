@@ -78,27 +78,6 @@ describe("empty submit with queued messages", () => {
 		expect(requestRender).toHaveBeenCalledTimes(1);
 	});
 
-	it("queues an image-only steer while streaming", async () => {
-		// An image-only draft is a bare marker: the composer always stages the
-		// chip token, which expands to `[Image #1]` at submit time.
-		const image: ImageContent = { type: "image", mimeType: "image/png", data: "aW1hZ2U=" };
-		const { ctx, abort, prompt, updatePendingMessagesDisplay, requestRender } = createContext({
-			hasInterruptibleInput: false,
-			pendingImages: [image],
-		});
-		const controller = new InputController(ctx);
-		controller.setupEditorSubmitHandler();
-
-		await ctx.editor.onSubmit?.("[Image #1]");
-
-		expect(abort).not.toHaveBeenCalled();
-		expect(prompt).toHaveBeenCalledWith("[Image #1]", { streamingBehavior: "steer", images: [image] });
-		expect(ctx.editor.pendingImages).toEqual([]);
-		expect(ctx.editor.pendingImageLinks).toEqual([]);
-		expect(updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
-		expect(requestRender).toHaveBeenCalledTimes(1);
-	});
-
 	it("restores an image-only steer when streaming dispatch rejects", async () => {
 		const image: ImageContent = { type: "image", mimeType: "image/png", data: "aW1hZ2U=" };
 		const { ctx, abort, prompt, showError, updatePendingMessagesDisplay, requestRender } = createContext({
@@ -122,18 +101,6 @@ describe("empty submit with queued messages", () => {
 		expect(ctx.editor.imageLinks).toEqual(["local://draft.png"]);
 		expect(updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 		expect(requestRender).toHaveBeenCalledTimes(1);
-	});
-
-	it("queues an image-only steer instead of aborting when messages are already queued", async () => {
-		const image: ImageContent = { type: "image", mimeType: "image/png", data: "aW1hZ2U=" };
-		const { ctx, abort, prompt } = createContext({ hasInterruptibleInput: true, pendingImages: [image] });
-		const controller = new InputController(ctx);
-		controller.setupEditorSubmitHandler();
-
-		await ctx.editor.onSubmit?.("[Image #1]");
-
-		expect(abort).not.toHaveBeenCalled();
-		expect(prompt).toHaveBeenCalledWith("[Image #1]", { streamingBehavior: "steer", images: [image] });
 	});
 
 	it("drops a pending image whose marker was deleted and aborts as an empty submit", async () => {

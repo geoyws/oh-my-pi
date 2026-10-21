@@ -15,10 +15,19 @@ import {
 	readArgsHaveTarget,
 } from "@oh-my-pi/pi-tui/chat/read-tool-group";
 import { RecapNotice } from "@oh-my-pi/pi-tui/chat/recap-notice";
+import { readMediaPath } from "@oh-my-pi/pi-tui/native/blobs";
 import { TodoReminderComponent } from "@oh-my-pi/pi-tui/chat/todo-reminder";
 import { isNativeRendering } from "@oh-my-pi/pi-tui/native/state";
 import { textContent } from "@oh-my-pi/pi-tui/chat/transcript-entry";
-import { ToolExecutionComponent, type ToolExecutionHandle, toolRenderName } from "@oh-my-pi/pi-tui/chat/tool-execution";
+import {
+	asyncJobState,
+	isSettledJobFrame,
+	parksAsBackground,
+	settleWithJobFrame,
+	ToolExecutionComponent,
+	type ToolExecutionHandle,
+	toolRenderName,
+} from "@oh-my-pi/pi-tui/chat/tool-execution";
 import { TtsrNotificationComponent } from "@oh-my-pi/pi-tui/chat/ttsr-notification";
 import { createUsageRowBlock, TurnUsageTally, turnElapsedMs } from "@oh-my-pi/pi-tui/overlays/usage-row";
 import { appKey } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
@@ -34,7 +43,8 @@ import {
 	readQueueChipText,
 	resolveAbortLabel,
 } from "../../session/messages";
-import { formatApprovalPrompt, resolveApproval } from "../../tools/approval";
+import { formatApprovalPrompt, resolveApproval, sessionApprovalScope } from "../../tools/approval";
+import { getApprovalGrants } from "../../tools/approval-cache";
 import { recoverAskQuestions } from "../../tools/ask";
 import { previewLine, PREVIEW_LIMITS, TRUNCATE_LENGTHS } from "@oh-my-pi/pi-tui/render/render-utils";
 import { PROPOSE_DEVICE_NAME } from "@oh-my-pi/pi-tui/tools/resolve";
@@ -71,6 +81,7 @@ import {
 	cfgTerminalShowImages,
 	cfgTerminalShowProgress,
 } from "../settings";
+import { getCacheWarmingDelayMs } from "../../session/cache-warmer";
 import { cfgCompaction } from "../../session/context-settings";
 import { cfgReadToolResultPreview, cfgToolsApproval, cfgToolsApprovalMode } from "../../tools/settings";
 import { cfgSpeechEnabled, cfgSpeechMode } from "../../tts/settings";
@@ -90,6 +101,11 @@ const IRC_MESSAGE_VISIBLE_TTL_MS = 10_000;
 const MAX_LIVE_IRC_CARDS = 4;
 const IDLE_RECAP_MIN_SECONDS = 1;
 const IDLE_RECAP_MAX_SECONDS = 3600;
+/**
+ * Idle compaction fires this long before the warmer's own refresh point, so the
+ * compaction request (not a one-token warm replay) reads the still-warm prefix.
+ */
+const IDLE_COMPACTION_CACHE_LEAD_MS = 5_000;
 
 const RAW_PARTIAL_JSON_RENDERERS: Record<string, true> = { bash: true, edit: true, apply_patch: true };
 
@@ -175,7 +191,14 @@ export class EventController {
 	#lastVisibleBlockCount = 0;
 	#renderedCustomMessages = new Set<string>();
 	#lastIntent: string | undefined = undefined;
-	#backgroundTaskCallIds = new Set<string>();
+	/** Returned calls parked for their background job's frames ({@link parksAsBackground}). */
+	#backgroundCallIds = new Set<string>();
+	/**
+	 * A job's settled frame ({@link isSettledJobFrame}) that landed while its
+	 * call was still executing, keyed by call id: a fast job can settle before
+	 * the call's `tool_execution_end` carries its `running` start result.
+	 */
+	#settledBeforeReturn = new Map<string, Extract<AgentSessionEvent, { type: "tool_execution_update" }>>();
 	/** Tool calls waiting on the user (an approval prompt or `ask`), with the
 	 *  `blocked` status each reports; cleared at their tool_execution_end so the
 	 *  run returns to `working` once none is left. */
@@ -245,6 +268,16 @@ export class EventController {
 	// mid-retry blip or the final settle — only the retry lifecycle events
 	// (never deferred) can tell them apart.
 	#retryPending = false;
+	// `waitId` of the wait that mounted the countdown: only that wait's `_end`
+	// may take it down. The Loader itself lives on `ctx.providerRetryLoader`
+	// (never `ctx.retryLoader`, whose overlay must not be clobbered) so the
+	// collab guest's host-state reconcile and `ensureLoadingAnimation()` can
+	// see that the status row is already owned.
+	#providerRetryWaitId: number | undefined;
+	// True between a replicated `agent_start` and its `agent_end`. Only a collab
+	// guest reads it (see `#turnIsStreaming`): its replica session never streams,
+	// so the host's turn lifecycle is the only local record that one is running.
+	#hostTurnActive = false;
 	#idleCompactionTimer?: NodeJS.Timeout;
 	#idleRecapTimer?: NodeJS.Timeout;
 	// True from `agent_end` until this idle window's recap timer fires, so a live
@@ -287,6 +320,10 @@ export class EventController {
 	#runEpoch = 0;
 	/** Epoch of the in-flight {@link #finishWhenRunSettles} watch, if any. */
 	#settleWatchEpoch: number | undefined = undefined;
+	// Composer activity: a host run or idle maintenance (auto-compaction) owns
+	// turn-scoped chrome, so the post-run chrome floor must not settle on it.
+	#runActive = false;
+	#maintenanceActive = false;
 	// Coalescing window for `message_update` events at the subscription boundary.
 	// `message_update` carries the CUMULATIVE assistant message (every update
 	// re-lists all content blocks), so when a burst of deltas arrives faster than
@@ -361,6 +398,8 @@ export class EventController {
 			auto_compaction_end: e => this.#handleAutoCompactionEnd(e),
 			auto_retry_start: e => this.#handleAutoRetryStart(e),
 			auto_retry_end: e => this.#handleAutoRetryEnd(e),
+			provider_retry_wait_start: e => this.#handleProviderRetryWaitStart(e),
+			provider_retry_wait_end: e => this.#handleProviderRetryWaitEnd(e),
 			cache_warming_start: async () => {},
 			cache_warming_end: async () => {},
 			retry_fallback_applied: e => this.#handleRetryFallbackApplied(e),
@@ -465,7 +504,7 @@ export class EventController {
 	/** Freeze foreground tool cards once no live agent turn can complete them. */
 	#sealAbandonedForegroundTools(): void {
 		const background = new Set<ToolExecutionHandle>();
-		for (const toolCallId of this.#backgroundTaskCallIds) {
+		for (const toolCallId of this.#backgroundCallIds) {
 			const component = this.ctx.pendingTools.get(toolCallId);
 			if (component) background.add(component);
 		}
@@ -478,12 +517,12 @@ export class EventController {
 			}
 		}
 		for (const [toolCallId, component] of this.ctx.pendingTools) {
-			if (this.#backgroundTaskCallIds.has(toolCallId)) continue;
+			if (this.#backgroundCallIds.has(toolCallId)) continue;
 			component.seal();
 			this.ctx.pendingTools.delete(toolCallId);
 		}
-		this.#backgroundTaskCallIds = new Set(
-			Array.from(this.#backgroundTaskCallIds).filter(toolCallId => this.ctx.pendingTools.has(toolCallId)),
+		this.#backgroundCallIds = new Set(
+			Array.from(this.#backgroundCallIds).filter(toolCallId => this.ctx.pendingTools.has(toolCallId)),
 		);
 		this.#finalizeAbandonedPostToolSegments();
 	}
@@ -691,7 +730,7 @@ export class EventController {
 
 	#inlineReadToolImages(
 		toolCallId: string,
-		result: { content: Array<{ type: string; data?: string; mimeType?: string }> },
+		result: { content: Array<{ type: string; data?: string; mimeType?: string }>; details?: unknown },
 	): boolean {
 		const assistantComponent = this.#readToolCallAssistantComponents.get(toolCallId);
 		if (!assistantComponent) return false;
@@ -701,9 +740,11 @@ export class EventController {
 					content.type === "image" && typeof content.data === "string" && typeof content.mimeType === "string",
 			)
 			.map(content => ({ type: "image", data: content.data, mimeType: content.mimeType }));
-		if (images.length === 0) return false;
-		assistantComponent.setToolResultImages(toolCallId, images);
-		return cfgTerminalShowImages.get(settings);
+		const mediaPath = readMediaPath(result.details);
+		if (images.length === 0 && !mediaPath) return false;
+		assistantComponent.setToolResultImages(toolCallId, images, mediaPath);
+		// A media-only result (a model, a PDF) still settles through the read group.
+		return images.length > 0 && cfgTerminalShowImages.get(settings);
 	}
 
 	#insertAfterTranscriptComponent(anchor: Component | undefined, component: Component): boolean {
@@ -892,6 +933,17 @@ export class EventController {
 		return this.#executionStartedCallIds.has(toolCallId);
 	}
 
+	/** The viewed session was swapped for an idle one: no run owns the chrome any more. */
+	markViewIdle(): void {
+		this.#runActive = false;
+		this.#maintenanceActive = false;
+		this.#syncComposerActivity();
+	}
+
+	#syncComposerActivity(): void {
+		this.ctx.composer.setRunActive(this.#runActive || this.#maintenanceActive);
+	}
+
 	/**
 	 * Clear every transcript-anchored/turn-scoped piece of state. Used by the
 	 * session focus proxy when re-pointing the transcript at another session:
@@ -916,7 +968,8 @@ export class EventController {
 		this.#syntheticFailureCards.clear();
 		this.#orphanedToolCompletions.clear();
 		this.#postToolAssistantComponents.clear();
-		this.#backgroundTaskCallIds.clear();
+		this.#backgroundCallIds.clear();
+		this.#settledBeforeReturn.clear();
 		this.#blockingPrompts.clear();
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();
@@ -979,7 +1032,16 @@ export class EventController {
 		// is awaiting, then the handler's own final requestRender schedules a
 		// second identical frame. Removing it lets the render cadence follow real
 		// state changes rather than event volume (issue #4353).
-		const run = this.#handlers[event.type] as (e: AgentSessionEvent) => Promise<void>;
+		const run = this.#handlers[event.type] as ((e: AgentSessionEvent) => Promise<void>) | undefined;
+		// A collab guest is fed events produced by the HOST's build. The hello
+		// handshake rejects a protocol mismatch, but a same-proto host may still
+		// carry a newer event type, and an unguarded table lookup would throw an
+		// unhandled TypeError and take the session down over a status-line
+		// nicety. Skipping the event only costs the display it would have driven.
+		if (!run) {
+			logger.debug("Ignoring session event with no handler", { type: event.type });
+			return;
+		}
 		await run(event);
 	}
 
@@ -1039,6 +1101,7 @@ export class EventController {
 
 	async #handleAgentStart(_event: Extract<AgentSessionEvent, { type: "agent_start" }>): Promise<void> {
 		this.#runEpoch += 1;
+		this.#hostTurnActive = true;
 		// A run with no user prompt in it (synthetic-only: `/goal` kickoff,
 		// approved-plan execution) must not measure prompt→yield from an unrelated
 		// earlier prompt. Normal user turns reseed via message_start before
@@ -1085,6 +1148,16 @@ export class EventController {
 			this.ctx.retryLoader = undefined;
 			this.ctx.statusContainer.disposeChildren();
 		}
+		// A new turn can never be inside the previous turn's provider backoff. A
+		// `provider_retry_wait_end` dropped en route (a collab reconnect, a
+		// renderer exception) would otherwise pin the countdown — and, because
+		// `ensureLoadingAnimation` yields to it, suppress "Working…" for every
+		// later turn.
+		if (this.ctx.providerRetryLoader) {
+			this.ctx.providerRetryLoader.stop();
+			this.ctx.providerRetryLoader = undefined;
+			this.ctx.statusContainer.disposeChildren();
+		}
 		this.#cancelIdleCompaction();
 		this.#cancelIdleRecap();
 		this.composerPrediction.cancel();
@@ -1093,6 +1166,8 @@ export class EventController {
 		this.#compactionOwnsProgress = false;
 		this.#setTerminalProgress(true);
 		this.ctx.ensureLoadingAnimation();
+		this.#runActive = true;
+		this.#syncComposerActivity();
 		setRunStatus({ state: "working" });
 		this.ctx.ui.requestRender();
 	}
@@ -1389,15 +1464,15 @@ export class EventController {
 	}
 
 	/**
-	 * Re-register parked background task cards after a transcript rebuild so a
-	 * detached task's replayed and live progress frames keep routing to the
-	 * preserved component. Focus attach clears {@link #backgroundTaskCallIds}
+	 * Re-register parked background cards after a transcript rebuild so a
+	 * background job's replayed and live progress frames keep routing to the
+	 * preserved component. Focus attach clears {@link #backgroundCallIds}
 	 * via {@link resetTranscriptAnchors} before the rebuild repopulates it.
 	 * Ids whose component did not survive into `pendingTools` are skipped.
 	 */
-	markBackgroundTaskCalls(toolCallIds: Iterable<string>): void {
+	markBackgroundCalls(toolCallIds: Iterable<string>): void {
 		for (const toolCallId of toolCallIds) {
-			if (this.ctx.pendingTools.has(toolCallId)) this.#backgroundTaskCallIds.add(toolCallId);
+			if (this.ctx.pendingTools.has(toolCallId)) this.#backgroundCallIds.add(toolCallId);
 		}
 	}
 
@@ -1739,7 +1814,7 @@ export class EventController {
 				if (supersededByRewind) {
 					this.ctx.streamingComponent.markRewound();
 					for (const [toolCallId, component] of Array.from(this.ctx.pendingTools.entries())) {
-						if (this.#backgroundTaskCallIds.has(toolCallId)) continue;
+						if (this.#backgroundCallIds.has(toolCallId)) continue;
 						if (
 							!(component instanceof ToolExecutionComponent) &&
 							!(component instanceof ReadToolGroupComponent)
@@ -1943,12 +2018,20 @@ export class EventController {
 			const questions = recoverAskQuestions(args)?.map(question => question.question);
 			return { state: "blocked", kind: "question", msg: questions?.join(" ") };
 		}
-		const tool = this.ctx.viewSession.getToolByName(toolName);
+		const session = this.ctx.viewSession;
+		const tool = session.getToolByName(toolName);
 		if (!tool) return undefined;
 		const mode = cfgToolsApprovalMode.get(settings);
 		const userPolicies: Record<string, unknown> = cfgToolsApproval.get(settings);
-		const approval = resolveApproval(tool, args, mode, userPolicies);
+		const grants =
+			mode === "always-ask-cached"
+				? getApprovalGrants(settings.getAgentDir(), this.ctx.sessionManager.getSessionId())
+				: undefined;
+		const approval = resolveApproval(tool, args, mode, userPolicies, grants);
 		if (approval.policy !== "prompt") return undefined;
+		// Approved for this session: the wrapper runs it without asking.
+		const scope = sessionApprovalScope(approval, tool.name);
+		if (scope && session.extensionRunner?.hasSessionApproval(scope.key)) return undefined;
 		return { state: "blocked", kind: "permission", msg: formatApprovalPrompt(tool, args, approval.reason) };
 	}
 
@@ -1958,22 +2041,21 @@ export class EventController {
 		this.#ensureWorkingLoaderWhileStreaming();
 		const component = this.ctx.pendingTools.get(event.toolCallId);
 		if (component) {
-			const asyncState = (event.partialResult.details as { async?: { state?: string } } | undefined)?.async?.state;
-			const isFinalAsyncState = asyncState === "completed" || asyncState === "failed";
+			const isFinalAsyncState = isSettledJobFrame(event.partialResult.details);
 			// A final async snapshot is terminal only for a parked background
 			// block (the call already returned and was kept alive for its jobs).
 			// While the call is still executing — a mixed blocking+async task
 			// call whose jobs settle before its blocking subset — treat it as a
 			// partial frame: `tool_execution_end` still owns the terminal result.
-			const isTerminal = isFinalAsyncState && this.#backgroundTaskCallIds.has(event.toolCallId);
-			component.updateResult(
-				{ ...event.partialResult, isError: asyncState === "failed" },
-				!isTerminal,
-				event.toolCallId,
-			);
+			const isTerminal = isFinalAsyncState && this.#backgroundCallIds.has(event.toolCallId);
 			if (isTerminal) {
+				settleWithJobFrame(component, event.partialResult, event.toolCallId);
 				this.ctx.pendingTools.delete(event.toolCallId);
-				this.#backgroundTaskCallIds.delete(event.toolCallId);
+				this.#backgroundCallIds.delete(event.toolCallId);
+			} else {
+				if (isFinalAsyncState) this.#settledBeforeReturn.set(event.toolCallId, event);
+				const isError = asyncJobState(event.partialResult.details) === "failed";
+				component.updateResult({ ...event.partialResult, isError }, true, event.toolCallId);
 			}
 			this.ctx.ui.requestRender();
 		}
@@ -2027,15 +2109,23 @@ export class EventController {
 		component: ToolExecutionHandle,
 		event: Extract<AgentSessionEvent, { type: "tool_execution_end" }>,
 	): void {
-		const asyncState = (event.result.details as { async?: { state?: string } } | undefined)?.async?.state;
-		const isBackgroundTask = event.toolName === "task" && asyncState === "running";
-		component.updateResult({ ...event.result, isError: event.isError }, isBackgroundTask, event.toolCallId);
-		if (isBackgroundTask) {
+		const settled = this.#settledBeforeReturn.get(event.toolCallId)?.partialResult;
+		this.#settledBeforeReturn.delete(event.toolCallId);
+		const parks = parksAsBackground(event.toolName, event.result.details);
+		if (parks && settled) {
+			// The job finished before the call returned: its settled frame, not the
+			// `running` start result, is the card's final state.
+			settleWithJobFrame(component, settled, event.toolCallId);
+			this.ctx.pendingTools.delete(event.toolCallId);
+			return;
+		}
+		component.updateResult({ ...event.result, isError: event.isError }, parks, event.toolCallId);
+		if (parks) {
 			component.parkAsBackground();
-			this.#backgroundTaskCallIds.add(event.toolCallId);
+			this.#backgroundCallIds.add(event.toolCallId);
 		} else {
 			this.ctx.pendingTools.delete(event.toolCallId);
-			this.#backgroundTaskCallIds.delete(event.toolCallId);
+			this.#backgroundCallIds.delete(event.toolCallId);
 		}
 	}
 
@@ -2219,7 +2309,20 @@ export class EventController {
 		// leaving "Working…" gone while the agent keeps running. The live turn owns
 		// the loader and finalizes it at its own agent_end (isStreaming === false by
 		// then). Mirrors the collab guest's !isStreaming loader reconciler.
-		if (this.ctx.session.isStreaming) return;
+		if (this.ctx.session.isStreaming) {
+			// A focused worker can end while the main session streams; its run is
+			// over even though main's is not. Tear down only what the viewed worker
+			// owns (its loader); main-owned work waits for main's own settle.
+			const view = this.ctx.viewSession;
+			if (view !== this.ctx.session && !view.isStreaming && this.ctx.loadingAnimation) {
+				this.ctx.loadingAnimation.stop();
+				this.ctx.loadingAnimation = undefined;
+				this.ctx.statusContainer.disposeChildren();
+			}
+			this.#runActive = view.isStreaming;
+			this.#syncComposerActivity();
+			return;
+		}
 		// A non-terminal settle (`isTerminal: false`) is a scheduling pause, not the
 		// end of the run: the agent's own continuation (reminder, retry, queued
 		// steer/follow-up, IRC wake) follows, or background work may re-wake it.
@@ -2318,6 +2421,7 @@ export class EventController {
 
 	async #finishAgentEnd(event: Extract<AgentSessionEvent, { type: "agent_end" }>): Promise<void> {
 		this.#setTerminalProgress(false);
+		this.#hostTurnActive = false;
 		this.ctx.statusLine.markActivityEnd();
 		this.#lastAgentEndAt = Date.now();
 		this.#streamingReveal.stop();
@@ -2327,6 +2431,18 @@ export class EventController {
 			this.ctx.loadingAnimation = undefined;
 			this.ctx.statusContainer.disposeChildren();
 		}
+		// The turn is over, so any backoff it was sleeping in is over too: clear a
+		// countdown whose `provider_retry_wait_end` never arrived rather than leave
+		// it ticking over an idle session.
+		if (this.ctx.providerRetryLoader) {
+			this.ctx.providerRetryLoader.stop();
+			this.ctx.providerRetryLoader = undefined;
+			this.ctx.statusContainer.disposeChildren();
+		}
+		// A stale end landing after the viewed session started a new turn must
+		// not mark that live turn idle.
+		this.#runActive = this.ctx.viewSession.isStreaming;
+		this.#syncComposerActivity();
 		await this.ctx.flushPendingModelSwitch();
 		this.#sealAbandonedForegroundTools();
 		this.#blockingPrompts.clear();
@@ -2377,12 +2493,26 @@ export class EventController {
 	}
 
 	/**
+	 * True while the turn these events describe is running. A collab guest
+	 * replays the HOST's events into a replica session that never streams
+	 * locally, so its equivalent is the host turn it is currently replaying:
+	 * the `agent_start` it already handled. The host's `state` frames carry
+	 * the same fact but land on their own debounce, which is too late for a
+	 * backoff that begins with the turn's first request — the first wait would
+	 * be gated off and the guest would sit on "Working…" through it.
+	 */
+	#turnIsStreaming(): boolean {
+		if (this.ctx.viewSession.isStreaming) return true;
+		return this.ctx.collabGuest !== undefined && this.#hostTurnActive;
+	}
+
+	/**
 	 * Restore the live "Working…" loader when a streaming event lands after a
 	 * transient status overlay cleared the container. Focus mode dispatches events
 	 * for `viewSession`, so key the reconciler on that session, not the main one.
 	 */
 	#ensureWorkingLoaderWhileStreaming(): void {
-		if (!this.ctx.viewSession.isStreaming) return;
+		if (!this.#turnIsStreaming()) return;
 		if (this.ctx.autoCompactionLoader || this.ctx.retryLoader) return;
 		this.ctx.ensureLoadingAnimation();
 	}
@@ -2446,6 +2576,8 @@ export class EventController {
 			() => this.ctx.interruptFromPointer(),
 		);
 		this.ctx.statusContainer.addChild(this.ctx.autoCompactionLoader);
+		this.#maintenanceActive = true;
+		this.#syncComposerActivity();
 		this.ctx.ui.requestRender();
 	}
 
@@ -2461,6 +2593,8 @@ export class EventController {
 			this.ctx.autoCompactionLoader = undefined;
 			this.ctx.statusContainer.disposeChildren();
 		}
+		this.#maintenanceActive = false;
+		this.#syncComposerActivity();
 		const isHandoffAction = event.action === "handoff";
 		const isRemoteAction = event.action === "remote";
 		const isShakeAction = event.action === "shake";
@@ -2486,14 +2620,14 @@ export class EventController {
 				if (!event.skipped) {
 					this.ctx.rebuildChatFromMessages();
 					this.ctx.statusLine.invalidate();
-					this.ctx.ui.requestRender();
+					this.ctx.ui.requestRender(true, { clearScrollback: true });
 				}
 				this.ctx.showWarning(event.errorMessage);
 			} else if (!event.skipped) {
 				this.ctx.lastAssistantUsage = undefined;
 				this.ctx.rebuildChatFromMessages();
 				this.ctx.statusLine.invalidate();
-				this.ctx.ui.requestRender();
+				this.ctx.ui.requestRender(true, { clearScrollback: true });
 				this.ctx.showStatus("Auto-shake completed");
 			}
 		} else if (event.result) {
@@ -2582,6 +2716,85 @@ export class EventController {
 			() => this.ctx.interruptFromPointer(),
 		);
 		this.ctx.statusContainer.addChild(this.ctx.retryLoader);
+		this.ctx.ui.requestRender();
+	}
+
+	/**
+	 * A provider-internal retry backoff started. This is a pause inside the SAME
+	 * turn — pi-ai will re-issue the request itself — so unlike
+	 * `#handleAutoRetryStart` it must not set `#retryPending`, retract synthetic
+	 * failure cards, or touch the pinned error: nothing has been superseded.
+	 * Only the status line changes, so the wait stops looking like a freeze.
+	 */
+	async #handleProviderRetryWaitStart(
+		event: Extract<AgentSessionEvent, { type: "provider_retry_wait_start" }>,
+	): Promise<void> {
+		// A session-level retry/compaction overlay owns the status container and
+		// carries the more important message; leave it alone.
+		if (this.ctx.retryLoader || this.ctx.autoCompactionLoader) return;
+		// Background waits are not this turn's story: advisor turns and side
+		// streams (title generation, idle recap, handoff summaries) share the
+		// session, and side streams also run while idle — where the row holds
+		// e.g. the F5 retry hint. Only the main turn's wait mounts a countdown,
+		// and only while the turn is actually streaming.
+		if (event.role !== undefined && event.role !== "main") return;
+		if (!this.#turnIsStreaming()) return;
+		// A newer wait supersedes the mounted one: the newest wait is what the
+		// user is waiting on, so only its `_end` clears the countdown. Detach
+		// just the loaders this controller owns — never `disposeChildren()`,
+		// which would unmount a retry/compaction overlay mounted afterwards or
+		// a hint row the countdown never owned.
+		const previous = this.ctx.providerRetryLoader;
+		const working = this.ctx.loadingAnimation;
+		previous?.stop();
+		this.#stopWorkingLoader();
+		for (const loader of [previous, working]) {
+			if (loader && this.ctx.statusContainer.children.includes(loader)) {
+				this.ctx.statusContainer.removeChild(loader);
+			}
+		}
+		const waitStartMs = Date.now();
+		// Only the loops that count their retries send the counters; without them
+		// the label stays bare rather than claiming a made-up attempt.
+		const attemptLabel =
+			event.attempt !== undefined && event.maxAttempts !== undefined
+				? ` (${event.attempt}/${event.maxAttempts})`
+				: "";
+		const loader = new Loader(
+			this.ctx.ui,
+			spinner => theme.fg("warning", spinner),
+			text => theme.fg("muted", text),
+			() => {
+				const remaining = Math.max(0, event.delayMs - (Date.now() - waitStartMs));
+				return `Provider retrying${attemptLabel} in ${formatDuration(remaining)}…`;
+			},
+			getSymbolTheme().spinnerFrames,
+		);
+		this.ctx.providerRetryLoader = loader;
+		this.#providerRetryWaitId = event.waitId;
+		this.ctx.statusContainer.addChild(loader);
+		this.ctx.ui.requestRender();
+	}
+
+	async #handleProviderRetryWaitEnd(
+		event: Extract<AgentSessionEvent, { type: "provider_retry_wait_end" }>,
+	): Promise<void> {
+		const loader = this.ctx.providerRetryLoader;
+		if (!loader) return;
+		// Only the mounted wait's `_end` takes the countdown down. A stale end —
+		// an earlier wait superseded by a newer one, or a background wait that
+		// ended while a session-level overlay owns the row — must never unmount
+		// someone else's loader.
+		if (event.waitId !== this.#providerRetryWaitId) return;
+		this.ctx.providerRetryLoader = undefined;
+		this.#providerRetryWaitId = undefined;
+		loader.stop();
+		if (this.ctx.statusContainer.children.includes(loader)) {
+			this.ctx.statusContainer.removeChild(loader);
+		}
+		// The turn never ended: put "Working…" back so the stream keeps its
+		// indicator whether the retry succeeds or the wait was aborted.
+		this.#ensureWorkingLoaderWhileStreaming();
 		this.ctx.ui.requestRender();
 	}
 
@@ -2721,7 +2934,25 @@ export class EventController {
 		if (threshold <= 0) return;
 		if (this.#currentContextTokens() < threshold) return;
 
-		const timeoutMs = Math.max(60, Math.min(3600, idleSettings.idleTimeoutSeconds)) * 1000;
+		// Compact just before a 1h (long-tier) prompt cache entry expires, while
+		// the summary request can still read the cached prefix; a turn that settles
+		// past that point but before expiry compacts right away. A 5-minute entry
+		// lapses too soon after a turn for compaction to be worth starting on its
+		// schedule, so it, an unknown lifetime, and an expired entry all fall back
+		// to the configured delay.
+		// Deliberate cost: the delay counts from agent_end while the entry's TTL
+		// counts from the request send (`touchedAt`), so with the default 300s
+		// delay a short-tier idle summary always runs after the 5-minute entry
+		// expired and pays a cold full-prefix read. That is the price of never
+		// compacting after a short break; do not re-time short entries to dodge it.
+		const promptCacheEntry = this.ctx.viewSession.promptCacheEntry;
+		const cacheEntry = promptCacheEntry?.tier === "long" ? promptCacheEntry : undefined;
+		const refreshDelayMs = cacheEntry ? getCacheWarmingDelayMs(cacheEntry.ttlMs) : undefined;
+		const now = Date.now();
+		const timeoutMs =
+			cacheEntry && refreshDelayMs !== undefined && cacheEntry.touchedAt + cacheEntry.ttlMs > now
+				? Math.max(0, cacheEntry.touchedAt + refreshDelayMs - IDLE_COMPACTION_CACHE_LEAD_MS - now)
+				: Math.max(60, Math.min(3600, idleSettings.idleTimeoutSeconds)) * 1000;
 		this.#idleCompactionTimer = setTimeout(() => {
 			this.#idleCompactionTimer = undefined;
 			// Re-check conditions before firing. Pruning may have run between arming

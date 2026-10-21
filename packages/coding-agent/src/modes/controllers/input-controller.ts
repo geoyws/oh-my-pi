@@ -4,6 +4,7 @@ import type { ImageContent } from "@oh-my-pi/pi-ai";
 import {
 	type AutocompleteProvider,
 	type Component,
+	emergencyTerminalRestore,
 	matchesKey,
 	parseSgrMouse,
 	type PasteOptions,
@@ -15,7 +16,9 @@ import { appKey, editorKey } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
 import { formatModelRoleAlias, roleCandidatePool } from "../../config/model-roles";
 import { resolveModelRoleValue } from "../../config/model-resolver";
 import { isSettingsInitialized, settings } from "../../config/settings";
+import { runWithExecOwner } from "../../exec/exec";
 import { InternalUrlRouter, resolveLocalRoot } from "../../internal-urls";
+import { ApprovalDialogComponent } from "@oh-my-pi/pi-tui/overlays/approval-dialog";
 import { AskDialogComponent } from "@oh-my-pi/pi-tui/overlays/ask-dialog";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
 import { extractImagePathFromText } from "@oh-my-pi/pi-tui/prompt/custom-editor";
@@ -41,11 +44,12 @@ import type { InteractiveModeContext, SubmittedUserInput } from "../../modes/typ
 import manualContinuePrompt from "../../prompts/system/manual-continue.md" with { type: "text" };
 import { AgentRegistry } from "../../registry/agent-registry";
 import type { RestoredQueuedMessage } from "../../session/agent-session-types";
+import { UserMessageRefusedError } from "../../session/user-message-refused-error";
 import { USER_INTERRUPT_LABEL } from "../../session/messages";
 import { PINNED_HUD_TOGGLE_ID } from "@oh-my-pi/pi-tui/prompt/composer";
 import { pickRecentFocusableAgentId } from "./session-focus-controller";
 import { executeBuiltinSlashCommand, lookupBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
-import { restoreDetachedDraft } from "../../slash-commands/helpers/draft";
+import { restoreDetachedDraft, restoreRefusedLine } from "../../slash-commands/helpers/draft";
 import { parseSlashCommand, parseSubcommand } from "../../slash-commands/helpers/parse";
 import { isTinyLocalModelKey } from "../../tiny/models";
 import { tinyTitleClient } from "../../tiny/title-client";
@@ -163,13 +167,22 @@ const SHELL_PROMPT_OPERATOR_RE = /(?:^|\s)(?:&&|\|\||\||2>&1|[<>]{1,2})(?:\s|$)/
 const OMP_STATUS_LINE_RE = /^\s*in:\s+\d+\s+out:\s+\d+(?:\s+cache\s+\S+)?\s+t:\s+\S+\s+tok\/s:\s+\S+/m;
 
 /**
- * Read-only slash commands that also run from a focused subagent view, keyed by name to
- * a check on their arguments; every other command (and mutating forms such as
- * `/usage reset`, which spends a saved rate-limit reset) still needs the main session.
+ * Slash commands that also run from a focused subagent view, keyed by canonical name to
+ * a check on their arguments: viewer-scoped reads, plus the model and effort controls,
+ * which act on the focused agent's session. Every other command (and mutating forms such
+ * as `/usage reset`, which spends a saved rate-limit reset, or `/jobs kill`, which cancels
+ * a running job) still needs the main session.
  */
 const FOCUSED_VIEW_COMMANDS: Record<string, (args: string) => boolean> = {
 	btw: () => true,
+	effort: () => true,
 	export: () => true,
+	jobs: args => {
+		const { verb, rest } = parseSubcommand(args);
+		return !verb || (verb === "full" && !rest);
+	},
+	model: () => true,
+	switch: () => true,
 	usage: args => {
 		const { verb, rest } = parseSubcommand(args);
 		return !verb || (verb === "show" && !rest);
@@ -442,6 +455,10 @@ export class InputController {
 				if (focused instanceof AskDialogComponent && focused.toggleQuestionExpansion()) {
 					return { consume: true };
 				}
+				// Likewise an approval prompt that summarized its call's details.
+				if (focused instanceof ApprovalDialogComponent && focused.toggleDetails()) {
+					return { consume: true };
+				}
 				this.toggleToolOutputExpansion();
 				return { consume: true };
 			});
@@ -669,7 +686,7 @@ export class InputController {
 		}
 
 		for (const key of this.ctx.keybindings.getKeys("app.session.new")) {
-			this.ctx.editor.setCustomKeyHandler(key, () => this.ctx.handleClearCommand());
+			this.ctx.editor.setCustomKeyHandler(key, () => this.ctx.handleNewCommand());
 		}
 		for (const key of this.ctx.keybindings.getKeys("app.session.tree")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => this.ctx.showTreeSelector());
@@ -727,6 +744,9 @@ export class InputController {
 
 		this.ctx.editor.onChange = (text: string) => {
 			this.#draftText = text;
+			// Typing signals an imminent turn; refresh the API connection now so
+			// the handshake overlaps composition instead of delaying the send.
+			if (text) this.ctx.session.prewarmModelConnection();
 			const wasBashMode = this.ctx.isBashMode;
 			const wasPythonMode = this.ctx.isPythonMode;
 			const trimmed = text.trimStart();
@@ -908,6 +928,21 @@ export class InputController {
 		return compacted.text.trim();
 	}
 
+	/** Refusal hand-back for a `!`/`$` line: in place while its images are still the live prefix. */
+	#handBackRefusedCommandLine(
+		error: unknown,
+		text: string,
+		images: ImageContent[] | undefined,
+		imageLinks: (string | undefined)[] | undefined,
+	): boolean {
+		if (!(error instanceof UserMessageRefusedError)) return false;
+		restoreRefusedLine(this.ctx.editor, text, images, imageLinks);
+		this.ctx.showError(error.notice);
+		this.ctx.updatePendingMessagesDisplay();
+		this.ctx.ui.requestRender();
+		return true;
+	}
+
 	#dropSubmittedPending(images: ImageContent[] | undefined, links: (string | undefined)[] | undefined): void {
 		if (!images?.length) return;
 		const pending = this.ctx.editor.pendingImages;
@@ -937,6 +972,25 @@ export class InputController {
 		return { text, images, imageLinks };
 	}
 
+	/**
+	 * Restore a submission refused by a `before_user_message` handler. The
+	 * refused text was never sent or persisted; merge it back alongside any
+	 * newer draft typed while dispatch was pending (never clobber it) and
+	 * show only the handler's safe notice. Returns true when `error` is a
+	 * refusal; other errors fall through to the caller's own handling.
+	 */
+	#restoreRefusedSubmission(
+		error: unknown,
+		text: string,
+		images?: ImageContent[],
+		imageLinks?: (string | undefined)[],
+	): boolean {
+		if (!(error instanceof UserMessageRefusedError)) return false;
+		restoreDetachedDraft(this.ctx.editor, text, images, imageLinks);
+		this.ctx.showError(error.notice);
+		return true;
+	}
+
 	setupEditorSubmitHandler(): void {
 		this.ctx.editor.onSubmit = async (text: string) => {
 			const submittedText = text;
@@ -950,8 +1004,9 @@ export class InputController {
 
 			// Focused subagent session: the editor is a plain chat box for it.
 			// Everything below (slash/bash/python, loop,
-			// compaction queueing) is main-session-only.
-			if (this.ctx.focusedAgentId) {
+			// compaction queueing) is main-session-only. A tool-approval dialog
+			// owning the composer is the main session's, so its draft steers main.
+			if (this.ctx.focusedAgentId && !this.ctx.approvalOwnsComposer) {
 				await this.#submitToFocusedSession(text, "steer");
 				return;
 			}
@@ -1141,6 +1196,17 @@ export class InputController {
 				const isExcluded = text.startsWith("!!");
 				const command = isExcluded ? text.slice(2).trim() : text.slice(1).trim();
 				if (command) {
+					// User-authored shell text is persisted with the execution and
+					// replayed into later context: gate it before anything runs.
+					// Production Enter already emptied the composer, so a refusal
+					// merges the full original line (with its `!` prefix) back
+					// ahead of any newer draft instead of only reporting.
+					try {
+						await this.ctx.session.gateUserMessage(text, inputImages, "interactive");
+					} catch (error) {
+						if (this.#handBackRefusedCommandLine(error, text, inputImages, inputImageLinks)) return;
+						throw error;
+					}
 					if (this.ctx.session.isBashRunning) {
 						this.ctx.showWarning(
 							`A bash command is already running. Press ${appKey(this.ctx.keybindings, "app.interrupt")} to cancel it first.`,
@@ -1162,6 +1228,16 @@ export class InputController {
 			if (pythonCommand) {
 				const { code, isExcluded } = pythonCommand;
 				if (code) {
+					// Same pre-persistence gate as `!`: user-authored code is
+					// persisted with the execution result. A refusal merges the
+					// full original line (with its `$` prefix) back — the
+					// composer is already empty on production Enter.
+					try {
+						await this.ctx.session.gateUserMessage(text, inputImages, "interactive");
+					} catch (error) {
+						if (this.#handBackRefusedCommandLine(error, text, inputImages, inputImageLinks)) return;
+						throw error;
+					}
 					if (this.ctx.session.isEvalRunning) {
 						this.ctx.showWarning(
 							`A Python execution is already running. Press ${appKey(this.ctx.keybindings, "app.interrupt")} to cancel it first.`,
@@ -1196,8 +1272,9 @@ export class InputController {
 			if (this.#isLocalExtensionCommand(text)) {
 				this.ctx.editor.clearDraft(text);
 				try {
-					await this.ctx.session.prompt(text, { images: inputImages });
+					await this.ctx.session.prompt(text, { images: inputImages, source: "interactive" });
 				} catch (error) {
+					if (this.#restoreRefusedSubmission(error, text, inputImages, inputImageLinks)) return;
 					// Restore the snapshot only when nothing newer was attached
 					// while the command ran; otherwise the newer draft wins.
 					if (inputImages && inputImages.length > 0 && this.ctx.editor.pendingImages.length === 0) {
@@ -1230,7 +1307,7 @@ export class InputController {
 				try {
 					const forwarded = await this.ctx.withLocalSubmission(
 						text,
-						() => this.ctx.session.prompt(text, { streamingBehavior: "steer", images }),
+						() => this.ctx.session.prompt(text, { streamingBehavior: "steer", images, source: "interactive" }),
 						{ imageCount: images?.length ?? 0 },
 					);
 					// An inline `/loop` body arms the loop only after dispatch
@@ -1240,6 +1317,13 @@ export class InputController {
 					// state untouched, so the previous body (if any) survives.
 					if (submittedMode === "loop" && forwarded) this.ctx.setLoopPrompt(text);
 				} catch (error) {
+					// A refusal merges back alongside any newer draft instead of
+					// overwriting it (see #restoreRefusedSubmission).
+					if (this.#restoreRefusedSubmission(error, text, images, inputImageLinks)) {
+						this.ctx.updatePendingMessagesDisplay();
+						this.ctx.ui.requestRender();
+						return;
+					}
 					// Don't lose the queued steer draft: restore images then the collapsed
 					// text so chip tokens (and band cards) survive the retry.
 					if (images && images.length > 0) {
@@ -1307,7 +1391,7 @@ export class InputController {
 				try {
 					const forwarded = await this.ctx.withLocalSubmission(
 						text,
-						() => this.ctx.session.prompt(text, { streamingBehavior: "steer", images }),
+						() => this.ctx.session.prompt(text, { streamingBehavior: "steer", images, source: "interactive" }),
 						{
 							imageCount: images?.length ?? 0,
 						},
@@ -1317,6 +1401,14 @@ export class InputController {
 					// loop instead of resubmitting a local action on next idle.
 					if (!forwarded && this.ctx.loopPrompt === text) this.ctx.pauseLoop();
 				} catch (error) {
+					// A refusal merges back alongside any newer draft instead of
+					// overwriting it (see #restoreRefusedSubmission).
+					if (this.#restoreRefusedSubmission(error, text, images, inputImageLinks)) {
+						if (this.ctx.loopPrompt === text) this.ctx.pauseLoop();
+						this.ctx.updatePendingMessagesDisplay();
+						this.ctx.ui.requestRender();
+						return;
+					}
 					// Don't lose the message: hand images then collapsed text back to the
 					// editor so the user can retry (e.g. prompt dispatch rejecting an
 					// extension command).
@@ -1427,9 +1519,12 @@ export class InputController {
 		}
 		if (text?.startsWith("/")) {
 			const parsed = parseSlashCommand(text);
-			if (parsed && FOCUSED_VIEW_COMMANDS[parsed.name]?.(parsed.args)) {
+			const name = parsed && lookupBuiltinSlashCommand(parsed.name)?.name;
+			if (parsed && name && FOCUSED_VIEW_COMMANDS[name]?.(parsed.args)) {
 				// Viewer-scoped commands: /btw asks about the focused transcript, /export
-				// writes it (with its own subagents), /usage reports account-wide limits.
+				// writes it (with its own subagents), /jobs lists the focused agent's jobs
+				// without a way to cancel them, /usage reports account-wide limits, and
+				// /model, /switch, /effort change the focused agent's model and thinking.
 				this.#recordSlashCommandUsage(text);
 				if ((await executeBuiltinSlashCommand(text, { ctx: this.ctx })) === true) {
 					if (!shouldSkipHistory(text)) this.ctx.editor.addToHistory(text);
@@ -1451,11 +1546,22 @@ export class InputController {
 			if (isContinueShortcut) {
 				await target.prompt(manualContinuePrompt, { synthetic: true, userInitiated: true });
 			} else {
-				await this.ctx.withLocalSubmission(text, () => target.prompt(text, { streamingBehavior, images }), {
-					imageCount: images?.length ?? 0,
-				});
+				await this.ctx.withLocalSubmission(
+					text,
+					() => target.prompt(text, { streamingBehavior, images, source: "interactive" }),
+					{
+						imageCount: images?.length ?? 0,
+					},
+				);
 			}
 		} catch (error) {
+			// A refusal merges back alongside any newer draft instead of
+			// overwriting it (see #restoreRefusedSubmission).
+			if (this.#restoreRefusedSubmission(error, text, images, imageLinks)) {
+				this.ctx.updatePendingMessagesDisplay();
+				this.ctx.ui.requestRender();
+				return;
+			}
 			// Hand the message back, mirroring the main submit error path: restore
 			// pasted images so the user can retry an image-only or text+image draft.
 			if (images && images.length > 0) {
@@ -1493,7 +1599,11 @@ export class InputController {
 		if (this.ctx.isShuttingDown) {
 			// Route through postmortem: this hard-abort can fire while an
 			// extension-load guard window is open, where raw process.exit is a
-			// throwing ExtensionExitError stub (#11789).
+			// throwing ExtensionExitError stub (#11789). exitProcess skips the
+			// postmortem cleanups, so hand the terminal back first: shutdown() has
+			// not reached ui.stop() yet, and a kitty keyboard frame left pushed
+			// makes the parent shell receive Ctrl+C as `CSI 99;5u` (prints `9;5u`).
+			emergencyTerminalRestore();
 			postmortem.exitProcess(130); // 128 + SIGINT
 		}
 
@@ -1674,10 +1784,16 @@ export class InputController {
 				imageLinks: draftImageLinks,
 				optimistic: true,
 				propagateErrors: true,
+				source: "interactive",
 			});
 			if (!dispatched) restoreDraft();
 			return dispatched;
 		} catch (error) {
+			// A refusal merges back alongside any newer draft typed while
+			// dispatch was pending instead of overwriting it (see
+			// #restoreRefusedSubmission); other errors keep the legacy
+			// snapshot restore.
+			if (this.#restoreRefusedSubmission(error, text, draftImages, draftImageLinks)) return true;
 			restoreDraft();
 			this.ctx.showError(error instanceof Error ? error.message : String(error));
 			return true;
@@ -1798,9 +1914,10 @@ export class InputController {
 							await this.ctx.session.prompt(message, {
 								images: queuedImages,
 								streamingBehavior: "followUp",
+								source: "interactive",
 							});
 						} else {
-							await this.ctx.session.followUp(message, queuedImages);
+							await this.ctx.session.followUp(message, queuedImages, { source: "interactive" });
 						}
 					},
 					{ imageCount: queuedImages?.length ?? 0 },
@@ -1808,6 +1925,19 @@ export class InputController {
 				queuedCount++;
 			}
 		} catch (error) {
+			// A refusal merges back alongside any newer draft typed while
+			// dispatch was pending instead of overwriting it (see
+			// #restoreRefusedSubmission). The detached path already merges;
+			// only the live-editor path needs the refusal branch.
+			if (
+				queuedCount === 0 &&
+				options.detachedText === undefined &&
+				this.#restoreRefusedSubmission(error, text, images, imageLinks)
+			) {
+				this.ctx.updatePendingMessagesDisplay();
+				this.ctx.ui.requestRender();
+				return;
+			}
 			if (queuedCount === 0) {
 				if (options.detachedText !== undefined) {
 					restoreDetachedDraft(this.ctx.editor, options.detachedText, images, imageLinks);
@@ -1827,10 +1957,20 @@ export class InputController {
 						: `=>\n${remaining
 								.map((message, index) => `${index + 1}. ${message.replaceAll("\n", "\n   ")}`)
 								.join("\n")}`;
-				if (options.detachedText !== undefined) restoreDetachedDraft(this.ctx.editor, restored);
-				else this.ctx.editor.setText(restored);
+				// A refusal merges the remainder back alongside any newer
+				// draft typed while dispatch was pending instead of
+				// overwriting it; other errors keep the legacy snapshot.
+				if (error instanceof UserMessageRefusedError || options.detachedText !== undefined) {
+					restoreDetachedDraft(this.ctx.editor, restored);
+				} else {
+					this.ctx.editor.setText(restored);
+				}
 			}
-			this.ctx.showError(error instanceof Error ? error.message : String(error));
+			if (error instanceof UserMessageRefusedError) {
+				this.ctx.showError(error.notice);
+			} else {
+				this.ctx.showError(error instanceof Error ? error.message : String(error));
+			}
 		}
 
 		this.ctx.updatePendingMessagesDisplay();
@@ -1857,7 +1997,7 @@ export class InputController {
 		if (!text && !images) return;
 
 		// Focused subagent session: follow-ups go to it; non-chat input is gated.
-		if (this.ctx.focusedAgentId) {
+		if (this.ctx.focusedAgentId && !this.ctx.approvalOwnsComposer) {
 			await this.#submitToFocusedSession(text, "followUp");
 			return;
 		}
@@ -1930,7 +2070,7 @@ export class InputController {
 			try {
 				await this.ctx.withLocalSubmission(
 					text,
-					() => this.ctx.session.prompt(text, { streamingBehavior: "followUp", images }),
+					() => this.ctx.session.prompt(text, { streamingBehavior: "followUp", images, source: "interactive" }),
 					{ imageCount: images?.length ?? 0 },
 				);
 			} catch (error) {
@@ -1944,9 +2084,13 @@ export class InputController {
 		// Not streaming — just submit normally
 		this.ctx.editor.addToHistory(text);
 		try {
-			await this.ctx.withLocalSubmission(text, () => this.ctx.session.prompt(text, { images }), {
-				imageCount: images?.length ?? 0,
-			});
+			await this.ctx.withLocalSubmission(
+				text,
+				() => this.ctx.session.prompt(text, { images, source: "interactive" }),
+				{
+					imageCount: images?.length ?? 0,
+				},
+			);
 		} catch (error) {
 			restoreOnError(error);
 		}
@@ -2606,6 +2750,7 @@ export class InputController {
 					cwd: manager.getCwd(),
 					sessionId: manager.getSessionId(),
 					sessionFile: manager.getSessionFile(),
+					seanceSourceArtifactsDir: manager.getSeanceSourceArtifactsDir() ?? undefined,
 				};
 			},
 			keybindings: this.ctx.keybindings,
@@ -2655,13 +2800,7 @@ export class InputController {
 	}
 
 	cycleThinkingLevel(): void {
-		if (this.ctx.focusedAgentId) {
-			this.ctx.showStatus(
-				`Model/thinking apply to the main session — press ${formatDoubleTap("left")} to return first`,
-			);
-			return;
-		}
-		const newLevel = this.ctx.session.cycleThinkingLevel();
+		const newLevel = this.ctx.viewSession.cycleThinkingLevel();
 		if (newLevel === undefined) {
 			this.ctx.showStatus("Current model does not support thinking");
 		} else {
@@ -2671,15 +2810,9 @@ export class InputController {
 	}
 
 	async cycleRoleModel(direction: "forward" | "backward" = "forward"): Promise<void> {
-		if (this.ctx.focusedAgentId) {
-			this.ctx.showStatus(
-				`Model/thinking apply to the main session — press ${formatDoubleTap("left")} to return first`,
-			);
-			return;
-		}
 		try {
 			const cycleOrder = cfgCycleOrder.get(settings);
-			const result = await this.ctx.session.cycleRoleModels(cycleOrder, direction);
+			const result = await this.ctx.viewSession.cycleRoleModels(cycleOrder, direction);
 			if (!result) {
 				this.ctx.showStatus("Only one role model available");
 				return;
@@ -2713,6 +2846,12 @@ export class InputController {
 	}
 
 	toggleToolActivityVisibility(): void {
+		// Refuse before touching view state: the preference persists globally.
+		const readOnlyReason = this.ctx.settings.getGlobalConfigReadOnlyReason();
+		if (readOnlyReason !== undefined) {
+			this.ctx.showError(`Tool activity visibility unchanged. ${readOnlyReason}`);
+			return;
+		}
 		this.ctx.hideToolActivity = !this.ctx.hideToolActivity;
 		cfgDisplayHideToolActivity.set(this.ctx.settings, this.ctx.hideToolActivity);
 
@@ -2760,6 +2899,12 @@ export class InputController {
 			((this.ctx.viewSession ?? this.ctx.session)?.thinkingLevel ?? ThinkingLevel.Off) === ThinkingLevel.Off;
 		if (thinkingOff && !this.ctx.hasDisplayableThinkingContent) {
 			this.ctx.showStatus("Thinking is off — enable thinking to show blocks");
+			return;
+		}
+		// Refuse before touching view state: the preference persists globally.
+		const readOnlyReason = this.ctx.settings.getGlobalConfigReadOnlyReason();
+		if (readOnlyReason !== undefined) {
+			this.ctx.showError(`Thinking block visibility unchanged. ${readOnlyReason}`);
 			return;
 		}
 		this.ctx.hideThinkingBlock = !this.ctx.hideThinkingBlock;
@@ -2824,7 +2969,9 @@ export class InputController {
 				if (!runner.isExtensionActive(shortcut.extensionPath)) return;
 				const ctx = runner.createCommandContext();
 				try {
-					runner.runScoped(() => shortcut.handler(ctx));
+					// Attribute `pi.exec` children the shortcut starts to this
+					// session, like every other extension entry point.
+					runner.runScoped(() => runWithExecOwner(runner.sessionId, () => shortcut.handler(ctx)));
 				} catch (err) {
 					runner.emitError({
 						extensionPath: shortcut.extensionPath,

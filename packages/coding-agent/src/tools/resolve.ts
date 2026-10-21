@@ -166,7 +166,7 @@ export function queueResolveHandler(
 			apply: options.apply,
 			reject: options.reject,
 			onApplyError: () => {
-				// Apply threw (e.g. ast_edit overlapping replacements). Keep the preview
+				// Apply threw (e.g. ast edit overlapping replacements). Keep the preview
 				// pending under the SAME id so the model can reject or fix-and-retry;
 				// runResolveInvocation rethrows, so the success-path removal below is skipped.
 				queue.registerPendingInvoker(id, options.sourceToolName, onInvoked);
@@ -217,7 +217,7 @@ async function runResolveInvocation(
 		reject?(reason: string): Promise<AgentToolResult<unknown> | undefined>;
 		/** Invoked synchronously when `apply()` throws, before the error is rethrown.
 		 *  The queued caller uses this to re-push the pending invoker so the
-		 *  pending preview survives a failed apply (e.g. overlapping ast_edit
+		 *  pending preview survives a failed apply (e.g. overlapping ast edit
 		 *  replacements) and the model can reject or fix-and-retry. */
 		onApplyError?(error: unknown): void;
 	},

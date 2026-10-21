@@ -8,11 +8,16 @@ import {
 	resolveOutputSinkArtifactMaxBytes,
 	resolveOutputSinkHeadBytes,
 } from "../tools/output-meta";
-import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP, isEvalTimeoutControlEvent } from "./bridge-timeout";
+import {
+	EVAL_TIMEOUT_PAUSE_OP,
+	EVAL_TIMEOUT_RESUME_OP,
+	rejectRuntimeTimeoutControl,
+	rejectTimeoutControlCollision,
+} from "./bridge-timeout";
 import type { JsStatusEvent } from "./js/shared/types";
-import type { KernelDisplayOutput } from "./py/display";
 import { registerPyToolBridge } from "./py/tool-bridge";
 import { getActiveEvalShadowCell } from "./speculation/runtime-context";
+import type { EvalDisplayOutput } from "./types";
 
 /**
  * Constructor for a language executor's cancellation error. Each backend
@@ -37,13 +42,12 @@ export class EvalKernelNotRunningError extends Error {
  * over agents keeps one event per handle instead of one per poll tick. Shared
  * by the kernel (Python) and VM (JS) executors.
  */
-export class DisplayOutputCollector<T extends KernelDisplayOutput> {
-	readonly outputs: T[] = [];
+export class DisplayOutputCollector {
+	readonly outputs: EvalDisplayOutput[] = [];
 	readonly #snapshotIndex = new Map<string, number>();
 
-	push(output: T): void {
-		const display: KernelDisplayOutput = output;
-		const key = display.type === "status" ? statusEventKey(display.event) : undefined;
+	push(output: EvalDisplayOutput): void {
+		const key = output.type === "status" ? statusEventKey(output.event) : undefined;
 		if (key !== undefined) {
 			const index = this.#snapshotIndex.get(key);
 			if (index !== undefined) {
@@ -77,6 +81,8 @@ export interface KernelExecutorBaseOptions {
 	bridgeSessionId?: string;
 	artifactId?: string;
 	artifactPath?: string;
+	/** Model-visible note that this cell runs in a kernel restarted after an idle reap; leads the output. */
+	kernelRestartNotice?: string;
 }
 
 /** Normalised execution result produced by {@link executeWithKernelBase}. */
@@ -93,7 +99,7 @@ export interface KernelExecutionResult {
 	totalBytes: number;
 	outputLines: number;
 	outputBytes: number;
-	displayOutputs: KernelDisplayOutput[];
+	displayOutputs: EvalDisplayOutput[];
 	stdinRequested: boolean;
 }
 
@@ -108,7 +114,7 @@ export interface GenericKernel<TEnv> {
 			id: string;
 			signal?: AbortSignal;
 			onChunk: (text: string) => Promise<void> | void;
-			onDisplay: (output: KernelDisplayOutput) => Promise<void> | void;
+			onDisplay: (output: EvalDisplayOutput) => Promise<void> | void;
 		},
 	): Promise<{
 		status: "ok" | "error";
@@ -117,6 +123,8 @@ export interface GenericKernel<TEnv> {
 		kernelKilled?: boolean;
 		stdinRequested?: boolean;
 	}>;
+	/** Runner process id, when the kernel runs as a host child process. */
+	readonly pid?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +272,10 @@ function createBridgeAbortShield(source: AbortSignal | undefined): BridgeAbortSh
 		}
 		if (event.op !== EVAL_TIMEOUT_RESUME_OP || pauseDepth === 0) return;
 		pauseDepth--;
+		// A nested resume only releases its own level: the deferred abort is
+		// delivered once the outermost pause resumes, so an inner bridge
+		// return can never expose an outer critical phase to a mid-merge abort.
+		if (pauseDepth > 0) return;
 		if (shield.abortRequested && !controller.signal.aborted) controller.abort(abortReason);
 	};
 	shield.dispose = (): void => {
@@ -425,6 +437,12 @@ export interface ExecuteWithKernelBaseParams<
 	buildKernelEnvPatch: (options: TOptions) => TEnv;
 	formatKernelTimeoutAnnotation: (executionTimeoutMs: number | undefined, kernelKilled: boolean) => string;
 	formatTimeoutAnnotation: (executionTimeoutMs: number | undefined) => string | undefined;
+	/**
+	 * Awaited kernel setup before the cell (e.g. prelude sync), given the remaining budget. It runs after
+	 * the restart notice reaches the output and after the deadline check, so its timeout or abort settles
+	 * as this cell's cancelled result.
+	 */
+	prepare?: (remainingMs: number | undefined) => Promise<void>;
 }
 
 export async function executeWithKernelBase<
@@ -441,6 +459,7 @@ export async function executeWithKernelBase<
 		buildKernelEnvPatch,
 		formatKernelTimeoutAnnotation,
 		formatTimeoutAnnotation,
+		prepare,
 	} = params;
 
 	const settings = await Settings.init();
@@ -453,7 +472,7 @@ export async function executeWithKernelBase<
 		maxColumns: resolveOutputMaxColumns(settings),
 	});
 
-	const display = new DisplayOutputCollector<KernelDisplayOutput>();
+	const display = new DisplayOutputCollector();
 	const displayOutputs = display.outputs;
 	const deadlineMs = getExecutionDeadlineMs(options);
 	const remainingMs = getRemainingTimeoutMs(deadlineMs);
@@ -475,17 +494,54 @@ export async function executeWithKernelBase<
 			: (timeoutSignal ?? options?.signal);
 	const abortShield = createBridgeAbortShield(abortSource);
 
-	const collectDisplay = (output: KernelDisplayOutput): void => {
+	/**
+	 * Host-owned watchdog control. Reaching this function *is* the authority:
+	 * only this process's `withBridgeTimeoutPause` wrapper is handed it, so
+	 * nothing a runtime sends — and no tool status event that merely shares the
+	 * op string — can move the cell deadline or the abort shield's defer depth.
+	 *
+	 * Atomic-sink contract: the shield above is applied first and the observer
+	 * fanout below is best-effort. A throwing status observer must not unwind
+	 * this channel: the applied pause/resume state stands, the failure is
+	 * logged, and pause/resume pairing (including nested depths) stays intact.
+	 */
+	const handleTimeoutControl = (event: JsStatusEvent): void => {
+		abortShield.handleStatus?.(event);
+		try {
+			options?.onStatus?.(event);
+		} catch (error) {
+			logger.warn("eval timeout control observer failed; keeping the applied pause/resume state", {
+				op: event.op,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	};
+
+	/**
+	 * Generic host status (tool progress, tool errors). Its `op` is a tool name,
+	 * so an op colliding with timeout control is a *name*, never authority: drop
+	 * the collision and leave the deadline armed.
+	 */
+	const emitHostStatus = (event: JsStatusEvent): void => {
+		if (rejectTimeoutControlCollision(event, `${errorLogLabel} tool status`)) return;
+		options?.onStatus?.(event);
+		display.push({ type: "status", event });
+	};
+
+	/**
+	 * Kernel-originated display. Evaluated code can call `__omp_emit_status`,
+	 * so a timeout pause/resume arriving here
+	 * is forged (or an echo) and is dropped: the deadline stays armed.
+	 */
+	const collectDisplay = (output: EvalDisplayOutput): void => {
 		if (output.type === "status") {
-			abortShield.handleStatus?.(output.event);
+			if (rejectRuntimeTimeoutControl(output.event, errorLogLabel)) return;
 			options?.onStatus?.(output.event);
-			if (isEvalTimeoutControlEvent(output.event)) return;
 		}
 		display.push(output);
 	};
 
-	const emitStatus: (event: JsStatusEvent) => void =
-		options?.emitStatus ?? (event => collectDisplay({ type: "status", event }));
+	const emitStatus: (event: JsStatusEvent) => void = options?.emitStatus ?? emitHostStatus;
 	const runId = `${runIdPrefix}-${crypto.randomUUID()}`;
 	// Two aborts cross the bridge, and conflating them is what let a cancelled
 	// turn keep working. Delegated work (above all the subagents `agent()`
@@ -503,6 +559,8 @@ export async function executeWithKernelBase<
 					signal: options.signal,
 					shieldedSignal: abortShield.signal,
 					emitStatus,
+					onTimeoutControl: handleTimeoutControl,
+					kernelPid: kernel.pid,
 					shadowCell: getActiveEvalShadowCell(),
 					abortRequested: () => {
 						return abortShield.abortRequested;
@@ -511,9 +569,12 @@ export async function executeWithKernelBase<
 			: null;
 
 	try {
+		// Before any early exit: every result dumped from this sink, a timeout included, carries the note.
+		if (options?.kernelRestartNotice) sink.push(options.kernelRestartNotice);
 		if (remainingMs !== undefined && remainingMs <= 0) {
 			throw new cancelledErrorClass(true);
 		}
+		await prepare?.(getRemainingTimeoutMs(deadlineMs));
 
 		const result = await kernel.execute(code, {
 			cwd: options?.cwd,

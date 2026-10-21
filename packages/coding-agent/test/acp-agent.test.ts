@@ -23,7 +23,7 @@ import type {
 	UsageFallbackConfirmation,
 } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SILENT_ABORT_MARKER } from "@oh-my-pi/pi-coding-agent/session/messages";
-import { resetSessionIndexForTests } from "@oh-my-pi/pi-coding-agent/session/session-index";
+import { closeSessionIndex } from "@oh-my-pi/pi-coding-agent/session/session-index";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -137,7 +137,9 @@ class FakeAgentSession {
 	}
 	promptCalls: string[] = [];
 	customMessages: Array<{ customType: string; content: string; details?: unknown }> = [];
-	customMessageOptions: Array<{ streamingBehavior?: "steer" | "followUp"; queueChipText?: string } | undefined> = [];
+	customMessageOptions: Array<
+		{ streamingBehavior?: "steer" | "followUp"; queueChipText?: string; source?: string } | undefined
+	> = [];
 	skillsSettings = { enableSkillCommands: true };
 	skills: Array<{ name: string; description: string; filePath: string; baseDir: string; source: string }> = [];
 	async refreshSkillsAndCommands(): Promise<void> {}
@@ -276,7 +278,7 @@ class FakeAgentSession {
 
 	async promptCustomMessage(
 		message: { customType: string; content: string; details?: unknown },
-		options?: { streamingBehavior?: "steer" | "followUp"; queueChipText?: string },
+		options?: { streamingBehavior?: "steer" | "followUp"; queueChipText?: string; source?: string },
 	): Promise<void> {
 		this.customMessages.push(message);
 		this.customMessageOptions.push(options);
@@ -483,7 +485,7 @@ afterEach(async () => {
 	resetSettingsForTest();
 
 	// Renames index titles in the process-wide `<agentDir>/history.db`; Windows cannot delete it while open.
-	resetSessionIndexForTests();
+	closeSessionIndex();
 	for (const root of cleanupRoots.splice(0)) {
 		await fs.promises.rm(root, { recursive: true, force: true });
 	}
@@ -1269,12 +1271,9 @@ describe("ACP agent", () => {
 				speedRange: { min: 0.5, max: 2.5 },
 			},
 		});
-		expect(result.speechToText.models.map(model => model.value)).toEqual([
-			"local/whisper-base",
-			"local/whisper-small",
-			"local/whisper-large-v3-turbo",
-			"local/parakeet-tdt-0.6b-v3",
-		]);
+		expect(result.speechToText.models).toContainEqual(
+			expect.objectContaining({ value: "local/nemotron-streaming-en-0.6b" }),
+		);
 		expect(result.textToSpeech.models.map(model => model.value)).toEqual(["local/kokoro"]);
 		expect(result.textToSpeech.models[0]?.voices).toEqual(result.textToSpeech.voices);
 		// Speed presets are numbers so clients can write them straight into the numeric settings.
@@ -2108,7 +2107,7 @@ describe("ACP agent", () => {
 		expect(customMessage.content).toContain("# Sample\nDo work.");
 		expect(customMessage.content).toContain(`[Skill directory: ${skillDir}]`);
 		expect(customMessage.content).toContain("User: extra context");
-		expect(session.customMessageOptions[0]).toEqual({ streamingBehavior: "steer" });
+		expect(session.customMessageOptions[0]).toEqual({ streamingBehavior: "steer", source: "acp" });
 
 		harness.abortController.abort();
 		await Bun.sleep(0);

@@ -2,7 +2,10 @@ import { beforeAll, describe, expect, it } from "bun:test";
 import * as os from "node:os";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { AstTool } from "@oh-my-pi/pi-coding-agent/tools/ast";
+import { GlobTool } from "@oh-my-pi/pi-coding-agent/tools/glob";
 import { GrepTool } from "@oh-my-pi/pi-coding-agent/tools/grep";
+import { FindTool } from "@oh-my-pi/pi-coding-agent/tools/jfind";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 
@@ -20,10 +23,13 @@ function createTestToolSession(cwd: string): ToolSession {
 	};
 }
 
+// A dynamic approval returns a bare tier or a `{ tier, policyKey? }` decision
+// (ast carries a per-mode policy key); these tests pin the tier.
 function callApproval(tool: { approval?: unknown }, args: unknown): string {
 	const approval = tool.approval;
 	if (typeof approval !== "function") throw new Error("expected a dynamic approval function");
-	return approval(args) as string;
+	const decision = approval(args) as string | { tier: string };
+	return typeof decision === "string" ? decision : decision.tier;
 }
 
 describe("ssh:// tools require exec-tier approval", () => {
@@ -43,10 +49,26 @@ describe("ssh:// tools require exec-tier approval", () => {
 		const tool = new GrepTool(createTestToolSession(os.tmpdir()));
 		// The delimited string is one entry at approval time (expansion happens
 		// later), so an anchored check would miss it — the substring scan must not.
+		expect(callApproval(tool, { path: "src,ssh://icaro/etc/hosts" })).toBe("exec");
+		expect(callApproval(tool, { path: "src;ssh://icaro/etc/hosts" })).toBe("exec");
+		// Unvalidated args may still carry a list or the legacy `paths` key.
+		expect(callApproval(tool, { path: ["src", "ssh://icaro/etc/hosts"] })).toBe("exec");
 		expect(callApproval(tool, { paths: "src,ssh://icaro/etc/hosts" })).toBe("exec");
-		expect(callApproval(tool, { paths: ["src", "ssh://icaro/etc/hosts"] })).toBe("exec");
-		expect(callApproval(tool, { paths: ["src", "lib"] })).toBe("read");
-		expect(callApproval(tool, { paths: "src" })).toBe("read");
+		expect(callApproval(tool, { path: '["src","ssh:\\/\\/icaro\\/etc\\/hosts"]' })).toBe("exec");
+		expect(callApproval(tool, { path: "src,lib" })).toBe("read");
+		expect(callApproval(tool, { path: "src" })).toBe("read");
+		expect(callApproval(tool, {})).toBe("read");
+	});
+
+	it.each([
+		["find", (session: ToolSession) => new FindTool(session)],
+		["glob", (session: ToolSession) => new GlobTool(session)],
+		["ast", (session: ToolSession) => new AstTool(session)],
+	])("%s: an ssh:// path is exec, local paths stay read", (_name, create) => {
+		const tool = create(createTestToolSession(os.tmpdir()));
+		expect(callApproval(tool, { path: "ssh://icaro/etc" })).toBe("exec");
+		expect(callApproval(tool, { path: "src,ssh://icaro/etc" })).toBe("exec");
+		expect(callApproval(tool, { path: "src" })).toBe("read");
 		expect(callApproval(tool, {})).toBe("read");
 	});
 

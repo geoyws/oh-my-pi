@@ -24,7 +24,8 @@ import type {
 import type { InteractiveModeContext } from "../modes/types";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
-import type { AgentSessionEvent } from "../session/agent-session";
+import { type AgentSessionEvent } from "../session/agent-session";
+import { UserMessageRefusedError } from "../session/user-message-refused-error";
 import { stripImagesFromMessage, USER_INTERRUPT_LABEL } from "../session/messages";
 import type { SessionEntry as StoredSessionEntry } from "../session/session-entries";
 import { TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT_PROGRESS_CHANNEL } from "../task/types";
@@ -97,6 +98,8 @@ const WIRE_AGENT_EVENT_TYPES: Record<WireAgentEvent["type"], true> = {
 	auto_compaction_end: true,
 	auto_retry_start: true,
 	auto_retry_end: true,
+	provider_retry_wait_start: true,
+	provider_retry_wait_end: true,
 	thinking_level_changed: true,
 };
 
@@ -1005,6 +1008,17 @@ export class CollabHost {
 				if (dispatched === false) return this.#notifyPromptDropped(fromPeer);
 			})
 			.catch(err => {
+				// A `before_user_message` refusal: nothing was sent or persisted. Hand
+				// the submitter its own text back (targeted, never broadcast) so the
+				// guest restores the draft its composer already cleared; the message
+				// carries only the handler's safe notice.
+				if (err instanceof UserMessageRefusedError) {
+					this.#send(
+						{ t: "error", message: err.notice, refused: { text, ...(images?.length ? { images } : {}) } },
+						fromPeer,
+					);
+					return;
+				}
 				logger.warn("collab guest prompt failed", { error: String(err) });
 				this.#send({ t: "error", message: `prompt failed: ${String(err)}` }, fromPeer);
 			});

@@ -37,6 +37,7 @@ import type {
 } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { ContextUsage } from "@oh-my-pi/pi-tui/status-line/types";
+import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type {
 	Api,
 	AssistantMessage,
@@ -256,6 +257,39 @@ export interface ExtensionCustomOptions {
 /** Wrap the current autocomplete provider with additional behavior (pi-compatible). */
 export type AutocompleteProviderFactory = (current: AutocompleteProvider) => AutocompleteProvider;
 
+/** The renderings of a tool-approval prompt passed to `ExtensionUIContext.approve()`. */
+export interface ExtensionApprovalPrompt {
+	full: string;
+	compact: string;
+	/** Label of the "approve for this session" choice; absent when the call must be approved each time. */
+	session?: string;
+	/**
+	 * Grants an `always-ask-cached` prompt can remember, in display order; absent otherwise. A host
+	 * that does not render them still answers `once`/`session`/`deny`.
+	 */
+	grants?: readonly ExtensionApprovalGrant[];
+}
+
+/** One remembered-approval choice of an `always-ask-cached` prompt. */
+export interface ExtensionApprovalGrant {
+	/** `folder`: the directory around the call, its own entries only; `target`: the exact file or URL. */
+	scope: "folder" | "target";
+	/** Label of the choice remembered for this session, e.g. `Approve Directory: ~/src`. */
+	label: string;
+	/** Label of the same choice remembered across sessions, e.g. `Always Approve Directory: ~/src`. */
+	alwaysLabel: string;
+}
+
+/**
+ * An answer to `ExtensionUIContext.approve()`: this call only, later like calls this session too,
+ * one of the prompt's {@link ExtensionApprovalPrompt.grants} (`always`: across sessions), or no.
+ */
+export type ExtensionApprovalAnswer =
+	| "once"
+	| "session"
+	| "deny"
+	| { grant: ExtensionApprovalGrant["scope"]; always: boolean };
+
 /**
  * UI context for extensions to request interactive UI.
  * Each mode (interactive, RPC, print) provides its own implementation.
@@ -290,6 +324,17 @@ export interface ExtensionUIContext {
 		questions: ExtensionAskDialogQuestion[],
 		dialogOptions?: ExtensionUIDialogOptions,
 	): Promise<ExtensionAskDialogResult | undefined>;
+
+	/**
+	 * Show a tool-approval prompt; anything but an explicit approval is `deny`, `session` only when
+	 * the prompt offers it, and a grant only one the prompt lists. Each prompt is a title line then
+	 * details: `compact` summarizes the tool's own details (command, path, content) to one row for a
+	 * host with little room, `full` keeps them whole. Absent: callers fall back to a `select`.
+	 */
+	approve?(
+		prompt: ExtensionApprovalPrompt,
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<ExtensionApprovalAnswer>;
 
 	/** Show a notification to the user. */
 	notify(message: string, type?: "info" | "warning" | "error"): void;
@@ -366,6 +411,9 @@ export interface ExtensionUIContext {
 	setEditorComponent(
 		factory: ((tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) => CustomEditor) | undefined,
 	): void;
+
+	/** Get the current custom editor factory, if one has been installed. */
+	getEditorComponent(): ((tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) => CustomEditor) | undefined;
 
 	/** Get the current theme for styling. */
 	readonly theme: Theme;
@@ -653,6 +701,33 @@ export interface ExtensionContext {
 	hasPendingMessages(): boolean;
 	/** Gracefully shutdown and exit. */
 	shutdown(): void;
+	/**
+	 * Answer the open interactive plan review as if the operator picked `choice` in it.
+	 * `refine` needs non-empty `input.feedback`, which is sent as the next planning prompt.
+	 * `save` writes the plan under its default file name without the path prompt.
+	 * Approvals execute the plan as it is when picked (in-overlay edits, else the plan
+	 * file), which may differ from the `planContent` that `plan_review_requested` reported.
+	 * `input.role` selects an approval's execution tier, matched against `plan_review_requested`'s
+	 * `tiers` by role name; without it the approval runs on the tier selected in the
+	 * overlay's model slider. `role` applies only to approvals (`execute`, `compact`, `keep`).
+	 * False when that review is not open, the choice is disabled or missing its feedback,
+	 * `input.role` names no selectable tier or accompanies a non-approval choice, or the
+	 * mode has no plan review.
+	 */
+	resolvePlanReview(reviewId: string, choice: PlanReviewChoice, input?: { feedback?: string; role?: string }): boolean;
+	/**
+	 * The open interactive plan review still awaiting an answer, as `plan_review_requested` reported it,
+	 * or `undefined`. Lets an extension that loaded or reconnected after the event answer the review.
+	 */
+	getPendingPlanReview(): PlanReviewRequestedEvent | undefined;
+	/**
+	 * Open the interactive plan review on the newest plan file, like `/plan-review`, while the
+	 * session is idle. True once a review is awaiting an answer (an already-open review is kept,
+	 * not replaced), without waiting for a choice. False, without aborting anything or showing
+	 * warnings, when plan mode is inactive, the agent is streaming or compacting, or no non-empty
+	 * plan file exists.
+	 */
+	openPlanReview(): Promise<boolean>;
 	/** Identity of the agent this session runs: the top-level session or a subagent. */
 	agent: ExtensionAgentIdentity;
 	/**
@@ -829,6 +904,9 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	/** Tool approval tier. Defaults to `"exec"` when omitted.
 	 *  `"read"`: read-only operations. `"write"`: mutations. `"exec"`: code execution. */
 	approval?: ToolApproval;
+	/** Exact targets an approval mode may remember for this call (`always-ask-cached`), one key per
+	 *  target, derived from the call's args. Omit it and approvals are never remembered per target. */
+	approvalCacheTargets?: (args: unknown) => readonly string[] | undefined;
 	/** Structured-output strict grammar opt-in/out. `false` is meaningful: OpenAI-family
 	 *  serializers preserve an explicit `strict: false` on the wire (#4336/#4340). */
 	strict?: boolean;
@@ -836,6 +914,8 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	mcpServerName?: string;
 	/** Original MCP tool name for discovery/search metadata. */
 	mcpToolName?: string;
+	/** MCP read-only annotation, independent of the approval tier. */
+	mcpReadOnlyHint?: boolean;
 	/** Previous public name when a rename changed minting. Forwarded through
 	 *  RegisteredToolAdapter so approval falls back to legacy `deny`/`prompt`. */
 	legacyName?: string;
@@ -1173,12 +1253,48 @@ export interface UserPythonEvent {
 // Input Events
 // ============================================================================
 
+/** Where a user message entered the session. `queued`/`aside` name the
+ * delivery-time recheck of a message that was already queued; every other
+ * value names the submission path. `unknown` means the caller did not say
+ * (programmatic sends that bypass the known ingress points). */
+export type UserMessageSource = "interactive" | "rpc" | "acp" | "print" | "extension" | "queued" | "aside" | "unknown";
+
 /** Fired when the user submits input (interactive mode only). */
 export interface InputEvent {
 	type: "input";
 	text: string;
 	images?: ImageContent[];
 	source: "interactive" | "rpc" | "extension";
+}
+
+/**
+ * Pre-persistence gate for a user message. Fires at submission (before the
+ * message reaches the provider, the session JSONL, or any queue that later
+ * persists it) and again at queued/aside delivery, so a message enqueued
+ * before extensions finished registering still faces the check.
+ *
+ * Unlike `input` (interactive/RPC ingress only, `handled: true` clears the
+ * draft), this covers every user-message ingress: typed prompts, queued and
+ * aside deliveries, user-invoked skill expansions, writable-collab peer
+ * prompts, `/btw` questions, `/goal` and RPC goal objectives, `/tan` work,
+ * `/omfg` complaints, `/cleanse` requests, `/guided-goal` and `/ratchet`
+ * text, summarizer instructions
+ * (`/compact`, `/handoff`, `/tree`), and local shell (`!`) and Python (`$`)
+ * commands. A refusal keeps
+ * the interactive editor draft. Return `{ refuse: true, notice }` to drop the
+ * message: it is never sent, never persisted, and the UI shows only `notice`.
+ * The notice is the extension's responsibility — it must be safe to display
+ * verbatim and must never quote the message text. A refusal without a notice
+ * receives a generic fallback. Any other return (including `undefined`)
+ * admits the message. A handler that throws or exceeds its timeout refuses
+ * the message (fail-closed) with the generic fallback notice.
+ */
+export interface BeforeUserMessageEvent {
+	type: "before_user_message";
+	/** The user message text as submitted (post command/template expansion at submission time). */
+	text: string;
+	images?: ImageContent[];
+	source: UserMessageSource;
 }
 
 // ============================================================================
@@ -1201,6 +1317,51 @@ export interface ToolApprovalResolvedEvent {
 	toolName: string;
 	approved: boolean;
 	reason?: string;
+}
+
+/** Stable ids for the interactive plan review's choices; labels may change (keep's label carries a token count). */
+export type PlanReviewChoice = "execute" | "compact" | "keep" | "refine" | "save";
+/** A choice as displayed in the interactive plan review, delivered in display order by `plan_review_requested`. */
+export interface PlanReviewOption {
+	id: PlanReviewChoice;
+	label: string;
+	disabled: boolean;
+}
+/** An execution tier selectable in the plan review's model slider; pass `role` back as `input.role` to `ctx.resolvePlanReview`. */
+export interface PlanReviewTier {
+	role: string;
+	provider: string;
+	model: string;
+	/** Thinking level the role's configured model pins (a `provider/model:high` suffix); absent when it inherits. */
+	thinkingLevel?: ConfiguredThinkingLevel;
+}
+
+/**
+ * The interactive plan review opened (interactive mode only). Resolve it with `ctx.resolvePlanReview`.
+ * `plan_review_resolved` waits until every handler of this event returns, so handlers should hand
+ * long work (a remote round-trip, a dialog) off rather than await it.
+ */
+export interface PlanReviewRequestedEvent {
+	type: "plan_review_requested";
+	reviewId: string;
+	sessionId: string;
+	title: string;
+	planFilePath: string;
+	planContent: string;
+	options: PlanReviewOption[];
+	/** Execution tiers in slider order (not selection order); omitted when fewer than two resolve. */
+	tiers?: PlanReviewTier[];
+}
+/**
+ * The plan review closed: a choice, or `undefined` when it was dismissed or cancelled (session switch,
+ * replacement review, shutdown). `by` is `"extension"` only for a choice made via `ctx.resolvePlanReview`.
+ */
+export interface PlanReviewResolvedEvent {
+	type: "plan_review_resolved";
+	reviewId: string;
+	sessionId: string;
+	choice: PlanReviewChoice | undefined;
+	by: "local" | "extension";
 }
 
 interface ToolCallEventBase {
@@ -1376,10 +1537,13 @@ export type ExtensionEvent =
 	| UserBashEvent
 	| UserPythonEvent
 	| InputEvent
+	| BeforeUserMessageEvent
 	| ToolCallEvent
 	| ToolResultEvent
 	| ToolApprovalRequestedEvent
-	| ToolApprovalResolvedEvent;
+	| ToolApprovalResolvedEvent
+	| PlanReviewRequestedEvent
+	| PlanReviewResolvedEvent;
 
 // ============================================================================
 // Event Results
@@ -1416,6 +1580,14 @@ export interface InputEventResult {
 	text?: string;
 	/** Replace any pending images */
 	images?: ImageContent[];
+}
+
+/** Result from a `before_user_message` handler. Return `undefined` to admit the message. */
+export interface BeforeUserMessageEventResult {
+	/** Refuse the message: it is never sent, never persisted, never queued. */
+	refuse?: boolean;
+	/** Safe-to-display notice shown in place of the message. Must never quote the message text. */
+	notice?: string;
 }
 
 /** Result from user_bash event handler */
@@ -1580,8 +1752,14 @@ export interface ExtensionAPI {
 	on(event: "goal_updated", handler: ExtensionHandler<GoalUpdatedEvent>): void;
 	on(event: "credential_disabled", handler: ExtensionHandler<CredentialDisabledEvent>): void;
 	on(event: "input", handler: ExtensionHandler<InputEvent, InputEventResult>): void;
+	on(
+		event: "before_user_message",
+		handler: ExtensionHandler<BeforeUserMessageEvent, BeforeUserMessageEventResult>,
+	): void;
 	on(event: "tool_approval_requested", handler: ExtensionHandler<ToolApprovalRequestedEvent>): void;
 	on(event: "tool_approval_resolved", handler: ExtensionHandler<ToolApprovalResolvedEvent>): void;
+	on(event: "plan_review_requested", handler: ExtensionHandler<PlanReviewRequestedEvent>): void;
+	on(event: "plan_review_resolved", handler: ExtensionHandler<PlanReviewResolvedEvent>): void;
 	on(event: "tool_call", handler: ExtensionHandler<ToolCallEvent, ToolCallEventResult>): void;
 	on(event: "tool_result", handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): void;
 	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): void;
@@ -2036,6 +2214,13 @@ export interface ExtensionContextActions {
 	abort: () => void;
 	hasPendingMessages: () => boolean;
 	shutdown: () => void;
+	resolvePlanReview?: (
+		reviewId: string,
+		choice: PlanReviewChoice,
+		input?: { feedback?: string; role?: string },
+	) => boolean;
+	getPendingPlanReview?: () => PlanReviewRequestedEvent | undefined;
+	openPlanReview?: () => Promise<boolean>;
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (instructionsOrOptions?: string | CompactOptions) => Promise<void>;
 	getSystemPrompt: () => string[];

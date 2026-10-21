@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { BaseKernel, isSignalableProcessGroup, killProcessGroup } from "../../src/eval/kernel-base";
+import { BaseKernel } from "../../src/eval/kernel-base";
+import { isSignalableProcessGroup, killProcessGroup } from "../../src/subprocess/process-group";
 
 class TestKernel extends BaseKernel {
 	constructor() {

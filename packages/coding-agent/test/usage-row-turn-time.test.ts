@@ -478,7 +478,6 @@ describe("AgentSession synthetic follow-up marking", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated(),
 			modelRegistry,
-			extensionRunner: {} as unknown as ExtensionRunner,
 		});
 		try {
 			// The approved-plan execution path queues the hidden directive this way

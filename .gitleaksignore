@@ -14,3 +14,12 @@ c4a2441d8f9195de810b3492be5bf5673cecf9c9:packages/coding-agent/test/acp-session-
 5060ac09dea7fad2eaaba2bfd7aac632353e97da:packages/ai/test/fixtures/factory-droid-responses-ws-frames.jsonl:generic-api-key:1
 5060ac09dea7fad2eaaba2bfd7aac632353e97da:packages/ai/test/fixtures/factory-droid-responses-ws-frames.jsonl:generic-api-key:2
 5060ac09dea7fad2eaaba2bfd7aac632353e97da:packages/ai/test/fixtures/factory-droid-responses-ws-frames.jsonl:generic-api-key:9
+# 2026-10-19 trunk merge (verified by @:geoyws/omp/driver/executor and ReviewTrunkFix4f66): factory-droid-gemini.test.ts:378 and acp-session-effects.test.ts:19 are the fake fixtures documented in the header above, at shifted lines. skillshare/pack.test.ts:141 is a credential-detector test fixture (PEM block the detector must flag), not previously documented; its source contains no real credential.
+packages/ai/test/factory-droid-gemini.test.ts:github-pat:378
+packages/ai/test/factory-droid-gemini.test.ts:generic-api-key:378
+packages/coding-agent/test/acp-session-effects.test.ts:github-pat:19
+packages/coding-agent/test/skillshare/pack.test.ts:private-key:141
+# 2026-10-20 upstream v18.12.3 public test fixtures (model ids / advisor fixture), not credentials (omp t-e3fa50e5)
+packages/catalog/test/image-tokenization.test.ts:generic-api-key:145
+packages/coding-agent/test/advisor/advisor.test.ts:generic-api-key:2147
+packages/coding-agent/test/model-registry.test.ts:generic-api-key:2835

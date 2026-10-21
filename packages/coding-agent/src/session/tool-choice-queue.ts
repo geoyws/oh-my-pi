@@ -76,7 +76,7 @@ interface InFlight {
 interface PendingInvoker {
 	/** Unique id for this staged preview; never reused (never clobbered by label). */
 	id: string;
-	/** Source tool that staged the preview (e.g. "ast_edit"), for the reminder. */
+	/** Source tool that staged the preview (e.g. "ast"), for the reminder. */
 	sourceToolName: string;
 	onInvoked: (input: unknown) => Promise<unknown> | unknown;
 }

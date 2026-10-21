@@ -19,8 +19,10 @@ function acpRuntime({
 		return handoffResult;
 	});
 	const output = vi.fn();
+	// Admitting `before_user_message` gate: refusal is covered in user-message-refusal.test.ts.
+	const gateUserMessage = vi.fn(async () => {});
 	const runtime = {
-		session: { isStreaming, isGeneratingHandoff, handoff },
+		session: { isStreaming, isGeneratingHandoff, handoff, gateUserMessage },
 		output,
 	} as unknown as SlashCommandRuntime;
 	return { handoff, output, runtime };

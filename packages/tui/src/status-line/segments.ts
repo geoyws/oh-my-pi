@@ -6,6 +6,7 @@ import { SPINNER_ADVANCE_MS, TERMINAL } from "../index";
 import {
 	formatDuration,
 	formatNumber,
+	getActiveProfile,
 	getProjectDir,
 	normalizePathForComparison,
 	relativePathWithinNormalizedRoot,
@@ -215,24 +216,34 @@ const piSegment: StatusLineSegment = {
 		// Brand fg fades between dim gray (idle) and the accent (working) across
 		// turn edges; the component samples the tween into `brandFgAnsi`.
 		const fgAnsi = ctx.brandFgAnsi ?? theme.getFgAnsi("dim");
+		const profile = ctx.options.pi?.showProfile === false ? undefined : getActiveProfile();
 		// While a turn runs the brand icon becomes a braille spinner plus a
 		// whole-unit turn timer (port of rust omp's status-band active brand).
 		// No trailing pad: the group renderer owns inter-segment spacing, so a
 		// trailing space here would double the gap at the first separator (#11103).
 		const content =
 			ctx.turnElapsedMs != null
-				? `${brandSpinnerFrame(ctx.now?.getTime())} ${brandTimer(ctx.turnElapsedMs)}`
-				: theme.icon.omp
-					? theme.icon.omp
-					: "";
+				? `${brandMark(brandSpinnerFrame(ctx.now?.getTime()), profile)} ${brandTimer(ctx.turnElapsedMs)}`
+				: brandMark(theme.icon.omp, profile);
 		return { content: `${fgAnsi}${content}\x1b[39m`, visible: true };
 	},
 	describe(ctx) {
 		if (ctx.focusedAgentId) return segView([span(ctx.focusedAgentId, "warning")], "ghost", "warning");
 		// The dock's working row owns activity natively: the brand stays still.
-		return segView([], "omp", "muted");
+		const profile = ctx.options.pi?.showProfile === false ? undefined : getActiveProfile();
+		return segView(profile ? [span(profile, "muted")] : [], "omp", "muted");
 	},
 };
+/**
+ * Brand glyph tagged with the active named profile (`π-work`) so sessions from
+ * different profiles are distinguishable at a glance; the bare glyph for the
+ * default profile or with `segmentOptions.pi.showProfile: false`. The tag
+ * stays put while the glyph slot animates.
+ */
+function brandMark(glyph: string, profile: string | undefined): string {
+	if (!profile) return glyph;
+	return glyph ? `${glyph}-${profile}` : profile;
+}
 /** Current braille-spinner glyph on the shared clock, at the Loader's 80ms cadence. */
 function brandSpinnerFrame(nowMs = Date.now()): string {
 	const frames = theme.getSpinnerFrames("activity");
@@ -279,32 +290,51 @@ function modelDisplayName(ctx: SegmentContext): string {
 	return modelName.startsWith("Claude ") ? modelName.slice(7) : modelName;
 }
 
+type ThinkingDisplaySession = Pick<StatusLineSession, "isAutoThinking" | "autoResolvedThinkingLevel"> & {
+	state: Pick<StatusLineSession["state"], "model" | "thinkingLevel">;
+};
+
 /**
- * The thinking-effort word (`high`, `off`; `auto` until auto thinking resolves
- * a level), or undefined when the model has no thinking. Drives the native
- * model segment and the composer's effort chip.
+ * The effective thinking-effort word (`high`, `off`; `auto` until auto thinking
+ * resolves a level), or undefined when the model has no thinking. Picks the
+ * level's colour and effort glyph; {@link thinkingLevelLabel} is the text.
  */
-export function thinkingLevelWord(
-	session: Pick<StatusLineSession, "state" | "isAutoThinking" | "autoResolvedThinkingLevel">,
-): string | undefined {
+export function thinkingLevelWord(session: ThinkingDisplaySession): string | undefined {
 	const state = session.state;
 	if (!state.model?.thinking) return undefined;
 	if (session.isAutoThinking) return session.autoResolvedThinkingLevel() ?? "auto";
 	return state.thinkingLevel ?? ThinkingLevel.Off;
 }
 
-/** Thinking-level display ("◉ xhigh", "⟳ auto", …), or "" when hidden or unsupported. */
+/**
+ * The thinking selection as shown to the user: an explicit level as itself
+ * (`high`), `auto` while auto thinking is pending, and `auto (high)` once it
+ * resolved, so a requested `auto` never reads as an explicit pin. Undefined
+ * when the model has no thinking.
+ */
+export function thinkingLevelLabel(session: ThinkingDisplaySession): string | undefined {
+	const word = thinkingLevelWord(session);
+	if (word === undefined || !session.isAutoThinking) return word;
+	const resolved = session.autoResolvedThinkingLevel();
+	return resolved ? `auto (${resolved})` : "auto";
+}
+
+/** Thinking-level display ("◉ xhigh", "⟳ auto", "◒ auto (high)", …), or "" when hidden or unsupported. */
 function modelThinkingDisplay(ctx: SegmentContext): string {
 	const state = ctx.session.state;
 	const opts = ctx.options.model ?? {};
 	if (opts.showThinkingLevel === false || !state.model?.thinking) return "";
 	if (ctx.session.isAutoThinking) {
 		// Pending (no turn classified yet / classifying) shows a symbol-theme
-		// question-box marker; once resolved it shows `<level>`.
+		// question-box marker; once resolved it shows the resolved level's glyph
+		// beside `auto (<level>)`.
 		const resolved = ctx.session.autoResolvedThinkingLevel();
-		return resolved
-			? (theme.thinking[resolved as keyof Theme["thinking"]] ?? resolved)
-			: `${theme.thinking.autoPending} auto`;
+		if (!resolved) return `${theme.thinking.autoPending} auto`;
+		const resolvedDisplay =
+			resolved === ThinkingLevel.Off
+				? theme.status.disabled
+				: (theme.thinking[resolved as keyof Theme["thinking"]] ?? resolved);
+		return `${leadingGlyph(resolvedDisplay)} auto (${resolved})`;
 	}
 	const level = state.thinkingLevel ?? ThinkingLevel.Off;
 	return level === ThinkingLevel.Off
@@ -378,15 +408,19 @@ const modelSegment: StatusLineSegment = {
 		return { content, visible: true };
 	},
 	describe(ctx) {
-		// Name, then the thinking level as a word in its level colour after a
-		// quiet separator; the terminal draws the model icon.
+		// Name, then the thinking selection (`high`, `auto`, `auto (high)`) in the
+		// effective level's colour after a quiet separator; the terminal draws the model icon.
 		const token = accentToken(ctx, "statusLineModel");
 		const spans: TspSpan[] = [span(modelDisplayName(ctx), token)];
 		const advisor = modelAdvisorBadge(ctx);
 		if (advisor) spans.push(span(` ${advisor.icon}`, advisor.color));
 		if (ctx.session.isFastModeActive() && theme.icon.fast) spans.push(span(` ${theme.icon.fast}`, token));
-		const level = ctx.options.model?.showThinkingLevel === false ? undefined : thinkingLevelWord(ctx.session);
-		if (level !== undefined) spans.push(span(" · ", "dim"), span(level, thinkingLevelToken(level)));
+		const showThinking = ctx.options.model?.showThinkingLevel !== false;
+		const level = showThinking ? thinkingLevelWord(ctx.session) : undefined;
+		const label = showThinking ? thinkingLevelLabel(ctx.session) : undefined;
+		if (level !== undefined && label !== undefined) {
+			spans.push(span(" · ", "dim"), span(label, thinkingLevelToken(level)));
+		}
 		const slowModeLabel = ctx.session.getAnthropicSlowModeLabel?.();
 		if (slowModeLabel) spans.push(span(`${theme.sep.dot}${slowModeLabel}`, "warning"));
 		return segView(spans, "model", slowModeLabel ? "warning" : undefined);

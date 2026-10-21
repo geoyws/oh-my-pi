@@ -14,6 +14,9 @@ import * as clipboard from "@oh-my-pi/pi-coding-agent/utils/clipboard";
 import { Container, Input, type KeyId, type TUI } from "@oh-my-pi/pi-tui";
 import type { DictationTarget } from "@oh-my-pi/pi-coding-agent/stt/push-to-talk";
 import { SPACE_HOLD_MECHANICAL_RUN, type SpaceHoldHandler } from "@oh-my-pi/pi-tui/space-hold";
+import { UserMessageRefusedError } from "@oh-my-pi/pi-coding-agent/session/user-message-refused-error";
+import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
+import { getEditorTheme } from "@oh-my-pi/pi-tui/theme/tui-adapters";
 
 interface TurnArgs {
 	promptText: string;
@@ -97,8 +100,11 @@ async function harness(spaceHoldKeys: readonly KeyId[] = ["space"]) {
 		model: { provider: "anthropic", id: "claude-sonnet-4-5" },
 		isStreaming: false,
 		runEphemeralTurn,
+		gateUserMessage: vi.fn(async () => {}),
 	} as unknown as InteractiveModeContext["session"];
+	const editor = new CustomEditor(getEditorTheme());
 	const ctx = {
+		editor,
 		ui: {
 			requestRender: vi.fn(),
 			requestComponentRender: vi.fn(),
@@ -155,6 +161,7 @@ async function harness(spaceHoldKeys: readonly KeyId[] = ["space"]) {
 		directory,
 		manager,
 		managers,
+		editor,
 		ctx,
 		controller,
 		requests,
@@ -341,6 +348,21 @@ describe("BTW follow-up lifecycle", () => {
 		panel.handleInput("c");
 		await drain();
 		expect(copy).toHaveBeenCalledWith("Useful original answer");
+	});
+
+	it("a refused history-panel follow-up leaves the main composer untouched", async () => {
+		const h = await harness();
+		const topic = await h.root("Original question", "Original answer");
+		h.editor.setText("unrelated main draft");
+		vi.spyOn(h.ctx.session, "gateUserMessage").mockRejectedValueOnce(new UserMessageRefusedError("Blocked."));
+		const calls = h.runEphemeralTurn.mock.calls.length;
+
+		expect(await h.controller.startFollowUp(topic.id, "follow-up FAKE-SECRET-NOT-REAL")).toBe(false);
+
+		// The panel keeps its own draft; the main composer never held this question.
+		expect(h.editor.getExpandedText()).toBe("unrelated main draft");
+		expect(h.ctx.showError).toHaveBeenCalledWith("Blocked.");
+		expect(h.runEphemeralTurn.mock.calls.length).toBe(calls);
 	});
 
 	it("refuses a busy move without cancellation and clears BTW only after successful relocation", async () => {
@@ -986,6 +1008,23 @@ describe("BTW follow-up composer", () => {
 		expect(h.onClose).not.toHaveBeenCalled();
 		h.panel.handleInput("\x1b");
 		expect(h.onClose).toHaveBeenCalledTimes(1);
+	});
+
+	it("scrolls a long answer while composing a follow-up without touching the draft", () => {
+		const h = composer(vi.fn(async () => true));
+		const answer = Array.from({ length: 80 }, (_, index) => `Answer row ${index + 1}`).join("\n\n");
+		h.panel.update([{ ...h.record, answer }]);
+		h.panel.handleInput("f");
+		h.panel.pasteText("draft");
+		const pinned = Bun.stripANSI(h.panel.render(100).join("\n"));
+		expect(pinned).toContain("Answer row 80");
+		for (let i = 0; i < 10; i++) h.panel.handleInput("\x1b[5~");
+		const scrolled = Bun.stripANSI(h.panel.render(100).join("\n"));
+		expect(scrolled).toMatch(/Answer row 1 /);
+		expect(scrolled).not.toContain("Answer row 80");
+		expect(scrolled).toContain("draft");
+		h.panel.handleInput("\x1b[B");
+		expect(Bun.stripANSI(h.panel.render(100).join("\n"))).not.toBe(scrolled);
 	});
 
 	it("submits once while pending and retains the rejected draft for a successful retry", async () => {

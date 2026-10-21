@@ -18,7 +18,7 @@ use napi::{
 };
 use napi_derive::napi;
 use pi_shell::{
-	MinimizerResult as CoreMinimizerResult, Shell as CoreShell,
+	MinimizerResult as CoreMinimizerResult, PipeTaps, Shell as CoreShell,
 	ShellExecuteOptions as CoreShellExecuteOptions, ShellOptions as CoreShellOptions,
 	ShellRunOptions as CoreShellRunOptions, ShellRunResult as CoreShellRunResult,
 	execute_shell as core_execute_shell, minimizer,
@@ -147,6 +147,89 @@ pub struct ShellRunOptions<'env> {
 	/// Filesystem for this run only, replacing the session's; the session's
 	/// filesystem applies again to later runs.
 	pub filesystem: Option<ShellFilesystem>,
+	/// Receives a copy of every byte crossing the run's pipeline pipes.
+	pub streams:    Option<ClassInstance<'env, PipeStreams>>,
+}
+
+/// The bytes crossing one shell run's pipeline pipes, during and after the run.
+///
+/// For `cargo build 2>&1 | tail -5`, stream 1 holds what `cargo` has written
+/// so far while `tail` still holds it back. Create one per run and pass it as
+/// [`ShellRunOptions::streams`]. Streams are numbered from 1 in the order the
+/// run opened its pipes; each keeps its most recent 1 MiB, and a run keeps its
+/// 4 newest finished streams.
+#[derive(Default)]
+#[napi]
+pub struct PipeStreams {
+	taps: Arc<PipeTaps>,
+}
+
+/// A tapped pipe of a run.
+#[napi(object)]
+pub struct PipeStreamInfo {
+	/// Stream number, from 1.
+	pub id:       u32,
+	/// Source text of the stage writing into the pipe.
+	pub producer: String,
+	/// Source text of the stage reading from it.
+	pub consumer: String,
+	/// Bytes written so far, including those no longer retained.
+	pub total:    f64,
+	/// Whether bytes may still arrive.
+	pub open:     bool,
+}
+
+/// Retained bytes of a stream, as stream offsets `start..end`.
+#[napi(object)]
+pub struct PipeStreamChunk {
+	/// Stream offset of `data`'s first byte; past 0 once older bytes were
+	/// dropped.
+	pub start: f64,
+	/// Stream offset just past `data`: the next read's `from`.
+	pub end:   f64,
+	/// The bytes `start..end`.
+	pub data:  Buffer,
+	/// Whether bytes may still arrive.
+	pub open:  bool,
+}
+
+#[napi]
+impl PipeStreams {
+	#[napi(constructor)]
+	pub fn new() -> Self {
+		Self::default()
+	}
+
+	/// The run's retained streams, oldest first.
+	#[napi]
+	pub fn list(&self) -> Vec<PipeStreamInfo> {
+		self
+			.taps
+			.list()
+			.into_iter()
+			.map(|stream| PipeStreamInfo {
+				id:       stream.id,
+				producer: stream.producer,
+				consumer: stream.consumer,
+				total:    stream.total as f64,
+				open:     stream.open,
+			})
+			.collect()
+	}
+
+	/// Retained bytes of stream `id` from stream offset `from` on (all of them
+	/// without it), or `null` for a stream the run never opened or no longer
+	/// keeps.
+	#[napi]
+	pub fn read(&self, id: u32, from: Option<f64>) -> Option<PipeStreamChunk> {
+		let from = from.map(|from| from.max(0.0) as u64);
+		self.taps.read(id, from).map(|read| PipeStreamChunk {
+			start: read.start as f64,
+			end:   read.end as f64,
+			data:  read.data.into(),
+			open:  read.open,
+		})
+	}
 }
 
 /// Options for executing a shell command via brush-core.
@@ -276,6 +359,7 @@ impl Shell {
 			env:        options.env,
 			timeout_ms: options.timeout_ms,
 			filesystem: options.filesystem.map(ShellFilesystem::into_fs),
+			pipe_taps:  options.streams.map(|streams| Arc::clone(&streams.taps)),
 		};
 		task::future(env, "shell.run", async move {
 			let (chunk_tx, drain_handle) = bridge_chunks(on_chunk);
@@ -295,6 +379,26 @@ impl Shell {
 	#[napi]
 	pub async fn abort(&self) -> Result<()> {
 		self.inner.abort().await;
+		Ok(())
+	}
+
+	/// Terminate leftover background jobs (`&`/`nohup` children) with awaited
+	/// TERM→KILL escalation. The host calls this at the end of a run whose
+	/// background jobs must not outlive the call, and at session dispose.
+	/// A no-op when no session core is materialized or no jobs are tracked.
+	#[napi]
+	pub async fn terminate_background_jobs(&self) -> Result<()> {
+		self.inner.terminate_background_jobs().await;
+		Ok(())
+	}
+
+	/// Abort any in-flight run and terminate leftover background jobs.
+	/// Session dispose path: never blocks on a wedged run holding the session
+	/// lock — the run's own cancel bridge owns its tree; this catches
+	/// leftovers from already-completed runs before the host drops the session.
+	#[napi]
+	pub async fn shutdown(&self) -> Result<()> {
+		self.inner.shutdown().await;
 		Ok(())
 	}
 
@@ -782,6 +886,7 @@ mod tests {
 						env:        None,
 						timeout_ms: None,
 						filesystem: None,
+						pipe_taps:  None,
 					},
 					Some(tx),
 					CancelToken::default(),
@@ -830,6 +935,7 @@ mod tests {
 						env:        None,
 						timeout_ms: None,
 						filesystem: None,
+						pipe_taps:  None,
 					},
 					None,
 					cancel,
@@ -869,6 +975,7 @@ mod tests {
 						env:        None,
 						timeout_ms: None,
 						filesystem: None,
+						pipe_taps:  None,
 					},
 					Some(tx),
 					cancel,

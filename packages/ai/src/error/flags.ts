@@ -167,8 +167,19 @@ function matchesPayloadRejectionText(text: string): boolean {
 
 const TIMEOUT_PATTERN = /\b(?:operation\s+)?timed?\s*out\b|\btimeout\b|\bstream stall\b/i;
 const TRANSIENT_ENVELOPE_PATTERN = /anthropic stream envelope error:/i;
-const TRANSIENT_ENVELOPE_TRUNCATION_PATTERN = /before message_(?:start|stop)/i;
+const TRANSIENT_ENVELOPE_TRUNCATION_PATTERN = /before message_(?:start|delta|stop)/i;
 export const STREAM_READ_ERROR_PATTERN = /stream[_ -]?read[_ -]?error/i;
+/**
+ * Leading text of {@link ProviderOperationDeadlineError}. Exported so the
+ * error class and the session layer agree on one spelling: recovery only ever
+ * sees the persisted `errorMessage` string, not the original instance.
+ */
+export const PROVIDER_OPERATION_DEADLINE_PREFIX = "Provider operation budget exhausted";
+
+/** Persisted-text form of a whole-operation budget exhaustion. */
+export function isProviderOperationDeadlineText(text: string | undefined): boolean {
+	return text !== undefined && text.startsWith(PROVIDER_OPERATION_DEADLINE_PREFIX);
+}
 /** Python h2/httpx diagnostics forwarded through provider or proxy error events. */
 export const PYTHON_HTTP2_STREAM_RESET_PATTERN = /<StreamReset stream_id:\d+, error_code:(?:2|7), remote_reset:True>/;
 /** Python h11/httpx EOF while reading an HTTP/1.1 chunked response body. */
@@ -217,8 +228,17 @@ export function isCodexSteerRejection(message: { api?: Api; errorMessage?: strin
 	);
 }
 
+/**
+ * Transport-failure wording that marks an error transient. Covers
+ * diagnostics forwarded verbatim by gateways/proxies in other runtimes, e.g.
+ * undici's "other side closed" and Go's `net.ErrClosed` ("use of closed
+ * network connection", #15385). Also covers OMP's own network-failure
+ * sentences from `networkFailureMessage` (offline / unreachable / refused /
+ * TLS), which must stay at least as retryable as the bare `Connection error.`
+ * text they replaced.
+ */
 export const TRANSIENT_TRANSPORT_PATTERN =
-	/\b(?:no[_ -]?capacity|(?:high|peak)[ _-]?demand|(?:at|over|insufficient)[ _-]?capacity|capacity[ _-]?(?:exceeded|exhausted)|peak[ _-]?load)\b|overloaded|provider.?returned.?error|rate.?limit|too many requests|auth-gateway\s+5\d{2}(?=[:\s]|$)|\b(?:429|500|502|503|504)\b|service.?unavailable|server.?error|internal.?error|retry your request|network.?error|connection.?error|connection.?refused|unable.?to.?connect\.\s*is the computer able to access the url\?|other side closed|fetch failed|upstream.?connect|upstream.?request.?failed|reset before headers|socket hang up|timed? out|timeout|terminated|retry delay|stream stall|no error details in response|HTTP2(?:StreamReset|RefusedStream|EnhanceYourCalm)|nghttp2_(?:internal_error|refused_stream)|stream closed with error code nghttp2_(?:internal_error|refused_stream)|malformed.?function.?call/i;
+	/\b(?:no[_ -]?capacity|(?:high|peak)[ _-]?demand|(?:at|over|insufficient)[ _-]?capacity|capacity[ _-]?(?:exceeded|exhausted)|peak[ _-]?load)\b|overloaded|provider.?returned.?error|rate.?limit|too many requests|auth-gateway\s+5\d{2}(?=[:\s]|$)|\b(?:429|500|502|503|504)\b|service.?unavailable|temporar(?:y|ily)[ _-]?unavailable|server.?error|internal.?error|retry your request|network.?error|connection.?error|connection.?refused|unable.?to.?connect\.\s*is the computer able to access the url\?|other side closed|use of closed network connection|fetch failed|upstream.?connect|upstream.?request.?failed|reset before headers|socket hang up|timed? out|timeout|terminated|retry delay|stream stall|no error details in response|HTTP2(?:StreamReset|RefusedStream|EnhanceYourCalm)|nghttp2_(?:internal_error|refused_stream)|stream closed with error code nghttp2_(?:internal_error|refused_stream)|\bE(?:TIMEOUT|NOTFOUND|NETUNREACH|HOSTUNREACH)\b|\bFailedToOpenSocket\b|no internet connection|couldn.?t reach|couldn.?t connect to|tls certificate verification failed|malformed.?function.?call/i;
 const AUTH_FAILURE_PATTERN =
 	/\b(?:401|403|unauthorized|forbidden|authentication|auth[_ ]?unavailable|no auth available|(?:invalid|no)[_ ]?api[_ ]?key)\b/i;
 const MALFORMED_FUNCTION_CALL_PATTERN = /\bmalformed.?function.?call\b/i;
@@ -235,6 +255,18 @@ export function isAnthropicAccountPolicyText(text: string, provider?: string, st
 	const statusCandidate = statusArg ?? (text ? status({ message: text }) : undefined);
 	if (statusCandidate !== undefined && statusCandidate !== 403) return false;
 	return ANTHROPIC_ACCOUNT_POLICY_PATTERN.test(text);
+}
+
+const IMMUTABLE_LATEST_THINKING_PATTERN =
+	/messages\.\d+\.content\.\d+.*\b(?:thinking|redacted_thinking)\b.*\blatest assistant message cannot be modified\b/is;
+
+/**
+ * Anthropic's rejection of a replayed latest assistant turn whose `thinking` or
+ * `redacted_thinking` blocks no longer verify. Resending the same turn fails the
+ * same way; only a request that changes that turn's reasoning can succeed.
+ */
+export function isImmutableLatestThinkingText(text: string): boolean {
+	return IMMUTABLE_LATEST_THINKING_PATTERN.test(text);
 }
 
 const CODEX_CHATGPT_ACCOUNT_MODEL_POLICY_PATTERN =
@@ -383,7 +415,7 @@ const CACHE_CONTROL_EMPTY_TEXT_PATTERN =
 const OAUTH_DEFINITIVE_FAILURE_PATTERN =
 	/invalid_grant|invalid_token|unauthorized_client|\brevoked\b|refresh[\s_]?token.*expired/i;
 const OAUTH_TRANSIENT_FAILURE_PATTERN =
-	/timeout|network|fetch failed|ECONN(?:REFUSED|RESET)|ETIMEDOUT|EAI_AGAIN|socket hang up|\b(?:408|425|429|5\d{2})\b|rate.?limit|too many requests|temporar|unavailable|forbidden|permission_denied|cloudflare|captcha/i;
+	/timeout|network|fetch failed|ECONN(?:REFUSED|RESET)|ETIMEDOUT|ETIMEOUT|ENOTFOUND|ENETUNREACH|EHOSTUNREACH|FailedToOpenSocket|EAI_AGAIN|socket hang up|\b(?:408|425|429|5\d{2})\b|rate.?limit|too many requests|temporar|unavailable|forbidden|permission_denied|cloudflare|captcha/i;
 const OAUTH_HTTP_AUTH_PATTERN = /\b401\b/;
 
 function matchesStrictToolsRejection(message: string, errorStatus: number | undefined): boolean {
@@ -656,6 +688,10 @@ function classifyText(
 		if (!isTerminalClientErrorStatus(statusClean)) {
 			if (isTimeoutText(errorMessage)) kinds |= Flag.Transient | Flag.Timeout;
 			else if (isTransientErrorText(errorMessage)) kinds |= Flag.Transient;
+			// An exhausted whole-operation budget reaches recovery as persisted text
+			// once the original error instance is gone, so classify it from the text
+			// too — it is the transient timeout its own flags already say it is.
+			if (isProviderOperationDeadlineText(errorMessage)) kinds |= Flag.Transient | Flag.Timeout;
 			// A stream truncation, transport-level stream drop, or forwarded Codex
 			// HTTP body-read failure may not match TRANSIENT_TRANSPORT_PATTERN. Flag
 			// it explicitly so AIError.retriable and the turn-recovery layer treat it
@@ -1082,7 +1118,7 @@ export function isTransientStreamParseError(error: unknown): boolean {
  * non-terminal status treat it as transient (#11805).
  */
 const STREAM_DROP_PATTERN =
-	/stream disconnected before completion|stream closed before response\.completed|stream was interrupted|stream ended before terminal (?:chunk|completion event)|socket disconnected before secure tls connection/i;
+	/stream disconnected before completion|(?:stream|websocket) closed before response\.completed|stream was interrupted|stream ended before (?:terminal (?:chunk|completion event)|message_(?:start|delta|stop))|socket disconnected before secure tls connection/i;
 
 /**
  * Transport stream-drop diagnostic (see {@link STREAM_DROP_PATTERN}). Unlike

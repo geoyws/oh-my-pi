@@ -10,6 +10,7 @@ import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mod
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { UserMessageRefusedError } from "@oh-my-pi/pi-coding-agent/session/user-message-refused-error";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { createTools, type Tool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -366,6 +367,29 @@ describe("guided goal setup", () => {
 
 			await harness.mode.handleGuidedGoalCommand("ship it");
 
+			expect(harness.mode.isGuidedGoalInterviewActive()).toBe(false);
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
+	it("gates the rough objective before exposing the goal tool or sending the kickoff", async () => {
+		const harness = await createHarness();
+		try {
+			const promptSpy = vi.spyOn(harness.session, "prompt").mockResolvedValue(true);
+			const images: ImageContent[] = [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }];
+			const gate = vi
+				.spyOn(harness.session, "gateUserMessage")
+				.mockRejectedValue(new UserMessageRefusedError("Blocked: secret."));
+
+			// The refusal propagates so the Enter path restores the `/guided-goal` line.
+			await expect(
+				harness.mode.handleGuidedGoalCommand("ship with FAKE-SECRET-NOT-REAL", { images }),
+			).rejects.toBeInstanceOf(UserMessageRefusedError);
+
+			expect(gate).toHaveBeenCalledWith("ship with FAKE-SECRET-NOT-REAL", images, "interactive");
+			expect(promptSpy).not.toHaveBeenCalled();
+			expect(harness.session.getEnabledToolNames()).not.toContain("goal");
 			expect(harness.mode.isGuidedGoalInterviewActive()).toBe(false);
 		} finally {
 			await harness.cleanup();

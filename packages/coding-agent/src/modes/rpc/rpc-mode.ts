@@ -290,7 +290,7 @@ export async function runRpcSkillCommand(
 			details: built.details,
 			attribution: "user",
 		},
-		{ streamingBehavior, queueChipText: invocation.queueChipText, onPromptAdmitted },
+		{ streamingBehavior, queueChipText: invocation.queueChipText, onPromptAdmitted, source: "rpc" },
 	);
 }
 
@@ -1607,6 +1607,10 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		setEditorComponent(): void {
 			// Custom editor components not supported in RPC mode
 		}
+
+		getEditorComponent() {
+			return undefined;
+		}
 	}
 
 	// Wire up UI context for tool execution (ask tool, etc.) and extensions.
@@ -1774,11 +1778,11 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			if (!isCurrent()) return "cancelled";
 			if (!text.trim() && !images?.length) return "local";
 			if (command.type === "steer") {
-				await session.steer(text, images);
+				await session.steer(text, images, { source: "rpc" });
 				return "admitted";
 			}
 			if (command.type === "follow_up") {
-				await session.followUp(text, images);
+				await session.followUp(text, images, { source: "rpc" });
 				return "admitted";
 			}
 			if (command.type === "prompt") {
@@ -1805,6 +1809,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					refreshCommands: emitAvailableCommandsUpdate,
 					reloadPlugins: reloadPluginState,
 					runCommandInBackground: task => shutdownCoordinator.track(task()),
+					userMessageSource: "rpc",
 					notifyTitleChanged: async () => {
 						output({ type: "session_info_update", title: session.sessionName, sessionId: session.sessionId });
 					},
@@ -1839,6 +1844,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 						images,
 						...(command.type === "prompt" ? { streamingBehavior: command.streamingBehavior } : {}),
 						onPromptAdmitted,
+						source: "rpc",
 					}),
 				results: promptResults,
 				onError: onPromptError(command.id, command.type),
@@ -2337,6 +2343,12 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			// =================================================================
 
 			case "compact": {
+				// User-authored summarizer focus reaches the summarizer
+				// provider: gate it first. A refusal rejects with only the
+				// handler's notice and compacts nothing.
+				if (command.customInstructions?.trim()) {
+					await session.gateUserMessage(command.customInstructions, undefined, "rpc");
+				}
 				const result = await session.compact(command.customInstructions);
 				return success(id, "compact", result);
 			}
@@ -2428,6 +2440,11 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				// flight (mirrors the TUI /handoff guard).
 				if (session.isStreaming) {
 					return error(id, "handoff", "Cannot hand off while a response is in progress");
+				}
+				// Same pre-persistence gate as `compact`: user-authored focus
+				// reaches the summarizer provider.
+				if (command.customInstructions?.trim()) {
+					await session.gateUserMessage(command.customInstructions, undefined, "rpc");
 				}
 				const result = await session.handoff(command.customInstructions);
 				return success(id, "handoff", result ? { savedPath: result.savedPath } : null);

@@ -11,13 +11,13 @@
  *     post-prompt recovery, but the loop is already done) must be drained when
  *     the session settles.
  */
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, AgentBusyError, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
-import { createMockModel, type MockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
+import { createMockModel, type MockHandler, type MockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import type { PromptTemplate } from "@oh-my-pi/pi-coding-agent/config/prompt-templates";
@@ -29,6 +29,10 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm, type CustomMessage, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { tagImageAttachmentSource } from "@oh-my-pi/pi-tui/prompt/image-source";
+import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
+import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
+import { getEditorTheme } from "@oh-my-pi/pi-tui/theme/tui-adapters";
 import { removeSyncWithRetries, Snowflake, withTimeout } from "@oh-my-pi/pi-utils";
 import manualContinuePrompt from "../src/prompts/system/manual-continue.md" with { type: "text" };
 
@@ -82,7 +86,7 @@ describe("AgentSession queued steer delivery", () => {
 	});
 
 	async function createSession(
-		responses: MockResponse[],
+		responses: MockHandler[],
 		promptTemplates: PromptTemplate[] = [],
 	): Promise<SteerHarness> {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
@@ -360,6 +364,32 @@ describe("AgentSession queued steer delivery", () => {
 		expect(settles).toEqual([false, true]);
 	});
 
+	// A host driving the session to a result (the subagent executor) awaits the
+	// interrupted prompt, then waitForIdle(). The steer's turn is scheduled only as
+	// abort() finishes unwinding; reporting idle before then ended a subagent run on
+	// the interrupted turn and dropped the steer.
+	it("stays busy through an interrupt's unwind until the queued steer is answered", async () => {
+		const turnStarted = Promise.withResolvers<void>();
+		const { session, mock } = await createSession([
+			() => {
+				turnStarted.resolve();
+				return { content: ["slow response"], delayMs: 60_000 };
+			},
+			{ content: ["steered response"] },
+		]);
+
+		const run = session.prompt("hello");
+		await turnStarted.promise;
+		await session.steer("change course");
+		const interrupt = session.abort({ reason: USER_INTERRUPT_LABEL });
+		await run;
+		await session.waitForIdle();
+
+		expect(mock.calls.length).toBe(2);
+		expect(session.getLastAssistantMessage()?.stopReason).toBe("stop");
+		await interrupt;
+	});
+
 	it("settles an interrupt terminally when nothing is queued to resume it", async () => {
 		const { session } = await createSession([{ content: ["slow response"], delayMs: 1_000 }]);
 		const settles: Array<boolean | undefined> = [];
@@ -432,6 +462,100 @@ describe("AgentSession queued steer delivery", () => {
 
 		expect(queuedUserContent).toEqual(["text", "image"]);
 	});
+
+	for (const alreadyQueued of [false, true]) {
+		it(`delivers an image-only Enter steer exactly once with ${alreadyQueued ? "an existing steer" : "an empty queue"}`, async () => {
+			const { session, sessionManager, mock } = await createSession([
+				{ content: ["initial"] },
+				{ content: ["steered answer"] },
+				{ content: ["remaining steer answer"] },
+			]);
+			const image = { type: "image" as const, mimeType: "image/png", data: PATH_PASTED_IMAGE.data };
+			// Session normalization always runs; images.autoResize only controls file loading.
+			// Independently repeat this solid pixel with nearest-neighbor, not the
+			// production normalizer or its resize/encoder-selection policy.
+			const expectedPng = await new Bun.Image(Buffer.from(image.data, "base64"))
+				.resize(200, 200, { filter: "nearest" })
+				.png()
+				.bytes();
+			const editor = new CustomEditor(getEditorTheme());
+			const showError = vi.fn();
+			const ctx = {
+				editor,
+				session,
+				viewSession: session,
+				sessionManager,
+				skillCommands: new Map(),
+				fileSlashCommands: new Set(),
+				compactionQueuedMessages: [],
+				locallySubmittedUserSignatures: new Set(),
+				isBashMode: false,
+				isPythonMode: false,
+				loopModeEnabled: false,
+				ui: { requestRender: vi.fn(), getFocused: () => editor },
+				showError,
+				updatePendingMessagesDisplay: vi.fn(),
+				withLocalSubmission: async <T>(_text: string, submit: () => Promise<T>) => submit(),
+			} as unknown as InteractiveModeContext;
+			new InputController(ctx).setupEditorSubmitHandler();
+			const onSubmit = editor.onSubmit;
+			let submission: Promise<void> | undefined;
+			editor.onSubmit = text => {
+				submission = Promise.resolve(onSubmit?.(text));
+				return submission;
+			};
+			let injected = false;
+			session.agent.setOnBeforeYield(async () => {
+				if (injected) return;
+				injected = true;
+				if (alreadyQueued) await session.steer("earlier steer");
+				expect(session.queuedMessageCount).toBe(alreadyQueued ? 1 : 0);
+				// The real composer submits only an image chip; Enter clears its
+				// text before the controller queues it in the real streaming session.
+				editor.setDraft("[Image #1]", [image]);
+				editor.handleInput("\r");
+				expect(submission).toBeDefined();
+				await submission;
+				expect(editor.getExpandedText()).toBe("");
+				expect(editor.pendingImages).toEqual([]);
+				expect(editor.pendingImageLinks).toEqual([]);
+			});
+
+			await session.prompt("start");
+			await session.waitForIdle();
+
+			expect(showError).not.toHaveBeenCalled();
+			expect(session.agent.hasQueuedMessages()).toBe(false);
+			const delivered = mock.calls.at(-1)!.context.messages.filter(message => message.role === "user");
+			const deliveredImages = delivered
+				.flatMap(message => (Array.isArray(message.content) ? message.content : []))
+				.filter(part => part.type === "image");
+			expect(deliveredImages).toHaveLength(1);
+			const deliveredImage = deliveredImages[0]!;
+			const decoded = new Bun.Image(Buffer.from(deliveredImage.data, "base64"));
+			const metadata = await decoded.metadata();
+			expect(metadata.width).toBe(200);
+			expect(metadata.height).toBe(200);
+			expect(deliveredImage.mimeType).toBe(`image/${metadata.format}`);
+			expect(await decoded.png().bytes()).toEqual(expectedPng);
+			const retainedImages = session.messages
+				.filter(message => message.role === "user")
+				.flatMap(message => (Array.isArray(message.content) ? message.content : []))
+				.filter(part => part.type === "image");
+			// Retain exactly the payload seen by the external provider, once.
+			expect(retainedImages).toEqual(deliveredImages);
+			if (alreadyQueued) {
+				const earlierSteers = delivered
+					.flatMap(message =>
+						typeof message.content === "string"
+							? [{ type: "text" as const, text: message.content }]
+							: message.content,
+					)
+					.filter(part => part.type === "text" && part.text === "earlier steer");
+				expect(earlierSteers).toHaveLength(1);
+			}
+		});
+	}
 
 	it("delivers a queued path-pasted image prompt in the same one-at-a-time turn as its source path", async () => {
 		const { session, mock } = await createSession([{ content: ["initial"] }, { content: ["image answer"] }]);

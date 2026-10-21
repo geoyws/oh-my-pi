@@ -307,13 +307,30 @@ describe("Anthropic forced tool_choice", () => {
 		expect(payload.tool_choice?.type).toBe("auto");
 	});
 
-	it("preserves a forced tool_choice below the Opus 5.5 floor (Opus 5, Opus 4.8)", async () => {
+	it("preserves a forced tool_choice below the Opus 5.5 floor (Opus 5, Opus 4.8), pinning low effort", async () => {
 		for (const id of ["claude-opus-5", "claude-opus-4-8"]) {
 			const payload = await capturePayload(adaptiveModel(id), {
 				toolChoice: { type: "tool", name: "get_weather" },
 			});
 			expect(payload.tool_choice?.type).toBe("tool");
+			expect(payload.thinking).toBeUndefined();
+			expect(payload.output_config?.effort).toBe("low");
 		}
+	});
+
+	// The forced-tool disable pins the lowest tier through the effort map, so
+	// the classes/minimax.kdl medium pin holds instead of a literal `low`.
+	it.each([
+		["any", "any"],
+		["a named tool", { type: "tool", name: "get_weather" }],
+	] as const)("keeps MiniMax-M3.1-Flash at medium effort on a forced %s tool_choice", async (_label, toolChoice) => {
+		const payload = await capturePayload(makeMiniMaxAnthropicModel("MiniMax-M3.1-Flash", "minimax-code"), {
+			reasoning: Effort.High,
+			thinkingEnabled: true,
+			toolChoice,
+		});
+		expect(payload.tool_choice?.type).toBe(toolChoice === "any" ? "any" : "tool");
+		expect(payload.output_config?.effort).toBe("medium");
 	});
 });
 
@@ -324,6 +341,14 @@ describe("Anthropic adaptive-only thinking disable", () => {
 		});
 		expect(payload.thinking).toBeUndefined();
 		expect(payload.output_config?.effort).toBe("low");
+	});
+
+	it("pins the policy effort, not a literal low, when direct callers turn MiniMax-M3.1-Flash thinking off", async () => {
+		const payload = await capturePayload(makeMiniMaxAnthropicModel("MiniMax-M3.1-Flash", "minimax-code"), {
+			thinkingEnabled: false,
+		});
+		expect(payload.thinking).toBeUndefined();
+		expect(payload.output_config?.effort).toBe("medium");
 	});
 
 	it("turns thinking off with between_tools on Sonnet 5.5, without an effort pin or block_binding", async () => {
@@ -407,31 +432,34 @@ describe("MiniMax Anthropic adaptive thinking", () => {
 		expect(payload.output_config?.effort).toBeUndefined();
 	});
 
-	// `high` must beat the M3 family's adaptive-tag map; `max` sits past the
-	// M3 family ladder.
-	it.each([
-		[Effort.High, "high"],
-		[Effort.Max, "max"],
-	] as const)("sends MiniMax-M3.1-Flash-Preview %s effort as output_config.effort", async (effort, wire) => {
-		const payload = await capturePayload(makeMiniMaxAnthropicModel("MiniMax-M3.1-Flash-Preview", "minimax-code"), {
-			reasoning: effort,
-			thinkingEnabled: true,
-		});
+	// The classes/minimax.kdl M3.1 pin maps every tier to `medium`; it must beat
+	// the M3 family's adaptive-tag map, and `max` (the server default) never
+	// reaches the wire.
+	it.each([Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max] as const)(
+		"sends MiniMax-M3.1-Flash %s effort as output_config.effort medium",
+		async effort => {
+			const payload = await capturePayload(makeMiniMaxAnthropicModel("MiniMax-M3.1-Flash", "minimax-code"), {
+				reasoning: effort,
+				thinkingEnabled: true,
+			});
 
-		expect(payload.thinking).toEqual({ type: "adaptive" });
-		expect(payload.output_config?.effort).toBe(wire);
-	});
+			expect(payload.thinking).toEqual({ type: "adaptive" });
+			expect(payload.output_config?.effort).toBe("medium");
+		},
+	);
 
 	// The model 400s on `thinking.type: "disabled"` (error 2013), so the row is
 	// mandatory-reasoning: no off level, and forced-off or effort-less requests
-	// clamp to the lowest effort before reaching the transport.
+	// clamp to an effort before reaching the transport, which the pin sends as
+	// `medium`.
 	it.each([
 		["an effort-less request", {}],
 		["a forced-off request", { forceReasoningOff: true }],
 		["a disabled-reasoning request", { disableReasoning: true }],
-	] as const)("clamps MiniMax-M3.1-Flash-Preview %s to low effort with thinking on", async (_label, opts) => {
-		const model = makeMiniMaxAnthropicModel("MiniMax-M3.1-Flash-Preview", "minimax-code");
+	] as const)("clamps MiniMax-M3.1-Flash %s to medium effort with thinking on", async (_label, opts) => {
+		const model = makeMiniMaxAnthropicModel("MiniMax-M3.1-Flash", "minimax-code");
 		expect(model.thinking?.requiresEffort).toBe(true);
+		expect(model.compat.supportsSamplingParams).toBe(false);
 
 		let payload: CapturedPayload | undefined;
 		await streamSimple(model, CONTEXT, {
@@ -444,7 +472,7 @@ describe("MiniMax Anthropic adaptive thinking", () => {
 		}).result();
 
 		expect(payload?.thinking).toEqual({ type: "adaptive" });
-		expect(payload?.output_config?.effort).toBe("low");
+		expect(payload?.output_config?.effort).toBe("medium");
 	});
 
 	it("drives Token Plan MiniMax-M3 through the adaptive tag like the pay-as-you-go host", async () => {

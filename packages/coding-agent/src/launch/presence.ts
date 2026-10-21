@@ -1,6 +1,7 @@
 import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
 import { isEnoent, logger, postmortem } from "@oh-my-pi/pi-utils";
 import { canonicalProjectDir, daemonRuntimeDir } from "./paths";
 
@@ -32,7 +33,14 @@ export interface DaemonProjectPresence {
 	close(): Promise<void>;
 }
 
-/** Register this omp process so project daemons survive while it remains alive. */
+/**
+ * Register this omp process so project daemons survive while it remains alive.
+ *
+ * The entry records the pid together with the process start-time token, so a
+ * reader can tell this process apart from an unrelated one that later
+ * recycles the pid. SIGKILL or a crash skips the postmortem that removes the
+ * file; {@link hasLiveDaemonProjectPresence} drops it instead.
+ */
 export async function registerDaemonProjectPresence(
 	projectDir: string,
 	runtimeOverride?: string,
@@ -43,7 +51,8 @@ export async function registerDaemonProjectPresence(
 	await fs.mkdir(clientsDir, { recursive: true, mode: 0o700 });
 	const id = `${process.pid}-${crypto.randomUUID()}`;
 	const presencePath = path.join(clientsDir, `${id}.json`);
-	await Bun.write(presencePath, JSON.stringify({ pid: process.pid, id, projectDir: canonical }));
+	const startTime = Process.fromPid(process.pid)?.startTime;
+	await Bun.write(presencePath, JSON.stringify({ pid: process.pid, startTime, id, projectDir: canonical }));
 	// POSIX modes are meaningless on Windows; chmod there only costs another syscall.
 	if (process.platform !== "win32") await fs.chmod(presencePath, 0o600);
 	let closed = false;
@@ -57,7 +66,23 @@ export async function registerDaemonProjectPresence(
 	return { close };
 }
 
-/** Return whether a registered omp process in this runtime directory is still alive. */
+/**
+ * Whether the process that wrote a presence entry is still running. A dead pid
+ * fails; so does a live pid whose start time differs from the recorded one —
+ * the kernel recycled the pid for an unrelated process, which a pid-only check
+ * would treat as the owner for as long as that process lives. Entries from
+ * builds that predate the start-time field fall back to pid liveness alone.
+ */
+function isPresenceOwnerAlive(pid: number, startTime: unknown): boolean {
+	const owner = Process.fromPid(pid);
+	if (!owner || owner.status() !== ProcessStatus.Running) return false;
+	return typeof startTime !== "number" || owner.startTime === startTime;
+}
+
+/**
+ * Return whether a registered omp process in this runtime directory is still
+ * alive, deleting entries whose owner is dead or whose pid was recycled.
+ */
 export async function hasLiveDaemonProjectPresence(runtimeDir: string): Promise<boolean> {
 	const clientsDir = path.join(runtimeDir, CLIENTS_DIR);
 	let entries: string[];
@@ -81,10 +106,9 @@ export async function hasLiveDaemonProjectPresence(runtimeDir: string): Promise<
 				await fs.rm(presencePath, { force: true });
 				continue;
 			}
-			try {
-				process.kill(decoded.pid, 0);
+			if (isPresenceOwnerAlive(decoded.pid, "startTime" in decoded ? decoded.startTime : undefined)) {
 				live = true;
-			} catch {
+			} else {
 				await fs.rm(presencePath, { force: true });
 			}
 		} catch (error) {

@@ -44,8 +44,7 @@ import type { EventBus } from "../utils/event-bus";
 import { WebSearchTool } from "../web/search";
 import type { WorkspaceTree } from "../workspace-tree";
 import { AskTool } from "./ask";
-import { AstEditTool } from "./ast-edit";
-import { AstGrepTool } from "./ast-grep";
+import { AstTool } from "./ast";
 import { BashTool } from "./bash";
 import { type BuiltinToolName, type HiddenToolName, normalizeToolNames } from "./builtin-names";
 import { type CheckpointState, CheckpointTool, type CompletedRewindState, RewindTool } from "./checkpoint";
@@ -215,6 +214,8 @@ export interface ToolSession {
 	hasUI: boolean;
 	/** Whether `ask` can reach a human. Defaults to `hasUI`. */
 	canPromptUser?: boolean;
+	/** Keep `ask` in a headless fork's roster; execution still requires UI. */
+	advertiseHeadlessAsk?: boolean;
 	/** The user approves `cfg://` writes for this session (top-level TUI session only). */
 	settingsApproval?: boolean;
 	/** Whether this session has begun disposal. */
@@ -321,6 +322,8 @@ export interface ToolSession {
 	 * required yield tool). Suppresses automatic tool-set expansion.
 	 */
 	restrictToolNames?: boolean;
+	/** Seance forks: the consulted session's artifacts dir, read in place by history://, artifact://, agent://. */
+	readonly seanceSourceArtifactsDir?: string;
 	/** Task recursion depth (0 = top-level, 1 = first child, etc.) */
 	taskDepth?: number;
 	/** Get this agent's eval executor session ID; keys its retained JS/Python/Ruby/Julia state. */
@@ -355,6 +358,8 @@ export interface ToolSession {
 	getMnemopiSessionState?: () => MnemopiSessionState | undefined;
 	/** Agent identity used for IRC routing. Returns the registry id (e.g. "Main", "AuthLoader"). */
 	getAgentId?: () => string | null;
+	/** Parent cache identity for sibling sharing, only when the parent model opts in. */
+	getPromptCacheKey?: () => string | undefined;
 	/** Look up a registered tool by name (used by the eval js backend's tool bridge). */
 	getToolByName?: (name: string) => AgentTool | undefined;
 	/** Look up an enabled tool through the eval bridge's normal permission pipeline. */
@@ -363,8 +368,6 @@ export interface ToolSession {
 	getToolContext?: () => AgentToolContext | undefined;
 	/** Names currently authorized for invocation through the eval bridge. */
 	getEvalBridgeToolNames?: () => readonly string[];
-	/** Direct partition of the active Code Mode surface; undefined when Code Mode is inactive. */
-	getCodeModeDirectToolNames?: () => readonly string[] | undefined;
 	/** Return whether a built-in tool is active in this turn's tool set. */
 	isToolActive?: (name: string) => boolean;
 	/** Update the active built-in tool predicate when a session changes tools mid-run. */
@@ -476,6 +479,8 @@ export interface ToolSession {
 	getLastAssistantText?: () => string | undefined;
 	/** Resolve a terminal yield's current or immediately preceding report, bound to its call ID. */
 	getYieldReportText?: (toolCallId: string) => string | undefined;
+	/** The `i` intent the model wrote on a tool call of the current turn, by call ID. */
+	getToolCallIntent?: (toolCallId: string) => string | undefined;
 	/** Replace the active workpool item contract and refresh its provider-facing prompt. */
 	setWorkPoolYieldItems?: (items: readonly WorkPoolYieldItem[]) => Promise<void>;
 	/** The tool-choice queue used to force forthcoming tool invocations and carry invocation handlers. */
@@ -554,8 +559,7 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	security_scan: s => new SecurityScanTool(s),
 	bash: s => new BashTool(s),
 	edit: s => new EditTool(s),
-	ast_grep: s => new AstGrepTool(s),
-	ast_edit: s => new AstEditTool(s),
+	ast: AstTool.createIf,
 	ask: AskTool.createIf,
 	debug: DebugTool.createIf,
 	ida: IdaTool.createIf,
@@ -686,18 +690,10 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 			requestedTools.push("goal");
 		}
 		if (
-			requestedTools.includes("grep") &&
-			!requestedTools.includes("ast_grep") &&
-			cfgAstGrepEnabled.get(session.settings)
+			(requestedTools.includes("grep") && cfgAstGrepEnabled.get(session.settings)) ||
+			(requestedTools.includes("edit") && cfgAstEditEnabled.get(session.settings))
 		) {
-			requestedTools.push("ast_grep");
-		}
-		if (
-			requestedTools.includes("edit") &&
-			!requestedTools.includes("ast_edit") &&
-			cfgAstEditEnabled.get(session.settings)
-		) {
-			requestedTools.push("ast_edit");
+			if (!requestedTools.includes("ast")) requestedTools.push("ast");
 		}
 		if (["hindsight", "mnemopi"].includes(cfgMemoryBackend.get(session.settings))) {
 			for (const name of ["recall", "retain", "reflect"]) {
@@ -748,8 +744,7 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 		if (name === "grep") return cfgGrepEnabled.get(session.settings);
 		if (name === "find") return isFindEnabled(session);
 		if (name === "github") return cfgGithubEnabled.get(session.settings);
-		if (name === "ast_grep") return cfgAstGrepEnabled.get(session.settings);
-		if (name === "ast_edit") return cfgAstEditEnabled.get(session.settings);
+		if (name === "ast") return cfgAstGrepEnabled.get(session.settings) || cfgAstEditEnabled.get(session.settings);
 		if (name === "web_search") return cfgWebSearchEnabled.get(session.settings);
 		if (name === "security_scan") return cfgSecurityEnabled.get(session.settings);
 		if (name === "think") return externalThinkingActive;
@@ -904,7 +899,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		session.xdev = createXdevState(session, toolRegistry, builtInNames, mountedNames);
 		tools = kept;
 	}
-	// Staged previews from deferrable tools (e.g. ast_edit) resolve through a
+	// Staged previews from deferrable tools (e.g. ast edit mode) resolve through a
 	// `write` to xd://resolve/reject, so retain write whenever one can stage.
 	const xdevMounted = (session.xdev?.mountedNames.size ?? 0) > 0;
 	if (

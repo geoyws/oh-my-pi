@@ -90,19 +90,38 @@ export class ModelMentionRegistry {
 
 	/** Register user-tagged models and replace their tokens with persisted agent tags. */
 	expandMentions(text: string): string {
+		return this.#expand(text, true);
+	}
+
+	/**
+	 * The text {@link expandMentions} would produce right now, without registering or
+	 * persisting anything: lets a submission be gated before it touches the session.
+	 */
+	previewMentions(text: string): string {
+		return this.#expand(text, false);
+	}
+
+	#expand(text: string, commit: boolean): string {
 		if (!text.includes("^")) return text;
+		const previewed = commit ? undefined : new Map<string, ModelMention>();
+		const previewedAgents = commit ? undefined : new Set<string>();
 		return text.replace(MODEL_MENTION_RE, (token, delimiter: string, selector: string) => {
-			let mention = this.#bySelector.get(selector);
+			let mention = this.#bySelector.get(selector) ?? previewed?.get(selector);
 			if (!mention) {
 				const model = this.findMentionable(selector);
 				if (!model) return token;
 				let next = 1;
-				while (this.#agents.has(`m${next}`)) next++;
+				while (this.#agents.has(`m${next}`) || previewedAgents?.has(`m${next}`)) next++;
 				mention = { agent: `m${next}`, selector, name: modelMentionDisplayName(model) };
-				this.#host.sessionManager.appendCustomEntry(MODEL_MENTION_ENTRY_TYPE, mention);
-				this.#mentions.push(mention);
-				this.#bySelector.set(selector, mention);
-				this.#agents.add(mention.agent);
+				if (previewed && previewedAgents) {
+					previewed.set(selector, mention);
+					previewedAgents.add(mention.agent);
+				} else {
+					this.#host.sessionManager.appendCustomEntry(MODEL_MENTION_ENTRY_TYPE, mention);
+					this.#mentions.push(mention);
+					this.#bySelector.set(selector, mention);
+					this.#agents.add(mention.agent);
+				}
 			}
 			return `${delimiter}${modelMentionTag(mention)}`;
 		});

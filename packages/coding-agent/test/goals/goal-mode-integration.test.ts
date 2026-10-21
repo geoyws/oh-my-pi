@@ -11,6 +11,7 @@ import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mod
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { SubmittedUserInput } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { UserMessageRefusedError } from "@oh-my-pi/pi-coding-agent/session/user-message-refused-error";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { normalizeCustomMessagePayload } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -364,6 +365,65 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(harness.mode.editor.pendingImages).toEqual(images);
 		expect(harness.mode.editor.pendingImageLinks).toEqual(imageLinks);
 	});
+
+	it("refuses a /goal objective before the goal is created, persisted or prompted", async () => {
+		const secret = "FAKE-SECRET-NOT-REAL";
+		const commandText = `/goal ship with ${secret}`;
+		vi.spyOn(harness.session, "gateUserMessage").mockRejectedValue(new UserMessageRefusedError("Blocked: secret"));
+		const createGoal = vi.spyOn(harness.session.goalRuntime, "createGoal");
+		const prompt = vi.spyOn(harness.session, "prompt").mockResolvedValue(true);
+		const showError = vi.spyOn(harness.mode, "showError");
+		harness.mode.editor.setText(commandText);
+
+		await executeBuiltinSlashCommand(commandText, { ctx: harness.mode });
+
+		expect(showError).toHaveBeenCalledWith("Blocked: secret");
+		expect(harness.mode.editor.getText()).toBe(commandText);
+		expect(createGoal).not.toHaveBeenCalled();
+		expect(prompt).not.toHaveBeenCalled();
+		expect(harness.session.getGoalModeState()).toBeUndefined();
+		expect(JSON.stringify(harness.session.sessionManager.getEntries())).not.toContain(secret);
+	});
+
+	it("refuses a /goal set replacement before the active goal is replaced", async () => {
+		const secret = "FAKE-SECRET-NOT-REAL";
+		await harness.mode.handleGoalModeCommand("Ship the release");
+		vi.spyOn(harness.session, "gateUserMessage").mockRejectedValue(new UserMessageRefusedError("Blocked: secret"));
+		const replaceGoal = vi.spyOn(harness.session.goalRuntime, "replaceGoal");
+
+		await expect(harness.mode.handleGoalModeCommand(`set replace with ${secret}`)).rejects.toBeInstanceOf(
+			UserMessageRefusedError,
+		);
+
+		expect(replaceGoal).not.toHaveBeenCalled();
+		expect(harness.session.getGoalModeState()?.goal.objective).toBe("Ship the release");
+		expect(JSON.stringify(harness.session.sessionManager.getEntries())).not.toContain(secret);
+	});
+
+	for (const testCase of [
+		{ name: "/plan", submit: (mode: InteractiveMode, text: string) => mode.handlePlanModeCommand(text) },
+		{ name: "/vibe", submit: (mode: InteractiveMode, text: string) => mode.handleVibeModeCommand(text) },
+	]) {
+		it(`refuses a ${testCase.name} prompt before entering the mode`, async () => {
+			const secret = "FAKE-SECRET-NOT-REAL";
+			const refusal = new UserMessageRefusedError("Blocked: secret");
+			vi.spyOn(harness.session, "activateVibeTools").mockResolvedValue();
+			// The prompt's own gate refuses too, as the real session would.
+			Object.defineProperty(harness.session, "isStreaming", { configurable: true, get: () => true });
+			vi.spyOn(harness.session, "gateUserMessage").mockRejectedValue(refusal);
+			vi.spyOn(harness.session, "prompt").mockRejectedValue(refusal);
+			const entriesBefore = harness.session.sessionManager.getEntries().length;
+
+			await expect(testCase.submit(harness.mode, `ship with ${secret}`)).rejects.toBeInstanceOf(
+				UserMessageRefusedError,
+			);
+
+			expect(harness.mode.planModeEnabled).toBe(false);
+			expect(harness.mode.vibeModeEnabled).toBe(false);
+			expect(harness.session.getPlanModeState()).toBeUndefined();
+			expect(harness.session.sessionManager.getEntries()).toHaveLength(entriesBefore);
+		});
+	}
 
 	it("keeps images pasted while delayed plan setup completes in the later draft", async () => {
 		const submittedImages: ImageContent[] = [{ type: "image", data: "b2xk", mimeType: "image/png" }];

@@ -195,9 +195,10 @@ describe("executeBash", () => {
 			data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
 		};
 		const frame = await encodeTerminalImage(image);
-		const result = await executeBash(`printf '%s' ${shellQuote(frame)}; sleep 3`, {
+		// The deadline must land after the image is out, even when a loaded runner is slow to start the shell.
+		const result = await executeBash(`printf '%s' ${shellQuote(frame)}; sleep 30`, {
 			cwd: tempDir,
-			timeout: 20,
+			timeout: 1_000,
 		});
 
 		expect(result.timedOut).toBe(true);
@@ -628,6 +629,8 @@ exit 64
 		// Redirect the backgrounded job's stdout so it doesn't hold the executor's
 		// output pipe open (which would add the ~250ms background-drain grace);
 		// `$!` reports the real external PID, which is all this test checks.
+		// The job is reaped at normal call end (see bash-process-group tests),
+		// so the pid is valid but already dead by the time we check.
 		const sleepBin = $which("sleep");
 		if (!sleepBin) throw new Error("sleep executable not found");
 		const result = await executeBash(`${shellQuote(sleepBin)} 30 >/dev/null 2>&1 & echo $!`, {
@@ -637,8 +640,7 @@ exit 64
 		const pid = Number.parseInt(result.output.trim(), 10);
 		expect(Number.isInteger(pid)).toBe(true);
 		expect(pid).toBeGreaterThan(0);
-		expect(() => process.kill(pid, 0)).not.toThrow();
-		expect(() => process.kill(pid, "SIGKILL")).not.toThrow();
+		expect(() => process.kill(pid, 0)).toThrow();
 	});
 
 	it("times out before follow-up output", async () => {

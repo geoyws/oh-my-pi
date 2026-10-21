@@ -31,6 +31,8 @@ import {
 	isFeedModelBadgeEnabled,
 	pluralize,
 	previewLine,
+	clipCollapsed,
+	flattenLine,
 	previewWindowRows,
 	replaceTabs,
 	shortenEmbeddedPaths,
@@ -351,7 +353,7 @@ function renderOutputSection(
 		lines.push(
 			`${continuePrefix}  ${theme.fg("warning", theme.status.warning)} ${theme.fg(
 				"dim",
-				truncateToWidth(sanitizeText(warning), 80),
+				clipCollapsed(sanitizeText(warning), 80, expanded),
 			)}`,
 		);
 
@@ -395,7 +397,7 @@ function renderOutputSection(
 		const outputLines = trimmedOutput.split("\n");
 		const previewCount = expanded ? maxExpanded : maxCollapsed;
 		for (const line of outputLines.slice(0, previewCount)) {
-			lines.push(`${continuePrefix}  ${theme.fg("dim", truncateToWidth(replaceTabs(line), 70))}`);
+			lines.push(`${continuePrefix}  ${theme.fg("dim", clipCollapsed(replaceTabs(line), 70, expanded))}`);
 		}
 
 		if (outputLines.length > previewCount) {
@@ -448,7 +450,7 @@ function renderOutputSection(
 	const outputLines = trimmedOutput.split("\n");
 	const previewCount = expanded ? maxExpanded : maxCollapsed;
 	for (const line of outputLines.slice(0, previewCount)) {
-		lines.push(`${continuePrefix}  ${theme.fg("dim", truncateToWidth(replaceTabs(line), 70))}`);
+		lines.push(`${continuePrefix}  ${theme.fg("dim", clipCollapsed(replaceTabs(line), 70, expanded))}`);
 	}
 
 	if (outputLines.length > previewCount) {
@@ -472,7 +474,7 @@ function renderTaskSection(
 	lines.push(`${continuePrefix}${theme.fg("dim", "Task")}`);
 	const taskLines = trimmed.split("\n");
 	for (const line of taskLines.slice(0, maxExpanded)) {
-		lines.push(`${continuePrefix}  ${theme.fg("dim", truncateToWidth(replaceTabs(line), 70))}`);
+		lines.push(`${continuePrefix}  ${theme.fg("dim", replaceTabs(line))}`);
 	}
 	if (taskLines.length > maxExpanded) {
 		lines.push(`${continuePrefix}  ${theme.fg("dim", formatMoreItems(taskLines.length - maxExpanded, "line"))}`);
@@ -723,7 +725,7 @@ function renderAgentProgress(
 
 	const fullDescription = progress.description ? replaceTabs(sanitizeText(progress.description)).trim() : undefined;
 	let statusBadge: string | undefined;
-	if (progress.retryState && progress.status === "running") {
+	if ((progress.retryState ?? progress.providerRetryState) && progress.status === "running") {
 		statusBadge = ` ${formatBadge("retrying", "warning", theme)}`;
 	} else if (progress.retryFailure && (progress.status === "failed" || progress.status === "aborted")) {
 		statusBadge = ` ${formatBadge("rate-limited", "error", theme)}`;
@@ -762,6 +764,15 @@ function renderAgentProgress(
 
 	// Current tool (if running) or most recent completed tool
 	if (progress.status === "running") {
+		if (progress.stage) {
+			lines.push(
+				truncateTaskRow(
+					`${continuePrefix}${theme.fg("muted", replaceTabs(sanitizeText(progress.stage)))}`,
+					maxWidth,
+					"",
+				),
+			);
+		}
 		if (progress.currentTool) {
 			let toolLine = `${continuePrefix}${theme.tree.hook} ${theme.fg("muted", sanitizeText(progress.currentTool))}`;
 			const toolDetail = toolCallDetail(
@@ -800,6 +811,14 @@ function renderAgentProgress(
 		const summary =
 			`retrying ${progress.retryState.attempt}/${progress.retryState.maxAttempts} ${waitLabel}: ` +
 			previewLine(sanitizeText(progress.retryState.errorMessage), 60);
+		lines.push(`${continuePrefix}${theme.tree.hook} ${theme.fg("warning", summary)}`);
+	} else if (progress.providerRetryState && progress.status === "running") {
+		const state = progress.providerRetryState;
+		const remainingMs = Math.max(0, state.startedAtMs + state.delayMs - nowMs);
+		const waitLabel = remainingMs > 0 ? `in ${formatDuration(remainingMs)}` : "now";
+		const count =
+			state.attempt !== undefined && state.maxAttempts !== undefined ? ` ${state.attempt}/${state.maxAttempts}` : "";
+		const summary = `provider retrying${count} ${waitLabel}: ${previewLine(sanitizeText(state.model), 60)}`;
 		lines.push(`${continuePrefix}${theme.tree.hook} ${theme.fg("warning", summary)}`);
 	} else if (progress.retryFailure && progress.status !== "running") {
 		const summary = `auto-retry gave up after ${progress.retryFailure.attempt} attempt${
@@ -1123,7 +1142,7 @@ function renderAgentResult(
 		lines.push(
 			`${continuePrefix}${theme.fg("error", theme.status.aborted)} ${theme.fg(
 				"dim",
-				previewLine(sanitizeText(result.abortReason), 80),
+				clipCollapsed(flattenLine(sanitizeText(result.abortReason)), 80, expanded),
 			)}`,
 		);
 	}
@@ -1215,7 +1234,7 @@ function renderAgentResult(
 		lines.push(
 			`${continuePrefix}${theme.fg("warning", theme.status.warning)} ${theme.fg(
 				"dim",
-				truncateToWidth(sanitizeText(missingCompleteWarning), 80),
+				clipCollapsed(sanitizeText(missingCompleteWarning), 80, expanded),
 			)}`,
 		);
 	}
@@ -1255,7 +1274,7 @@ function renderAgentResult(
 	// Error message
 	if (result.error && (!success || mergeFailed) && (!aborted || result.error !== result.abortReason)) {
 		lines.push(
-			`${continuePrefix}${theme.fg(mergeFailed ? "warning" : "error", previewLine(sanitizeText(result.error), 70))}`,
+			`${continuePrefix}${theme.fg(mergeFailed ? "warning" : "error", clipCollapsed(flattenLine(sanitizeText(result.error)), 70, expanded))}`,
 		);
 	}
 
@@ -1871,6 +1890,9 @@ function describeProgressAgent(progress: AgentProgress, state: AgentDescribeStat
 					age: progress.currentToolStartMs ? Math.max(0, nowMs - progress.currentToolStartMs) : undefined,
 				}
 			: null;
+	const summary = taskSummary(progress.description || progress.assignment || progress.task);
+	// The agent's own stage line (from its completion probe) rides beside the task while it runs.
+	const stage = running && progress.stage ? plainText(progress.stage) : "";
 	const retry =
 		running && progress.retryState
 			? {
@@ -1885,7 +1907,7 @@ function describeProgressAgent(progress: AgentProgress, state: AgentDescribeStat
 		{
 			name: formatTaskId(progress.id),
 			agent: progress.agent || undefined,
-			task: taskSummary(progress.description || progress.assignment || progress.task) || undefined,
+			task: stage ? (summary ? [span(summary), span(` · ${stage}`, "muted")] : stage) : summary || undefined,
 			status,
 			model: progress.resolvedModelIdentity ?? progress.resolvedModel,
 			thinking: thinkingToken(progress.resolvedThinkingLevel),
@@ -2204,6 +2226,10 @@ export interface TaskItem {
 	name?: string;
 	/** Agent type to run this item (e.g. "scout"). Defaults to the spawn policy's default agent. */
 	agent?: string;
+	/** Historical source session selected by the bundled consult agent. */
+	sourceSession?: string;
+	/** Optional model selector override for the historical source session. */
+	model?: string | string[];
 	/** The work; required by the schema. */
 	task?: string;
 	/** How open-ended the work is; required by the schema and the child's sole `auto` thinking classification input. */
@@ -2237,6 +2263,10 @@ export interface TaskParams {
 	name?: string;
 	/** Agent type to spawn (flat form); omitted values resolve from the session spawn policy. */
 	agent?: string;
+	/** Historical source session selected by the bundled consult agent. */
+	sourceSession?: string;
+	/** Optional model selector override for the historical source session. */
+	model?: string | string[];
 	/** The work (flat form). */
 	task?: string;
 	/** How open-ended the work is (flat form); see {@link TaskItem.solutionSpace}. */
@@ -2384,6 +2414,18 @@ export interface AgentProgress {
 	advisor?: boolean;
 	/** The agent's latest self-estimate of task completion (0–100), from the periodic `task.completionProbe` side request. */
 	completionPercent?: number;
+	/**
+	 * The agent's current step in its own words (one line, ≤ 80 chars), from the
+	 * same probe reply as {@link completionPercent}. Running rows prefer it over
+	 * `lastIntent`; the job widget uses it as its stage line.
+	 */
+	stage?: string;
+	/**
+	 * What the agent says shows its progress live (one line, ≤ 200 chars), e.g.
+	 * "BENCH lines in bg_2 pipe:1, tok_s higher is better, target 70% of roofline";
+	 * from the probe reply. Feeds the job widget author's brief; never rendered.
+	 */
+	watch?: string;
 	/** Data extracted by registered subprocess tool handlers (keyed by tool name) */
 	extractedToolData?: Record<string, unknown[]>;
 	/**
@@ -2399,6 +2441,21 @@ export interface AgentProgress {
 		delayMs: number;
 		errorMessage: string;
 		startedAtMs: number;
+	};
+	/**
+	 * Provider-internal retry backoff the subagent is sleeping through (pi-ai's
+	 * own stream retry, e.g. an Anthropic `retry-after`). Unlike `retryState`
+	 * no turn was superseded and there is no error to quote — the model and
+	 * the wait's correlation id identify it. Cleared when the matching
+	 * `provider_retry_wait_end` arrives.
+	 */
+	providerRetryState?: {
+		waitId: number;
+		delayMs: number;
+		model: string;
+		startedAtMs: number;
+		attempt?: number;
+		maxAttempts?: number;
 	};
 	/**
 	 * Terminal retry failure surfaced once the subagent gave up retrying

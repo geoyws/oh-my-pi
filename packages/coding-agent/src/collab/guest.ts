@@ -28,12 +28,13 @@ import type { InteractiveModeContext } from "../modes/types";
 import { AgentRegistry } from "../registry/agent-registry";
 import type { AgentSessionEvent } from "../session/agent-session";
 import type { SessionEntry } from "../session/session-entries";
-import { mintSessionId } from "../session/session-manager";
+import { mintSessionId, SessionManager } from "../session/session-manager";
 import { FileSessionStorage } from "../session/session-storage";
 import { shouldDisableReasoning, toReasoningEffort } from "@oh-my-pi/pi-tui/thinking";
 import { emitSubagentFrame } from "../utils/event-bus";
 import { GuestLifecycleEmitter } from "../extensibility/extensions/lifecycle-mirror";
 import { setSessionTerminalTitle } from "../utils/title-generator";
+import { restoreRefusedDraft } from "../slash-commands/helpers/draft";
 import { importRoomKey } from "./crypto";
 import { collabDisplayName } from "./display-name";
 import {
@@ -97,6 +98,8 @@ export interface GuestIdleReconcilerCtx {
 	statusLine: { markActivityEnd: () => void };
 	statusContainer: Pick<InteractiveModeContext["statusContainer"], "disposeChildren">;
 	loadingAnimation: { stop: () => void } | undefined;
+	/** Replicated provider-retry countdown; an idle host frame retires one whose `wait_end` was lost. */
+	providerRetryLoader?: { stop: () => void } | undefined;
 }
 
 /**
@@ -105,8 +108,10 @@ export interface GuestIdleReconcilerCtx {
  * dropped the event mid-stream. Reached via {@link reconcileGuestSnapshotHostState}
  * (the live `state`-frame and welcome/resync reconciler) when the host reports `isStreaming === false`:
  * folds the in-flight active-time window into the per-session meter (so
- * `time_spent` stops ticking) and stops the `Working…` loader if one is
- * still animating. No-op when the host is still streaming.
+ * `time_spent` stops ticking) and stops the `Working…` loader and any
+ * provider-retry countdown still mounted (a reconnect can drop
+ * `provider_retry_wait_end`, and a pinned countdown would also suppress
+ * `Working…` on later turns). No-op when the host is still streaming.
  *
  * Exported for direct unit testing; mutates the loader field on `ctx` so
  * the same loader is not stopped twice on subsequent reconciliations.
@@ -114,9 +119,11 @@ export interface GuestIdleReconcilerCtx {
 export function reconcileGuestIdleHostState(ctx: GuestIdleReconcilerCtx, isStreaming: boolean): void {
 	if (isStreaming) return;
 	ctx.statusLine.markActivityEnd();
-	if (ctx.loadingAnimation) {
-		ctx.loadingAnimation.stop();
+	if (ctx.loadingAnimation || ctx.providerRetryLoader) {
+		ctx.loadingAnimation?.stop();
 		ctx.loadingAnimation = undefined;
+		ctx.providerRetryLoader?.stop();
+		ctx.providerRetryLoader = undefined;
 		ctx.statusContainer.disposeChildren();
 	}
 }
@@ -134,6 +141,7 @@ export interface GuestSnapshotActivityReconcilerCtx extends GuestIdleReconcilerC
 	ensureLoadingAnimation: InteractiveModeContext["ensureLoadingAnimation"];
 	autoCompactionLoader: InteractiveModeContext["autoCompactionLoader"];
 	retryLoader: InteractiveModeContext["retryLoader"];
+	providerRetryLoader: InteractiveModeContext["providerRetryLoader"];
 }
 
 /** Status-area state which cannot outlive removal of its child components. */
@@ -141,6 +149,7 @@ export interface GuestTransientStatusCtx {
 	statusContainer: Pick<InteractiveModeContext["statusContainer"], "clear">;
 	autoCompactionLoader: InteractiveModeContext["autoCompactionLoader"];
 	retryLoader: InteractiveModeContext["retryLoader"];
+	providerRetryLoader: InteractiveModeContext["providerRetryLoader"];
 }
 
 /** Stop and forget status-area loaders before detaching their components. */
@@ -153,13 +162,17 @@ export function clearGuestTransientStatus(ctx: GuestTransientStatusCtx): void {
 		ctx.retryLoader.stop();
 		ctx.retryLoader = undefined;
 	}
+	if (ctx.providerRetryLoader) {
+		ctx.providerRetryLoader.stop();
+		ctx.providerRetryLoader = undefined;
+	}
 	ctx.statusContainer.clear();
 }
 
 export function reconcileGuestSnapshotHostState(ctx: GuestSnapshotActivityReconcilerCtx, isStreaming: boolean): void {
 	if (isStreaming) {
 		ctx.statusLine.markActivityStart();
-		if (!ctx.autoCompactionLoader && !ctx.retryLoader) ctx.ensureLoadingAnimation();
+		if (!ctx.autoCompactionLoader && !ctx.retryLoader && !ctx.providerRetryLoader) ctx.ensureLoadingAnimation();
 		return;
 	}
 	reconcileGuestIdleHostState(ctx, false);
@@ -477,7 +490,7 @@ export class CollabGuestLink {
 			...pending.header,
 			id: this.#replicaId,
 			parentSession: pending.header.id,
-			providerPromptCacheKey: pending.header.providerPromptCacheKey ?? pending.header.id,
+			providerPromptCacheKey: SessionManager.getInheritedProviderPromptCacheKey(pending.header),
 		};
 		const lines = [header, ...pending.entries].map(entry => JSON.stringify(entry)).join("\n");
 		const storage = new FileSessionStorage();
@@ -657,6 +670,15 @@ export class CollabGuestLink {
 				break;
 			}
 			case "error":
+				if (frame.refused) {
+					// Our prompt was refused by the host's before_user_message gate.
+					// Enter already cleared the composer: put the refused text (and
+					// images) back ahead of any newer draft, never clobbering it.
+					restoreRefusedDraft(this.#ctx.editor, frame.refused.text, frame.refused.images);
+					this.#ctx.showError(frame.message);
+					this.#ctx.ui.requestRender();
+					break;
+				}
 				this.#ctx.showError(`Collab host: ${frame.message}`);
 				break;
 			default:

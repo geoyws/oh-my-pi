@@ -14,6 +14,7 @@ import type {
 	Context,
 	Usage,
 } from "@oh-my-pi/pi-ai/types";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 
 function makeEventStream(events: AssistantMessageEvent[], final: AssistantMessage): AssistantMessageEventStream {
@@ -154,6 +155,18 @@ describe("pi-native parseRequest", () => {
 		expect(parsed.options.acceptEmptyResponse).toBe(true);
 	});
 
+	it("forwards the operation budget but never the epoch deadline", () => {
+		const parsed = parseRequest({
+			modelId: "x",
+			context: baseContext,
+			options: { operationTimeoutMs: 900_000, operationDeadlineAt: Date.now() + 900_000 },
+		});
+		// The gateway stamps its own deadline from the budget on entry; an
+		// epoch stamp from the client's clock must not cross the wire.
+		expect(parsed.options.operationTimeoutMs).toBe(900_000);
+		expect("operationDeadlineAt" in parsed.options).toBe(false);
+	});
+
 	it("preserves headers, metadata, sessionId, thinkingBudgets, and hidden thinking summaries", () => {
 		const parsed = parseRequest({
 			modelId: "x",
@@ -278,6 +291,59 @@ describe("pi-native gateway cache controls", () => {
 			storage.close();
 			await fs.rm(dir, { recursive: true, force: true });
 			clearCustomApis();
+		}
+	});
+});
+describe("pi-native gateway retry budgets", () => {
+	it("limits upstream OpenAI requests on persistent 429", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-pi-native-retry-"));
+		const storage = await AuthStorage.create(path.join(dir, "auth.db"));
+		storage.keys.setRuntime("openai", "test-key");
+		const model = buildModel({
+			id: "memory-429",
+			name: "Memory 429",
+			api: "openai-completions",
+			provider: "openai",
+			baseUrl: "https://api.openai.test/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 32_000,
+			maxTokens: 4096,
+		});
+		let upstreamRequests = 0;
+		const handle = startAuthGateway({
+			bind: "127.0.0.1:0",
+			bearerTokens: ["test-token"],
+			storage,
+			resolveModel: () => model,
+			version: "test",
+			fetch: async () => {
+				upstreamRequests++;
+				return Response.json(
+					{ error: { message: "rate limited", type: "rate_limit_error" } },
+					{ status: 429, headers: { "retry-after": "0" } },
+				);
+			},
+		});
+
+		try {
+			const response = await fetch(`${handle.url}/v1/pi/stream`, {
+				method: "POST",
+				headers: { Authorization: "Bearer test-token", "Content-Type": "application/json" },
+				body: JSON.stringify({
+					modelId: "openai/memory-429",
+					context: baseContext,
+					options: { maxHttpAttempts: 3 },
+					stream: false,
+				}),
+			});
+			expect(response.ok).toBe(false);
+			expect(upstreamRequests).toBe(3);
+		} finally {
+			await handle.close();
+			storage.close();
+			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
 });

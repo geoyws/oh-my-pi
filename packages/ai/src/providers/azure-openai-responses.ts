@@ -1,4 +1,4 @@
-import { $env, type ServerSentEvent } from "@oh-my-pi/pi-utils";
+import { $env, logger, type ServerSentEvent } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import { getEnvApiKey } from "../env-api-key";
 import type {
@@ -36,9 +36,11 @@ import {
 	buildResponsesInput,
 	createInitialResponsesAssistantMessage,
 	getOpenAIPromptCacheKey,
+	isForeignEncryptedReasoningError,
 	isOpenAIResponsesProgressEvent,
 	parseAzureDeploymentNameMap,
 	processResponsesStream,
+	resolveOpenAIEffortFallbackConstraints,
 } from "./openai-shared";
 
 export { parseAzureDeploymentNameMap } from "./openai-shared";
@@ -151,6 +153,8 @@ const streamAzureOpenAIResponsesOnce = (
 				typeof params.model === "string" ? params.model : model.id,
 			);
 			const attemptedReasoningEffortFallbacks = new Set<string>();
+			let foreignEncryptedReasoningRetryAvailable = true;
+			let appliedReasoningEffortFallback: OpenAIReasoningEffortFallback | undefined;
 			let openaiStream: AsyncIterable<ResponseStreamEvent>;
 			while (true) {
 				let requestTimeout: NodeJS.Timeout | undefined;
@@ -179,14 +183,47 @@ const streamAzureOpenAIResponsesOnce = (
 					openaiStream = handle.events;
 					break;
 				} catch (error) {
+					// Legacy turns stored before `credentialId` was recorded
+					// replay caller-bound `encrypted_content` no credential
+					// comparison can drop. On the server's foreign-caller 400,
+					// rebuild once with every encrypted reasoning blob
+					// stripped; other 400s fall through untouched. The flag
+					// makes a second failure surface normally — no loop.
+					if (
+						foreignEncryptedReasoningRetryAvailable &&
+						!requestSignal.aborted &&
+						isForeignEncryptedReasoningError(error)
+					) {
+						foreignEncryptedReasoningRetryAvailable = false;
+						logger.debug(
+							"Azure OpenAI responses foreign encrypted reasoning rejected; retrying with encrypted reasoning stripped",
+							{ provider: model.provider, model: model.id },
+						);
+						params = buildParams(requestModel, context, options, deploymentName, true);
+						if (appliedReasoningEffortFallback !== undefined) {
+							applyOpenAIReasoningEffortFallback(params, appliedReasoningEffortFallback);
+						}
+						const strippedReplacement = await options?.onPayload?.(params, requestModel);
+						if (strippedReplacement !== undefined) {
+							params = strippedReplacement as typeof params;
+						}
+						rawRequestDump.body = params;
+						continue;
+					}
 					const capturedErrorResponse = error instanceof OpenAIHttpError ? error.captured : undefined;
 					const reasoningEffortFallback: OpenAIReasoningEffortFallback | undefined = !requestSignal.aborted
-						? resolveOpenAIReasoningEffortFallback(error, capturedErrorResponse, params)
+						? resolveOpenAIReasoningEffortFallback(
+								error,
+								capturedErrorResponse,
+								params,
+								resolveOpenAIEffortFallbackConstraints(model, model.compat),
+							)
 						: undefined;
 					if (reasoningEffortFallback === undefined) throw error;
 					const retryMarker = `${reasoningEffortFallbackKey}:${String(reasoningEffortFallback)}`;
 					if (attemptedReasoningEffortFallbacks.has(retryMarker)) throw error;
 					attemptedReasoningEffortFallbacks.add(retryMarker);
+					appliedReasoningEffortFallback = reasoningEffortFallback;
 					applyOpenAIReasoningEffortFallback(params, reasoningEffortFallback);
 					rawRequestDump.body = params;
 				} finally {
@@ -368,6 +405,7 @@ function buildParams(
 	context: Context,
 	options: AzureOpenAIResponsesOptions | undefined,
 	deploymentName: string,
+	stripEncryptedReasoning = false,
 ) {
 	const systemRole = model.reasoning && model.compat.supportsDeveloperRole ? "developer" : "system";
 	const messages = buildResponsesInput({
@@ -377,6 +415,7 @@ function buildParams(
 		supportsImageDetailOriginal: model.compat.supportsImageDetailOriginal,
 		systemRole,
 		currentCredentialId: options?.credentialId,
+		stripEncryptedReasoning,
 		nativeHistory: { replay: true, filterReasoning: false },
 		includeThinkingSignatures: true,
 		developerStringContent: true,

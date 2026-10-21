@@ -1,3 +1,4 @@
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent, logger, postmortem, ptree, stableStringifyJson, untilAborted } from "@oh-my-pi/pi-utils";
 import { encodeMessageFrame, MessageFramer } from "../jsonrpc/message-framing";
@@ -55,11 +56,12 @@ let idleTimeoutMs: number | null = null;
 let idleCheckInterval: NodeJS.Timeout | null = null;
 const IDLE_CHECK_INTERVAL_MS = 60 * 1000;
 
-// Broker-shared server mode (one language server per project shared by every
-// omp instance through the LSP mux daemon). Off by default so embedders and
-// tests that drive getOrCreateClient directly never touch the daemon broker;
-// the SDK sets it from the `lsp.shared` setting at session creation and on every
-// later change. Only consulted at cold-start, so running clients keep their transport.
+// Broker-shared server mode: language servers hosted by the per-project LSP mux
+// daemon, one per connection; a released server lingers for reuse while the mux runs.
+// Off by default so embedders and tests that drive getOrCreateClient directly
+// never touch the daemon broker; the SDK sets it from the `lsp.shared` setting at
+// session creation and on every later change. Only consulted at cold-start, so
+// running clients keep their transport.
 let sharedLspEnabled = false;
 
 /** Enable or disable attaching to broker-shared language servers. */
@@ -1061,6 +1063,9 @@ export async function getOrCreateClient(
 	const clientPromise = (async () => {
 		const baseCommand = config.resolvedCommand ?? config.command;
 		const baseArgs = config.args ?? [];
+		// Sent in both the mux handshake and `initialize`: a reused shared server
+		// answers `initialize` from cache, so the mux keys servers on these options.
+		const initializationOptions = config.initOptions ?? {};
 
 		// Wrap with lspmux if available and supported
 		const { command, args, env } = isLspmuxSupported(baseCommand)
@@ -1072,7 +1077,7 @@ export async function getOrCreateClient(
 		// to a private spawn so LSP never regresses on broker trouble.
 		let proc: LspTransport | null = null;
 		if (sharedLspEnabled && command === baseCommand) {
-			proc = await connectSharedLspTransport({ command, args, cwd, env, signal });
+			proc = await connectSharedLspTransport({ command, args, cwd, env, initializationOptions, signal });
 		}
 		proc ??= ptree.spawn([command, ...args], {
 			cwd,
@@ -1154,7 +1159,7 @@ export async function getOrCreateClient(
 					rootUri: fileToUri(cwd),
 					rootPath: cwd,
 					capabilities: CLIENT_CAPABILITIES,
-					initializationOptions: config.initOptions ?? {},
+					initializationOptions,
 					workspaceFolders: currentWorkspaceFolders(client),
 				},
 				signal,
@@ -1891,6 +1896,41 @@ export async function shutdownAll(): Promise<void> {
 			pending.then(client => {
 				if (seen.has(client)) return;
 				seen.add(client);
+				return shutdownClientInstance(client);
+			}),
+		),
+	]);
+}
+
+/**
+ * Shut down every client (including ones still initializing) whose workspace is
+ * `dir` or lies inside it. Called when an isolated subagent worktree is torn
+ * down: its servers have nothing left to serve, and each broker-shared mux
+ * transport holds a broker lease that would otherwise keep that worktree's
+ * daemon broker alive for the rest of the process.
+ */
+export async function shutdownClientsUnder(dir: string): Promise<void> {
+	const resolved = path.resolve(dir);
+	// Clients may record either spelling of a symlinked root (macOS `/tmp` → `/private/tmp`).
+	const roots = new Set([resolved, await fs.realpath(resolved).catch(() => resolved)]);
+	const inside = (cwd: string): boolean => {
+		const target = path.resolve(cwd);
+		for (const root of roots) {
+			const relative = path.relative(root, target);
+			if (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`)) return true;
+		}
+		return false;
+	};
+	const targets = new Set(Array.from(clients.values()).filter(client => inside(client.cwd)));
+	const pendingClients = Array.from(clientLocks.values())
+		.filter(pending => inside(pending.cwd))
+		.map(pending => pending.promise);
+	await Promise.allSettled([
+		...Array.from(targets, client => shutdownClientInstance(client)),
+		...pendingClients.map(pending =>
+			pending.then(client => {
+				if (targets.has(client)) return;
+				targets.add(client);
 				return shutdownClientInstance(client);
 			}),
 		),

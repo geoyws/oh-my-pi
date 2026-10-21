@@ -185,7 +185,7 @@ describe("queued user delivery policy", () => {
 				systemPrompt: [
 					...BASE,
 					`tools:${toolNames.join(",")}`,
-					(await backend.buildDeveloperInstructions(dir.path(), settings, session)) ?? "",
+					(await backend.buildDeveloperInstructions(dir.path(), dir.path(), settings, session)) ?? "",
 				],
 			}),
 			{ settings, tools, policy },
@@ -925,8 +925,8 @@ describe("queued user delivery policy", () => {
 		);
 		const prepare = agent.prepareQueuedMessages;
 		if (!prepare) throw new Error("Session queue preparation was not installed");
-		agent.prepareQueuedMessages = async (messages, signal) => {
-			const preparation = await prepare(messages, signal);
+		agent.prepareQueuedMessages = async (messages, signal, queue) => {
+			const preparation = await prepare(messages, signal, queue);
 			await session.setActiveToolsByName(["new_tool"]);
 			return preparation;
 		};
@@ -1096,8 +1096,9 @@ describe("queued user delivery policy", () => {
 			const reached = Promise.withResolvers<void>();
 			const release = Promise.withResolvers<void>();
 			let calls = 0;
-			// The first model call queues the input; the run dequeues it once that call ends and
-			// holds the next call here, before the transcript records it.
+			// The first model call's gate queues the input. A steer cancels that call and the run
+			// drains it for the replacement; a follow-up waits for the first call to end. Either way the
+			// run dequeues it and holds the next call here, before the transcript records it.
 			const removeGate = agent.addBeforeModelCallHook(async () => {
 				if (calls++ === 0) {
 					if (queue === "steering") await session.steer("dequeued input", [image]);

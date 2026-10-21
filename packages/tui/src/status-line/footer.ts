@@ -1,5 +1,4 @@
 import { stripVTControlCharacters } from "node:util";
-import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { type Component, padding, truncateToWidth, visibleWidth } from "../index";
 import { formatNumber, getProjectDir } from "@oh-my-pi/pi-utils";
@@ -18,6 +17,7 @@ import {
 import type { TspProps, TspSpan } from "@oh-my-pi/pi-wire";
 import type { NativeNode } from "../native/node";
 import { col, node, span } from "../native/describe";
+import { thinkingLevelLabel } from "./segments";
 
 /**
  * Footer component that shows pwd, token stats, and context usage
@@ -169,6 +169,17 @@ export class FooterComponent implements Component {
 	}
 
 	/**
+	 * Thinking selection after the model id: the explicit level, `auto` behind the
+	 * symbol-theme pending marker until a turn classifies it, then `auto (<level>)`.
+	 */
+	#thinkingDisplay(): string {
+		const label = thinkingLevelLabel(this.session) ?? "";
+		return this.session.isAutoThinking && !this.session.autoResolvedThinkingLevel()
+			? `${theme.thinking.autoPending} ${label}`
+			: label;
+	}
+
+	/**
 	 * Native footer: a `status` bar (path and branch, usage counters, billing
 	 * and context on the left, model on the right) plus the extension statuses.
 	 * Rebuilt per call from cheap session reads; the node identity holds while
@@ -176,22 +187,11 @@ export class FooterComponent implements Component {
 	 */
 	describe(): NativeNode {
 		const state = this.session.state;
-		let input = 0;
-		let output = 0;
-		let cacheRead = 0;
-		let cacheWrite = 0;
-		let cost = 0;
-		let premiumRequests = 0;
-		for (const entry of this.session.sessionManager.getEntries()) {
-			if (entry.type === "message" && entry.message?.role === "assistant") {
-				input += entry.message.usage.input;
-				output += entry.message.usage.output;
-				cacheRead += entry.message.usage.cacheRead;
-				cacheWrite += entry.message.usage.cacheWrite;
-				cost += entry.message.usage.cost.total;
-				premiumRequests += entry.message.usage.premiumRequests ?? 0;
-			}
-		}
+		// Cumulative usage: the session manager's running rollup spans every entry
+		// in the session (so it survives compaction) and already folds in the usage
+		// completed `task` tool results carry, which is where subagent spend lands.
+		const { input, output, cacheRead, cacheWrite, cost, premiumRequests } =
+			this.session.sessionManager.getUsageStatistics();
 		const segs: NativeNode[] = [];
 		const seg = (key: string, props: TspProps<"seg">): void => {
 			segs.push(node("seg", { role: `omp.footer.${key}`, ...props }, undefined, key));
@@ -230,10 +230,7 @@ export class FooterComponent implements Component {
 		seg("context", contextProps);
 		let model = state.model?.id || "no-model";
 		if (state.model?.thinking) {
-			const level = this.session.isAutoThinking
-				? (this.session.autoResolvedThinkingLevel() ?? `${theme.thinking.autoPending} auto`)
-				: (state.thinkingLevel ?? ThinkingLevel.Off);
-			model += ` • ${level}`;
+			model += ` • ${this.#thinkingDisplay()}`;
 		}
 		seg("model", { side: "right", priority: 5, icon: "model", spans: [span(model, "dim")] });
 		const bar = node("status", { role: "omp.footer" }, segs, "bar");
@@ -255,25 +252,19 @@ export class FooterComponent implements Component {
 	render(width: number): readonly string[] {
 		const state = this.session.state;
 
-		// Calculate cumulative usage from ALL session entries (not just post-compaction messages)
-		let totalInput = 0;
-		let totalOutput = 0;
-		let totalCacheRead = 0;
-		let totalCacheWrite = 0;
-		let totalCost = 0;
-		let totalPremiumRequests = 0;
-
-		for (const entry of this.session.sessionManager.getEntries()) {
-			if (entry.type === "message" && entry.message?.role === "assistant") {
-				totalInput += entry.message.usage.input;
-				totalOutput += entry.message.usage.output;
-				totalCacheRead += entry.message.usage.cacheRead;
-				totalCacheWrite += entry.message.usage.cacheWrite;
-				totalCost += entry.message.usage.cost.total;
-				totalPremiumRequests += entry.message.usage.premiumRequests ?? 0;
-			}
-		}
-
+		// Cumulative usage comes from the session manager's running rollup, which
+		// spans every entry in the session and folds in the usage completed `task`
+		// tool results carry (subagent spend). Context usage below is a separate
+		// question and stays window-scoped on purpose. Destructured straight off the
+		// rollup: a repaint must not allocate a second copy of these six fields.
+		const {
+			input: totalInput,
+			output: totalOutput,
+			cacheRead: totalCacheRead,
+			cacheWrite: totalCacheWrite,
+			cost: totalCost,
+			premiumRequests: totalPremiumRequests,
+		} = this.session.sessionManager.getUsageStatistics();
 		// Calculate context usage from session (handles compaction correctly).
 		// After compaction, tokens are unknown until the next LLM response.
 		const contextUsage = this.session.getContextUsage();
@@ -347,15 +338,7 @@ export class FooterComponent implements Component {
 		// Add thinking level hint when the current model advertises supported efforts
 		let rightSide = modelName;
 		if (state.model?.thinking) {
-			if (this.session.isAutoThinking) {
-				// Pending (no turn classified yet / classifying) shows a symbol-theme
-				// question-box marker; once resolved it shows `<level>`.
-				const resolved = this.session.autoResolvedThinkingLevel();
-				rightSide = `${modelName} • ${resolved ? resolved : `${theme.thinking.autoPending} auto`}`;
-			} else {
-				const thinkingLevel = state.thinkingLevel ?? ThinkingLevel.Off;
-				rightSide = `${modelName} • ${thinkingLevel}`;
-			}
+			rightSide = `${modelName} • ${this.#thinkingDisplay()}`;
 		}
 
 		let statsLeftWidth = visibleWidth(statsLeft);

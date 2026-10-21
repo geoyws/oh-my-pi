@@ -1,3 +1,4 @@
+import { getOAuthCredentialProvider } from "@oh-my-pi/pi-ai/oauth";
 import { runProviderSetupWizard as runProviderWizard } from "@oh-my-pi/pi-tui/setup/lazy";
 import type { SetupHost, SetupScene } from "@oh-my-pi/pi-tui/setup/scenes/types";
 import {
@@ -22,7 +23,7 @@ import {
 	cfgThemeDark,
 	cfgThemeLight,
 } from "./settings";
-import { cfgDisabledProviders, cfgModelRoleStorage } from "../config/model-settings";
+import { cfgDisabledProviders } from "../config/model-settings";
 
 export { ALL_SCENES, CURRENT_SETUP_VERSION };
 export type { SetupScene, SetupSceneHost } from "@oh-my-pi/pi-tui/setup/scenes/types";
@@ -59,12 +60,17 @@ export function createSetupHost(ctx: InteractiveModeContext): SetupHost {
 		}),
 		refreshModels: () => ctx.session.modelRegistry.refresh("online-if-uncached"),
 		selectModel: async (model, selector) => {
-			const projectScope = cfgModelRoleStorage.get(ctx.settings) === "project";
+			ctx.settings.assertModelRoleWritable("default");
+			const projectScope = ctx.settings.getModelRoleStorage() === "project";
 			await ctx.session.setModel(model, "default", { selector, persist: !projectScope });
 			if (projectScope) ctx.settings.setProjectModelRole("default", selector);
 			await ctx.settings.flush();
 		},
-		refreshProvider: provider => ctx.session.modelRegistry.refreshProvider(provider, "online"),
+		refreshProvider: async provider => {
+			// An OAuth alias (`openai-codex-device`) stores its credential under the base provider.
+			await ctx.session.modelRegistry.refreshProvider(getOAuthCredentialProvider(provider), "online");
+			await ctx.refreshScopedModelsAfterLogin?.();
+		},
 		saveComposerShape: async shape => {
 			cfgComposerShape.set(ctx.settings, shape);
 			await ctx.settings.flush();
@@ -100,16 +106,30 @@ export function selectSetupScenes(
 	ctx?: InteractiveModeContext,
 	options: SetupSceneSelectionOptions = {},
 ): Promise<SetupScene[]> {
+	// Onboarding saves its preferences and completion in global config. A
+	// read-only global config can never record completion, so automatic
+	// onboarding would reopen on every launch; only an explicit request
+	// proceeds, and runSetupWizard refuses it with the policy reason.
+	if (!options.force && ctx?.settings.isGlobalConfigReadOnly()) return Promise.resolve([]);
 	return selectScenes(storedVersion, scenes, ctx ? createSetupHost(ctx) : undefined, options);
 }
 
 /** Run setup with application-owned persistence and provider effects. */
-export function runSetupWizard(
+export async function runSetupWizard(
 	ctx: InteractiveModeContext,
 	scenes: readonly SetupScene[] = ALL_SCENES,
 	options: RunSetupWizardOptions = {},
 ): Promise<void> {
-	return runWizard(createSetupHost(ctx), scenes, options);
+	// Refuse before the overlay opens: every onboarding scene and the
+	// completion marker write global config, so nothing could be saved.
+	const readOnlyReason = ctx.settings.getGlobalConfigReadOnlyReason();
+	if (readOnlyReason !== undefined) {
+		ctx.showError(
+			`Setup is unavailable. ${readOnlyReason} Provider sign-in stays available through /setup providers.`,
+		);
+		return;
+	}
+	await runWizard(createSetupHost(ctx), scenes, options);
 }
 
 /** Open provider setup without advancing onboarding or replaying the welcome intro. */

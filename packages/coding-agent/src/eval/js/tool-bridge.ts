@@ -9,7 +9,7 @@ import { schemaDeclaresIntentField } from "../../utils/tool-schema";
 import { findEnabledEvalPrelude, invokeEvalPrelude } from "../preludes";
 import { EVAL_AGENT_BRIDGE_NAME, type EvalAgentHandleResult, runEvalAgent } from "../agent-bridge";
 import { EVAL_BUDGET_BRIDGE_NAME, type EvalBudgetResult, runEvalBudget } from "../budget-bridge";
-import { withBridgeTimeoutPause } from "../bridge-timeout";
+import { type EvalTimeoutControlSink, withBridgeTimeoutPause } from "../bridge-timeout";
 import { EVAL_COMPLETION_BRIDGE_NAME, type EvalCompletionHandleResult, runEvalCompletion } from "../completion-bridge";
 import {
 	EVAL_JUDGMENT_BATCH_BRIDGE_NAME,
@@ -32,12 +32,23 @@ import { EVAL_WORKPOOL_BRIDGE_NAME, type EvalWorkpoolResult, runEvalWorkpool } f
 import type { RuntimeCallIdentity } from "./shared/runtime";
 import type { JsStatusEvent } from "./shared/types";
 
+/** These tools await delegated subagents/jobs, not the cell runtime's own work. */
+const DELEGATED_WORK_TOOLS = new Set(["task", "wait"]);
+
 export type { JsStatusEvent } from "./shared/types";
 
 export interface ToolBridgeOptions {
 	session: ToolSession;
 	signal?: AbortSignal;
 	emitStatus?: (event: JsStatusEvent) => void;
+	/**
+	 * Dedicated host-owned channel for eval timeout pause/resume. Kept apart
+	 * from {@link ToolBridgeOptions.emitStatus}: that sink carries
+	 * `{ op: <tool name> }` events, so a tool named `timeout-pause` would
+	 * otherwise read as deadline authority. Authority is the channel, not the
+	 * string.
+	 */
+	onTimeoutControl?: EvalTimeoutControlSink;
 	identity?: RuntimeCallIdentity;
 	shadowCell?: EvalShadowCellSession;
 }
@@ -207,7 +218,7 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 			// wait to Eval as well can kill its kernel during a first-use browser
 			// install or an explicitly longer navigation. Caller abort still flows
 			// through; only the runtime-work watchdog is paused.
-			const result = await withBridgeTimeoutPause(options.emitStatus, () =>
+			const result = await withBridgeTimeoutPause(options.onTimeoutControl, () =>
 				invokeEvalPrelude(request.name, request.parameters, {
 					session: options.session,
 					toolCallId,
@@ -296,12 +307,12 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 		if (claimed) return bridgeValueFromToolResult(name, validatedArgs, claimed, options.emitStatus);
 	}
 	try {
-		const result = await tool.execute(
-			toolCallId,
-			validatedArgs,
-			options.signal,
-			undefined,
-			options.session.getToolContext?.(),
+		// A delegated-work tool pauses only the cell's runtime-work watchdog; the turn's
+		// signal still reaches it. The pause rides the host-owned control channel, never
+		// the generic status sink (which drops colliding ops); without it this is a no-op.
+		const result = await withBridgeTimeoutPause(
+			DELEGATED_WORK_TOOLS.has(name) ? options.onTimeoutControl : undefined,
+			() => tool.execute(toolCallId, validatedArgs, options.signal, undefined, options.session.getToolContext?.()),
 		);
 		if (name === "todo") {
 			// A bridged call emits no `todo` toolResult entry, the only thing branch

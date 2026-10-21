@@ -87,6 +87,8 @@ type ThinkingContent struct {
 	Thinking          string  `json:"thinking"`
 	ThinkingSignature *string `json:"thinkingSignature,omitempty"`
 	ItemID            *string `json:"itemId,omitempty"`
+	// Prose the model addressed to the user, returned by the provider as thinking; present it as answer text.
+	Narration *bool `json:"narration,omitempty"`
 	// Extra holds undeclared keys and declared keys whose value did not decode (that field stays zero).
 	// Encoding writes them back, over a declared field with the same key.
 	Extra map[string]json.RawMessage `json:"-"`
@@ -103,6 +105,7 @@ func (v *ThinkingContent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("thinking", &out.Thinking)
 	d.optional("thinkingSignature", &out.ThinkingSignature)
 	d.optional("itemId", &out.ItemID)
+	d.optional("narration", &out.Narration)
 	out.Extra = d.rest()
 	if d.err != nil {
 		return d.err
@@ -2645,12 +2648,13 @@ func (v *FastModeResult) decodeFrom(raw map[string]json.RawMessage) error {
 }
 
 type CompactionResult struct {
-	Summary          string                     `json:"summary"`
-	FirstKeptEntryID string                     `json:"firstKeptEntryId"`
-	TokensBefore     int64                      `json:"tokensBefore"`
-	ShortSummary     *string                    `json:"shortSummary,omitempty"`
-	Details          json.RawMessage            `json:"details,omitempty"`
-	PreserveData     map[string]json.RawMessage `json:"preserveData,omitempty"`
+	Summary                      string                     `json:"summary"`
+	FirstKeptEntryID             string                     `json:"firstKeptEntryId"`
+	TokensBefore                 int64                      `json:"tokensBefore"`
+	ShortSummary                 *string                    `json:"shortSummary,omitempty"`
+	Details                      json.RawMessage            `json:"details,omitempty"`
+	PreserveData                 map[string]json.RawMessage `json:"preserveData,omitempty"`
+	ProviderReplayThroughEntryID *string                    `json:"providerReplayThroughEntryId,omitempty"`
 }
 
 func (v *CompactionResult) UnmarshalJSON(data []byte) error {
@@ -2666,6 +2670,7 @@ func (v *CompactionResult) decodeFrom(raw map[string]json.RawMessage) error {
 	d.optional("shortSummary", &out.ShortSummary)
 	d.optional("details", &out.Details)
 	d.optional("preserveData", &out.PreserveData)
+	d.optional("providerReplayThroughEntryId", &out.ProviderReplayThroughEntryID)
 	if d.err != nil {
 		return d.err
 	}
@@ -3516,7 +3521,10 @@ func (v *NotifyType) UnmarshalJSON(data []byte) error {
 	return unknownValue("NotifyType", s)
 }
 
-type AgentStartEvent struct{}
+type AgentStartEvent struct {
+	// Calls of an unpaired assistant tail a continued run executes before its first model request.
+	ResumedToolCallIds []string `json:"resumedToolCallIds,omitempty"`
+}
 
 func (v *AgentStartEvent) UnmarshalJSON(data []byte) error {
 	return decodeWith(data, "AgentStartEvent", v.decodeFrom)
@@ -3526,6 +3534,7 @@ func (v *AgentStartEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	var out AgentStartEvent
 	d := fieldDecoder{raw: raw, owner: "AgentStartEvent"}
 	d.constant("type", "agent_start")
+	d.optional("resumedToolCallIds", &out.ResumedToolCallIds)
 	if d.err != nil {
 		return d.err
 	}
@@ -3963,6 +3972,93 @@ func (v *AutoRetryEndEvent) decodeFrom(raw map[string]json.RawMessage) error {
 func (v AutoRetryEndEvent) MarshalJSON() ([]byte, error) {
 	type plain AutoRetryEndEvent
 	return encodeObject(plain(v), `"type":"auto_retry_end"`, nil)
+}
+
+type ProviderRetryWaitStartEvent struct {
+	WaitID      int64                           `json:"waitId"`
+	Role        ProviderRetryWaitStartEventRole `json:"role"`
+	DelayMs     int64                           `json:"delayMs"`
+	Model       string                          `json:"model"`
+	Provider    string                          `json:"provider"`
+	API         string                          `json:"api"`
+	Attempt     *int64                          `json:"attempt,omitempty"`
+	MaxAttempts *int64                          `json:"maxAttempts,omitempty"`
+}
+
+func (v *ProviderRetryWaitStartEvent) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "ProviderRetryWaitStartEvent", v.decodeFrom)
+}
+
+func (v *ProviderRetryWaitStartEvent) decodeFrom(raw map[string]json.RawMessage) error {
+	var out ProviderRetryWaitStartEvent
+	d := fieldDecoder{raw: raw, owner: "ProviderRetryWaitStartEvent"}
+	d.constant("type", "provider_retry_wait_start")
+	d.required("waitId", &out.WaitID)
+	d.required("role", &out.Role)
+	d.required("delayMs", &out.DelayMs)
+	d.required("model", &out.Model)
+	d.required("provider", &out.Provider)
+	d.required("api", &out.API)
+	d.optional("attempt", &out.Attempt)
+	d.optional("maxAttempts", &out.MaxAttempts)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v ProviderRetryWaitStartEvent) MarshalJSON() ([]byte, error) {
+	type plain ProviderRetryWaitStartEvent
+	return encodeObject(plain(v), `"type":"provider_retry_wait_start"`, nil)
+}
+
+type ProviderRetryWaitStartEventRole string
+
+const (
+	ProviderRetryWaitStartEventRoleMain    ProviderRetryWaitStartEventRole = "main"
+	ProviderRetryWaitStartEventRoleAdvisor ProviderRetryWaitStartEventRole = "advisor"
+	ProviderRetryWaitStartEventRoleSide    ProviderRetryWaitStartEventRole = "side"
+)
+
+func (v *ProviderRetryWaitStartEventRole) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "ProviderRetryWaitStartEventRole")
+	if err != nil {
+		return err
+	}
+	switch value := ProviderRetryWaitStartEventRole(s); value {
+	case ProviderRetryWaitStartEventRoleMain, ProviderRetryWaitStartEventRoleAdvisor, ProviderRetryWaitStartEventRoleSide:
+		*v = value
+		return nil
+	}
+	return unknownValue("ProviderRetryWaitStartEventRole", s)
+}
+
+type ProviderRetryWaitEndEvent struct {
+	Aborted bool  `json:"aborted"`
+	WaitID  int64 `json:"waitId"`
+}
+
+func (v *ProviderRetryWaitEndEvent) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "ProviderRetryWaitEndEvent", v.decodeFrom)
+}
+
+func (v *ProviderRetryWaitEndEvent) decodeFrom(raw map[string]json.RawMessage) error {
+	var out ProviderRetryWaitEndEvent
+	d := fieldDecoder{raw: raw, owner: "ProviderRetryWaitEndEvent"}
+	d.constant("type", "provider_retry_wait_end")
+	d.required("aborted", &out.Aborted)
+	d.required("waitId", &out.WaitID)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v ProviderRetryWaitEndEvent) MarshalJSON() ([]byte, error) {
+	type plain ProviderRetryWaitEndEvent
+	return encodeObject(plain(v), `"type":"provider_retry_wait_end"`, nil)
 }
 
 // A prompt-cache refresh was handed to the provider.
@@ -4427,6 +4523,8 @@ func (AutoCompactionStartEvent) isRpcAgentEvent()    {}
 func (AutoCompactionEndEvent) isRpcAgentEvent()      {}
 func (AutoRetryStartEvent) isRpcAgentEvent()         {}
 func (AutoRetryEndEvent) isRpcAgentEvent()           {}
+func (ProviderRetryWaitStartEvent) isRpcAgentEvent() {}
+func (ProviderRetryWaitEndEvent) isRpcAgentEvent()   {}
 func (CacheWarmingStartEvent) isRpcAgentEvent()      {}
 func (CacheWarmingEndEvent) isRpcAgentEvent()        {}
 func (RetryFallbackAppliedEvent) isRpcAgentEvent()   {}
@@ -4494,6 +4592,10 @@ func (v *RpcAgentEvent) decodeFrom(raw map[string]json.RawMessage) error {
 		value, err = decodeVariant[AutoRetryStartEvent](raw)
 	case "auto_retry_end":
 		value, err = decodeVariant[AutoRetryEndEvent](raw)
+	case "provider_retry_wait_start":
+		value, err = decodeVariant[ProviderRetryWaitStartEvent](raw)
+	case "provider_retry_wait_end":
+		value, err = decodeVariant[ProviderRetryWaitEndEvent](raw)
 	case "cache_warming_start":
 		value, err = decodeVariant[CacheWarmingStartEvent](raw)
 	case "cache_warming_end":
@@ -6463,6 +6565,8 @@ func (AutoCompactionStartEvent) isRpcNotification()     {}
 func (AutoCompactionEndEvent) isRpcNotification()       {}
 func (AutoRetryStartEvent) isRpcNotification()          {}
 func (AutoRetryEndEvent) isRpcNotification()            {}
+func (ProviderRetryWaitStartEvent) isRpcNotification()  {}
+func (ProviderRetryWaitEndEvent) isRpcNotification()    {}
 func (CacheWarmingStartEvent) isRpcNotification()       {}
 func (CacheWarmingEndEvent) isRpcNotification()         {}
 func (RetryFallbackAppliedEvent) isRpcNotification()    {}
@@ -6561,6 +6665,10 @@ func (v *RpcNotification) UnmarshalJSON(data []byte) error {
 		value, err = decodeVariant[AutoRetryStartEvent](raw)
 	case "auto_retry_end":
 		value, err = decodeVariant[AutoRetryEndEvent](raw)
+	case "provider_retry_wait_start":
+		value, err = decodeVariant[ProviderRetryWaitStartEvent](raw)
+	case "provider_retry_wait_end":
+		value, err = decodeVariant[ProviderRetryWaitEndEvent](raw)
 	case "cache_warming_start":
 		value, err = decodeVariant[CacheWarmingStartEvent](raw)
 	case "cache_warming_end":
@@ -6653,6 +6761,8 @@ func (AutoCompactionStartEvent) isRpcServerFrame()     {}
 func (AutoCompactionEndEvent) isRpcServerFrame()       {}
 func (AutoRetryStartEvent) isRpcServerFrame()          {}
 func (AutoRetryEndEvent) isRpcServerFrame()            {}
+func (ProviderRetryWaitStartEvent) isRpcServerFrame()  {}
+func (ProviderRetryWaitEndEvent) isRpcServerFrame()    {}
 func (CacheWarmingStartEvent) isRpcServerFrame()       {}
 func (CacheWarmingEndEvent) isRpcServerFrame()         {}
 func (RetryFallbackAppliedEvent) isRpcServerFrame()    {}
@@ -6761,6 +6871,10 @@ func (v *RpcServerFrame) UnmarshalJSON(data []byte) error {
 		value, err = decodeVariant[AutoRetryStartEvent](raw)
 	case "auto_retry_end":
 		value, err = decodeVariant[AutoRetryEndEvent](raw)
+	case "provider_retry_wait_start":
+		value, err = decodeVariant[ProviderRetryWaitStartEvent](raw)
+	case "provider_retry_wait_end":
+		value, err = decodeVariant[ProviderRetryWaitEndEvent](raw)
 	case "cache_warming_start":
 		value, err = decodeVariant[CacheWarmingStartEvent](raw)
 	case "cache_warming_end":
