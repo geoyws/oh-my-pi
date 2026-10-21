@@ -23,5 +23,3 @@ packages/coding-agent/test/skillshare/pack.test.ts:private-key:141
 packages/catalog/test/image-tokenization.test.ts:generic-api-key:145
 packages/coding-agent/test/advisor/advisor.test.ts:generic-api-key:2147
 packages/coding-agent/test/model-registry.test.ts:generic-api-key:2835
-# 2026-10-20 generated catalog: single-line models.json; the match is a public "tokenizer" family id already on trunk, not a credential (omp t-031036f7)
-packages/catalog/src/models.json:generic-api-key:1
