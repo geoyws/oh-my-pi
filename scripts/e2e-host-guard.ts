@@ -6,10 +6,12 @@
  * OrbStack, Docker and Linux guests alike, with no automatic Mac fallback.
  * geoyws e2e runs on @@hal only, a bare-metal Linux host.
  *
- * The guard therefore admits only a host it can prove is bare-metal Linux,
- * and for container work only a local, non-VM-backed Docker engine. Any probe
- * it cannot read is a refusal. There is deliberately no override: no flag or
- * environment variable admits a refused host.
+ * The guard therefore admits only an approved e2e host (today @@hal alone,
+ * identified by hostname and /etc/machine-id) that it can also prove is
+ * bare-metal Linux, and for container work only a local, non-VM-backed Docker
+ * engine. Any probe it cannot read is a refusal. There is deliberately no
+ * override: no flag or environment variable admits a refused host. The
+ * allowlist is code; changing placement is a reviewed commit.
  *
  * Callers run it before creating any workload (scratch, clone, image,
  * container, agent process). CLI:
@@ -57,6 +59,11 @@ const GUEST_DMI = /apple|qemu|kvm|vmware|virtualbox|parallels|utm|bochs|xen|micr
 const VM_BACKED_ENGINE = /orbstack|docker desktop|linuxkit|colima|rancher|lima|podman machine/i;
 const LOCAL_DOCKER_SOCKET = "unix:///var/run/docker.sock";
 
+/** Hosts approved for omp e2e (kb rule g-ca3365d2: geoyws/Unum e2e on @@hal only). */
+export const APPROVED_E2E_HOSTS: readonly { label: string; hostname: string; machineId: string }[] = [
+	{ label: "@@hal", hostname: "hal", machineId: "f8916e3bb2ff407685a97b3be9b3abd1" },
+];
+
 export class E2eHostRefusedError extends Error {
 	constructor(
 		readonly entrypoint: string,
@@ -82,6 +89,9 @@ export function e2eHostRefusal(kind: E2eWorkloadKind, probe: E2eHostProbe): stri
 	const virt = probe.detectVirt()?.trim();
 	if (!virt) return "cannot prove bare metal: systemd-detect-virt unavailable";
 	if (virt !== "none") return `virtualized host (systemd-detect-virt: ${virt})`;
+	const machineId = probe.readText("/etc/machine-id")?.trim() ?? "";
+	const approved = APPROVED_E2E_HOSTS.find(host => host.hostname === probe.hostname && host.machineId === machineId);
+	if (!approved) return `${probe.hostname} is not an approved e2e host (${APPROVED_E2E_HOSTS.map(h => h.label).join(", ")})`;
 	if (kind === "e2e") return null;
 
 	const dockerHost = probe.env.DOCKER_HOST?.trim();

@@ -27,9 +27,13 @@ function fakeBin(scripts: Record<string, string>): string {
 	return dir;
 }
 
-/** A bare-metal Linux host with a local Debian docker engine: the @@hal shape. */
+/** @@hal: bare-metal Linux, its machine-id, a local Debian docker engine. */
 function bareLinux(overrides: Partial<E2eHostProbe> & { files?: Record<string, string> } = {}): E2eHostProbe {
-	const files: Record<string, string> = { "/sys/class/dmi/id/sys_vendor": "Hetzner\n", ...overrides.files };
+	const files: Record<string, string> = {
+		"/sys/class/dmi/id/sys_vendor": "Hetzner\n",
+		"/etc/machine-id": "f8916e3bb2ff407685a97b3be9b3abd1\n",
+		...overrides.files,
+	};
 	return {
 		platform: "linux",
 		kernelRelease: "6.12.94+deb13-amd64",
@@ -52,7 +56,7 @@ const BYPASS_ATTEMPTS = {
 };
 
 describe("e2eHostRefusal", () => {
-	test("admits a bare-metal Linux host for e2e and container work", () => {
+	test("admits @@hal for e2e and container work", () => {
 		expect(e2eHostRefusal("e2e", bareLinux())).toBeNull();
 		expect(e2eHostRefusal("container", bareLinux())).toBeNull();
 		expect(
@@ -61,6 +65,27 @@ describe("e2eHostRefusal", () => {
 				bareLinux({ env: { DOCKER_HOST: "unix:///var/run/docker.sock", DOCKER_CONTEXT: "default" } }),
 			),
 		).toBeNull();
+	});
+
+	test("refuses a bare-metal Linux host that is not on the allowlist", () => {
+		// The IFCA test host @@hig shape: bare metal, local engine, different identity.
+		const hig = bareLinux({
+			hostname: "hig",
+			kernelRelease: "6.8.0-124-generic",
+			files: { "/etc/machine-id": "0123456789abcdef0123456789abcdef\n" },
+			dockerEngine: () => ({ operatingSystem: "Ubuntu 24.04.4 LTS", name: "hig" }),
+		});
+		expect(e2eHostRefusal("e2e", hig)).toBe("hig is not an approved e2e host (@@hal)");
+		expect(e2eHostRefusal("container", hig)).toBe("hig is not an approved e2e host (@@hal)");
+	});
+
+	test("refuses a host named hal without hal's machine-id", () => {
+		const reason = "hal is not an approved e2e host (@@hal)";
+		expect(e2eHostRefusal("e2e", bareLinux({ files: { "/etc/machine-id": "ffffffffffffffffffffffffffffffff\n" } }))).toBe(
+			reason,
+		);
+		const noMachineId = bareLinux();
+		expect(e2eHostRefusal("e2e", { ...noMachineId, readText: p => (p === "/etc/machine-id" ? null : noMachineId.readText(p)) })).toBe(reason);
 	});
 
 	test("refuses native Darwin whatever the environment says", () => {
