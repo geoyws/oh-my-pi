@@ -2822,10 +2822,10 @@ export class InputController {
 					cycleOrder.map(entry => ({ label: entry })),
 					cycleOrder.indexOf(role),
 				);
-			// Mid-turn presses on the main session queue; a focused subagent view
-			// cycles its own session immediately.
-			if (!this.ctx.focusedAgentId) {
-				const session = this.ctx.session;
+			// Presses aimed at the main session go through the turn-end queue; a
+			// focused subagent view cycles its own session immediately.
+			const session = this.ctx.viewSession;
+			if (session === this.ctx.session) {
 				// Advance from a switch already queued for after this turn, so a second
 				// press mid-turn reads `A -> C` instead of re-picking `B`.
 				const next = session.nextRoleModel(cycleOrder, direction, this.ctx.pendingUserModelSwitch);
@@ -2834,15 +2834,18 @@ export class InputController {
 					return;
 				}
 				const outcome = this.ctx.routeUserModelSwitch(
+					session,
 					next.model,
 					async () => {
 						await session.applyRoleModel(next);
 						this.ctx.statusLine.invalidate();
 						this.ctx.updateEditorBorderColor();
+						return true;
 					},
 					{ role: next.role },
 				);
-				if (outcome === "queued") {
+				// Queued, or wrapped back onto the live model (queue cancelled).
+				if (outcome !== "apply") {
 					showTrack(next.role);
 					return;
 				}

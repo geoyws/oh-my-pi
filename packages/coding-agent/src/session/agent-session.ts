@@ -11080,6 +11080,11 @@ export class AgentSession implements SettingsScope {
 		return this.#models.setModel(model, role, options);
 	}
 
+	/** Writes a role assignment to global settings without switching the live model. */
+	persistModelRole(model: Model, role: string, options?: { selector?: string; thinkingLevel?: ThinkingLevel }): void {
+		this.#models.persistModelRole(model, role, options);
+	}
+
 	/** Selects a model for this session without updating persisted model settings. */
 	setModelTemporary(
 		model: Model,

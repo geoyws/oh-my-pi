@@ -251,19 +251,7 @@ export class ModelControls {
 		this.#host.clearActiveRetryFallback();
 		await this.#host.setModelWithProviderSessionReset(targetModel);
 		this.#host.sessionManager.appendModelChange(`${targetModel.provider}/${targetModel.id}`, role);
-		if (options?.persist) {
-			this.#host.settings.setModelRole(
-				role,
-				formatRoleModelValue(
-					this.#host.settings,
-					this.#host.modelRegistry,
-					role,
-					targetModel,
-					options.selector,
-					options.thinkingLevel,
-				),
-			);
-		}
+		if (options?.persist) this.persistModelRole(targetModel, role, options);
 		this.#host.settings.getStorage()?.recordModelUsage(`${targetModel.provider}/${targetModel.id}`);
 
 		// Re-apply thinking for the newly selected model. Prefer the model's
@@ -271,6 +259,26 @@ export class ModelControls {
 		this.#reapplyThinkingLevel(targetModel.thinking?.defaultLevel);
 		await this.#host.syncAfterModelChange(previousEditMode);
 		return { switched: true };
+	}
+
+	/**
+	 * Write `role` = `model` to global settings without touching the live model:
+	 * the persistence half of `setModel(..., { persist: true })`, for callers that
+	 * record a role assignment now and switch the live model later.
+	 */
+	persistModelRole(model: Model, role: string, options?: { selector?: string; thinkingLevel?: ThinkingLevel }): void {
+		this.#host.settings.assertModelRoleWritable(role);
+		this.#host.settings.setModelRole(
+			role,
+			formatRoleModelValue(
+				this.#host.settings,
+				this.#host.modelRegistry,
+				role,
+				model,
+				options?.selector,
+				options?.thinkingLevel,
+			),
+		);
 	}
 
 	/**

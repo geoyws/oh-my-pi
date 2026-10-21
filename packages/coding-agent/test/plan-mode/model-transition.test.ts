@@ -71,7 +71,11 @@ describe("resolveUserModelSwitch", () => {
 		expect(resolveUserModelSwitch(a, b, true)).toEqual({ kind: "queue", from: a, to: b });
 	});
 
-	it("queues a mid-turn pick of the active model too (role/thinking changes ride along)", () => {
-		expect(resolveUserModelSwitch(a, a, true)).toEqual({ kind: "queue", from: a, to: a });
+	it("cancels instead of queueing `A -> A` when a mid-turn pick is the live model", () => {
+		expect(resolveUserModelSwitch(a, model("anthropic", "sonnet"), true)).toEqual({ kind: "cancel" });
+	});
+
+	it("applies a pick of the live model normally when idle", () => {
+		expect(resolveUserModelSwitch(a, a, false)).toEqual({ kind: "apply" });
 	});
 });

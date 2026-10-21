@@ -304,7 +304,7 @@ export function createInteractiveModeContext(overrides: ContextOverrides = {}): 
 		reconcileOptimisticSkillMessage: vi.fn(),
 		flushCompactionQueue: vi.fn(async () => {}),
 		flushPendingModelSwitch: vi.fn(async () => {}),
-		routeUserModelSwitch: vi.fn((): "apply" | "queued" => "apply"),
+		routeUserModelSwitch: vi.fn((): "apply" | "queued" | "cancelled" => "apply"),
 		pendingUserModelSwitch: undefined,
 		reloadTodos: vi.fn(async () => {}),
 		setTodos: vi.fn(),

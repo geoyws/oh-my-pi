@@ -372,12 +372,21 @@ export interface InteractiveModeContext {
 	flushPendingModelSwitch(): Promise<void>;
 	/**
 	 * Route a user model switch (model hub, alt+p, `/switch`, ctrl+p, `/model`)
-	 * through `resolveUserModelSwitch`. `"apply"`: the caller switches now, as
-	 * before. `"queued"`: the main session is mid-turn, so the switch is held
-	 * (replacing any queued one) and the queued status line is already shown;
-	 * `apply` runs once from `flushPendingModelSwitch` when the turn settles.
+	 * aimed at `session` through `resolveUserModelSwitch`. Only the main session
+	 * queues, whichever view is focused. `"apply"`: the caller switches now, as
+	 * before, and any switch still queued is dropped. `"queued"`: main is
+	 * mid-turn, so the switch is held (replacing any queued one) and the queued
+	 * status line is already shown; `apply` runs once when main settles and
+	 * resolves `true` only if the model actually switched. `"cancelled"`: main
+	 * is mid-turn and `target` is its live model; any queued switch was dropped
+	 * and the status line already says so.
 	 */
-	routeUserModelSwitch(target: Model, apply: () => Promise<void>, options?: { role?: string }): "apply" | "queued";
+	routeUserModelSwitch(
+		session: AgentSession,
+		target: Model,
+		apply: () => Promise<boolean>,
+		options?: { role?: string },
+	): "apply" | "queued" | "cancelled";
 	/** The user model switch waiting for the running turn to settle, if any. */
 	readonly pendingUserModelSwitch: { model: Model; role?: string } | undefined;
 	setWorkingMessage(message?: string): void;

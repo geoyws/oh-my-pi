@@ -236,6 +236,12 @@ export class SessionFocusController {
 			}
 			await this.ctx.reloadTodos(target);
 			if (generation !== this.#attachGeneration) return false;
+			// Main may have settled while another view was focused; a switch it
+			// queued for after that turn lands now instead of at a later settle.
+			if (target === this.ctx.session && !target.isStreaming) {
+				await this.ctx.flushPendingModelSwitch();
+				if (generation !== this.#attachGeneration) return false;
+			}
 			this.ctx.updatePendingMessagesDisplay();
 			this.ctx.updateEditorBorderColor();
 			this.ctx.ui.requestRender();

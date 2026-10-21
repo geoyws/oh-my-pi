@@ -1,24 +1,26 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import type { Model } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
-import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { HistoryStorage } from "@oh-my-pi/pi-coding-agent/session/history-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { executeBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
+import * as modelHubModule from "@oh-my-pi/pi-tui/overlays/model-hub";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 /**
  * A user model switch made while a turn streams is queued for the turn's
  * settle and shown on the model chip (`A -> B (after this turn)`), instead of
- * flipping the live model mid-turn. Drives ctrl+p (`cycleRoleModel`) on a real
- * InteractiveMode with the turn faked as streaming.
+ * flipping the live model mid-turn. Drives the real InteractiveMode router
+ * with the main turn faked as streaming.
  */
-describe("queued user model switch (ctrl+p mid-turn)", () => {
+describe("queued user model switch", () => {
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
 	let session: AgentSession;
@@ -27,6 +29,8 @@ describe("queued user model switch (ctrl+p mid-turn)", () => {
 	let sonnet: Model;
 	let opus: Model;
 	let haiku: Model;
+	/** Live main-session listeners, so tests can deliver session events. */
+	let listeners: Array<(event: AgentSessionEvent) => unknown>;
 
 	beforeAll(() => {
 		initTheme();
@@ -55,7 +59,7 @@ describe("queued user model switch (ctrl+p mid-turn)", () => {
 			modelRegistry,
 		});
 		// Default ctrl+p order is smol -> default -> slow: from default, forward
-		// lands on slow (opus), then wraps to smol (haiku).
+		// lands on slow (opus), then smol (haiku), then wraps to default (sonnet).
 		session.settings.setModelRole("default", "anthropic/claude-sonnet-4-5");
 		session.settings.setModelRole("slow", "anthropic/claude-opus-4-5");
 		session.settings.setModelRole("smol", "anthropic/claude-haiku-4-5");
@@ -66,6 +70,17 @@ describe("queued user model switch (ctrl+p mid-turn)", () => {
 		// live model pointer to move when the queued switch finally applies.
 		vi.spyOn(session, "applyRoleModel").mockImplementation(async entry => {
 			session.agent.setModel(entry.model);
+		});
+
+		listeners = [];
+		const subscribe = session.subscribe.bind(session);
+		vi.spyOn(session, "subscribe").mockImplementation(listener => {
+			listeners.push(listener);
+			const unsubscribe = subscribe(listener);
+			return () => {
+				listeners = listeners.filter(entry => entry !== listener);
+				unsubscribe();
+			};
 		});
 
 		mode = new InteractiveMode(session, "test");
@@ -84,12 +99,22 @@ describe("queued user model switch (ctrl+p mid-turn)", () => {
 	const chip = () => Bun.stripANSI(mode.statusLine.renderBottomBar(400, "full"));
 	const name = (model: Model) => (model.name.startsWith("Claude ") ? model.name.slice(7) : model.name);
 	const selector = (model: Model) => `${model.provider}/${model.id}`;
-	// The thinking-level tail sits between `A -> B` and the dim trailer.
 	const expectPendingChip = (from: Model, to: Model) => {
-		const text = chip();
-		expect(text).toContain(`${name(from)} -> ${name(to)}`);
-		expect(text.indexOf("(after this turn)")).toBeGreaterThan(text.indexOf(`-> ${name(to)}`));
+		expect(chip()).toContain(`${name(from)} -> ${name(to)} (after this turn)`);
 	};
+	const statusLines = (spy: { mock: { calls: unknown[][] } }) => spy.mock.calls.map(([message]) => String(message));
+	/** Pretend a subagent view is focused: the event controller follows that view, not main. */
+	const focusSubagent = () => {
+		Object.defineProperty(mode, "focusedAgentId", { configurable: true, get: () => "worker-1" });
+	};
+	const emitMainEvent = async (event: AgentSessionEvent) => {
+		for (const listener of [...listeners]) await listener(event);
+	};
+	const abortedAgentEnd = (): AgentSessionEvent =>
+		({
+			type: "agent_end",
+			messages: [{ role: "assistant", content: [], stopReason: "aborted" } as unknown as AssistantMessage],
+		}) as AgentSessionEvent;
 
 	it("queues ctrl+p while streaming, shows it on the chip, and applies it once at settle", async () => {
 		const showStatus = vi.spyOn(mode, "showStatus");
@@ -123,9 +148,9 @@ describe("queued user model switch (ctrl+p mid-turn)", () => {
 		expect(mode.pendingUserModelSwitch).toBeUndefined();
 		expect(chip()).toContain(name(haiku));
 		expect(chip()).not.toContain("->");
-		expect(chip()).not.toContain("(after this turn)");
-		const switchedLines = showStatus.mock.calls.filter(([message]) => message.startsWith("Model switched to"));
-		expect(switchedLines).toEqual([[`Model switched to ${selector(haiku)}`]]);
+		expect(statusLines(showStatus).filter(line => line.startsWith("Model switched to"))).toEqual([
+			`Model switched to ${selector(haiku)}`,
+		]);
 	});
 
 	it("applies ctrl+p immediately when no turn is running", async () => {
@@ -138,6 +163,234 @@ describe("queued user model switch (ctrl+p mid-turn)", () => {
 		expect(session.model?.id).toBe(opus.id);
 		expect(mode.pendingUserModelSwitch).toBeUndefined();
 		expect(chip()).not.toContain("(after this turn)");
+	});
+
+	it("cancels the queue instead of queueing `A -> A` when ctrl+p wraps back to the live model", async () => {
+		const showStatus = vi.spyOn(mode, "showStatus");
+
+		await mode.cycleRoleModel("forward"); // -> opus
+		await mode.cycleRoleModel("forward"); // -> haiku
+		await mode.cycleRoleModel("forward"); // -> sonnet, the live model
+
+		expect(mode.pendingUserModelSwitch).toBeUndefined();
+		expect(chip()).not.toContain("(after this turn)");
+		expect(statusLines(showStatus)).toContain(`Queued model switch cancelled; staying on ${selector(sonnet)}`);
+		expect(statusLines(showStatus).some(line => line.includes(`-> ${selector(sonnet)}`))).toBe(false);
+
+		isStreaming = false;
+		await mode.flushPendingModelSwitch();
+		expect(session.applyRoleModel).not.toHaveBeenCalled();
+	});
+
+	it("an idle switch drops a switch left queued from the earlier turn", async () => {
+		await mode.cycleRoleModel("forward");
+		expect(mode.pendingUserModelSwitch?.model.id).toBe(opus.id);
+
+		// Main idled without a flush (e.g. it settled while another view was focused).
+		isStreaming = false;
+		await mode.cycleRoleModel("backward"); // idle: default -> smol applies now
+		expect(session.model?.id).toBe(haiku.id);
+		expect(mode.pendingUserModelSwitch).toBeUndefined();
+
+		await mode.flushPendingModelSwitch();
+		expect(session.model?.id).toBe(haiku.id);
+		expect(session.applyRoleModel).not.toHaveBeenCalled();
+	});
+
+	it("applies the queued switch when main settles while a subagent view is focused", async () => {
+		await mode.init({ suppressWelcomeIntro: true });
+		await mode.cycleRoleModel("forward");
+		expect(mode.pendingUserModelSwitch?.model.id).toBe(opus.id);
+
+		// Focusing a subagent moves the event controller onto that view, so main's
+		// agent_end never reaches the event controller's flush sites.
+		focusSubagent();
+		mode.unsubscribe?.();
+		const applied = Promise.withResolvers<void>();
+		vi.spyOn(session, "applyRoleModel").mockImplementation(async entry => {
+			session.agent.setModel(entry.model);
+			applied.resolve();
+		});
+		isStreaming = false;
+		await emitMainEvent({ type: "agent_end", messages: [] } as AgentSessionEvent);
+		// The main-session listener flushes fire-and-forget; wait for the switch itself.
+		await applied.promise;
+
+		expect(session.applyRoleModel).toHaveBeenCalledTimes(1);
+		expect(session.model?.id).toBe(opus.id);
+		expect(mode.pendingUserModelSwitch).toBeUndefined();
+	});
+
+	it("keeps the switch across an Esc abort and applies it once at the settle", async () => {
+		const showStatus = vi.spyOn(mode, "showStatus");
+		await mode.cycleRoleModel("forward");
+
+		// Esc: the turn is aborted; the queued switch survives until the settle.
+		await session.abort();
+		expect(mode.pendingUserModelSwitch?.model.id).toBe(opus.id);
+
+		isStreaming = false;
+		await mode.eventController.handleEvent(abortedAgentEnd());
+		await mode.eventController.handleEvent(abortedAgentEnd());
+
+		expect(session.applyRoleModel).toHaveBeenCalledTimes(1);
+		expect(session.model?.id).toBe(opus.id);
+		expect(statusLines(showStatus).filter(line => line.startsWith("Model switched to"))).toEqual([
+			`Model switched to ${selector(opus)}`,
+		]);
+	});
+
+	it("keeps the switch for the next settle when a superseded agent_end lands after a new turn started", async () => {
+		await mode.cycleRoleModel("forward");
+
+		// The follow-up turn is already streaming when the old turn's agent_end arrives.
+		await mode.eventController.handleEvent({ type: "agent_end", messages: [] } as AgentSessionEvent);
+		await mode.flushPendingModelSwitch();
+		expect(session.applyRoleModel).not.toHaveBeenCalled();
+		expect(mode.pendingUserModelSwitch?.model.id).toBe(opus.id);
+		expectPendingChip(sonnet, opus);
+
+		isStreaming = false;
+		await mode.eventController.handleEvent({ type: "agent_end", messages: [] } as AgentSessionEvent);
+		expect(session.applyRoleModel).toHaveBeenCalledTimes(1);
+		expect(session.model?.id).toBe(opus.id);
+	});
+
+	it("plan entry mid-turn absorbs the queued switch as the model to restore, and says so", async () => {
+		const showStatus = vi.spyOn(mode, "showStatus");
+		await mode.cycleRoleModel("forward");
+		vi.spyOn(session, "resolveRoleModelWithThinking").mockReturnValue({
+			model: haiku,
+			thinkingLevel: undefined,
+			explicitThinkingLevel: false,
+			warning: undefined,
+		});
+		vi.spyOn(session, "sendPlanModeContext").mockResolvedValue(undefined);
+		const setModelTemporary = vi.spyOn(session, "setModelTemporary").mockResolvedValue(undefined);
+
+		await mode.handlePlanModeCommand();
+		expect(mode.planModeEnabled).toBe(true);
+		expect(mode.pendingUserModelSwitch).toBeUndefined();
+		expect(statusLines(showStatus)).toContain(
+			`Queued model switch to ${selector(opus)} replaced by plan mode; it is restored when plan mode exits`,
+		);
+
+		// The settle applies the plan model; exiting plan mode then restores the user's target.
+		isStreaming = false;
+		await mode.flushPendingModelSwitch();
+		expect(setModelTemporary).toHaveBeenLastCalledWith(haiku, undefined);
+		vi.spyOn(mode, "showHookConfirm").mockResolvedValue(true);
+		await mode.handlePlanModeCommand();
+		expect(mode.planModeEnabled).toBe(false);
+		expect(setModelTemporary).toHaveBeenLastCalledWith(opus, undefined);
+	});
+
+	it("/model <selector> queues on the main session even while a subagent view is focused", async () => {
+		focusSubagent();
+		const showStatus = vi.spyOn(mode, "showStatus");
+		const setModel = vi.spyOn(session, "setModel");
+
+		await executeBuiltinSlashCommand(`/model ${selector(opus)}`, { ctx: mode } as never);
+
+		expect(setModel).not.toHaveBeenCalled();
+		expect(mode.pendingUserModelSwitch?.model.id).toBe(opus.id);
+		expect(statusLines(showStatus)).toContain(
+			`Model switch queued for after this turn: ${selector(sonnet)} -> ${selector(opus)}`,
+		);
+		expect(statusLines(showStatus).some(line => line.startsWith("Model set to"))).toBe(false);
+
+		isStreaming = false;
+		await mode.flushPendingModelSwitch();
+		expect(setModel).toHaveBeenCalledTimes(1);
+		expect(session.model?.id).toBe(opus.id);
+		expect(statusLines(showStatus)).toContain(`Model switched to ${selector(opus)}`);
+	});
+
+	it("/model <selector> while idle switches now and reports `Model set to ...`", async () => {
+		isStreaming = false;
+		const showStatus = vi.spyOn(mode, "showStatus");
+
+		await executeBuiltinSlashCommand(`/model ${selector(opus)}`, { ctx: mode } as never);
+
+		expect(session.model?.id).toBe(opus.id);
+		expect(mode.pendingUserModelSwitch).toBeUndefined();
+		expect(statusLines(showStatus)).toContain(`Model set to ${selector(opus)}.`);
+	});
+
+	it("prints no success line when the queued switch reports it did not switch", async () => {
+		const showStatus = vi.spyOn(mode, "showStatus");
+		vi.spyOn(session, "setModel").mockResolvedValue({ switched: false });
+
+		await executeBuiltinSlashCommand(`/model ${selector(opus)}`, { ctx: mode } as never);
+		isStreaming = false;
+		await mode.flushPendingModelSwitch();
+
+		expect(session.setModel).toHaveBeenCalledTimes(1);
+		expect(mode.pendingUserModelSwitch).toBeUndefined();
+		expect(statusLines(showStatus).some(line => line.startsWith("Model switched to"))).toBe(false);
+	});
+
+	it("model hub default assignment while focused: persists now, queues only the live switch", async () => {
+		type HubCallbacks = {
+			onAssign: (model: Model, role: string, thinkingLevel: undefined, selector: string) => Promise<boolean>;
+		};
+		let callbacks: HubCallbacks | undefined;
+		vi.spyOn(modelHubModule, "ModelHubComponent").mockImplementation(function (this: unknown, ...args: unknown[]) {
+			callbacks = args[4] as HubCallbacks;
+			return {
+				render: () => [],
+				invalidate: () => {},
+				handleInput: () => {},
+				dispose: () => {},
+				refreshAfterExternalMutation: () => {},
+			};
+		} as never);
+		const setModel = vi.spyOn(session, "setModel");
+
+		// The hub only opens on the main view; the subagent is focused while it is up.
+		mode.showModelSelector();
+		if (!callbacks) throw new Error("model hub did not open");
+		focusSubagent();
+		expect(await callbacks.onAssign(opus, "default", undefined, selector(opus))).toBe(true);
+
+		// The role assignment is recorded at assign time; only the live switch waits.
+		expect(session.settings.getModelRole("default")).toContain(opus.id);
+		expect(setModel).not.toHaveBeenCalled();
+		expect(mode.pendingUserModelSwitch?.model.id).toBe(opus.id);
+
+		// A later switch replaces the queued live switch, never the persisted role.
+		await mode.cycleRoleModel("backward");
+		expect(mode.pendingUserModelSwitch?.model.id).toBe(haiku.id);
+		expect(session.settings.getModelRole("default")).toContain(opus.id);
+
+		isStreaming = false;
+		await mode.flushPendingModelSwitch();
+		expect(setModel).not.toHaveBeenCalled();
+		expect(session.applyRoleModel).toHaveBeenCalledTimes(1);
+		expect(session.settings.getModelRole("default")).toContain(opus.id);
+	});
+
+	it("a non-plan role edit in plan mode keeps the queued user switch; a plan-role edit says so", async () => {
+		await mode.init({ suppressWelcomeIntro: true });
+		// The plan model (haiku) differs from the live model, so an unguarded
+		// reconcile would queue a plan-role switch over the user's entry.
+		session.settings.setModelRole("plan", "anthropic/claude-haiku-4-5");
+		// Role listeners run on the next microtask.
+		await Promise.resolve();
+		const showStatus = vi.spyOn(mode, "showStatus");
+		mode.planModeEnabled = true;
+		await mode.cycleRoleModel("forward");
+		expect(mode.pendingUserModelSwitch?.model.id).toBe(opus.id);
+
+		session.settings.setModelRole("smol", "anthropic/claude-sonnet-4-5");
+		await Promise.resolve();
+		expect(mode.pendingUserModelSwitch?.model.id).toBe(opus.id);
+		expect(statusLines(showStatus).some(line => line.startsWith("Plan role changed"))).toBe(false);
+
+		session.settings.setModelRole("plan", "anthropic/claude-sonnet-4-5");
+		await Promise.resolve();
+		expect(mode.pendingUserModelSwitch?.model.id).toBe(opus.id);
+		expect(statusLines(showStatus)).toContain(`Plan role changed; keeping the queued switch to ${selector(opus)}`);
 	});
 
 	it("drops a queued user switch on session teardown but keeps it across focus retargeting", async () => {

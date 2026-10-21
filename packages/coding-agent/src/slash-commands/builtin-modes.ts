@@ -507,12 +507,15 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				ctx.showError(`Unknown model: ${selector}`);
 				return;
 			}
+			const session = ctx.session;
 			const apply = async () => {
-				await ctx.session.setModel(match);
-				if (resolved.thinkingLevel !== undefined) ctx.session.setThinkingLevel(resolved.thinkingLevel);
+				const { switched } = await session.setModel(match);
+				if (switched && resolved.thinkingLevel !== undefined) session.setThinkingLevel(resolved.thinkingLevel);
+				return switched;
 			};
-			// Mid-turn the router prints the queued line instead of `Model set to ...`.
-			if (ctx.routeUserModelSwitch(match, apply) === "queued") return;
+			// `/model` drives the main session even from a focused subagent view;
+			// mid-turn the router prints the queued (or cancelled) line instead of `Model set to ...`.
+			if (ctx.routeUserModelSwitch(session, match, apply) !== "apply") return;
 			try {
 				await apply();
 				ctx.showStatus(`Model set to ${match.provider}/${match.id}.`);

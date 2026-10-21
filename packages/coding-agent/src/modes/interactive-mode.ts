@@ -1273,11 +1273,13 @@ const JOBS_SHEET_REFRESH_MS = 250;
  * wins). `plan-role`: queued by the live plan-role reconciler, the only kind
  * `#clearPendingPlanModelSwitch` drops; `plan-restore`: the pre-plan model
  * restored on plan exit; `user`: a user switch, shown on the model chip and
- * replayed through its entry point's `apply` at settle.
+ * replayed through its entry point's `apply` at settle (`apply` resolves
+ * `true` only when the model actually switched). A queued user switch
+ * outranks plan reconciles; plan entry absorbs it as the model to restore.
  */
 type PendingModelSwitch =
 	| { source: "plan-role" | "plan-restore"; model: Model; thinkingLevel?: ConfiguredThinkingLevel }
-	| { source: "user"; model: Model; role?: string; apply: () => Promise<void> };
+	| { source: "user"; model: Model; role?: string; apply: () => Promise<boolean> };
 
 export class InteractiveMode implements InteractiveModeContext {
 	#ownsStartedUi: boolean;
@@ -1672,6 +1674,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	#previousGoalContinuationActivity: string | undefined;
 	#goalSuppressNextContinuation = false;
 	#planModePreviousModelState: { model: Model; thinkingLevel?: ConfiguredThinkingLevel } | undefined;
+	/** `plan` role value the reconciler last saw, so other role edits are told apart. */
+	#lastPlanRoleValue: string | undefined;
 	#pendingModelSwitch: PendingModelSwitch | undefined;
 	#planModeHasEntered = false;
 	#planReviewOverlay: PlanReviewOverlay | undefined;
@@ -2626,6 +2630,15 @@ export class InteractiveMode implements InteractiveModeContext {
 					this.#scheduleComposerStatusPersist();
 					this.session.prewarmModelConnection();
 				}
+				// The event controller follows the viewed session, so a main turn that
+				// settles while a subagent is focused never reaches its flush sites.
+				if (
+					event.type === "agent_end" &&
+					!this.session.isStreaming &&
+					this.#pendingModelSwitch?.source === "user"
+				) {
+					void this.flushPendingModelSwitch();
+				}
 				if (event.type === "config_warnings_changed") {
 					this.#syncConfigWarningHeader();
 				}
@@ -2641,6 +2654,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Config warnings can change during the same pre-subscription window; the
 		// event is not replayed, so rebuild from the live array once here too.
 		this.#syncConfigWarningHeader();
+		this.#lastPlanRoleValue = this.settings.getModelRole("plan");
 		this.#eventBusUnsubscribers.push(
 			cfgModelRoles.listen(this.settings, () => this.#reapplyPlanModeModelOnRoleChange()),
 		);
@@ -4920,16 +4934,27 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (!resolved.model) return;
 
 		const currentModel = this.session.model;
+		// A user switch queued for after this turn is the model the user is really
+		// moving to: plan mode takes over now and restores that target on exit.
+		const pendingUser = this.#pendingModelSwitch?.source === "user" ? this.#pendingModelSwitch : undefined;
+		if (pendingUser) {
+			this.#setPendingModelSwitch(undefined);
+			this.showStatus(
+				`Queued model switch to ${formatModelString(pendingUser.model)} replaced by plan mode; it is restored when plan mode exits`,
+			);
+		}
 		// Capture the pre-plan model so #exitPlanMode can restore it. Only the
 		// entry path records this — a mid-planning role change (below) leaves the
 		// active model on the plan role, so overwriting here would restore the old
 		// plan model instead of the user's real pre-plan model.
-		this.#planModePreviousModelState = currentModel
-			? {
-					model: currentModel,
-					thinkingLevel: this.session.configuredThinkingLevel(),
-				}
-			: undefined;
+		this.#planModePreviousModelState = pendingUser
+			? { model: pendingUser.model }
+			: currentModel
+				? {
+						model: currentModel,
+						thinkingLevel: this.session.configuredThinkingLevel(),
+					}
+				: undefined;
 
 		await this.#applyPlanModelTransition(currentModel, resolved);
 	}
@@ -4943,10 +4968,24 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * settings.
 	 */
 	async #reapplyPlanModeModelOnRoleChange(): Promise<void> {
+		// `cfgModelRoles` fires for every role edit; only a change to `plan`
+		// itself is a plan-role reassignment. Tracked even outside plan mode.
+		const planRoleValue = this.settings.getModelRole("plan");
+		const planRoleChanged = planRoleValue !== this.#lastPlanRoleValue;
+		this.#lastPlanRoleValue = planRoleValue;
 		if (!this.planModeEnabled) return;
 		const resolved = this.session.resolveRoleModelWithThinking("plan");
 		if (!resolved.model) {
 			this.#clearPendingPlanModelSwitch();
+			return;
+		}
+		// A user switch queued for after this turn outranks the reconcile: the user
+		// picked that model after entering plan mode. A plan-role edit only says so.
+		const pendingUser = this.#pendingModelSwitch?.source === "user" ? this.#pendingModelSwitch : undefined;
+		if (pendingUser) {
+			if (planRoleChanged && !modelsAreEqual(pendingUser.model, resolved.model)) {
+				this.showStatus(`Plan role changed; keeping the queued switch to ${formatModelString(pendingUser.model)}`);
+			}
 			return;
 		}
 		await this.#applyPlanModelTransition(this.session.model, resolved);
@@ -5010,12 +5049,14 @@ export class InteractiveMode implements InteractiveModeContext {
 	async flushPendingModelSwitch(): Promise<void> {
 		const pending = this.#pendingModelSwitch;
 		if (!pending) return;
+		// A user switch lands only on an idle main session: a settle whose
+		// successor turn already started leaves it for that turn's own settle.
+		if (pending.source === "user" && this.session.isStreaming) return;
 		// The turn has settled: drop the `A -> B` chip before awaiting the switch.
 		this.#setPendingModelSwitch(undefined);
 		try {
 			if (pending.source === "user") {
-				await pending.apply();
-				this.showStatus(`Model switched to ${formatModelString(pending.model)}`);
+				if (await pending.apply()) this.showStatus(`Model switched to ${formatModelString(pending.model)}`);
 			} else {
 				await this.session.setModelTemporary(pending.model, pending.thinkingLevel);
 			}
@@ -5031,16 +5072,36 @@ export class InteractiveMode implements InteractiveModeContext {
 		return pending?.source === "user" ? { model: pending.model, role: pending.role } : undefined;
 	}
 
-	routeUserModelSwitch(target: Model, apply: () => Promise<void>, options?: { role?: string }): "apply" | "queued" {
-		// The queue belongs to the main session; a focused subagent view switches its own model now.
-		if (this.focusedAgentId) return "apply";
+	routeUserModelSwitch(
+		session: AgentSession,
+		target: Model,
+		apply: () => Promise<boolean>,
+		options?: { role?: string },
+	): "apply" | "queued" | "cancelled" {
+		// Only the main session queues; a focused subagent's own model switches now.
+		if (session !== this.session) return "apply";
 		const decision = resolveUserModelSwitch(this.session.model, target, this.session.isStreaming);
-		if (decision.kind === "apply") return "apply";
-		this.#setPendingModelSwitch({ source: "user", model: decision.to, role: options?.role, apply });
-		this.showStatus(
-			`Model switch queued for after this turn: ${decision.from ? formatModelString(decision.from) : "no model"} -> ${formatModelString(decision.to)}`,
-		);
-		return "queued";
+		switch (decision.kind) {
+			case "apply":
+				// An idle switch supersedes one left queued from an earlier turn.
+				if (this.#pendingModelSwitch?.source === "user") this.#setPendingModelSwitch(undefined);
+				return "apply";
+			case "cancel":
+				// Back onto the model the turn runs on: nothing to switch after it.
+				if (this.#pendingModelSwitch) {
+					this.#setPendingModelSwitch(undefined);
+					this.showStatus(`Queued model switch cancelled; staying on ${formatModelString(target)}`);
+				} else {
+					this.showStatus(`Already on ${formatModelString(target)}`);
+				}
+				return "cancelled";
+			case "queue":
+				this.#setPendingModelSwitch({ source: "user", model: decision.to, role: options?.role, apply });
+				this.showStatus(
+					`Model switch queued for after this turn: ${decision.from ? formatModelString(decision.from) : "no model"} -> ${formatModelString(decision.to)}`,
+				);
+				return "queued";
+		}
 	}
 
 	async #clearTransientModeState(options?: {
@@ -5307,6 +5368,16 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	async #restorePlanPreviousModel(prev: { model: Model; thinkingLevel?: ConfiguredThinkingLevel }): Promise<void> {
+		// A user switch queued during plan mode is newer than the pre-plan model.
+		const pendingUser = this.#pendingModelSwitch?.source === "user" ? this.#pendingModelSwitch : undefined;
+		if (pendingUser) {
+			if (!modelsAreEqual(pendingUser.model, prev.model)) {
+				this.showStatus(
+					`Keeping the queued switch to ${formatModelString(pendingUser.model)} instead of restoring ${formatModelString(prev.model)}`,
+				);
+			}
+			return;
+		}
 		if (modelsAreEqual(this.session.model, prev.model)) {
 			// Same model — only thinking level may differ. Avoid setModelTemporary()
 			// which would reset provider-side sessions and break continuity.
