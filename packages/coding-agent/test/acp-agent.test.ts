@@ -158,8 +158,9 @@ class FakeAgentSession {
 	constructor(
 		cwd: string,
 		private readonly models: Model[] = TEST_MODELS,
+		sessionDir?: string,
 	) {
-		this.sessionManager = SessionManager.create(cwd);
+		this.sessionManager = SessionManager.create(cwd, sessionDir);
 		this.sessionId = this.sessionManager.getSessionId();
 		this.agent = {
 			sessionId: this.sessionId,
@@ -499,6 +500,8 @@ async function createHarness(
 		sessionUpdateHook?: (notification: SessionNotification) => Promise<void> | void;
 		/** Gives each session the factory creates a real extension runner with no extensions. */
 		extensionRunners?: boolean;
+		/** `--session-dir` override shared by the session factory and the agent's stored-session lookups. */
+		sessionDir?: string;
 	} = {},
 ): Promise<AgentHarness> {
 	const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-acp-test-"));
@@ -531,10 +534,10 @@ async function createHarness(
 		closed: Promise.withResolvers<void>().promise,
 	} as unknown as AgentSideConnection;
 
-	const initialSession = new FakeAgentSession(cwdA);
+	const initialSession = new FakeAgentSession(cwdA, TEST_MODELS, options.sessionDir);
 	sessions.push(initialSession);
 	const factory = async (cwd: string, factoryOptions?: { interactivePrompts?: boolean }) => {
-		const session = new FakeAgentSession(cwd);
+		const session = new FakeAgentSession(cwd, TEST_MODELS, options.sessionDir);
 		if (options.extensionRunners) {
 			session.extensionRunner = new ExtensionRunner(
 				[],
@@ -551,7 +554,7 @@ async function createHarness(
 		return { session: session as unknown as AgentSession, setToolUIContext };
 	};
 
-	const agent = new AcpAgent(connection, factory, initialSession as unknown as AgentSession);
+	const agent = new AcpAgent(connection, factory, initialSession as unknown as AgentSession, options.sessionDir);
 	const clientCapabilities =
 		options.clientCapabilities ?? (options.elicitationHandler ? { elicitation: { form: {} } } : undefined);
 	if (clientCapabilities) {
@@ -1401,6 +1404,51 @@ describe("ACP agent", () => {
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
+	});
+
+	it("loads, lists and resumes a --session-dir session after an ACP restart (t-6ac64916)", async () => {
+		const sessionDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-acp-session-dir-"));
+		cleanupRoots.push(sessionDir);
+
+		// First server process: create and prompt a session under the custom dir.
+		const first = await createHarness({ sessionDir });
+		const workspace = first.cwdA;
+		const created = await first.agent.newSession({ cwd: workspace, mcpServers: [] });
+		const sessionId = created.sessionId;
+		await first.agent.prompt({ sessionId, prompt: [{ type: "text", text: "remember me" }] });
+		const createdSession = first.findSession(sessionId);
+		if (!createdSession) throw new Error("session not registered");
+		await createdSession.sessionManager.ensureOnDisk();
+		await createdSession.sessionManager.flush();
+		const sessionFile = createdSession.sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("session file not persisted");
+		expect(fs.realpathSync(path.dirname(sessionFile))).toBe(fs.realpathSync(sessionDir));
+		await first.agent.dispose();
+
+		// Restarted server with the same --session-dir. Its agent dir (and so the
+		// default session root) is fresh, so only the custom dir holds the session.
+		const second = await createHarness({ sessionDir });
+		const listed = await second.agent.listSessions({ cwd: workspace });
+		expect(listed.sessions.map(session => session.sessionId)).toContain(sessionId);
+		const listedAll = await second.agent.listSessions({});
+		expect(listedAll.sessions.map(session => session.sessionId)).toContain(sessionId);
+
+		const loaded = await second.agent.loadSession({ sessionId, cwd: workspace, mcpServers: [] });
+		expectAcpStructure(zLoadSessionResponse, loaded);
+		const replayedUserText: string[] = [];
+		for (const { sessionId: updateSessionId, update } of second.updates) {
+			if (updateSessionId !== sessionId || update.sessionUpdate !== "user_message_chunk") continue;
+			if (update.content.type === "text") replayedUserText.push(update.content.text);
+		}
+		expect(replayedUserText.some(text => text.includes("remember me"))).toBe(true);
+		await second.agent.dispose();
+
+		// session/resume runs the same lookup on another fresh server.
+		const third = await createHarness({ sessionDir });
+		await third.agent.resumeSession({ sessionId, cwd: workspace, mcpServers: [] });
+		const resumedFile = third.findSession(sessionId)?.sessionManager.getSessionFile();
+		expect(resumedFile && fs.realpathSync(resumedFile)).toBe(fs.realpathSync(sessionFile));
+		await third.agent.dispose();
 	});
 
 	it("delivers the final visible answer when agent_end overtakes the assistant message_end (#4902)", async () => {

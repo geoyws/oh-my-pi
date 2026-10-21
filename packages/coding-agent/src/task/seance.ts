@@ -152,7 +152,7 @@ export async function resolveSeanceSource(
 	const localMatch = chooseId(local, source);
 	if (localMatch) return validateSourceFile(localMatch.path, storage);
 	if (options.includeGlobal) {
-		const matchGlobal = chooseId(await SessionManager.listAll(storage), source);
+		const matchGlobal = chooseId(await SessionManager.listAll(undefined, storage), source);
 		if (matchGlobal) return validateSourceFile(matchGlobal.path, storage);
 	}
 	throw new Error(`Session "${label}" was not found.`);

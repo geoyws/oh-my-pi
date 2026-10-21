@@ -4449,9 +4449,16 @@ export class SessionManager {
 		return sortPinnedFirst(sessions, await loadPinnedSessionIds());
 	}
 
-	/** List all sessions across all project directories, pinned sessions first. */
-	static async listAll(storage: SessionStorage = new FileSessionStorage()): Promise<SessionInfo[]> {
-		const sessions = await listAllSessions(storage);
+	/**
+	 * List all sessions across all project directories, pinned sessions first.
+	 * @param sessionDir Optional custom dir (`--session-dir`); it holds every
+	 *   project's sessions directly, so only it is listed instead of the default buckets.
+	 */
+	static async listAll(
+		sessionDir?: string,
+		storage: SessionStorage = new FileSessionStorage(),
+	): Promise<SessionInfo[]> {
+		const sessions = sessionDir ? await listSessions(sessionDir, storage) : await listAllSessions(storage);
 		return sortPinnedFirst(sessions, await loadPinnedSessionIds());
 	}
 
