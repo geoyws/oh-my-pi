@@ -275,7 +275,10 @@ describe("user model switches during a streaming turn", () => {
 	});
 
 	it("clears the role at once but queues the hub unassign fallback switch while streaming", async () => {
-		await Bun.write(tempDir.join(".omp", "config.yml"), YAML.stringify({ modelRoles: { default: `anthropic/${OPUS}` } }));
+		await Bun.write(
+			tempDir.join(".omp", "config.yml"),
+			YAML.stringify({ modelRoles: { default: `anthropic/${OPUS}` } }),
+		);
 		const { live, ctx, queue, setStreaming } = await start();
 		const setModel = vi.spyOn(live, "setModel");
 		setStreaming(true);

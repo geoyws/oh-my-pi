@@ -138,7 +138,9 @@ describe("ModelSwitchQueue", () => {
 
 		await queue.flush();
 
-		expect(host.showWarning).toHaveBeenCalledWith("Failed to switch model after streaming: No API key for anthropic/opus");
+		expect(host.showWarning).toHaveBeenCalledWith(
+			"Failed to switch model after streaming: No API key for anthropic/opus",
+		);
 		expect(queue.pending).toBeUndefined();
 	});
 
