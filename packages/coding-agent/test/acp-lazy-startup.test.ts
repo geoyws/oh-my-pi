@@ -241,6 +241,40 @@ describe("ACP lazy startup", () => {
 		});
 	});
 
+	it("hands --session-dir to ACP mode so stored-session lookups search it (t-6ac64916)", async () => {
+		const { runRootCommand } = await import("@oh-my-pi/pi-coding-agent/main");
+		const sessionDir = startupDir.path();
+		const stopMessage = "stop test ACP mode";
+		let observedSessionDir: string | undefined;
+		await expect(
+			runRootCommand(
+				{
+					mode: "acp",
+					messages: [],
+					fileArgs: [],
+					unknownFlags: new Map(),
+					unrecognizedFlags: [],
+					invalidFlagValues: [],
+					noSkills: true,
+					noRules: true,
+					noTools: true,
+					noLsp: true,
+					sessionDir,
+				},
+				[],
+				{
+					discoverAuthStorage: async () => startupAuthStorage,
+					settings: Settings.isolated(),
+					runAcpMode: async (_createAcpSession, options) => {
+						observedSessionDir = options?.sessionDir;
+						throw new Error(stopMessage);
+					},
+				},
+			),
+		).rejects.toThrow(stopMessage);
+		expect(observedSessionDir).toBe(sessionDir);
+	});
+
 	it("honors explicit host-defaulted and todo settings for protocol hosts", async () => {
 		// Regression for #3207: in RPC/ACP startup, runtime overrides applied via
 		// `applyDefaultSettingOverrides` previously clobbered any explicitly

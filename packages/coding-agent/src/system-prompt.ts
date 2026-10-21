@@ -487,6 +487,8 @@ export function projectSystemPromptToolMetadata(
 	return metadata;
 }
 
+const DEFAULT_PROMPT_SEARCH_MODES: readonly string[] = ["regex", "glob"];
+
 export interface BuildSystemPromptOptions {
 	/** Custom system prompt (replaces default). */
 	customPrompt?: string;
@@ -541,6 +543,12 @@ export interface BuildSystemPromptOptions {
 	scoutAvailable?: boolean;
 	/** Active model's delegation appetite (catalog `delegation-bias` axis); selects the Delegation section's wording. Default: `eager`. */
 	delegationBias?: DelegationBias;
+	/**
+	 * `search` modes enabled in this session (`regex`/`glob`/`semantic`); the
+	 * prompt only steers toward modes listed here. Default: `regex` and `glob`
+	 * (semantic needs a judge, so it is never assumed).
+	 */
+	searchModes?: readonly string[];
 
 	/** Rules with alwaysApply=true — their full content is injected into the prompt. */
 	alwaysApplyRules?: AlwaysApplyRule[];
@@ -658,6 +666,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		workspaceTree: providedWorkspaceTree,
 		scoutAvailable = true,
 		delegationBias = "eager",
+		searchModes = DEFAULT_PROMPT_SEARCH_MODES,
 		memoryBackend,
 		securityEnabled = false,
 		settingsApproval = false,
@@ -985,6 +994,9 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		taskBatch,
 		MAX_CONCURRENCY: normalizeConcurrencyLimit(taskMaxConcurrency),
 		scoutAvailable,
+		searchRegex: searchModes.includes("regex"),
+		searchGlob: searchModes.includes("glob"),
+		searchSemantic: searchModes.includes("semantic"),
 		taskIrcEnabled,
 		secretsEnabled,
 		browserEnabled: evalPreludes.some(prelude => prelude.name === "browser"),

@@ -8,7 +8,7 @@
  *
  * Adapter boundaries (extension `registerTool`, SDK custom tools, RPC host
  * tools) default an omitted `loadMode` to `"discoverable"`. A UI-only
- * re-register of a built-in — e.g. wrapping `read`/`write`/`bash`/`edit`/`glob`
+ * re-register of a built-in — e.g. wrapping `read`/`write`/`bash`/`edit`/`search`
  * to customize rendering — would then silently demote it to `discoverable` and,
  * with `tools.xdev` on, unmount it from the top-level schema (issue #5764).
  * {@link defaultLoadModeForToolName} pins these names to `"essential"` when the
@@ -25,8 +25,7 @@ export const ESSENTIAL_BUILTIN_TOOL_NAMES: Record<string, true> = {
 	write: true,
 	bash: true,
 	edit: true,
-	glob: true,
-	find: true,
+	search: true,
 	eval: true,
 	task: true,
 	wait: true,

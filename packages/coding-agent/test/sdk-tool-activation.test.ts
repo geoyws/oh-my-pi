@@ -180,7 +180,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 
 		try {
 			// The device-only xd:// transport write is surfaced in the active set...
-			expect(session.getActiveToolNames()).toEqual(expect.arrayContaining(["read", "grep", "glob", "write"]));
+			expect(session.getActiveToolNames()).toEqual(expect.arrayContaining(["read", "search", "write"]));
 			// ...so a discoverable extension tool mounts under xd:// instead of
 			// shipping its full schema top-level on every request.
 			const deviceNames = session.getXdevToolEntries().map(entry => entry.name);
@@ -1789,16 +1789,16 @@ describe("createAgentSession defaultInactive tool activation", () => {
 
 		const { session } = await createAgentSession({
 			...baseOptions(tempDir),
-			toolNames: ["read", "search", "glob"],
+			toolNames: ["read", "grep", "glob"],
 		});
 
 		try {
 			const activeToolNames = session.getActiveToolNames();
 
 			expect(activeToolNames).toContain("read");
-			expect(activeToolNames).toContain("grep");
-			expect(activeToolNames).toContain("glob");
-			expect(activeToolNames).not.toContain("search");
+			expect(activeToolNames).toContain("search");
+			expect(activeToolNames).not.toContain("grep");
+			expect(activeToolNames).not.toContain("glob");
 		} finally {
 			await session.dispose();
 		}

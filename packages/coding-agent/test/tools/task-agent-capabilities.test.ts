@@ -22,7 +22,7 @@ describe("task agent capability descriptions", () => {
 	it("keeps `wait` read-only while any exec-tier tool disqualifies the agent", () => {
 		const scout = agentByName(loadBundledAgents(), "scout");
 
-		expect(isReadOnlyAgent({ ...scout, tools: ["read", "grep", "wait", "yield"] })).toBe(true);
-		expect(isReadOnlyAgent({ ...scout, tools: ["read", "grep", "wait", "bash"] })).toBe(false);
+		expect(isReadOnlyAgent({ ...scout, tools: ["read", "search", "wait", "yield"] })).toBe(true);
+		expect(isReadOnlyAgent({ ...scout, tools: ["read", "search", "wait", "bash"] })).toBe(false);
 	});
 });

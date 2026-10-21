@@ -344,6 +344,7 @@ Generated declarations currently include exports from these Rust modules:
 - No candidate could load: throws with full candidate error list and mode-specific remediation hints.
 - Embedded extraction and Windows staging problems: decompress/mkdir/write/copy errors are recorded and included in final diagnostics if load fails.
 - Version mismatch: install/compiled loads normally require the package version through a stamp or legacy sentinel. Pre-sentinel addons with no release identity can pass the loader's narrow compatibility check. Driver installs, local binding builds, and Nix builds stamp artifacts; a raw `bazel-bin` output copied elsewhere is unstamped and reports no version. Workspace loads skip release validation.
+- Missing native symbols: install/compiled loads reject an addon lacking any function or class method declared in `index.d.ts` (listed in `native/required-surface.js`), even when its release stamp matches; the error names the file, its release, the first missing symbols, and the rebuild/reinstall fix. Workspace loads mark such an addon stale and stub the missing symbols instead.
 
 ## Troubleshooting matrix
 

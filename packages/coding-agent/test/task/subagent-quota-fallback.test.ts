@@ -1,8 +1,8 @@
 /**
- * A task subagent whose role model answers a subscription-quota 429 with a
- * multi-day retry-after must walk `retry.fallbackChains` exactly like the main
- * loop: the next rung answers and the task succeeds instead of exiting on the
- * first 429.
+ * A task subagent whose role model answers a usage-limit error (a
+ * subscription-quota 429 with a multi-day retry-after, or a 402 billing cap)
+ * must walk `retry.fallbackChains` exactly like the main loop: the next rung
+ * answers and the task succeeds instead of exiting on the first error.
  */
 import { afterEach, beforeEach, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -23,8 +23,23 @@ import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
 const MOCK_API_SOURCE = "test/subagent-quota-fallback";
 const ENV_KEYS = ["HOME", "PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE"] as const;
-const QUOTA_429 =
-	"429 Subscription quota exhausted. Your usage window resets at 2026-10-19T00:00:00Z. retry-after-ms=310373000";
+const QUOTA_429 = {
+	message:
+		"429 Subscription quota exhausted. Your usage window resets at 2026-10-19T00:00:00Z. retry-after-ms=310373000",
+};
+// An xAI-shaped 402 billing cap whose wording alone is not usage-limit text
+// (no "exhausted"/"insufficient"), so only the HTTP 402 billing-cap arm
+// (packages/ai/src/error/rate-limit.ts is402BillingCapBody) classifies it as
+// a usage limit. Drop the status and it classifies as nothing.
+const BILLING_CAP_402 = {
+	status: 402,
+	message: '{"code":"Payment Required","error":"Add credits at https://console.x.ai to continue."}',
+};
+// An informative non-quota 402: never a usage limit.
+const SUBSCRIPTION_REQUIRED_402 = {
+	status: 402,
+	message: '{"code":"Forbidden","error":"A subscription is required for this endpoint."}',
+};
 
 let savedEnv: Record<string, string | undefined> = {};
 let root: string;
@@ -72,14 +87,19 @@ const OPUS = "anthropic/claude-opus-5-5:medium";
 
 /**
  * Spawns a `task` subagent through the real executor and session on the
- * `task` role model, which answers every request with the subscription-quota
- * 429. Mirrors the reported config: the model's own chain names glm then grok,
- * and the `task` role chain (installed as the child's `subagent:<id>` chain)
- * starts with opus. `suppressed` selectors start on a sibling-recorded cooldown
- * in the shared registry, as when an earlier child's walk already found them
- * exhausted.
+ * `task` role model, which answers every request with `error`. Mirrors
+ * the reported config: the model's own chain names glm then grok, and the
+ * `task` role chain (installed as the child's `subagent:<id>` chain) starts
+ * with opus. `suppressed` selectors start on a sibling-recorded cooldown in
+ * the shared registry, as when an earlier child's walk already found them
+ * exhausted. `fallbackOn` is `retry.fallbackOn`; `"usage-limit"` makes the
+ * walk depend on the error classifying as a usage limit.
  */
-async function runQuotaExhaustedTaskSubagent(suppressed: readonly string[]) {
+async function runQuotaExhaustedTaskSubagent(
+	suppressed: readonly string[],
+	error: { message: string; status?: number } = QUOTA_429,
+	fallbackOn: "any" | "usage-limit" = "any",
+) {
 	const cwd = path.join(root, "home", "work");
 	const artifactsDir = path.join(root, "artifacts");
 	await fs.mkdir(cwd, { recursive: true });
@@ -97,7 +117,7 @@ async function runQuotaExhaustedTaskSubagent(suppressed: readonly string[]) {
 		provider: "muse-code",
 		id: "muse-spark-1.3-contributor",
 		reasoning: true,
-		handler: { stopReason: "error", errorMessage: QUOTA_429 },
+		handler: { stopReason: "error", errorMessage: error.message, errorStatus: error.status },
 	});
 	const glm = createMockModel({
 		provider: "zhipu-coding-plan",
@@ -152,6 +172,7 @@ async function runQuotaExhaustedTaskSubagent(suppressed: readonly string[]) {
 				"todo.reminders": false,
 				"advisor.enabled": false,
 				"retry.baseDelayMs": 1,
+				"retry.fallbackOn": fallbackOn,
 				modelRoles: { default: OPUS, task: MUSE },
 				"retry.fallbackChains": {
 					"muse-code/muse-spark-1.3-contributor": [GLM, GROK],
@@ -187,4 +208,28 @@ it("falls through to the subagent's role chain when every model-keyed rung is un
 	expect(opus.calls.length).toBeGreaterThan(0);
 	expect(result.exitCode).toBe(0);
 	expect(result.output).toContain("answered by opus");
+}, 20_000);
+
+// `retry.fallbackOn: usage-limit` admits only usage-limit errors to the walk,
+// so the 402 status must classify the billing cap for the child to reach opus.
+it("falls through to the subagent's role chain when the task role model dies on a 402 billing cap", async () => {
+	const { result, muse, glm, grok, opus } = await runQuotaExhaustedTaskSubagent(
+		[GLM, GROK],
+		BILLING_CAP_402,
+		"usage-limit",
+	);
+
+	expect(muse.calls.length).toBeGreaterThan(0);
+	expect(glm.calls).toHaveLength(0);
+	expect(grok.calls).toHaveLength(0);
+	expect(opus.calls.length).toBeGreaterThan(0);
+	expect(result.exitCode).toBe(0);
+	expect(result.output).toContain("answered by opus");
+}, 20_000);
+
+it("does not walk to the role chain on a non-quota 402 when only usage limits fall back", async () => {
+	const { result, opus } = await runQuotaExhaustedTaskSubagent([GLM, GROK], SUBSCRIPTION_REQUIRED_402, "usage-limit");
+
+	expect(opus.calls).toHaveLength(0);
+	expect(result.exitCode).not.toBe(0);
 }, 20_000);
