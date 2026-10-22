@@ -1,0 +1,385 @@
+import { afterEach, describe, expect, it } from "bun:test";
+import { streamSimple } from "@oh-my-pi/pi-ai/stream";
+import type { AssistantMessage, AssistantMessageEvent, Context, FetchImpl, Model } from "@oh-my-pi/pi-ai/types";
+import { ProviderRequestTelemetry } from "@oh-my-pi/pi-ai/utils/request-telemetry";
+import { auxiliaryFetch, getProviderRequestTelemetry, transportFetch } from "@oh-my-pi/pi-ai/utils/transport-fetch";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { logger } from "@oh-my-pi/pi-utils";
+
+// Every logical provider request must be reconstructable from the log file alone:
+// how long it took, how many attempts it burned, how many bytes and tokens it
+// moved, and how it ended. A `start` with no `end` is the hung-request signature.
+
+type Fields = Record<string, unknown>;
+
+const model: Model<"google-generative-ai"> = buildModel({
+	id: "gemini-3-flash",
+	name: "Gemini 3 Flash",
+	api: "google-generative-ai",
+	provider: "google",
+	baseUrl: "",
+	reasoning: true,
+	input: ["text"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 200_000,
+	maxTokens: 32_000,
+});
+
+const context: Context = { messages: [{ role: "user", content: "hi", timestamp: 1 }] };
+
+const SSE_BODY = `data: ${JSON.stringify({
+	candidates: [{ content: { parts: [{ text: "hello" }] }, finishReason: "STOP" }],
+	usageMetadata: {
+		promptTokenCount: 10,
+		candidatesTokenCount: 5,
+		cachedContentTokenCount: 3,
+		totalTokenCount: 15,
+	},
+})}\n\n`;
+
+function sseResponse(): Response {
+	return new Response(SSE_BODY, { status: 200, headers: { "content-type": "text/event-stream" } });
+}
+
+let dispose: (() => void) | undefined;
+
+function captureTelemetry(): { lines: Array<{ message: string; fields: Fields }> } {
+	const lines: Array<{ message: string; fields: Fields }> = [];
+	dispose = logger.registerLogSink(event => {
+		if (!event.message.startsWith("provider request")) return;
+		lines.push({ message: event.message, fields: (event.context ?? {}) as Fields });
+	});
+	return { lines };
+}
+
+async function drain(stream: AsyncIterable<AssistantMessageEvent>): Promise<AssistantMessageEvent[]> {
+	const events: AssistantMessageEvent[] = [];
+	try {
+		for await (const event of stream) events.push(event);
+	} catch {
+		// Terminal failures are asserted through the telemetry lines, not here.
+	}
+	return events;
+}
+
+/** Telemetry closes on the result promise, which settles on the same tick as the last event. */
+async function settle(): Promise<void> {
+	await Promise.resolve();
+	await Promise.resolve();
+	await Promise.resolve();
+}
+
+afterEach(() => {
+	dispose?.();
+	dispose = undefined;
+});
+
+describe("provider request telemetry", () => {
+	it("records response timing without inventing an HTTP status for native transports", () => {
+		const { lines } = captureTelemetry();
+		const telemetry = new ProviderRequestTelemetry(model, "native-statusless");
+		telemetry.noteCall();
+		telemetry.noteResponseHeaders();
+		telemetry.noteBytes(9);
+		telemetry.failed(new Error("native failure"));
+		const end = lines.find(line => line.message === "provider request end")!;
+		expect(end.fields).toMatchObject({ attempts: 1, bytesIn: 9, outcome: "error" });
+		expect(end.fields.status).toBeUndefined();
+		expect(typeof end.fields.ttfbMs).toBe("number");
+	});
+
+	it("exposes native accounting only on inference fetch and shares header timing and bytes", async () => {
+		const { lines } = captureTelemetry();
+		const telemetry = new ProviderRequestTelemetry(model, "native");
+		const fetch = transportFetch(model, async () => sseResponse(), telemetry);
+		expect(getProviderRequestTelemetry(fetch)).toBe(telemetry);
+		expect(getProviderRequestTelemetry(auxiliaryFetch(fetch))).toBeUndefined();
+		expect(getProviderRequestTelemetry(undefined)).toBeUndefined();
+		expect(getProviderRequestTelemetry(globalThis.fetch)).toBeUndefined();
+		telemetry.noteCall();
+		telemetry.noteResponseHeaders(503);
+		telemetry.noteBytes(7);
+		telemetry.noteCallError(new Error("native disconnected"));
+		await (await fetch("https://x/stream")).arrayBuffer();
+		telemetry.failed(new Error("terminal"));
+		const attempts = lines.filter(line => line.message === "provider request attempt");
+		expect(attempts).toHaveLength(1);
+		expect(attempts[0].fields).toMatchObject({
+			attempt: 2,
+			previousStatus: 503,
+			previousError: "native disconnected",
+		});
+		const end = lines.find(line => line.message === "provider request end")!;
+		expect(end.fields).toMatchObject({
+			attempts: 2,
+			status: 200,
+			bytesIn: 7 + Buffer.byteLength(SSE_BODY),
+			outcome: "error",
+		});
+		expect(typeof end.fields.ttfbMs).toBe("number");
+	});
+
+	it("emits one start/end pair per request with duration, bytes, and token counts", async () => {
+		const { lines } = captureTelemetry();
+		const fetchImpl = (async () => sseResponse()) as unknown as FetchImpl;
+
+		const stream = streamSimple(model, context, { apiKey: "k", fetch: fetchImpl });
+		await drain(stream);
+		expect((await stream.result()).stopReason).toBe("stop");
+		await settle();
+
+		expect(lines.map(l => l.message)).toEqual(["provider request start", "provider request end"]);
+		const [start, end] = lines;
+		expect(start.fields).toMatchObject({
+			provider: "google",
+			model: "gemini-3-flash",
+			api: "google-generative-ai",
+			transport: "http",
+			attempt: 1,
+		});
+		expect(typeof start.fields.requestId).toBe("string");
+		expect(typeof start.fields.sessionId).toBe("string");
+		expect(end.fields.requestId).toBe(start.fields.requestId);
+		expect(end.fields).toMatchObject({
+			outcome: "ok",
+			stopReason: "stop",
+			attempts: 1,
+			bytesIn: Buffer.byteLength(SSE_BODY),
+			inputTokens: 7,
+			outputTokens: 5,
+			cacheReadTokens: 3,
+			totalTokens: 15,
+			status: 200,
+		});
+		expect(typeof end.fields.durationMs).toBe("number");
+		expect(end.fields.durationMs as number).toBeGreaterThanOrEqual(0);
+		expect(typeof end.fields.ttfbMs).toBe("number");
+	});
+
+	it("logs an attempt-boundary line per retried attempt under a single request id", async () => {
+		const { lines } = captureTelemetry();
+		let calls = 0;
+		const fetchImpl = (async () => {
+			calls += 1;
+			if (calls === 1) {
+				return new Response(JSON.stringify({ error: { message: "invalid key", code: 401 } }), {
+					status: 401,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			return sseResponse();
+		}) as unknown as FetchImpl;
+
+		await drain(
+			streamSimple(model, context, {
+				apiKey: ({ lastChance }) => (lastChance ? "k2" : "k1"),
+				fetch: fetchImpl,
+			}),
+		);
+		await settle();
+
+		expect(calls).toBe(2);
+		const attempts = lines.filter(l => l.message === "provider request attempt");
+		expect(attempts.map(l => l.fields.attempt)).toEqual([2]);
+		expect(attempts[0].fields.previousStatus).toBe(401);
+		expect(typeof attempts[0].fields.sinceStartMs).toBe("number");
+		const requestIds = new Set(lines.map(l => l.fields.requestId));
+		expect(requestIds.size).toBe(1);
+		const end = lines.at(-1)!;
+		expect(end.message).toBe("provider request end");
+		expect(end.fields).toMatchObject({ outcome: "ok", attempts: 2 });
+	});
+
+	it("does not attribute an earlier HTTP status to a later transport failure", async () => {
+		const { lines } = captureTelemetry();
+		let calls = 0;
+		const fetchImpl = (async () => {
+			calls += 1;
+			if (calls === 1) {
+				return new Response(JSON.stringify({ error: { message: "invalid key", code: 401 } }), {
+					status: 401,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			throw new TypeError("fetch failed after auth retry");
+		}) as unknown as FetchImpl;
+
+		await drain(
+			streamSimple(model, context, {
+				apiKey: ({ lastChance }) => (lastChance ? "k2" : "k1"),
+				fetch: fetchImpl,
+			}),
+		);
+		await settle();
+
+		const end = lines.find(l => l.message === "provider request end")!;
+		expect(end.fields).toMatchObject({ outcome: "error", attempts: 2 });
+		expect(end.fields.status).toBeUndefined();
+		expect(String(end.fields.error)).toContain("fetch failed after auth retry");
+	});
+
+	it.each(["payload", "transport"] as const)(
+		"reports an unclassified %s failure without treating zero error flags as success",
+		async phase => {
+			const { lines } = captureTelemetry();
+			const failure = new Error("Generation failed unexpectedly");
+			let calls = 0;
+			const stream = streamSimple(model, context, {
+				apiKey: "k",
+				fetch: (async () => {
+					calls += 1;
+					throw failure;
+				}) as unknown as FetchImpl,
+				onPayload() {
+					if (phase === "payload") throw failure;
+				},
+			});
+			const events = await drain(stream);
+			const result = await stream.result();
+			await settle();
+
+			expect(result.stopReason).toBe("error");
+			expect(result.errorId).toBe(0);
+			expect(result.errorMessage).toContain(failure.message);
+			expect(events.at(-1)).toMatchObject({ type: "error", reason: "error", error: result });
+			expect(calls).toBe(phase === "payload" ? 0 : 1);
+			expect(lines.map(line => line.message)).toEqual(["provider request start", "provider request end"]);
+			expect(lines[1].fields).toMatchObject({
+				requestId: lines[0].fields.requestId,
+				outcome: "error",
+				stopReason: result.stopReason,
+				attempts: calls,
+				bytesIn: 0,
+				error: result.errorMessage,
+			});
+			expect(lines[1].fields.status).toBeUndefined();
+			expect(lines[1].fields.errorFlags).toBeUndefined();
+		},
+	);
+
+	it("reports a transport failure as outcome error with its class and text", async () => {
+		const { lines } = captureTelemetry();
+		const fetchImpl = (async () => {
+			throw new TypeError("fetch failed");
+		}) as unknown as FetchImpl;
+
+		await drain(streamSimple(model, context, { apiKey: "k", fetch: fetchImpl }));
+		await settle();
+
+		const end = lines.find(l => l.message === "provider request end")!;
+		expect(end.fields.outcome).toBe("error");
+		expect(String(end.fields.error)).toContain("fetch failed");
+		expect(typeof end.fields.errorFlags).toBe("string");
+	});
+
+	it("separates a timeout from a generic error", async () => {
+		const { lines } = captureTelemetry();
+		const fetchImpl = (async () => {
+			throw new Error("Request timed out after 60000ms");
+		}) as unknown as FetchImpl;
+
+		await drain(streamSimple(model, context, { apiKey: "k", fetch: fetchImpl }));
+		await settle();
+
+		expect(lines.find(l => l.message === "provider request end")!.fields.outcome).toBe("timeout");
+	});
+
+	it("reports an aborted request as outcome aborted", async () => {
+		const { lines } = captureTelemetry();
+		const controller = new AbortController();
+		const fetchImpl = (async () => {
+			controller.abort();
+			throw new DOMException("The operation was aborted.", "AbortError");
+		}) as unknown as FetchImpl;
+
+		const stream = streamSimple(model, context, { apiKey: "k", fetch: fetchImpl, signal: controller.signal });
+		await drain(stream);
+		expect((await stream.result()).stopReason).toBe("aborted");
+		await settle();
+
+		expect(lines.find(l => l.message === "provider request end")!.fields.outcome).toBe("aborted");
+	});
+
+	describe("auxiliary HTTP calls through the same transport", () => {
+		// Devin (GetUserJwt, AssignModel), GitLab (direct-access token) and Cursor
+		// (BidiAppend frames) send non-inference calls through the request's
+		// transport fetch. They are HTTP calls, not attempts.
+		const json = (status = 200) =>
+			new Response(JSON.stringify({ ok: status < 400, metadata: "x".repeat(4096) }), {
+				status,
+				headers: { "content-type": "application/json" },
+			});
+		const done = { stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 } };
+
+		async function call(fetch: FetchImpl, url: string): Promise<void> {
+			await (await fetch(url, { method: "POST" })).arrayBuffer();
+		}
+
+		it("counts successful auxiliary calls before the model stream as one attempt, timed on the stream", async () => {
+			const { lines } = captureTelemetry();
+			const telemetry = new ProviderRequestTelemetry(model, "s");
+			const base = (async (input: string | URL | Request) => {
+				if (String(input).endsWith("/stream")) {
+					await Bun.sleep(40);
+					return sseResponse();
+				}
+				return json();
+			}) as unknown as FetchImpl;
+			const fetch = transportFetch(model, base, telemetry);
+
+			await call(auxiliaryFetch(fetch), "https://x/auth/GetUserJwt");
+			await call(auxiliaryFetch(fetch), "https://x/AssignModel");
+			await call(fetch, "https://x/stream");
+			telemetry.completed(done as unknown as AssistantMessage);
+
+			expect(lines.filter(l => l.message === "provider request attempt")).toEqual([]);
+			const end = lines.find(l => l.message === "provider request end")!;
+			expect(end.fields).toMatchObject({
+				outcome: "ok",
+				attempts: 1,
+				status: 200,
+				bytesIn: Buffer.byteLength(SSE_BODY),
+			});
+			expect(end.fields.ttfbMs as number).toBeGreaterThanOrEqual(40);
+		});
+
+		it("opens an attempt only after a failed call, even when an auxiliary call comes between", async () => {
+			const { lines } = captureTelemetry();
+			const telemetry = new ProviderRequestTelemetry(model, "s");
+			let streamCalls = 0;
+			const base = (async (input: string | URL | Request) => {
+				if (!String(input).endsWith("/stream")) return json();
+				streamCalls += 1;
+				return streamCalls === 1 ? json(429) : sseResponse();
+			}) as unknown as FetchImpl;
+			const fetch = transportFetch(model, base, telemetry);
+
+			await call(fetch, "https://x/stream");
+			await call(auxiliaryFetch(fetch), "https://x/auth/GetUserJwt");
+			await call(fetch, "https://x/stream");
+			telemetry.completed(done as unknown as AssistantMessage);
+
+			const attempts = lines.filter(l => l.message === "provider request attempt");
+			expect(attempts.map(l => [l.fields.attempt, l.fields.previousStatus])).toEqual([[2, 429]]);
+			const end = lines.find(l => l.message === "provider request end")!;
+			expect(end.fields).toMatchObject({ attempts: 2, status: 200 });
+		});
+
+		it("does not count concurrent append frames beside the stream as attempts", async () => {
+			const { lines } = captureTelemetry();
+			const telemetry = new ProviderRequestTelemetry(model, "s");
+			const base = (async (input: string | URL | Request) =>
+				String(input).endsWith("/RunSSE") ? sseResponse() : json()) as unknown as FetchImpl;
+			const fetch = transportFetch(model, base, telemetry);
+
+			await Promise.all([
+				call(fetch, "https://x/RunSSE"),
+				...Array.from({ length: 5 }, () => call(auxiliaryFetch(fetch), "https://x/BidiAppend")),
+			]);
+			telemetry.completed(done as unknown as AssistantMessage);
+
+			const end = lines.find(l => l.message === "provider request end")!;
+			expect(end.fields).toMatchObject({ attempts: 1, bytesIn: Buffer.byteLength(SSE_BODY) });
+		});
+	});
+});

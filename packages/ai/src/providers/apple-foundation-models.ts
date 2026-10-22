@@ -28,7 +28,9 @@ import type {
 import { normalizeSystemPrompts } from "../utils";
 import { clearStreamingPartialJson, kStreamingLastParseLen, kStreamingPartialJson } from "../utils/block-symbols";
 import { AssistantMessageEventStream } from "../utils/event-stream";
+import type { ProviderRequestTelemetry } from "../utils/request-telemetry";
 import { decodeFoundationModelsArguments, toFoundationModelsSchema, toolWireSchema } from "../utils/schema";
+import { getProviderRequestTelemetry } from "../utils/transport-fetch";
 import { transformMessages } from "./transform-messages";
 import { joinTextWithImagePlaceholder, partitionVisionContent } from "./vision-guard";
 
@@ -207,15 +209,32 @@ function buildRequest(
 }
 
 /** Runs one bridge generation, yielding its events until the terminal one. */
-async function* generate(request: GenerateRequest, signal: AbortSignal | undefined): AsyncGenerator<BridgeEvent> {
+async function* generate(
+	request: GenerateRequest,
+	signal: AbortSignal | undefined,
+	telemetry: ProviderRequestTelemetry | undefined,
+): AsyncGenerator<BridgeEvent> {
 	const queue: BridgeEvent[] = [];
 	let wake: (() => void) | undefined;
-	const handle = appleFmGenerate(JSON.stringify(request), (error, event) => {
-		queue.push(
-			error ? { type: "error", code: "runtime", message: error.message } : (JSON.parse(event) as BridgeEvent),
-		);
-		wake?.();
-	});
+	const payload = JSON.stringify(request);
+	let handle: ReturnType<typeof appleFmGenerate>;
+	// Local callback JSON is not network traffic or HTTP headers.
+	telemetry?.noteCall();
+	try {
+		handle = appleFmGenerate(payload, (error, event) => {
+			const parsed: BridgeEvent = error
+				? { type: "error", code: "runtime", message: error.message }
+				: (JSON.parse(event) as BridgeEvent);
+			if (parsed.type === "error") {
+				telemetry?.noteCallError(error ?? new Error(`${parsed.message} (${parsed.code})`));
+			}
+			queue.push(parsed);
+			wake?.();
+		});
+	} catch (error) {
+		telemetry?.noteCallError(error);
+		throw error;
+	}
 	let finished = false;
 	const cancel = () => {
 		if (!finished) appleFmCancel(handle);
@@ -294,7 +313,7 @@ export const streamAppleFoundationModels: StreamFunction<"apple-foundation-model
 			const { request, encodedPaths } = buildRequest(model, context, options);
 			await options.onPayload?.(request, model);
 			stream.push({ type: "start", partial: output });
-			for await (const event of generate(request, options.signal)) {
+			for await (const event of generate(request, options.signal, getProviderRequestTelemetry(options.fetch))) {
 				switch (event.type) {
 					case "text": {
 						endThinking();

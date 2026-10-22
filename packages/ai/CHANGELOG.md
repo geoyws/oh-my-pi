@@ -179,6 +179,13 @@
 ### Added
 
 - Added support for `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` on the `anthropic` provider: when set, requests omit pre-release fields (`context_management`, beta tool fields such as `strict` and `defer_loading`, task budgets, structured-output format, `thinking.block_binding`, and Anthropic server compaction) along with their beta headers, so `ANTHROPIC_BASE_URL` gateways that reject them keep working ([#15458](https://github.com/can1357/oh-my-pi/pull/15458) by [@H4vC](https://github.com/H4vC))
+### Added
+
+- Every provider inference request now logs `provider request start`, one `provider request attempt` per retried inference call, and `provider request end` under a shared `requestId`, carrying duration, time-to-first-byte/token, attempt count, inference bytes received, input/output/cache token counts and the failure class ([#12319](https://github.com/can1357/oh-my-pi/issues/12319)). Auxiliary auth, routing and Cursor append calls retain transport policy but do not affect inference counts or timing.
+
+### Fixed
+
+- Provider request telemetry now reports terminal assistant errors as failures even when their error classification is unknown, preserving the consumer-visible stop reason and native transports' absent HTTP status.
 
 ## [18.9.2] - 2026-10-11
 
