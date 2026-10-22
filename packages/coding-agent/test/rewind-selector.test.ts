@@ -113,7 +113,8 @@ describe("RewindSelectorComponent", () => {
 		await initTheme();
 	});
 	beforeEach(async () => {
-		await Settings.init({ inMemory: true, cwd: process.cwd() });
+		// The rail assertions read the Unicode glyph set; the fork ships nerd by default.
+		await Settings.init({ inMemory: true, cwd: process.cwd(), overrides: { symbolPreset: "unicode" } });
 		setKeybindings(KeybindingsManager.inMemory());
 	});
 	afterEach(() => {

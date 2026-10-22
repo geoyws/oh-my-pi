@@ -37,7 +37,15 @@ describe("inline click-to-focus geometry", () => {
 	beforeEach(async () => {
 		resetSettingsForTest();
 		tempDir = TempDir.createSync("@pi-click-focus-e2e-");
-		await Settings.init({ inMemory: true, cwd: tempDir.path() });
+		// Hover-band colors were measured on the upstream chrome; pin it so the
+		// fork's catppuccin/nerd/borderless defaults do not change the geometry.
+		const upstreamChrome = {
+			"theme.dark": "titanium",
+			"theme.light": "light",
+			symbolPreset: "unicode",
+			"composer.shape": "band",
+		} as const;
+		await Settings.init({ inMemory: true, cwd: tempDir.path(), overrides: upstreamChrome });
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
 		const modelRegistry = new ModelRegistry(authStorage);
 		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
@@ -45,7 +53,7 @@ describe("inline click-to-focus geometry", () => {
 		session = new AgentSession({
 			agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
 			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
-			settings: Settings.isolated(),
+			settings: Settings.isolated(upstreamChrome),
 			modelRegistry,
 		});
 		term = new VirtualTerminal(120, 32);

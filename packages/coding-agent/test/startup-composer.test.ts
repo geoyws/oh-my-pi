@@ -289,7 +289,8 @@ describe("Composer prepaint", () => {
 	beforeEach(async () => {
 		resetSettingsForTest();
 		await initTheme();
-		settings = await Settings.init({ inMemory: true });
+		// Frame assertions read the band composer's edges; the fork ships borderless by default.
+		settings = await Settings.init({ inMemory: true, overrides: { "composer.shape": "band" } });
 		config = {
 			quiet: cfgStartupQuiet.get(settings),
 			composerShape: cfgComposerShape.get(settings) ?? "box",
