@@ -1,3 +1,4 @@
+import { auxiliaryFetch } from "../utils/transport-fetch";
 /**
  * Application Default Credentials (ADC) resolution for Vertex AI.
  *
@@ -293,7 +294,7 @@ export async function getVertexAccessToken(options?: { signal?: AbortSignal; fet
 	// override var; `GOOGLE_CLOUD_ACCESS_TOKEN` is the omp-facing alias.
 	const explicitToken = Bun.env.GOOGLE_CLOUD_ACCESS_TOKEN || Bun.env.CLOUDSDK_AUTH_ACCESS_TOKEN;
 	if (explicitToken) return explicitToken;
-	const fetchImpl = options?.fetch ?? globalThis.fetch.bind(globalThis);
+	const fetchImpl = auxiliaryFetch(options?.fetch);
 	const skew = getRefreshSkewMs();
 	const now = Date.now();
 
