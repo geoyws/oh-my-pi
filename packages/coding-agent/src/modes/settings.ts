@@ -1076,7 +1076,7 @@ export const cfgPasteLargeMenuThreshold = register({
 export const cfgStartupQuiet = register({
 	id: "startup.quiet",
 	type: "boolean",
-	default: true,
+	default: false,
 	ui: {
 		tab: "interaction",
 		group: "Startup & Updates",

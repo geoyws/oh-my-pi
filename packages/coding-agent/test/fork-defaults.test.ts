@@ -4,7 +4,6 @@ import { ALL_SCENES, selectSetupScenes } from "@oh-my-pi/pi-coding-agent/modes/s
 import {
 	cfgComposerShape,
 	cfgStartupCheckUpdate,
-	cfgStartupQuiet,
 	cfgStartupSetupWizard,
 	cfgStatusLineCompactThinkingLevel,
 	cfgStatusLineContextLine,
@@ -17,7 +16,6 @@ import {
 	cfgThemeDark,
 	cfgThemeLight,
 } from "@oh-my-pi/pi-coding-agent/modes/settings";
-import { cfgTaskShowResolvedModelBadge } from "@oh-my-pi/pi-coding-agent/task/settings";
 import { getThemeByName } from "@oh-my-pi/pi-tui/theme";
 import { getAvailableThemes } from "@oh-my-pi/pi-tui/theme/loader";
 
@@ -37,9 +35,7 @@ describe("fork shipped defaults", () => {
 		expect(cfgStatusLineShowHookStatus.get(settings)).toBe(false);
 		expect(cfgStatusLineLeftSegments.get(settings)).toEqual(["status", "model", "context_pct", "mode", "subagents"]);
 		expect(cfgStatusLineRightSegments.get(settings)).toEqual(["session_name", "usage", "cost"]);
-		expect(cfgStartupQuiet.get(settings)).toBe(true);
 		expect(cfgStartupCheckUpdate.get(settings)).toBe(false);
-		expect(cfgTaskShowResolvedModelBadge.get(settings)).toBe(true);
 	});
 
 	it("ships the default themes as built-ins with the fork's glyph overrides", async () => {

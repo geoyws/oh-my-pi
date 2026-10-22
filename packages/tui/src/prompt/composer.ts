@@ -48,7 +48,7 @@ export interface ComposerPreferences {
 
 /** Settings-schema-compatible defaults used when constructing a dependency-free composer. */
 export const COMPOSER_DEFAULTS: ComposerPreferences = {
-	quiet: true,
+	quiet: false,
 	composerShape: "borderless",
 	showHardwareCursor: true,
 	maxInlineImages: 8,
