@@ -37,14 +37,9 @@ describe("inline click-to-focus geometry", () => {
 	beforeEach(async () => {
 		resetSettingsForTest();
 		tempDir = TempDir.createSync("@pi-click-focus-e2e-");
-		// Hover-band colors were measured on the upstream chrome; pin it so the
-		// fork's catppuccin/nerd/borderless defaults do not change the geometry.
-		const upstreamChrome = {
-			"theme.dark": "titanium",
-			"theme.light": "light",
-			symbolPreset: "unicode",
-			"composer.shape": "band",
-		} as const;
+		// Row lookups read the Unicode glyphs and band composer; the theme stays
+		// on the fork default so the hover band is checked against its colors.
+		const upstreamChrome = { symbolPreset: "unicode", "composer.shape": "band" } as const;
 		await Settings.init({ inMemory: true, cwd: tempDir.path(), overrides: upstreamChrome });
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
 		const modelRegistry = new ModelRegistry(authStorage);

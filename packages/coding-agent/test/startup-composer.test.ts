@@ -289,8 +289,9 @@ describe("Composer prepaint", () => {
 	beforeEach(async () => {
 		resetSettingsForTest();
 		await initTheme();
-		// Frame assertions read the band composer's edges; the fork ships borderless by default.
-		settings = await Settings.init({ inMemory: true, overrides: { "composer.shape": "band" } });
+		// Frame assertions read the band composer's edges and the welcome scene;
+		// the fork ships borderless and quiet startup by default.
+		settings = await Settings.init({ inMemory: true, overrides: { "composer.shape": "band", "startup.quiet": false } });
 		config = {
 			quiet: cfgStartupQuiet.get(settings),
 			composerShape: cfgComposerShape.get(settings) ?? "box",

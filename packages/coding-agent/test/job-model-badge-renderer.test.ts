@@ -265,10 +265,12 @@ describe("hub jobs task model badges", () => {
 					},
 				],
 			});
+			// Before initialization the effect state is the schema default, which
+			// the fork turns on (task.showResolvedModelBadge: true).
 			expect(text).toContain("ColdStart");
 			expect(text).toContain("task");
-			expect(text).not.toContain("provider/model");
-			expect(text).not.toContain(uiTheme.icon.advisor);
+			expect(text).toContain("provider/model");
+			expect(text).toContain(uiTheme.icon.advisor);
 		} finally {
 			await Settings.init({ inMemory: true });
 		}

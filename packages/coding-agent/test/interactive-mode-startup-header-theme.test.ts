@@ -57,9 +57,9 @@ describe("InteractiveMode startup header after the terminal reports a light back
 
 		resetSettingsForTest();
 		tempDir = TempDir.createSync("@pi-interactive-mode-startup-header-theme-");
-		// Pin the built-in dark/light pair this test swaps between; the fork's
-		// shipped defaults are the catppuccin-omp themes.
-		const themePair = { "theme.dark": "dark", "theme.light": "light" } as const;
+		// Pin the built-in dark/light pair this test swaps between and show the
+		// startup header; the fork ships catppuccin-omp themes and quiet startup.
+		const themePair = { "theme.dark": "dark", "theme.light": "light", "startup.quiet": false } as const;
 		await Settings.init({ inMemory: true, cwd: tempDir.path(), overrides: themePair });
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
 		const modelRegistry = new ModelRegistry(authStorage);

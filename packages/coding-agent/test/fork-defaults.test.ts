@@ -4,6 +4,7 @@ import { ALL_SCENES, selectSetupScenes } from "@oh-my-pi/pi-coding-agent/modes/s
 import {
 	cfgComposerShape,
 	cfgStartupCheckUpdate,
+	cfgStartupQuiet,
 	cfgStartupSetupWizard,
 	cfgStatusLineCompactThinkingLevel,
 	cfgStatusLineContextLine,
@@ -16,6 +17,7 @@ import {
 	cfgThemeDark,
 	cfgThemeLight,
 } from "@oh-my-pi/pi-coding-agent/modes/settings";
+import { cfgTaskShowResolvedModelBadge } from "@oh-my-pi/pi-coding-agent/task/settings";
 import { getThemeByName } from "@oh-my-pi/pi-tui/theme";
 import { getAvailableThemes } from "@oh-my-pi/pi-tui/theme/loader";
 
@@ -36,6 +38,8 @@ describe("fork shipped defaults", () => {
 		expect(cfgStatusLineLeftSegments.get(settings)).toEqual(["status", "model", "context_pct", "mode", "subagents"]);
 		expect(cfgStatusLineRightSegments.get(settings)).toEqual(["session_name", "usage", "cost"]);
 		expect(cfgStartupCheckUpdate.get(settings)).toBe(false);
+		expect(cfgStartupQuiet.get(settings)).toBe(true);
+		expect(cfgTaskShowResolvedModelBadge.get(settings)).toBe(true);
 	});
 
 	it("ships the default themes as built-ins with the fork's glyph overrides", async () => {
@@ -51,6 +55,11 @@ describe("fork shipped defaults", () => {
 		expect(dark?.symbol("icon.fast")).toBe("fast");
 		expect(dark?.symbol("icon.context")).toBe("");
 		expect(light?.symbol("icon.time")).toBe("");
+		// The hover/selection band repaints a live (pending) tool card with
+		// selectedBg; equal colors would make the band invisible.
+		for (const shipped of [dark, light]) {
+			expect(shipped?.getBgHex("selectedBg")).not.toBe(shipped?.getBgHex("toolPendingBg"));
+		}
 	});
 
 	it("does not select onboarding scenes on a fresh install", async () => {

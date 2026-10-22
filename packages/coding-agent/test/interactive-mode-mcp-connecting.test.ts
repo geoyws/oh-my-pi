@@ -49,7 +49,8 @@ describe("InteractiveMode MCP connection status", () => {
 
 		resetSettingsForTest();
 		tempDir = TempDir.createSync("@pi-interactive-mode-mcp-connecting-");
-		await Settings.init({ inMemory: true, cwd: tempDir.path() });
+		// Startup status messages only show without quiet startup (fork default: quiet).
+		await Settings.init({ inMemory: true, cwd: tempDir.path(), overrides: { "startup.quiet": false } });
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
 		const modelRegistry = new ModelRegistry(authStorage);
 		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
@@ -67,7 +68,7 @@ describe("InteractiveMode MCP connection status", () => {
 				},
 			}),
 			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
-			settings: Settings.isolated(),
+			settings: Settings.isolated({ "startup.quiet": false }),
 			modelRegistry,
 		});
 		eventBus = new EventBus();
