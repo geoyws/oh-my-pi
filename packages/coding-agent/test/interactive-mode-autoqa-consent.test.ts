@@ -19,7 +19,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { HistoryStorage } from "@oh-my-pi/pi-coding-agent/session/history-storage";
-import { resetSessionIndexForTests } from "@oh-my-pi/pi-coding-agent/session/session-index";
+import { closeSessionIndex } from "@oh-my-pi/pi-coding-agent/session/session-index";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { __resetAutoQaConsentForTests, resolveAutoQaConsent } from "@oh-my-pi/pi-coding-agent/tools/report-tool-issue";
 import { cfgDevAutoqa, cfgDevAutoqaConsent, cfgTodoRemindersMax } from "@oh-my-pi/pi-coding-agent/tools/settings";
@@ -119,7 +119,7 @@ describe("InteractiveMode Auto-QA consent production adapter", () => {
 		persistent = undefined;
 		AgentStorage.close();
 		HistoryStorage.close();
-		resetSessionIndexForTests();
+		closeSessionIndex();
 		closeModelCache();
 		restoreSettingsTestState(state);
 		state = undefined;
