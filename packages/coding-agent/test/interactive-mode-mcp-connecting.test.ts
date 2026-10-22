@@ -68,9 +68,11 @@ describe("InteractiveMode MCP connection status", () => {
 				},
 			}),
 			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
-			settings: Settings.isolated({ "startup.quiet": false }),
+			settings: Settings.isolated(),
 			modelRegistry,
 		});
+		// Set (not override) so the quiet-enabled case can flip it back on.
+		cfgStartupQuiet.set(session.settings, false);
 		eventBus = new EventBus();
 		mode = new InteractiveMode(session, "test", undefined, () => {}, [], undefined, eventBus);
 		// This contract is the banner wiring, not git branch watching; a real
