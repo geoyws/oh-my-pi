@@ -11097,6 +11097,11 @@ export class AgentSession implements SettingsScope {
 		return this.#models.setModel(model, role, options);
 	}
 
+	/** Writes a role assignment to global settings without switching the live model. */
+	persistModelRole(model: Model, role: string, options?: { selector?: string; thinkingLevel?: ThinkingLevel }): void {
+		this.#models.persistModelRole(model, role, options);
+	}
+
 	/** Selects a model for this session without updating persisted model settings. */
 	setModelTemporary(
 		model: Model,
@@ -11119,6 +11124,15 @@ export class AgentSession implements SettingsScope {
 	/** Applies a resolved role model without changing global settings. */
 	applyRoleModel(entry: ResolvedRoleModel): Promise<void> {
 		return this.#models.applyRoleModel(entry);
+	}
+
+	/** The role model one step along `roleOrder` (from `from` when given), without applying it. */
+	nextRoleModel(
+		roleOrder: readonly string[],
+		direction: "forward" | "backward" = "forward",
+		from?: { model: Model; role?: string },
+	): ResolvedRoleModel | undefined {
+		return this.#models.nextRoleModel(roleOrder, direction, from);
 	}
 
 	/** Cycles the configured role models in the supplied order. */

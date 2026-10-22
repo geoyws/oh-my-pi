@@ -97,6 +97,10 @@ export interface SegmentContext {
 		enabled: boolean;
 		paused: boolean;
 	} | null;
+	/** User model switch queued until the running turn settles; the model chip shows it only while streaming. */
+	pendingModelSwitch?: {
+		model: Model;
+	} | null;
 	prewalk: {
 		enabled: boolean;
 	} | null;

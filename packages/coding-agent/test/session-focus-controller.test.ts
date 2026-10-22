@@ -122,6 +122,7 @@ function makeHarness(options: { renderInitialMessages?: () => void | Promise<voi
 		reloadTodos: async (source?: AgentSession) => {
 			reloadTodoSessions.push(source ?? main.session);
 		},
+		flushPendingModelSwitch: async () => {},
 		updatePendingMessagesDisplay: () => uiHelpers.updatePendingMessagesDisplay(),
 		updateEditorBorderColor() {},
 		ui: { requestRender() {}, requestComponentRender() {} },
