@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fsp from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
@@ -455,6 +456,43 @@ describe("AgentLifecycleManager", () => {
 
 		await lifecycle.release("Owned-Sub");
 
+		expect(releaseResource).toHaveBeenCalledTimes(1);
+	});
+
+	it("releases owned resources once when an adopted agent's ref is removed from the registry", async () => {
+		const owned = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-lifecycle-removed-"));
+		try {
+			await fsp.writeFile(path.join(owned, "work.txt"), "owned\n");
+			const released = deferred();
+			const releaseResource = vi.fn(async () => {
+				await fsp.rm(owned, { recursive: true, force: true });
+				released.resolve();
+			});
+			const ref = registerIdleSub("Removed-Sub", makeSessionStub().session);
+			lifecycle.adopt("Removed-Sub", { idleTtlMs: 0, onRelease: releaseResource }, ref);
+
+			expect(registry.unregister("Removed-Sub", ref)).toBe(true);
+			await released.promise;
+
+			expect(lifecycle.has("Removed-Sub")).toBe(false);
+			expect(await fsp.exists(owned)).toBe(false);
+			// The adoption is gone, so a later release cannot run it twice.
+			expect(await lifecycle.release("Removed-Sub")).toBe(false);
+			expect(releaseResource).toHaveBeenCalledTimes(1);
+		} finally {
+			await fsp.rm(owned, { recursive: true, force: true });
+		}
+	});
+
+	it("release runs owned resources once even though it removes the ref", async () => {
+		const releaseResource = vi.fn(async () => {});
+		const ref = registerIdleSub("Released-Sub", makeSessionStub().session);
+		lifecycle.adopt("Released-Sub", { idleTtlMs: 0, onRelease: releaseResource }, ref);
+
+		await lifecycle.release("Released-Sub");
+		await flushAsync();
+
+		expect(registry.get("Released-Sub")).toBeUndefined();
 		expect(releaseResource).toHaveBeenCalledTimes(1);
 	});
 

@@ -59,18 +59,10 @@ function childResult(id: string, outcome: Partial<SingleResult>): SingleResult {
 
 /**
  * Run one isolated child that writes `edit` (when given) and ends with
- * `outcome`. With `releasedDuringRun`, the child is kept alive and its
- * lifecycle releases it before the run returns, as an aborted agent is. With
- * `breakArtifacts`, the artifacts directory is replaced by a file first, so
- * every patch write fails.
+ * `outcome`. With `breakArtifacts`, the artifacts directory is replaced by a
+ * file first, so every patch write fails.
  */
-async function runChild(
-	id: string,
-	outcome: Partial<SingleResult>,
-	edit?: string,
-	releasedDuringRun = false,
-	breakArtifacts = false,
-) {
+async function runChild(id: string, outcome: Partial<SingleResult>, edit?: string, breakArtifacts = false) {
 	const repo = await tempDir("omp-failed-capture-repo-");
 	await git(repo, "init", "-q", "-b", "main");
 	await git(repo, "config", "user.email", "t@t");
@@ -94,9 +86,9 @@ async function runChild(
 			await fs.rm(artifactsDir, { recursive: true });
 			await fs.writeFile(artifactsDir, "");
 		}
-		// The executor's lifecycle logs a failed release and still returns the
-		// child's result ("Subagent lifecycle resource cleanup failed").
-		if (releasedDuringRun) await options.onRelease?.()?.catch(() => undefined);
+		// The executor's one-shot finalize calls `onRelease` before returning;
+		// it must leave the worktree for the run-end capture.
+		await options.onRelease?.();
 		return childResult(id, outcome);
 	});
 	const result = await runIsolatedSubprocess({
@@ -106,7 +98,8 @@ async function runChild(
 			task: "Do work",
 			index: 0,
 			id,
-			keepAlive: releasedDuringRun,
+			// Ignored: an isolated child is never kept alive.
+			keepAlive: true,
 		},
 		context: { repoRoot: repo },
 		preferredBackend: undefined,
@@ -147,29 +140,11 @@ describe("isolated child that does not succeed", () => {
 		expect(await git(repo, "status", "--porcelain")).toBe("");
 	});
 
-	it("names what an in-run lifecycle release kept for an aborted kept-alive child", async () => {
-		const { repo, result, isolationDir } = await runChild(
-			"CaptureReleased",
-			{ exitCode: 1, aborted: true, abortReason: "Subagent runtime limit exceeded" },
-			"released edit\n",
-			true,
-		);
-		expect(await fs.exists(isolationDir)).toBe(false);
-		expect(await Bun.file(result.patchPath!).text()).toContain("+released edit");
-		expect(result.branchName).toBe("omp/task/CaptureReleased");
-		expect(await git(repo, "show", "omp/task/CaptureReleased:tracked.txt")).toBe("released edit");
-		const merge = await mergeIsolatedChanges({ result, repoRoot: repo, mergeMode: "patch" });
-		expect(merge.hadAnyChanges).toBe(false);
-		expect(await git(repo, "status", "--porcelain")).toBe("");
-		expect(await git(repo, "rev-parse", "--abbrev-ref", "HEAD")).toBe("main");
-	});
-
-	it("names the retained workspace when the in-run release cannot write the patch", async () => {
+	it("names the retained workspace when a cancelled child's patch cannot be written", async () => {
 		const { repo, result } = await runChild(
-			"CaptureReleaseFails",
+			"CaptureFails",
 			{ exitCode: 1, aborted: true, abortReason: "Subagent runtime limit exceeded" },
 			"kept edit\n",
-			true,
 			true,
 		);
 		const retained = result.isolationError?.match(/retained at (\S+)/)?.[1];
