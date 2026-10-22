@@ -1093,7 +1093,10 @@ export class SelectorController {
 										);
 									}
 									if (liveThinking) {
-										session.setThinkingLevel(liveThinking, isAuto && !this.ctx.settings.isGlobalConfigReadOnly());
+										session.setThinkingLevel(
+											liveThinking,
+											isAuto && !this.ctx.settings.isGlobalConfigReadOnly(),
+										);
 									}
 									this.ctx.statusLine.invalidate();
 									this.ctx.updateEditorBorderColor();
