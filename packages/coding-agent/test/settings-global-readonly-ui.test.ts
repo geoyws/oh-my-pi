@@ -315,6 +315,8 @@ describe("/model default role clear under the global read-only policy", () => {
 			},
 			statusLine: { invalidate: vi.fn() },
 			updateEditorBorderColor: vi.fn(),
+			// The session here is idle, so the turn-end router lets the clear switch now.
+			routeUserModelSwitch: vi.fn((): "apply" | "queued" | "cancelled" => "apply"),
 			keybindings: { getKeys: () => [], getDisplayString: () => "" },
 			showStatus,
 			showError,
