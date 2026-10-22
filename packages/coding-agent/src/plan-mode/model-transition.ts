@@ -49,3 +49,38 @@ export function resolvePlanModelTransition(
 	}
 	return { kind: "apply", model: resolved.model, thinkingLevel: planThinkingLevel, deferred: isStreaming };
 }
+
+/** The action implied by a user-initiated model switch (model hub, alt+p, ctrl+p, `/model`). */
+export type UserModelSwitch =
+	/** Idle: switch now, exactly as before; any switch still queued is superseded. */
+	| { kind: "apply" }
+	/**
+	 * Mid-stream: hold the switch until the turn settles so the running turn
+	 * stays on one model; it replaces any switch already queued (last write wins).
+	 */
+	| { kind: "queue"; from: Model | undefined; to: Model }
+	/**
+	 * Mid-stream pick of the model the turn already runs on: nothing to switch,
+	 * so a queued user switch is cancelled instead of queueing `A -> A`; a
+	 * queued plan-mode switch is kept.
+	 */
+	| { kind: "cancel" };
+
+/**
+ * Decide how a user model switch takes effect. A live switch mid-turn would
+ * send the turn's remaining requests to a different model, so while streaming
+ * the switch is queued for the turn's settle instead.
+ *
+ * @param currentModel - The session's active model, or `undefined` before one is set.
+ * @param target - The model the user picked.
+ * @param isStreaming - Whether the session is mid-turn.
+ */
+export function resolveUserModelSwitch(
+	currentModel: Model | undefined,
+	target: Model,
+	isStreaming: boolean,
+): UserModelSwitch {
+	if (!isStreaming) return { kind: "apply" };
+	if (modelsAreEqual(currentModel, target)) return { kind: "cancel" };
+	return { kind: "queue", from: currentModel, to: target };
+}

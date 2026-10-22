@@ -1,7 +1,8 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "bun:test";
 import * as path from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import type { Model } from "@oh-my-pi/pi-ai";
+import { Effort, type Model } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { type RawSettings, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -12,6 +13,7 @@ import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as modelHubModule from "@oh-my-pi/pi-tui/overlays/model-hub";
+import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-tui/theme";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
 import { createInteractiveModeContext } from "../../helpers/interactive-mode-context";
@@ -59,7 +61,10 @@ describe("SelectorController model hub writes", () => {
 			createInteractiveModeContext({
 				session: live,
 				settings,
-				ui: { showOverlay: () => ({ hide: () => {}, setHidden: () => {}, isHidden: () => false }) },
+				ui: {
+					showOverlay: () => ({ hide: () => {}, setHidden: () => {}, isHidden: () => false }),
+					terminal: { rows: 40 },
+				},
 				keybindings: { getKeys: () => [], getDisplayString: () => "" },
 				showError,
 			}),
@@ -135,4 +140,76 @@ describe("SelectorController model hub writes", () => {
 		expect(await refreshed.promise).toBe(1_050_000);
 		expect(showError).not.toHaveBeenCalled();
 	});
+
+	// The real hub, opened by the controller: its #assignRole forwards the role's current level to onAssign.
+	function openRealModelHub(controller: SelectorController) {
+		const RealHub = modelHubModule.ModelHubComponent;
+		let hub: modelHubModule.ModelHubComponent | undefined;
+		let onAssign: Mock<modelHubModule.ModelHubCallbacks["onAssign"]> | undefined;
+		vi.spyOn(modelHubModule, "ModelHubComponent").mockImplementation(function (
+			...args: ConstructorParameters<typeof RealHub>
+		) {
+			onAssign = vi.fn(args[4].onAssign);
+			args[4] = { ...args[4], onAssign };
+			hub = new RealHub(...args);
+			return hub;
+		} as never);
+		controller.showModelSelector();
+		if (!hub || !onAssign) throw new Error("model hub was not opened");
+		return { hub, onAssign };
+	}
+
+	for (const [role, label] of [
+		["smol", "SMOL"],
+		["default", "DEFAULT"],
+	] as const) {
+		it(`keeps the persisted ${role} thinking suffix when the same model is re-picked in the hub`, async () => {
+			const theme = await getThemeByName("dark");
+			if (!theme) throw new Error("Failed to load dark theme");
+			setThemeInstance(theme);
+			const agentDir = tempDir.join("agent");
+			const config = path.join(agentDir, "config.yml");
+			const sonnet = model("claude-sonnet-4-5");
+			const selector = `${sonnet.provider}/${sonnet.id}`;
+			const source = `# user config\nmodelRoles:\n  default: ${selector}:high # keep\n  smol: ${selector}:high\n`;
+			await Bun.write(config, source);
+			const settings = await Settings.init({ agentDir, cwd: tempDir.path() });
+			const { controller, showError } = start(settings, sonnet);
+			session!.setScopedModels([{ model: sonnet }]);
+
+			const { hub, onAssign } = openRealModelHub(controller);
+			try {
+				hub.handleInput("\x1b[A"); // All models → Roles.
+				hub.handleInput("\n"); // Dive into the role rows.
+				let selectedRow = "";
+				for (let step = 0; step < 20; step++) {
+					selectedRow =
+						hub
+							.render(220)
+							.map(line => stripVTControlCharacters(line))
+							.find(line => line.includes("❯")) ?? "";
+					if (selectedRow.includes(label)) break;
+					hub.handleInput("\x1b[B");
+				}
+				expect(selectedRow).toContain(label);
+				hub.handleInput("\n"); // Pick a model for the role.
+				hub.handleInput("\n"); // Re-pick the sole (already assigned) model.
+
+				expect(onAssign).toHaveBeenCalledTimes(1);
+				const [picked, assignedRole, level, assignedSelector] = onAssign.mock.calls[0]!;
+				expect(picked.id).toBe(sonnet.id);
+				expect(assignedRole).toBe(role);
+				expect(level).toBe(Effort.High);
+				expect(assignedSelector).toBe(selector);
+				expect(await onAssign.mock.results[0]!.value).toBe(true);
+			} finally {
+				hub.dispose();
+			}
+			await settings.flush();
+
+			expect(showError).not.toHaveBeenCalled();
+			expect(settings.getModelRole(role)).toBe(`${selector}:high`);
+			expect(await Bun.file(config).text()).toBe(source);
+		});
+	}
 });

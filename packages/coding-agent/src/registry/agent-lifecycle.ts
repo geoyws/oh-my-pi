@@ -680,6 +680,12 @@ export class AgentLifecycleManager {
 		if (event.type === "removed") {
 			clearTimeout(adopted.timer);
 			this.#adopted.delete(event.ref.id);
+			// The ref left the registry without passing through `release`, so the
+			// resources it owns (e.g. a temporary artifacts dir) would otherwise
+			// outlive it until the process exits. `trackLateCleanup` logs failures.
+			if (adopted.onRelease) {
+				trackLateCleanup(adopted.onRelease(), { id: event.ref.id, resource: "adopted-agent-removed" });
+			}
 			return;
 		}
 		if (event.type !== "status_changed") return;

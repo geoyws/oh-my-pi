@@ -179,8 +179,11 @@ export interface InteractiveModeContext {
 	togglePinnedHudExpanded(): void;
 	/** Point the inline hover band at a click-candidate id (or clear it). */
 	setClickHoverId(id: string | undefined): void;
-	/** Clear loader, transient HUD/pending containers, streaming state, and pending tools. */
-	clearTransientSessionUi(): void;
+	/**
+	 * Clear loader, transient HUD/pending containers, streaming state, and pending tools.
+	 * Also drops a queued user model switch unless `keepPendingModelSwitch` (focus retargeting).
+	 */
+	clearTransientSessionUi(options?: { keepPendingModelSwitch?: boolean }): void;
 	settings: Settings;
 	keybindings: KeybindingsManager;
 	agent: AgentSession["agent"];
@@ -367,6 +370,29 @@ export interface InteractiveModeContext {
 	flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void>;
 	flushPendingBashComponents(): void;
 	flushPendingModelSwitch(): Promise<void>;
+	/**
+	 * Route a user model switch (model hub, alt+p, `/switch`, ctrl+p, `/model`)
+	 * aimed at `session` through `resolveUserModelSwitch`. Only the main session
+	 * queues, whichever view is focused. `"apply"`: the caller switches now, as
+	 * before, and any switch still queued is dropped. `"queued"`: main is
+	 * mid-turn, so the switch is held (replacing any queued one) and the queued
+	 * status line is already shown; `apply` runs once when main settles and
+	 * resolves `true` only if the model actually switched. `"cancelled"`: main
+	 * is mid-turn and `target` is its live model; a queued user switch was
+	 * dropped (a plan-origin one stays) and the status line already says so.
+	 * `statusPrefix` leads the queued/cancelled status line, so a caller that
+	 * also records something (the hub's role write) states both in one line.
+	 * `thinkingLevel`: the level `apply` configures, if it sets one; a replay
+	 * that finds the session already on `target` applies only that.
+	 */
+	routeUserModelSwitch(
+		session: AgentSession,
+		target: Model,
+		apply: () => Promise<boolean>,
+		options?: { role?: string; statusPrefix?: string; thinkingLevel?: ConfiguredThinkingLevel },
+	): "apply" | "queued" | "cancelled";
+	/** The user model switch waiting for the running turn to settle, if any. */
+	readonly pendingUserModelSwitch: { model: Model; role?: string } | undefined;
 	setWorkingMessage(message?: string): void;
 	applyPendingWorkingMessage(): void;
 	ensureLoadingAnimation(): void;
@@ -622,7 +648,7 @@ export interface InteractiveModeContext {
 	setLoopPrompt(prompt: string): void;
 	armLoopAutoSubmit(): void;
 	disableLoopMode(message?: string): void;
-	cancelGoalContinuation(): void;
+	holdGoalContinuation(): void;
 	disableGoalMode(message?: string): void;
 	pauseLoop(): void;
 	handlePlanApproval(details: PlanApprovalDetails): Promise<void>;

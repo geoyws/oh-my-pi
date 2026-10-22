@@ -744,6 +744,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 	 */
 	#activeMeters: WeakMap<TSession, ActiveMeter> = new WeakMap();
 	#planModeStatus: { enabled: boolean; paused: boolean } | null = null;
+	#pendingModelSwitchStatus: SegmentContext["pendingModelSwitch"] = null;
 	#loopModeStatus: SegmentContext["loopMode"] = null;
 	#goalModeStatus: { enabled: boolean; paused: boolean } | null = null;
 	#vibeModeStatus: { enabled: boolean } | null = null;
@@ -985,6 +986,12 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		return this.#resolveSettings();
 	}
 
+	/** Whether the effective preset/custom layout renders `id` in either group. */
+	hasSegment(id: StatusLineSegmentId): boolean {
+		const effectiveSettings = this.#resolveSettings();
+		return effectiveSettings.leftSegments.includes(id) || effectiveSettings.rightSegments.includes(id);
+	}
+
 	setAutoCompactEnabled(enabled: boolean): void {
 		if (this.#autoCompactEnabled === enabled) return;
 		this.#autoCompactEnabled = enabled;
@@ -1141,6 +1148,23 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			return;
 		}
 		this.#planModeStatus = next;
+		this.#invalidateStatusLineRenderCache();
+	}
+
+	/**
+	 * Model switch queued until the running turn settles; the model chip renders
+	 * `current -> pending (after this turn)` while the session streams.
+	 */
+	setPendingModelSwitch(status: NonNullable<SegmentContext["pendingModelSwitch"]> | undefined): void {
+		const next = status ?? null;
+		const current = this.#pendingModelSwitchStatus;
+		if (
+			current === next ||
+			(current?.model.provider === next?.model.provider && current?.model.id === next?.model.id)
+		) {
+			return;
+		}
+		this.#pendingModelSwitchStatus = next;
 		this.#invalidateStatusLineRenderCache();
 	}
 
@@ -2607,6 +2631,8 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			compactThinkingLevel: this.#resolveSettings().compactThinkingLevel ?? false,
 			hookStatuses: this.#sortedHookStatuses,
 			planMode: this.#planModeStatus,
+			// Pending switches belong to the main session; a focused subagent view shows its own model.
+			pendingModelSwitch: this.#focusedAgentId === undefined ? this.#pendingModelSwitchStatus : null,
 			loopMode: this.#loopModeStatus,
 			prewalk:
 				typeof this.session.getPrewalkState === "function" && this.session.getPrewalkState()

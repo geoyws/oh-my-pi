@@ -575,6 +575,9 @@ export class InputController {
 			}
 			if (this.ctx.loadingAnimation) {
 				if (this.ctx.cancelPendingSubmission()) {
+					// The cancelled submission may be the goal continuation itself; hold so the next
+					// idle window does not re-fire it.
+					this.ctx.holdGoalContinuation();
 					return;
 				}
 				this.restoreQueuedMessagesToEditor({ abort: true });
@@ -596,6 +599,9 @@ export class InputController {
 				// Esc must not destroy an in-progress draft.
 				this.ctx.lastEscapeTime = 0;
 			} else {
+				// Idle bare Esc stops goal auto-continuation (a pending tick included) the same way a
+				// streaming Esc does; the goal stays active.
+				this.ctx.holdGoalContinuation();
 				// Double-interrupt with an empty editor runs the configured action:
 				// the transcript rewind selector (default) or the session tree.
 				const doubleEscapeAction = cfgDoubleEscapeAction.get(settings);
@@ -2812,6 +2818,45 @@ export class InputController {
 	async cycleRoleModel(direction: "forward" | "backward" = "forward"): Promise<void> {
 		try {
 			const cycleOrder = cfgCycleOrder.get(settings);
+			const showTrack = (role: string) =>
+				// The status line already reports the resolved model + thinking level, so
+				// the cycle status is just a status-line-style chip track (active role
+				// filled), matching the plan-approval model slider. It renders into its
+				// own anchored container above the editor (cleared+rebuilt each cycle),
+				// so it updates in place instead of stacking duplicates in the scrollback.
+				this.ctx.showModelCycleTrack(
+					cycleOrder.map(entry => ({ label: entry })),
+					cycleOrder.indexOf(role),
+				);
+			// Presses aimed at the main session go through the turn-end queue; a
+			// focused subagent view cycles its own session immediately.
+			const session = this.ctx.viewSession;
+			if (session === this.ctx.session) {
+				// Advance from a switch already queued for after this turn, so a second
+				// press mid-turn reads `A -> C` instead of re-picking `B`.
+				const next = session.nextRoleModel(cycleOrder, direction, this.ctx.pendingUserModelSwitch);
+				if (!next) {
+					this.ctx.showStatus("Only one role model available");
+					return;
+				}
+				const outcome = this.ctx.routeUserModelSwitch(
+					session,
+					next.model,
+					async () => {
+						await session.applyRoleModel(next);
+						this.ctx.statusLine.invalidate();
+						this.ctx.updateEditorBorderColor();
+						return true;
+					},
+					{ role: next.role, thinkingLevel: next.explicitThinkingLevel ? next.thinkingLevel : undefined },
+				);
+				// Queued, or wrapped back onto the live model (queue cancelled).
+				if (outcome !== "apply") {
+					showTrack(next.role);
+					return;
+				}
+			}
+
 			const result = await this.ctx.viewSession.cycleRoleModels(cycleOrder, direction);
 			if (!result) {
 				this.ctx.showStatus("Only one role model available");
@@ -2820,15 +2865,7 @@ export class InputController {
 
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorBorderColor();
-			// The status line already reports the resolved model + thinking level, so
-			// the cycle status is just a status-line-style chip track (active role
-			// filled), matching the plan-approval model slider. It renders into its
-			// own anchored container above the editor (cleared+rebuilt each cycle),
-			// so it updates in place instead of stacking duplicates in the scrollback.
-			this.ctx.showModelCycleTrack(
-				cycleOrder.map(role => ({ label: role })),
-				cycleOrder.indexOf(result.role),
-			);
+			showTrack(result.role);
 		} catch (error) {
 			this.ctx.showError(error instanceof Error ? error.message : String(error));
 		}

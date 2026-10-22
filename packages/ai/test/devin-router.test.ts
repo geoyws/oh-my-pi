@@ -1,3 +1,5 @@
+import { streamSimple } from "@oh-my-pi/pi-ai/stream";
+import { logger } from "@oh-my-pi/pi-utils";
 import { describe, expect, it } from "bun:test";
 import { gunzipSync } from "node:zlib";
 import { streamDevin } from "@oh-my-pi/pi-ai/providers/devin";
@@ -146,6 +148,33 @@ const context: Context = {
 };
 
 describe("streamDevin router assignment", () => {
+	it("reports one inference attempt after Devin authentication and model assignment", async () => {
+		const { fetch: fetchImpl, recorded } = fakeDevin({
+			assignment: { assignmentJwt: "assign-jwt", modelUid: "claude-sonnet-4-5" },
+		});
+		const events: Array<{ message: string; fields: Record<string, unknown> }> = [];
+		const unsubscribe = logger.registerLogSink(event => {
+			if (event.message.startsWith("provider request"))
+				events.push({ message: event.message, fields: event.context ?? {} });
+		});
+		try {
+			const result = await streamSimple(devinModel({ modelRouter: true }), context, {
+				apiKey: "token",
+				fetch: fetchImpl,
+			}).result();
+			await Promise.resolve();
+			expect(result.stopReason).toBe("stop");
+			expect(recorded.paths).toEqual([
+				"/exa.auth_pb.AuthService/GetUserJwt",
+				"/exa.api_server_pb.ApiServerService/AssignModel",
+				"/exa.api_server_pb.ApiServerService/GetChatMessage",
+			]);
+			expect(events.map(event => event.message)).toEqual(["provider request start", "provider request end"]);
+			expect(events[1].fields).toMatchObject({ attempts: 1, outcome: "ok", status: 200 });
+		} finally {
+			unsubscribe();
+		}
+	});
 	it("assigns a concrete model before chat and forwards the assignment", async () => {
 		const { fetch: fetchImpl, recorded } = fakeDevin({
 			assignment: { assignmentJwt: "assign-jwt", modelUid: "claude-sonnet-4-5" },
