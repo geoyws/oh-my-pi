@@ -32,13 +32,18 @@ export const STATUS_LINE_SEGMENT_IDS = [
 /** One identifier from the supported status-line segment catalog. */
 export type StatusLineSegmentId = (typeof STATUS_LINE_SEGMENT_IDS)[number];
 
-/** Baseline segments used when Custom is selected without segment overrides. */
+/**
+ * Baseline segments used when Custom is selected without segment overrides.
+ * Fork default (omp t-489b1a44): Custom is the default preset, so these are
+ * the bar a bare install shows. `status` renders extension setStatus text and
+ * stays empty without an extension.
+ */
 export const CUSTOM_STATUS_LINE_DEFAULTS: {
 	readonly left: StatusLineSegmentId[];
 	readonly right: StatusLineSegmentId[];
 } = {
-	left: ["vim", "model", "mode", "path", "git", "pr"],
-	right: ["session_name", "token_total", "cost", "context_pct"],
+	left: ["status", "model", "context_pct", "mode", "subagents"],
+	right: ["session_name", "usage", "cost"],
 };
 
 export const CONTEXT_LINE_MODE_VALUES = ["off", "percentage", "annotated", "embedded"] as const;

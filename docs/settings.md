@@ -875,16 +875,22 @@ task:
 
 ```yaml
 theme:
-  dark: titanium
-  light: light
-symbolPreset: unicode # unicode, nerd, ascii
+  dark: dark-catppuccin-omp
+  light: light-catppuccin-omp
+symbolPreset: nerd # unicode, nerd, ascii
 colorBlindMode: false
+composer:
+  shape: borderless
 
 statusLine:
-  preset: default # default, minimal, compact, full, nerd, ascii, custom
-  separator: powerline-thin
+  preset: custom # default, minimal, compact, full, nerd, ascii, custom
+  separator: powerline
   transparent: false
-  showHookStatus: true
+  contextLine: off
+  compactThinkingLevel: false
+  showHookStatus: false
+  leftSegments: [status, model, context_pct, mode, subagents]
+  rightSegments: [session_name, usage, cost]
 
 terminal:
   showImages: true
@@ -897,16 +903,17 @@ tui:
 
 | Key                           | Type    | Default          | Values                                                                    |
 | ----------------------------- | ------- | ---------------- | ------------------------------------------------------------------------- |
-| `theme.dark`                  | string  | `titanium`       | Theme used on a dark terminal background.                                 |
-| `theme.light`                 | string  | `light`          | Theme used on a light terminal background.                                |
-| `symbolPreset`                | enum    | `unicode`        | `unicode`, `nerd`, `ascii`.                                               |
+| `theme.dark`                  | string  | `dark-catppuccin-omp` | Theme used on a dark terminal background.                            |
+| `theme.light`                 | string  | `light-catppuccin-omp` | Theme used on a light terminal background.                          |
+| `symbolPreset`                | enum    | `nerd`           | `unicode`, `nerd`, `ascii`.                                               |
+| `composer.shape`              | string  | `borderless`     | Composer layout, for example `band` or `borderless`.                      |
 | `colorBlindMode`              | boolean | `false`          | Use blue instead of green for diff additions.                             |
 | `showHardwareCursor`          | boolean | `true`           | Show the terminal hardware cursor.                                        |
-| `statusLine.preset`           | enum    | `default`        | `default`, `minimal`, `compact`, `full`, `nerd`, `ascii`, `custom`.       |
-| `statusLine.separator`        | enum    | `powerline-thin` | `powerline`, `powerline-thin`, `slash`, `pipe`, `block`, `none`, `ascii`. |
+| `statusLine.preset`           | enum    | `custom`         | `default`, `minimal`, `compact`, `full`, `nerd`, `ascii`, `custom`.       |
+| `statusLine.separator`        | enum    | `powerline`      | `powerline`, `powerline-thin`, `slash`, `pipe`, `block`, `none`, `ascii`. |
 | `statusLine.sessionAccent`    | boolean | `true`           | Tint the editor border with the session color.                            |
 | `statusLine.transparent`      | boolean | `false`          | Use the terminal background for the status line.                          |
-| `statusLine.showHookStatus`   | boolean | `true`           | Show hook status messages.                                                |
+| `statusLine.showHookStatus`   | boolean | `false`          | Show hook status messages.                                                |
 | `terminal.showImages`         | boolean | `true`           | Render images inline (when the terminal supports it).                     |
 | `images.autoResize`           | boolean | `true`           | Resize large images for model compatibility.                              |
 | `images.blockImages`          | boolean | `false`          | Never send images to providers.                                           |
@@ -942,10 +949,10 @@ The `cost` segment shows recorded session costs. For an active provider/model wi
 | `input.bareExitOnEmptySession` | boolean | `true` | Submitting exactly `exit`, `quit`, or `q` (case-insensitive) before the first message quits. |
 | `input.bareSlashCommands` | boolean | `false` | Run an exact command name without `/`; after session messages exist, Enter must be pressed twice to confirm. |
 | `tui.vimMode` | boolean | `false` | Enable modal prompt editing; `tui.vimModeDisplay` selects `text`, `icon`, or `none` (default `text`). |
-| `startup.quiet` | boolean | `false` | Suppress welcome/startup chrome, including the splash. |
+| `startup.quiet` | boolean | `true` | Suppress welcome/startup chrome, including the splash. |
 | `startup.showSplash` | boolean | `false` | Show the full setup animation on ordinary interactive startup without rerunning setup. |
 | `startup.changelogMode` | enum | `summary` | `summary`, `expanded`, `hidden`: choose startup release-note presentation. |
-| `startup.setupWizard` | boolean | `true` | Show newly added onboarding steps once per setup version. |
+| `startup.setupWizard` | boolean | `false` | Show newly added onboarding steps once per setup version. Off by default; `/setup` still opens the wizard on request. |
 
 ### Providers and services
 
