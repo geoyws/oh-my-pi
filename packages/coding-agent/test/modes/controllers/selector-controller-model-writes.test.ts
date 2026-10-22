@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import type { Model } from "@oh-my-pi/pi-ai";
+import { Effort, type Model } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { type RawSettings, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -135,4 +135,30 @@ describe("SelectorController model hub writes", () => {
 		expect(await refreshed.promise).toBe(1_050_000);
 		expect(showError).not.toHaveBeenCalled();
 	});
+
+	for (const role of ["smol", "default"]) {
+		it(`keeps the persisted ${role} thinking suffix when the hub re-assigns the same model`, async () => {
+			const agentDir = tempDir.join("agent");
+			const config = path.join(agentDir, "config.yml");
+			const sonnet = model("claude-sonnet-4-5");
+			const source = `# user config\nmodelRoles:\n  default: anthropic/claude-sonnet-4-5:high # keep\n  smol: anthropic/claude-sonnet-4-5:high\n`;
+			await Bun.write(config, source);
+			const settings = await Settings.init({ agentDir, cwd: tempDir.path() });
+			const { controller, showError } = start(settings, sonnet);
+
+			// The hub's #assignRole forwards the role's current explicit level with the item selector.
+			const assigned = await openModelHub(controller).onAssign(
+				sonnet,
+				role,
+				Effort.High,
+				`${sonnet.provider}/${sonnet.id}`,
+			);
+			await settings.flush();
+
+			expect(showError).not.toHaveBeenCalled();
+			expect(assigned).toBe(true);
+			expect(settings.getModelRole(role)).toBe("anthropic/claude-sonnet-4-5:high");
+			expect(await Bun.file(config).text()).toBe(source);
+		});
+	}
 });

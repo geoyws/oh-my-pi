@@ -7,6 +7,7 @@ import * as autoThinkingClassifier from "@oh-my-pi/pi-coding-agent/auto-thinking
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -15,6 +16,7 @@ import { thinkingLevelLabel } from "@oh-my-pi/pi-tui/status-line/segments";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import * as advisorModule from "../src/advisor";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
+import { beginSettingsTest, restoreSettingsTestState } from "./helpers/settings-test-state";
 
 import { cfgDefaultThinkingLevel } from "@oh-my-pi/pi-coding-agent/session/settings";
 
@@ -217,6 +219,36 @@ describe("AgentSession role model thinking behavior", () => {
 		await session.setModel(slowModel, "default", { persist: true });
 
 		expect(sessionSettings.getModelRole("default")).toBe(`${slowModel.provider}/${slowModel.id}:off`);
+	});
+
+	it("keeps the persisted role thinking suffix when the same model is re-picked without a level", async () => {
+		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const state = beginSettingsTest();
+		try {
+			const agentDir = tempDir.join("agent");
+			const config = path.join(agentDir, "config.yml");
+			const source = `# user config\nmodelRoles:\n  default: ${defaultModel.provider}/${defaultModel.id}:high # keep\n  smol: 'anthropic/claude-sonnet-4-6:low'\n`;
+			await Bun.write(config, source);
+			sessionSettings = await Settings.init({ agentDir, cwd: tempDir.path() });
+			session = new AgentSession({
+				agent: new Agent({
+					initialState: { model: defaultModel, systemPrompt: ["Test"], tools: [], messages: [] },
+				}),
+				sessionManager: SessionManager.inMemory(),
+				settings: sessionSettings,
+				modelRegistry,
+			});
+
+			await session.setModel(defaultModel, "default", { persist: true });
+			await sessionSettings.flush();
+
+			expect(sessionSettings.getModelRole("default")).toBe(`${defaultModel.provider}/${defaultModel.id}:high`);
+			expect(await Bun.file(config).text()).toBe(source);
+		} finally {
+			await session.dispose();
+			AgentStorage.close();
+			restoreSettingsTestState(state);
+		}
 	});
 
 	it.each([
