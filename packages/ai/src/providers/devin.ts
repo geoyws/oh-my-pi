@@ -237,7 +237,12 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 		try {
 			const fetchImpl = options?.fetch ?? fetch;
 			const baseUrl = (model.baseUrl || DEVIN_API_URL).replace(/\/+$/, "");
-			const auth = await fetchDevinAuthMetadata(options?.apiKey, baseUrl, auxiliaryFetch(fetchImpl), options?.signal);
+			const auth = await fetchDevinAuthMetadata(
+				options?.apiKey,
+				baseUrl,
+				auxiliaryFetch(fetchImpl),
+				options?.signal,
+			);
 			const chatBaseUrl = auth.baseUrl ?? baseUrl;
 			const turn: DevinTurn = {
 				apiKey: auth.apiKey,
