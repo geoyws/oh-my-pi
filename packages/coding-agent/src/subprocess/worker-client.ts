@@ -533,11 +533,16 @@ export function createWorkerHandle<Inbound, Outbound>(
 	};
 }
 
-/** Resolve true when `proc` is reaped within `timeoutMs`, false on expiry. */
+/**
+ * Resolve true when `proc` is reaped within `timeoutMs`, false on expiry.
+ * The timer stays referenced: workers are `unref`'d, so a referenced timer is
+ * the only thing holding the event loop while a caller awaits the reap. An
+ * unref'd timer let a one-shot run (`omp --smoke-test`) drain with
+ * `terminate()` still pending and exit as unsettled.
+ */
 async function waitForSubprocessExit(proc: Subprocess, timeoutMs: number): Promise<boolean> {
 	const expired = Promise.withResolvers<false>();
 	const timer = setTimeout(() => expired.resolve(false), Math.max(0, timeoutMs));
-	timer.unref?.();
 	try {
 		return await Promise.race([proc.exited.then(() => true), expired.promise]);
 	} finally {
