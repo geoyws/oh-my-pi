@@ -424,7 +424,14 @@ describe("setup wizard short terminals", () => {
 			const frame = component.render(80).map(line => Bun.stripANSI(line));
 			expect(frame.length).toBe(24);
 			expect(frame.some(line => line.trimStart().startsWith(theme.nav.cursor))).toBe(true);
-			for (const label of ["Match terminal", "Titanium", "Light", "Colorblind colors", "ANSI-safe", "Browse all"]) {
+			for (const label of [
+				"Match terminal",
+				"Catppuccin Dark",
+				"Catppuccin Light",
+				"Colorblind colors",
+				"ANSI-safe",
+				"Browse all",
+			]) {
 				expect(frame.some(line => line.includes(label))).toBe(true);
 			}
 		} finally {

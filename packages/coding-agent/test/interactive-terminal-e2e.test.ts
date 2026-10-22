@@ -41,7 +41,8 @@ describe("libkitty end-to-end", () => {
 	beforeEach(async () => {
 		resetSettingsForTest();
 		tempDir = TempDir.createSync("@pi-libkitty-e2e-");
-		await Settings.init({ inMemory: true, cwd: tempDir.path() });
+		// The welcome header these buffer checks count only renders without quiet startup (fork default: quiet).
+		await Settings.init({ inMemory: true, cwd: tempDir.path(), overrides: { "startup.quiet": false } });
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
 		const modelRegistry = new ModelRegistry(authStorage);
 		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
@@ -49,7 +50,7 @@ describe("libkitty end-to-end", () => {
 		session = new AgentSession({
 			agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
 			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
-			settings: Settings.isolated(),
+			settings: Settings.isolated({ "startup.quiet": false }),
 			modelRegistry,
 		});
 		term = new VirtualTerminal(120, 32);

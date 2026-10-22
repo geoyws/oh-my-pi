@@ -26,9 +26,13 @@ import type { SetupScene, SetupSceneController, SetupSceneHost } from "./types";
 type ThemeMode = "curated" | "all";
 
 const CURATED_ITEMS: readonly SelectItem[] = [
-	{ value: "auto", label: "Match terminal", description: "Titanium in dark terminals, Light in light terminals" },
-	{ value: "theme:titanium", label: "Titanium", description: "Default dark theme" },
-	{ value: "theme:light", label: "Light", description: "Default light theme" },
+	{
+		value: "auto",
+		label: "Match terminal",
+		description: "Catppuccin Dark in dark terminals, Catppuccin Light in light terminals",
+	},
+	{ value: "theme:dark-catppuccin-omp", label: "Catppuccin Dark", description: "Default dark theme" },
+	{ value: "theme:light-catppuccin-omp", label: "Catppuccin Light", description: "Default light theme" },
 	{ value: "colorblind", label: "Colorblind colors", description: "Adjust red/green contrast" },
 	{ value: "ansi", label: "ANSI-safe", description: "ASCII glyphs with the dark terminal theme" },
 	{ value: "browse", label: "Browse all…", description: "Show every built-in and custom theme" },
@@ -303,8 +307,8 @@ class ThemeSceneController implements SetupSceneController {
 
 	#currentCuratedIndex(): number {
 		const current = getCurrentThemeName();
-		if (current === "titanium") return 1;
-		if (current === "light") return 2;
+		if (current === "dark-catppuccin-omp") return 1;
+		if (current === "light-catppuccin-omp") return 2;
 		return 0;
 	}
 
@@ -350,8 +354,8 @@ class ThemeSceneController implements SetupSceneController {
 
 	async #commit(value: string): Promise<void> {
 		if (value === "auto") {
-			this.#host.ctx.saveTheme("dark", "titanium");
-			this.#host.ctx.saveTheme("light", "light");
+			this.#host.ctx.saveTheme("dark", "dark-catppuccin-omp");
+			this.#host.ctx.saveTheme("light", "light-catppuccin-omp");
 			await this.#applyPreviewPresentation(this.#originalSymbolPreset, this.#originalColorBlindMode);
 			enableAutoTheme();
 			return;

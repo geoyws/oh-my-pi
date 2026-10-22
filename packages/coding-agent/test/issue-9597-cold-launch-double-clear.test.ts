@@ -56,7 +56,8 @@ describe("issue #9597 — cold-launch welcome duplication", () => {
 	beforeEach(async () => {
 		resetSettingsForTest();
 		await initTheme();
-		settings = await Settings.init({ inMemory: true });
+		// The welcome header under test only renders without quiet startup (fork default: quiet).
+		settings = await Settings.init({ inMemory: true, overrides: { "startup.quiet": false } });
 		config = {
 			quiet: cfgStartupQuiet.get(settings),
 			composerShape: cfgComposerShape.get(settings) ?? "box",

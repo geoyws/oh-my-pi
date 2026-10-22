@@ -59,7 +59,9 @@ export const cfgGitEnabled = register({
 export const cfgThemeDark = register({
 	id: "theme.dark",
 	type: "string",
-	default: "titanium",
+	// Fork default (omp t-489b1a44): our catppuccin chrome ships built in, so a
+	// bare launch with no PI_CONFIG_FILES overlay looks like the standard setup.
+	default: "dark-catppuccin-omp",
 	ui: {
 		tab: "appearance",
 		group: "Theme",
@@ -73,7 +75,7 @@ effect(cfgThemeDark, name => setAutoThemeMapping("dark", name));
 export const cfgThemeLight = register({
 	id: "theme.light",
 	type: "string",
-	default: "light",
+	default: "light-catppuccin-omp",
 	ui: {
 		tab: "appearance",
 		group: "Theme",
@@ -88,18 +90,18 @@ export const cfgSymbolPreset = register({
 	id: "symbolPreset",
 	type: "enum",
 	values: ["unicode", "nerd", "ascii"] as const,
-	default: "unicode",
+	default: "nerd",
 	ui: {
 		tab: "appearance",
 		group: "Theme",
 		label: "Symbol Preset",
 		description: "Glyph set for icons and symbols (Unicode, Nerd Font, or ASCII)",
 		options: [
-			{ value: "unicode", label: "Unicode", description: "Standard symbols (default)" },
+			{ value: "unicode", label: "Unicode", description: "Standard symbols" },
 			{
 				value: "nerd",
 				label: "Nerd Font",
-				description: "Requires a Nerd Font, or a Glyph Protocol terminal (icons ship in-band)",
+				description: "Requires a Nerd Font, or a Glyph Protocol terminal (icons ship in-band) (default)",
 			},
 			{ value: "ascii", label: "ASCII", description: "Maximum compatibility" },
 		],
@@ -124,7 +126,7 @@ effect(cfgColorBlindMode, setColorBlindMode);
 export const cfgComposerShape = register({
 	id: "composer.shape",
 	type: "string",
-	default: "band",
+	default: "borderless",
 	ui: {
 		tab: "appearance",
 		group: "Composer",
@@ -153,7 +155,7 @@ export const cfgStatusLinePreset = register({
 	id: "statusLine.preset",
 	type: "enum",
 	values: STATUS_LINE_PRESET_VALUES,
-	default: "default",
+	default: "custom",
 	ui: {
 		tab: "appearance",
 		group: "Status Line",
@@ -175,7 +177,7 @@ export const cfgStatusLineSeparator = register({
 	id: "statusLine.separator",
 	type: "enum",
 	values: STATUS_LINE_SEPARATOR_VALUES,
-	default: "powerline-thin",
+	default: "powerline",
 	ui: {
 		tab: "appearance",
 		group: "Status Line",
@@ -197,7 +199,7 @@ export const cfgStatusLineContextLine = register({
 	id: "statusLine.contextLine",
 	type: "enum",
 	values: CONTEXT_LINE_MODE_VALUES,
-	default: "embedded",
+	default: "off",
 	ui: {
 		tab: "appearance",
 		group: "Status Line",
@@ -252,7 +254,7 @@ export const cfgStatusLineTransparent = register({
 export const cfgStatusLineCompactThinkingLevel = register({
 	id: "statusLine.compactThinkingLevel",
 	type: "boolean",
-	default: true,
+	default: false,
 	ui: {
 		tab: "appearance",
 		group: "Status Line",
@@ -265,7 +267,7 @@ export const cfgStatusLineCompactThinkingLevel = register({
 export const cfgStatusLineShowHookStatus = register({
 	id: "statusLine.showHookStatus",
 	type: "boolean",
-	default: true,
+	default: false,
 	ui: {
 		tab: "appearance",
 		group: "Status Line",
@@ -1074,7 +1076,7 @@ export const cfgPasteLargeMenuThreshold = register({
 export const cfgStartupQuiet = register({
 	id: "startup.quiet",
 	type: "boolean",
-	default: false,
+	default: true,
 	ui: {
 		tab: "interaction",
 		group: "Startup & Updates",
@@ -1099,7 +1101,7 @@ export const cfgStartupShowSplash = register({
 export const cfgStartupSetupWizard = register({
 	id: "startup.setupWizard",
 	type: "boolean",
-	default: true,
+	default: false,
 	ui: {
 		tab: "interaction",
 		group: "Startup & Updates",
@@ -1111,7 +1113,7 @@ export const cfgStartupSetupWizard = register({
 export const cfgStartupCheckUpdate = register({
 	id: "startup.checkUpdate",
 	type: "boolean",
-	default: true,
+	default: false,
 	ui: {
 		tab: "interaction",
 		group: "Startup & Updates",

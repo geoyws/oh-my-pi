@@ -7,6 +7,7 @@ import dark_abyss from "./dark-abyss.json" with { type: "json" };
 import dark_arctic from "./dark-arctic.json" with { type: "json" };
 import dark_aurora from "./dark-aurora.json" with { type: "json" };
 import dark_catppuccin from "./dark-catppuccin.json" with { type: "json" };
+import dark_catppuccin_omp from "./dark-catppuccin-omp.json" with { type: "json" };
 import dark_cavern from "./dark-cavern.json" with { type: "json" };
 import dark_celestial from "./dark-celestial.json" with { type: "json" };
 import dark_copper from "./dark-copper.json" with { type: "json" };
@@ -53,6 +54,7 @@ import light_arctic from "./light-arctic.json" with { type: "json" };
 import light_aurora_day from "./light-aurora-day.json" with { type: "json" };
 import light_canyon from "./light-canyon.json" with { type: "json" };
 import light_catppuccin from "./light-catppuccin.json" with { type: "json" };
+import light_catppuccin_omp from "./light-catppuccin-omp.json" with { type: "json" };
 import light_cirrus from "./light-cirrus.json" with { type: "json" };
 import light_coral from "./light-coral.json" with { type: "json" };
 import light_cyberpunk from "./light-cyberpunk.json" with { type: "json" };
@@ -109,6 +111,7 @@ export const defaultThemes = {
 	"dark-arctic": dark_arctic,
 	"dark-aurora": dark_aurora,
 	"dark-catppuccin": dark_catppuccin,
+	"dark-catppuccin-omp": dark_catppuccin_omp,
 	"dark-cavern": dark_cavern,
 	"dark-celestial": dark_celestial,
 	"dark-copper": dark_copper,
@@ -155,6 +158,7 @@ export const defaultThemes = {
 	"light-aurora-day": light_aurora_day,
 	"light-canyon": light_canyon,
 	"light-catppuccin": light_catppuccin,
+	"light-catppuccin-omp": light_catppuccin_omp,
 	"light-cirrus": light_cirrus,
 	"light-coral": light_coral,
 	"light-cyberpunk": light_cyberpunk,

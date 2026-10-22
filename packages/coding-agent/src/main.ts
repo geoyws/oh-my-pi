@@ -685,19 +685,21 @@ async function runInteractiveMode(
 	try {
 		// Cold-launch gate: the full setup wizard (every scene + the overlay and
 		// their TUI/OAuth/search/theme deps) is heavy, yet the common case only needs
-		// to know whether the stored setup version is current. Lazy-load the wizard
-		// barrel only when setup is stale, forced, or the explicit startup splash
-		// setting needs the shared setup splash renderer.
+		// to know whether onboarding is enabled and the stored setup version is
+		// current. Lazy-load the wizard barrel only when setup is enabled and stale,
+		// forced, or the explicit startup splash setting needs the shared setup
+		// splash renderer. Onboarding is off by default in the fork (omp t-489b1a44).
 		const storedSetupVersion = cfgSetupVersion.get(settings);
+		const setupWizardEnabled = cfgStartupSetupWizard.get(settings);
 		setupWizard =
-			forceSetupWizard || storedSetupVersion < CURRENT_SETUP_VERSION || showStartupSplash
+			forceSetupWizard || (setupWizardEnabled && storedSetupVersion < CURRENT_SETUP_VERSION) || showStartupSplash
 				? await import("./modes/setup")
 				: undefined;
 		setupScenes = setupWizard
 			? await setupWizard.selectSetupScenes(storedSetupVersion, setupWizard.ALL_SCENES, mode, {
 					resuming,
 					isTTY: process.stdin.isTTY && process.stdout.isTTY,
-					setupWizardEnabled: cfgStartupSetupWizard.get(settings),
+					setupWizardEnabled,
 					force: forceSetupWizard,
 				})
 			: [];

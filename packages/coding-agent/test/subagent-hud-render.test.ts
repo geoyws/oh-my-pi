@@ -145,7 +145,7 @@ describe("subagent HUD lines", () => {
 			expect(withoutAdvisor).not.toContain(theme.icon.advisor);
 		});
 
-		it("keeps metadata hidden when disabled or settings have not initialized", () => {
+		it("hides metadata when disabled and returns to the shipped default after reset", () => {
 			const sessions = [
 				makeSession({
 					id: "HiddenBadge",
@@ -165,8 +165,11 @@ describe("subagent HUD lines", () => {
 			expect(disabled).not.toContain("openai/gpt-5");
 			expect(disabled).not.toContain(theme.icon.advisor);
 
+			// Reset restores the schema default, which the fork turns on.
 			resetSettingsForTest();
-			expect(render(sessions)).toBe(disabled);
+			const restored = render(sessions);
+			expect(restored).toContain("openai/gpt-5");
+			expect(restored).toContain(theme.icon.advisor);
 		});
 
 		it("preserves model identity and the agent name while fitting descriptions and task previews", () => {

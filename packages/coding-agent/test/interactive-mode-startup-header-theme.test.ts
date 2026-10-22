@@ -57,7 +57,10 @@ describe("InteractiveMode startup header after the terminal reports a light back
 
 		resetSettingsForTest();
 		tempDir = TempDir.createSync("@pi-interactive-mode-startup-header-theme-");
-		await Settings.init({ inMemory: true, cwd: tempDir.path() });
+		// Pin the built-in dark/light pair this test swaps between and show the
+		// startup header; the fork ships catppuccin-omp themes and quiet startup.
+		const themePair = { "theme.dark": "dark", "theme.light": "light", "startup.quiet": false } as const;
+		await Settings.init({ inMemory: true, cwd: tempDir.path(), overrides: themePair });
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
 		const modelRegistry = new ModelRegistry(authStorage);
 		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
@@ -65,7 +68,7 @@ describe("InteractiveMode startup header after the terminal reports a light back
 		session = new AgentSession({
 			agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
 			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
-			settings: Settings.isolated(),
+			settings: Settings.isolated(themePair),
 			modelRegistry,
 		});
 		mode = new InteractiveMode(session, "test", startupChangelog);

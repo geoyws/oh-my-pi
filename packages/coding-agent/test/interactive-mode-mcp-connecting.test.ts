@@ -49,7 +49,8 @@ describe("InteractiveMode MCP connection status", () => {
 
 		resetSettingsForTest();
 		tempDir = TempDir.createSync("@pi-interactive-mode-mcp-connecting-");
-		await Settings.init({ inMemory: true, cwd: tempDir.path() });
+		// Startup status messages only show without quiet startup (fork default: quiet).
+		await Settings.init({ inMemory: true, cwd: tempDir.path(), overrides: { "startup.quiet": false } });
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
 		const modelRegistry = new ModelRegistry(authStorage);
 		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
@@ -70,6 +71,8 @@ describe("InteractiveMode MCP connection status", () => {
 			settings: Settings.isolated(),
 			modelRegistry,
 		});
+		// Set (not override) so the quiet-enabled case can flip it back on.
+		cfgStartupQuiet.set(session.settings, false);
 		eventBus = new EventBus();
 		mode = new InteractiveMode(session, "test", undefined, () => {}, [], undefined, eventBus);
 		// This contract is the banner wiring, not git branch watching; a real

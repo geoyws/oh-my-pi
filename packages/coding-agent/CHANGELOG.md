@@ -6,6 +6,7 @@
 
 - Isolated task and eval `agent()` changes are now retained as patch or branch artifacts by default instead of being applied to the parent checkout: `task.isolation.apply` defaults to `false`, and enabling it (or passing `apply: true` to `agent()`) is the explicit acceptance that integrates successful isolated changes. Previously an isolated run could copy its edits into a caller tree holding unrelated work and report `Applied patches: yes`.
 - Eval `agent()` now honors `task.isolation.apply` when `apply` is omitted instead of always applying; a per-call `apply: false` still forces artifact-only delivery.
+- Fork defaults now ship the standard look: built-in `dark-catppuccin-omp` / `light-catppuccin-omp` themes (`theme.dark` / `theme.light`, with `selectedBg` one step lighter than the pending-tool tint so hover and selection bands stay visible), `symbolPreset: nerd`, `composer.shape: borderless`, the `custom` status line (`powerline` separator, left `status, model, context_pct, mode, subagents`, right `session_name, usage, cost`, `contextLine: off`, `compactThinkingLevel: false`, `showHookStatus: false`), `startup.quiet: true`, `startup.checkUpdate: false` and `task.showResolvedModelBadge: true`. `startup.setupWizard` now defaults to `false`, so a fresh install starts without the onboarding wizard (and without loading it); `/setup` still opens it. Set the old values in config to restore the previous look.
 
 ### Added
 

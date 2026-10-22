@@ -536,7 +536,7 @@ export const cfgTaskPrewalk = register({
 export const cfgTaskShowResolvedModelBadge = register({
 	id: "task.showResolvedModelBadge",
 	type: "boolean",
-	default: false,
+	default: true,
 	ui: {
 		tab: "appearance",
 		group: "Display",

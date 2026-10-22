@@ -165,7 +165,8 @@ describe("Agent hub Enter activation", () => {
 
 	beforeEach(async () => {
 		resetSettingsForTest();
-		await Settings.init({ inMemory: true });
+		// Roster parsing reads the Unicode tree glyphs; the fork ships nerd by default.
+		await Settings.init({ inMemory: true, overrides: { symbolPreset: "unicode" } });
 	});
 
 	afterEach(() => {

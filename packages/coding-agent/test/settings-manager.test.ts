@@ -2559,7 +2559,7 @@ describe("Settings", () => {
 			resetSettingsForTest();
 
 			const second = await Settings.init({ cwd: projectDir, agentDir });
-			expect(cfgSymbolPreset.get(second)).toBe("unicode");
+			expect(cfgSymbolPreset.get(second)).toBe("nerd");
 			expect(cfgSymbolPreset.isConfigured(second)).toBe(false);
 			expect(await Bun.file(getConfigPath()).exists()).toBe(false);
 		});
@@ -2793,7 +2793,7 @@ describe("Settings", () => {
 			const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
 
 			const settings = await Settings.init({ cwd: projectDir, agentDir, inMemory: true });
-			expect(cfgSymbolPreset.get(settings)).toBe("unicode");
+			expect(cfgSymbolPreset.get(settings)).toBe("nerd");
 			expect(warnSpy).toHaveBeenCalledWith(
 				expect.stringMatching(/Settings: \[Claude Code\] Failed to parse JSON in .*settings\.json/),
 			);
@@ -2859,7 +2859,7 @@ describe("Settings", () => {
 			await Bun.write(claudeSettings, '{ "symbolPreset": "ascii", }');
 			await settings.reloadFromDisk();
 
-			expect(cfgSymbolPreset.get(settings)).toBe("unicode");
+			expect(cfgSymbolPreset.get(settings)).toBe("nerd");
 			expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(claudeSettings));
 		});
 	});

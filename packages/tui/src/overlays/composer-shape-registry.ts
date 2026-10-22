@@ -8,7 +8,7 @@ export type ComposerShape = string;
 export const BUILTIN_COMPOSER_SHAPES = [
 	{
 		value: "band",
-		label: "Status Band (Default)",
+		label: "Status Band",
 		description: "Flush soft-capped status band above a curved prompt, no frame",
 	},
 	{
@@ -28,7 +28,7 @@ export const BUILTIN_COMPOSER_SHAPES = [
 	},
 	{
 		value: "borderless",
-		label: "Borderless",
+		label: "Borderless (Default)",
 		description: "Clean prompt glyph with status line at bottom, no box borders",
 	},
 	{

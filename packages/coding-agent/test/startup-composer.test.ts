@@ -289,7 +289,12 @@ describe("Composer prepaint", () => {
 	beforeEach(async () => {
 		resetSettingsForTest();
 		await initTheme();
+		// Frame assertions read the band composer's edges and the welcome scene;
+		// the fork ships borderless and quiet startup by default. Set (not override)
+		// so individual tests can still change the shape.
 		settings = await Settings.init({ inMemory: true });
+		cfgComposerShape.set(settings, "band");
+		cfgStartupQuiet.set(settings, false);
 		config = {
 			quiet: cfgStartupQuiet.get(settings),
 			composerShape: cfgComposerShape.get(settings) ?? "box",
