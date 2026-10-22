@@ -245,7 +245,6 @@ describe("AgentSession role model thinking behavior", () => {
 			expect(sessionSettings.getModelRole("default")).toBe(`${defaultModel.provider}/${defaultModel.id}:high`);
 			expect(await Bun.file(config).text()).toBe(source);
 		} finally {
-			await session.dispose();
 			AgentStorage.close();
 			restoreSettingsTestState(state);
 		}
