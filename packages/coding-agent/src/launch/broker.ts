@@ -117,6 +117,8 @@ interface ManagedDaemon {
 	persistedSpec?: string;
 	/** Serialized metadata last written (or recovered); a write is skipped while unchanged. */
 	persistedMeta?: string;
+	/** Exit waits include log closure, metadata persistence and completion delivery. */
+	terminalSettling?: boolean;
 }
 
 interface BrokerLease {
@@ -1103,29 +1105,34 @@ class DaemonBroker {
 			}, delay);
 			return;
 		}
+		record.terminalSettling = true;
 		record.snapshot.state = failed && !record.stopRequested ? "failed" : "exited";
-		const completion =
-			record.snapshot.owner !== undefined &&
-			!record.stopRequested &&
-			this.#completionSubscriptions.has(record.snapshot.owner)
-				? ({
-						event: "daemon-completed",
-						completionId: crypto.randomUUID(),
-						owner: record.snapshot.owner,
-						daemon: { ...record.snapshot },
-					} satisfies DaemonCompletionNotification)
-				: undefined;
-		if (completion) record.pendingCompletions.push(completion);
-		this.#persist(record);
-		await record.log?.close();
-		record.log = undefined;
-		await record.persistQueue;
-		if (
-			completion &&
-			this.#completionSubscriptions.has(completion.owner) &&
-			record.pendingCompletions.some(pending => pending.completionId === completion.completionId)
-		) {
-			this.#notifyCompletion(completion);
+		try {
+			const completion =
+				record.snapshot.owner !== undefined &&
+				!record.stopRequested &&
+				this.#completionSubscriptions.has(record.snapshot.owner)
+					? ({
+							event: "daemon-completed",
+							completionId: crypto.randomUUID(),
+							owner: record.snapshot.owner,
+							daemon: { ...record.snapshot },
+						} satisfies DaemonCompletionNotification)
+					: undefined;
+			if (completion) record.pendingCompletions.push(completion);
+			this.#persist(record);
+			await record.log?.close();
+			record.log = undefined;
+			await record.persistQueue;
+			if (
+				completion &&
+				this.#completionSubscriptions.has(completion.owner) &&
+				record.pendingCompletions.some(pending => pending.completionId === completion.completionId)
+			) {
+				this.#notifyCompletion(completion);
+			}
+		} finally {
+			record.terminalSettling = false;
 		}
 		// Terminal settlement can free the last live persistent daemon. The idle
 		// timer that fired while that daemon was alive returned without rearming
@@ -1218,7 +1225,9 @@ class DaemonBroker {
 				// for the full window would hide the exit behind a bogus timeout.
 				return terminalState(record.snapshot.state);
 			}
-			if (operation.for === "exit") return terminalState(record.snapshot.state);
+			// Keep settlement inside the normal polling window, preserving timeout
+			// and cancellation while preventing an exit response ahead of completion.
+			if (operation.for === "exit") return terminalState(record.snapshot.state) && !record.terminalSettling;
 			// Wake on observed readiness or any terminal state so the wait never
 			// blocks for the full timeout; success is judged by readyObserved below.
 			return readyObserved() || terminalState(record.snapshot.state);
