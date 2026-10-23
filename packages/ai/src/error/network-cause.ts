@@ -35,7 +35,7 @@ const OFFLINE_TEXT_PATTERN = /\b(?:ETIMEOUT|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH)\
 const UNREACHABLE_CODE_PATTERN = /^(?:ENOTFOUND|FailedToOpenSocket)$/i;
 const UNREACHABLE_TEXT_PATTERN = /\b(?:ENOTFOUND|FailedToOpenSocket|getaddrinfo)\b/i;
 const REFUSED_CODE_PATTERN = /^(?:ECONNREFUSED|ConnectionRefused)$/i;
-const REFUSED_TEXT_PATTERN = /\bECONNREFUSED\b|\bConnectionRefused\b|\bUnable to connect\b/i;
+const REFUSED_TEXT_PATTERN = /\bECONNREFUSED\b|\bConnectionRefused\b|\bUnable to connect\b|\bconnection refused\b/i;
 const TLS_CODE_PATTERN =
 	/^(?:CERT_|SELF_SIGNED|UNABLE_TO_GET_ISSUER_CERT|UNABLE_TO_VERIFY|DEPTH_ZERO_SELF_SIGNED_CERT|ERR_TLS_CERT)/i;
 const TLS_TEXT_PATTERN =
