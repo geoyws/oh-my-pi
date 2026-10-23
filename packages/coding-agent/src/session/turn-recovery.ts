@@ -3205,9 +3205,10 @@ export class TurnRecovery {
 					// without bound (switches bypass the budget); only a model switch
 					// or a confirmed reset may continue, as with rotation above.
 					if (!choice.candidate.fallback && retryBudgetExhausted) continue;
+					// The provider's own error stays in the reason, as in the chain walk.
 					const reason = choice.account
-						? `${currentSelector} hit its usage limit; ${this.#describeQuotaChoice(choice)} has available quota (${quotaPlan.compared} candidates compared)`
-						: `${currentSelector} hit its usage limit; ${this.#describeQuotaChoice(choice)} is the next configured fallback (${quotaPlan.compared} candidates compared)`;
+						? `${currentSelector} hit its usage limit (${errorMessage}); ${this.#describeQuotaChoice(choice)} has available quota (${quotaPlan.compared} candidates compared)`
+						: `${currentSelector} hit its usage limit (${errorMessage}); ${this.#describeQuotaChoice(choice)} is the next configured fallback (${quotaPlan.compared} candidates compared)`;
 					if (choice.candidate.fallback) {
 						this.noteRetryFallbackCooldown(currentSelector, usageCooldownMs ?? parsedRetryAfterMs, errorMessage);
 					}
