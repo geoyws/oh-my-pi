@@ -368,15 +368,19 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		const afterSpans: ViewportClickSpan[] = [];
 		const ends: { root: Component; end: number }[] = [];
 		let dismissibleRows = 0;
+		this.editor.takeRenderedAutocompleteRows();
 		for (const root of afterRoots) {
 			const start = after.length;
 			this.#renderBelowRoot(root, width, after, afterSpans);
 			if (this.#dismissibleChrome.has(root)) dismissibleRows += after.length - start;
 			ends.push({ root, end: after.length });
 		}
+		// The editor's autocomplete dropdown opens and closes with no output, like
+		// a dismissible panel: it covers the tail instead of retiring rows.
+		dismissibleRows += this.editor.takeRenderedAutocompleteRows();
 		// Chrome that displaces transcript rows: everything below the transcript
-		// except dismissible panels, which cover the tail instead (see
-		// RuntimeChildrenOptions.dismissibleChrome).
+		// except dismissible panels and the dropdown, which cover the tail
+		// instead (see RuntimeChildrenOptions.dismissibleChrome).
 		const chrome = after.length - dismissibleRows;
 		this.#rowsBelow = new Map(ends.map(({ root, end }) => [root, after.length - end]));
 		// Offer history under capacity pressure only: blocks stay live (and keep
