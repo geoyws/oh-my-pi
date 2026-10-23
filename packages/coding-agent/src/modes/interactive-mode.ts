@@ -2366,6 +2366,9 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.hookWidgetContainerBelow,
 			],
 			{
+				// A docked report and the /btw panel cover the transcript tail while
+				// open; Esc puts the covered rows back in place.
+				dismissibleChrome: [this.btwContainer, this.reportContainer],
 				// Natively the HUD pills lead the dock, queued messages sit between
 				// the working row and the composer, and the attachment chips live
 				// inside the composer.

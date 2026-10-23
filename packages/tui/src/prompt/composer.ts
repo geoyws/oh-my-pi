@@ -95,6 +95,14 @@ export interface RuntimeChildrenOptions {
 	 * to the roots below the transcript in render order.
 	 */
 	readonly nativeDock?: readonly Component[];
+	/**
+	 * Below-transcript panels the user opens and closes without new output
+	 * (a docked report, the `/btw` panel). They cover the live tail like an
+	 * overlay: retirement and the live layout ignore their rows, so the rows
+	 * they cover stay live and return in place when they close instead of being
+	 * pushed into scrollback and leaving a blank band above the input.
+	 */
+	readonly dismissibleChrome?: readonly Component[];
 }
 
 /** Controls the first terminal paint for a composer that does not already own the terminal. */
@@ -204,6 +212,7 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 	#headerAfter: readonly Component[] = [];
 	#runtimeChildren: readonly Component[] = [];
 	#nativeDock: readonly Component[] | undefined;
+	#dismissibleChrome: ReadonlySet<Component> = new Set();
 	/** Cache-driven status line shown until {@link setStatusComponent} mounts the session's. */
 	#startupStatus: StatusLineComponent | undefined;
 	#runtimeMounted = false;
@@ -358,10 +367,17 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		const after: string[] = [];
 		const afterSpans: ViewportClickSpan[] = [];
 		const ends: { root: Component; end: number }[] = [];
+		let dismissibleRows = 0;
 		for (const root of afterRoots) {
+			const start = after.length;
 			this.#renderBelowRoot(root, width, after, afterSpans);
+			if (this.#dismissibleChrome.has(root)) dismissibleRows += after.length - start;
 			ends.push({ root, end: after.length });
 		}
+		// Chrome that displaces transcript rows: everything below the transcript
+		// except dismissible panels, which cover the tail instead (see
+		// RuntimeChildrenOptions.dismissibleChrome).
+		const chrome = after.length - dismissibleRows;
 		this.#rowsBelow = new Map(ends.map(({ root, end }) => [root, after.length - end]));
 		// Offer history under capacity pressure only: blocks stay live (and keep
 		// reflowing to the current width) while the screen has room. Capacity is
@@ -375,15 +391,16 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		// Retirement measures the same live blocks the viewport lays out below;
 		// one open frame renders each of them once for both.
 		transcript.beginFrame(frame);
-		const history = this.#offerHistory(transcript, width, rows, preRoots.length + after.length);
+		const history = this.#offerHistory(transcript, width, rows, preRoots.length + chrome);
 		const headerVisible = !this.#headerRetired && this.#offeredHistory?.source !== "header";
 		const headerRows = headerVisible ? this.#header.render(width) : [];
 		const before = [...headerRows, ...preRoots];
 		// The live tail is laid out against the same capacity retirement is
 		// billed against, so its compaction allocator (one row per block, no
 		// inter-block blanks) engages only when a block genuinely cannot retire.
-		// Only chrome taller than the screen leaves rows for the `drop` slice.
-		const active = transcript.renderViewport(width, Math.max(0, rows - before.length - after.length), frame);
+		// Only chrome taller than the screen, or an open dismissible panel, leaves
+		// rows for the `drop` slice; the panel's covered rows stay live.
+		const active = transcript.renderViewport(width, Math.max(0, rows - before.length - chrome), frame);
 		const activeSpans: ViewportClickSpan[] = [];
 		for (const span of transcript.getLastViewportSpans()) {
 			const ids = (span.component as Partial<{ getClickFocusAgentIds(): string[] }>).getClickFocusAgentIds?.();
@@ -901,6 +918,7 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 	setRuntimeChildren(children: readonly Component[], options: RuntimeChildrenOptions = {}): void {
 		if (this.#stopped) return;
 		this.#nativeDock = options.nativeDock;
+		this.#dismissibleChrome = new Set(options.dismissibleChrome);
 		this.ui.removeChild(this.#statusHost);
 		if (this.#runtimeMounted) {
 			for (const child of this.#runtimeChildren) this.ui.removeChild(child);
