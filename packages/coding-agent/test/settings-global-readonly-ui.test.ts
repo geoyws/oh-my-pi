@@ -459,7 +459,11 @@ describe("/model effort persistence across project and global scopes", () => {
 		setThemeInstance(testTheme);
 		let callbacks: modelHubModule.ModelHubCallbacks | undefined;
 		const Hub = modelHubModule.ModelHubComponent;
-		vi.spyOn(modelHubModule, "ModelHubComponent").mockImplementation(function (
+		// Bun installs a callable constructor hook; retain the real component behind it.
+		const hubFactory = modelHubModule as unknown as {
+			ModelHubComponent: (...args: ConstructorParameters<typeof Hub>) => InstanceType<typeof Hub>;
+		};
+		vi.spyOn(hubFactory, "ModelHubComponent").mockImplementation(function (
 			...args: ConstructorParameters<typeof Hub>
 		) {
 			callbacks = args[4];
