@@ -7,6 +7,7 @@ import { InteractiveMode } from "../src/modes/interactive-mode";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
+import { cfgSessionIdleCheckpointMs } from "../src/session/settings";
 import { Composer } from "@oh-my-pi/pi-tui/prompt/composer";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { postmortem, TempDir } from "@oh-my-pi/pi-utils";
@@ -191,4 +192,110 @@ describe("owner checkpoint terminal flow", () => {
 			await reopened.close();
 		}
 	}, 15_000);
+
+	describe("bounded idle retirement", () => {
+		const IDLE_MS = 300;
+		/** Long enough for several idle windows to elapse; the owner must still be live. */
+		const SEVERAL_WINDOWS_MS = IDLE_MS * 4;
+
+		async function startIdleOwner(): Promise<void> {
+			cfgSessionIdleCheckpointMs.set(session.settings, IDLE_MS);
+			await mode.init({ suppressWelcomeIntro: true });
+			void mode.getUserInput();
+			await terminal.waitForRender();
+		}
+
+		it("checkpoints an idle owner, exits through real teardown and prints its resume command", async () => {
+			const quit = Promise.withResolvers<number>();
+			vi.spyOn(postmortem, "quit").mockImplementation(async code => {
+				quit.resolve(code ?? 0);
+			});
+			const stderr: string[] = [];
+			vi.spyOn(process.stderr, "write").mockImplementation(chunk => {
+				stderr.push(String(chunk));
+				return true;
+			});
+			const started = Date.now();
+			await startIdleOwner();
+			const id = manager.getSessionId();
+			expect(await quit.promise).toBe(0);
+			expect(Date.now() - started).toBeGreaterThanOrEqual(IDLE_MS);
+			expect(mode.isShuttingDown).toBe(true);
+			expect(Bun.stripANSI(stderr.join(""))).toContain(`--resume ${id}`);
+			expect(manager.isSessionOnDisk()).toBe(true);
+			const resumed = await SessionManager.open(manager.getSessionFile()!);
+			try {
+				expect(resumed.getSessionId()).toBe(id);
+			} finally {
+				await resumed.close();
+			}
+		}, 15_000);
+
+		it("keeps typing activity alive and never retires an owner with an unsent draft", async () => {
+			const quit = vi.spyOn(postmortem, "quit").mockResolvedValue();
+			await startIdleOwner();
+			// Keystrokes inside the window postpone retirement; the draft they leave then blocks it.
+			for (const key of "draft") {
+				await Bun.sleep(IDLE_MS / 3);
+				terminal.sendInput(key);
+			}
+			await Bun.sleep(SEVERAL_WINDOWS_MS);
+			expect(mode.isShuttingDown).toBe(false);
+			expect(quit).not.toHaveBeenCalled();
+			expect(mode.editor.getText()).toBe("draft");
+		}, 15_000);
+
+		it("never retires an owner while a dialog awaits an answer", async () => {
+			const quit = vi.spyOn(postmortem, "quit").mockResolvedValue();
+			await startIdleOwner();
+			const answer = mode.showHookConfirm("Keep going?", "A pending question must hold the session.");
+			await terminal.waitForRender(() =>
+				terminal.getViewport().some(row => Bun.stripANSI(row).includes("Keep going?")),
+			);
+			await Bun.sleep(SEVERAL_WINDOWS_MS);
+			expect(mode.isShuttingDown).toBe(false);
+			expect(quit).not.toHaveBeenCalled();
+			terminal.sendInput("\x1b");
+			await answer;
+		}, 15_000);
+
+		it("never retires an owner during a real foreground shell run", async () => {
+			const quit = vi.spyOn(postmortem, "quit").mockResolvedValue();
+			await startIdleOwner();
+			const releaseFile = path.join(dir.path(), "release-idle");
+			const ready = Promise.withResolvers<void>();
+			const execution = session.executeBash(
+				"printf idle-ready; while [ ! -f " +
+					JSON.stringify(releaseFile) +
+					" ]; do sleep 0.01; done; printf idle-finished",
+				chunk => {
+					if (chunk.includes("idle-ready")) ready.resolve();
+				},
+				{ useUserShell: false },
+			);
+			try {
+				await ready.promise;
+				await Bun.sleep(SEVERAL_WINDOWS_MS);
+				expect(session.isBashRunning).toBe(true);
+				expect(mode.isShuttingDown).toBe(false);
+				expect(quit).not.toHaveBeenCalled();
+			} finally {
+				await Bun.write(releaseFile, "release");
+			}
+			const result = await execution;
+			expect(result.exitCode).toBe(0);
+			expect(result.output).toContain("idle-finished");
+		}, 20_000);
+
+		it("never arms when the bound is 0", async () => {
+			const quit = vi.spyOn(postmortem, "quit").mockResolvedValue();
+			cfgSessionIdleCheckpointMs.set(session.settings, 0);
+			await mode.init({ suppressWelcomeIntro: true });
+			void mode.getUserInput();
+			await terminal.waitForRender();
+			await Bun.sleep(SEVERAL_WINDOWS_MS);
+			expect(mode.isShuttingDown).toBe(false);
+			expect(quit).not.toHaveBeenCalled();
+		}, 15_000);
+	});
 });

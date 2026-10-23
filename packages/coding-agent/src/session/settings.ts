@@ -31,6 +31,21 @@ const EMPTY_NUMBER_RECORD: Record<string, number> = {};
 const EMPTY_STRING_ARRAYS_RECORD: Record<string, string[]> = {};
 const DEFAULT_TOOL_CALL_LOOP_EXEMPT_TOOLS: string[] = ["wait"];
 
+// Idle owner checkpoint: an interactive session idle past this bound saves
+// itself and exits to the shell with its `--resume` line, freeing memory.
+export const cfgSessionIdleCheckpointMs = register({
+	id: "session.idleCheckpointMs",
+	type: "number",
+	default: 24 * 60 * 60 * 1000,
+	ui: {
+		tab: "interaction",
+		group: "Power",
+		label: "Idle Checkpoint",
+		description:
+			"After this many ms with no input or agent activity, an idle interactive session saves itself and exits to the shell, printing its resume command. Never while a turn, tool, shell or Python run, draft, dialog or question is pending. 0 disables.",
+	},
+});
+
 // Power assertions: macOS IOKit, Linux login1/ScreenSaver, Windows execution state.
 export const cfgPowerSleepPrevention = register({
 	id: "power.sleepPrevention",
