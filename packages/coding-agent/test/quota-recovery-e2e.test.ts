@@ -572,24 +572,26 @@ function expectMediumFallbackEffort(record: InferenceRecord, run: RunResult): vo
 
 test("an account whose later window still blocks loses to a sibling that is usable sooner", async () => {
 	// alpha's 5-hour window resets first of anything (T0+2.5 s) but its 7-day
-	// window holds it until T0+6.5 s; bravo is usable from T0+4 s. The earliest
-	// usable candidate is bravo, not the earliest single window reset.
+	// window holds it until T0+11 s; bravo is usable from T0+6 s. The earliest
+	// usable candidate is bravo, not the earliest single window reset. Every
+	// wait exceeds the transport's few-second in-request sibling unblock, so
+	// the session-level quota planner owns the decision and announces it.
 	const run = await runScenario({
 		accounts: {
-			alpha: { exhaustedFor: { fiveHour: 2_500, sevenDay: 6_500 } },
-			bravo: { exhaustedFor: { fiveHour: 4_000 } },
+			alpha: { exhaustedFor: { fiveHour: 2_500, sevenDay: 11_000 } },
+			bravo: { exhaustedFor: { fiveHour: 6_000 } },
 		},
 	});
 	expectCleanRecovery(run);
 	const t0 = run.t0 as number;
 	const served = expectServedOnce(run, "bravo");
 	expect(served.model, diagnostics(run)).toBe(PRIMARY_MODEL_ID);
-	expect(served.at - t0, diagnostics(run)).toBeGreaterThanOrEqual(4_000);
-	expect(served.at - t0, diagnostics(run)).toBeLessThan(6_500);
-	expectWakeAnnounced(run, PRIMARY, "bravo", t0 + 4_000);
+	expect(served.at - t0, diagnostics(run)).toBeGreaterThanOrEqual(6_000);
+	expect(served.at - t0, diagnostics(run)).toBeLessThan(11_000);
+	expectWakeAnnounced(run, PRIMARY, "bravo", t0 + 6_000);
 	// No visible recovery line schedules alpha at its 5-hour reset alone.
 	for (const stamps of announcedWakes(run, PRIMARY, "alpha")) {
-		expect(Math.max(...stamps), diagnostics(run)).toBeGreaterThanOrEqual(t0 + 6_500 - WAKE_EARLY_TOLERANCE_MS);
+		expect(Math.max(...stamps), diagnostics(run)).toBeGreaterThanOrEqual(t0 + 11_000 - WAKE_EARLY_TOLERANCE_MS);
 	}
 }, 90_000);
 
