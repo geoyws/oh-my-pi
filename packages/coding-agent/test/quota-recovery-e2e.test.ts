@@ -532,10 +532,19 @@ function expectCleanRecovery(run: RunResult): void {
 	const diag = diagnostics(run);
 	expect(run.timedOut, diag).toBe(false);
 	expect(run.t0, diag).toBeDefined();
-	expect(run.inference.filter(record => record.account === "unknown"), diag).toEqual([]);
-	expect(run.probes.filter(probe => probe.account === "unknown"), diag).toEqual([]);
+	expect(
+		run.inference.filter(record => record.account === "unknown"),
+		diag,
+	).toEqual([]);
+	expect(
+		run.probes.filter(probe => probe.account === "unknown"),
+		diag,
+	).toEqual([]);
 	// Saved resets are redeemed only by POSTing an account route; recovery never does.
-	expect(run.other.filter(entry => entry.method !== "GET"), diag).toEqual([]);
+	expect(
+		run.other.filter(entry => entry.method !== "GET"),
+		diag,
+	).toEqual([]);
 	// An exhausted account may be discovered by one refused request; any second
 	// refusal is an early or repeated attempt instead of a timed wake.
 	for (const account of Object.keys(ACCOUNT) as AccountName[]) {
@@ -698,6 +707,9 @@ test("terminating the child while it waits for a reset exits at once without ano
 	).toEqual([]);
 	expect(servedBy(run), diag).toEqual([]);
 	expect(refusals(run, "alpha").length, diag).toBeLessThanOrEqual(1);
-	expect(run.other.filter(entry => entry.method !== "GET"), diag).toEqual([]);
+	expect(
+		run.other.filter(entry => entry.method !== "GET"),
+		diag,
+	).toEqual([]);
 	expectWakeAnnounced(run, PRIMARY, "alpha", (run.t0 as number) + 120_000);
 }, 90_000);

@@ -18,7 +18,7 @@ const SESSION_ID = "quota-plan-session";
 const HOUR_MS = 3_600_000;
 const QUOTA_ERROR = "429 quota exceeded for this account";
 
-function bundled(provider: string, id: string): Model {
+function bundled(provider: Parameters<typeof getBundledModel>[0], id: string): Model {
 	const model = getBundledModel(provider, id);
 	if (!model) throw new Error(`Expected bundled model ${provider}/${id}`);
 	return model;
@@ -278,8 +278,18 @@ describe("TurnRecovery quota recovery planning", () => {
 	it("re-arms the same wait when refreshed usage moves the reset, without spending retry attempts", async () => {
 		const now = Date.now();
 		stubHealth([
-			{ "anthropic/claude-sonnet-4-5": pool([depleted(1, now + HOUR_MS, true), depleted(2, now + 2 * HOUR_MS, true)]) },
-			{ "anthropic/claude-sonnet-4-5": pool([depleted(1, now + 3 * HOUR_MS, true), depleted(2, now + 2 * HOUR_MS, true)]) },
+			{
+				"anthropic/claude-sonnet-4-5": pool([
+					depleted(1, now + HOUR_MS, true),
+					depleted(2, now + 2 * HOUR_MS, true),
+				]),
+			},
+			{
+				"anthropic/claude-sonnet-4-5": pool([
+					depleted(1, now + 3 * HOUR_MS, true),
+					depleted(2, now + 2 * HOUR_MS, true),
+				]),
+			},
 			{ "anthropic/claude-sonnet-4-5": pool([depleted(1, now + 3 * HOUR_MS, true), healthy(2)]) },
 		]);
 		const waitSpy = mockSchedulerWaitWithClock();

@@ -2481,7 +2481,11 @@ export class TurnRecovery {
 				health = await authStorage.health.model(provider, { modelId, sessionId, baseUrl, reserveFraction, signal });
 			} catch (error) {
 				signal.throwIfAborted();
-				logger.debug("Quota recovery could not read usage health", { provider, model: modelId, error: String(error) });
+				logger.debug("Quota recovery could not read usage health", {
+					provider,
+					model: modelId,
+					error: String(error),
+				});
 				continue;
 			}
 			signal.throwIfAborted();
@@ -2622,7 +2626,11 @@ export class TurnRecovery {
 			}
 			const wakeAt = new Date(plan.wake.wakeAtMs).toISOString();
 			const delayMs = Math.max(0, plan.wake.wakeAtMs - Date.now());
-			if (retrySettings.maxDelayMs > 0 && delayMs > retrySettings.maxDelayMs && retrySettings.waitForUsageReset !== true) {
+			if (
+				retrySettings.maxDelayMs > 0 &&
+				delayMs > retrySettings.maxDelayMs &&
+				retrySettings.waitForUsageReset !== true
+			) {
 				return {
 					outcome: "exhausted",
 					detail: `the earliest reset moved to ${wakeAt} for ${this.#describeQuotaChoice(plan.wake.choice)}, past retry.maxDelayMs (${retrySettings.maxDelayMs}ms)`,
@@ -3453,7 +3461,12 @@ export class TurnRecovery {
 			// dispose and a new prompt cancel every re-armed wait as well.
 			let wake: QuotaRecoveryWakeOutcome;
 			try {
-				wake = await this.#awaitQuotaRecoveryWake(quotaWait, generation, retrySettings, retryAbortController.signal);
+				wake = await this.#awaitQuotaRecoveryWake(
+					quotaWait,
+					generation,
+					retrySettings,
+					retryAbortController.signal,
+				);
 			} catch (error) {
 				if (!retryAbortController.signal.aborted) {
 					if (this.#retryAbortController === retryAbortController) this.#retryAbortController = undefined;
