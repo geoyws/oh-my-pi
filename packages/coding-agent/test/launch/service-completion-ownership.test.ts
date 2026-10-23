@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "bun:test";
+import { scheduler } from "node:timers/promises";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Process } from "@oh-my-pi/pi-natives";
@@ -150,8 +151,17 @@ describe("session-owned supervised services", () => {
 			expect(deliveries).toEqual([]);
 
 			switchTo("old-session");
-			// The broker writes the replay before the list response, so the sink has already run.
 			await listServices(session);
+			// The exit wait resolves when the state turns terminal, but the broker
+			// queues the completion for replay only after the daemon's log and
+			// metadata flush (broker #settle). On a loaded host the re-subscribe can
+			// land inside that window, so the replay may follow the list response:
+			// wait for the delivery itself instead of assuming it already ran.
+			const replayDeadline = performance.now() + 5_000;
+			while (deliveries.length === 0) {
+				if (performance.now() >= replayDeadline) throw new Error("Timed out waiting for the replayed completion");
+				await scheduler.yield();
+			}
 			expect(
 				deliveries.map(([receiver, { owner, daemon }]) => [receiver, owner, daemon.name, daemon.state]),
 			).toEqual([["old-session", "old-session", "old-service", "failed"]]);
