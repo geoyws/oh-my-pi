@@ -1,5 +1,7 @@
+import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import * as path from "node:path";
+import { SESSION_STICKY_CACHE_PREFIX } from "@oh-my-pi/pi-ai/auth/affinity";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { getAgentDbPath, TempDir } from "@oh-my-pi/pi-utils";
 
@@ -427,17 +429,23 @@ async function runScenario(scenario: Scenario): Promise<RunResult> {
 		}
 
 		const [stdout, stderr, exitCode] = await Promise.all([stdoutText, stderrText, exited]);
-		// Read the affinity the child persisted, the same rows a later process or
-		// revived subagent inherits. `include` only observes; nothing is copied.
+		// Read the session affinity rows the child persisted: the rows a later
+		// process or a revived subagent restores.
 		const affinity: RunResult["affinity"] = [];
-		const after = await AuthStorage.create(getAgentDbPath(root));
+		const db = new Database(getAgentDbPath(root), { readonly: true });
 		try {
-			after.sessions.inherit(ALPHA_FIRST_SESSION_ID, "quota-recovery-e2e-pin-probe", (provider, explicit) => {
+			const rows = db
+				.query<{ key: string; value: string }, [string]>("SELECT key, value FROM cache WHERE key LIKE ? || '%'")
+				.all(SESSION_STICKY_CACHE_PREFIX);
+			for (const row of rows) {
+				if (!row.value) continue;
+				const provider = row.key.slice(SESSION_STICKY_CACHE_PREFIX.length).split(":")[0] ?? "";
+				const parsed: unknown = JSON.parse(row.value);
+				const explicit = typeof parsed === "object" && parsed !== null && "explicit" in parsed && parsed.explicit === true;
 				affinity.push({ provider, explicit });
-				return false;
-			});
+			}
 		} finally {
-			after.close();
+			db.close();
 		}
 		return {
 			t0: clock.t0,
