@@ -54,8 +54,8 @@ const KEY = {
 const BOTTOM_BAND = 6;
 /** The status line sits within this many rows of the input row. */
 const STATUS_REACH = 4;
-/** Paragraphs streamed at the tail before the reader scrolls up: twice a 30-row screen. */
-const TAIL_STEPS = 24;
+/** Enough paragraphs to read a whole screen of committed native history. */
+const TAIL_STEPS = 40;
 const HELD_STEPS = 4;
 /** When set, the raw PTY bytes, final screen and step receipt are written here. */
 const RECEIPT_DIR_ENV = "OMP_CLI_PTY_RECEIPT_DIR";
@@ -587,18 +587,34 @@ describe.skipIf(process.platform === "win32")("omp CLI streaming on a real PTY (
 			expect(tokens(history(screen))).toContain(openToken(0));
 			expect(tokens(activeGrid(screen))).not.toContain(openToken(0));
 
-			// A reader scrolls up into native history while the rest of the answer arrives.
+			// A shallow scroll still shows eight mutable grid rows at the bottom.
+			// Its already-committed prefix must stay fixed while those live rows update.
 			const shift = screen.rows - 8;
 			expect(screen.getBufferPosition().baseY).toBeGreaterThanOrEqual(shift);
 			screen.scrollLines(-shift);
+			const shallow = screen.getViewport().map(plain);
+			const shallowAt = screen.getBufferPosition().viewportY;
+			for (let step = 1; step <= HELD_STEPS; step++) {
+				const label = `partly scrolled up ${step}`;
+				await strictStep(label);
+				expect(screen.getViewport().map(plain).slice(0, shift), `${label}: committed rows`).toEqual(
+					shallow.slice(0, shift),
+				);
+				expect(screen.getBufferPosition().viewportY, `${label}: reader offset`).toBe(shallowAt);
+			}
+
+			// Farther up, the entire reading window is immutable native history.
+			screen.scrollLines(screen.getBufferPosition().baseY);
+			screen.scrollLines(-(screen.rows + 8));
 			const held = screen.getViewport().map(plain);
-			const heldAt = screen.getBufferPosition().viewportY;
+			const heldPosition = screen.getBufferPosition();
+			expect(heldPosition.viewportY + screen.rows).toBeLessThanOrEqual(heldPosition.baseY);
 			expect(tokens(held).length).toBeGreaterThan(0);
 			for (let step = 1; step <= HELD_STEPS; step++) {
-				const label = `scrolled up ${step}`;
+				const label = `native history ${step}`;
 				await strictStep(label);
 				expect(screen.getViewport().map(plain), `${label}: reader viewport`).toEqual(held);
-				expect(screen.getBufferPosition().viewportY, `${label}: reader offset`).toBe(heldAt);
+				expect(screen.getBufferPosition().viewportY, `${label}: reader offset`).toBe(heldPosition.viewportY);
 			}
 
 			// Back at the tail, the view follows the stream again.

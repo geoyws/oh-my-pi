@@ -991,6 +991,7 @@ describe("TUI inline-image budget", () => {
 	 */
 	function trackKittyGraphics(term: VirtualTerminal): GraphicsStore & {
 		alt: GraphicsStore;
+		readonly active: GraphicsStore;
 		deleted: number[];
 		writes: string[];
 	} {
@@ -1054,7 +1055,15 @@ describe("TUI inline-image budget", () => {
 			}
 			realWrite(data);
 		});
-		return { ...screen, alt, deleted, writes };
+		return {
+			...screen,
+			alt,
+			deleted,
+			writes,
+			get active() {
+				return active;
+			},
+		};
 	}
 
 	it("keeps normal-buffer placements visible across a fullscreen overlay pass", async () => {
@@ -1591,7 +1600,7 @@ describe("TUI inline-image budget", () => {
 	it("keeps a non-fullscreen overlay image placed while the provider frame fills the cap", async () => {
 		const originalGraphics = { ...getKittyGraphics() };
 		const term = new VirtualTerminal(40, 12);
-		const { resident, placed } = trackKittyGraphics(term);
+		const graphics = trackKittyGraphics(term);
 
 		setKittyGraphics({ unicodePlaceholders: false });
 		const tui = new TUI(term);
@@ -1609,24 +1618,24 @@ describe("TUI inline-image budget", () => {
 			await settle(term);
 			tui.showOverlay({ render: width => modal.render(width), invalidate: () => {} }, { anchor: "center" });
 			await settle(term);
-			expect(placed.has(modalId)).toBe(true);
+			expect(graphics.active.placed.has(modalId)).toBe(true);
 
-			// Overlays composite after the budget pass closes, so a later repaint
-			// that leaves them byte-identical must not mistake them for retired.
+			// A byte-identical repaint must keep the image on the currently
+			// visible surface, whether the overlay borrows the alternate buffer or not.
 			tui.requestRender();
 			await settle(term);
-			expect(placed.has(modalId)).toBe(true);
-			expect(resident.has(modalId)).toBe(true);
+			expect(graphics.active.placed.has(modalId)).toBe(true);
+			expect(graphics.active.resident.has(modalId)).toBe(true);
 		} finally {
 			tui.stop();
 			setKittyGraphics(originalGraphics);
 		}
 	});
 
-	it("holds the cap over a provider frame plus its non-fullscreen overlay", async () => {
+	it("holds the visible image cap while a non-fullscreen overlay opens, repaints and closes", async () => {
 		const originalGraphics = { ...getKittyGraphics() };
 		const term = new VirtualTerminal(40, 12);
-		const { resident, placed } = trackKittyGraphics(term);
+		const graphics = trackKittyGraphics(term);
 
 		setKittyGraphics({ unicodePlaceholders: false });
 		const tui = new TUI(term);
@@ -1642,7 +1651,7 @@ describe("TUI inline-image budget", () => {
 		try {
 			tui.start();
 			await settle(term);
-			expect(resident.size).toBe(2);
+			expect(graphics.active.resident.size).toBe(2);
 
 			const overlay = tui.showOverlay(
 				{ render: width => modalImages.flatMap(image => image.render(width)), invalidate: () => {} },
@@ -1650,20 +1659,20 @@ describe("TUI inline-image budget", () => {
 			);
 			await settle(term);
 
-			// The overlay's images are the newest in display order, so the cap keeps
-			// them and demotes the transcript's — it may not simply stop counting.
+			// Count the images actually visible in the active graphics store;
+			// a borrowed alternate buffer must not delete the underlying store.
 			const sizes: number[] = [];
 			for (let i = 0; i < 4; i++) {
 				tui.requestRender();
 				await settle(term);
-				sizes.push(resident.size);
+				sizes.push(graphics.active.resident.size);
 			}
 			expect(sizes).toEqual([2, 2, 2, 2]);
-			expect(modalIds.every(id => placed.has(id))).toBe(true);
+			expect(modalIds.every(id => graphics.active.placed.has(id))).toBe(true);
 
 			overlay.hide();
 			await settle(term);
-			expect(resident.size).toBe(2);
+			expect(graphics.active.resident.size).toBe(2);
 		} finally {
 			tui.stop();
 			setKittyGraphics(originalGraphics);
@@ -1794,12 +1803,6 @@ describe("TUI inline-image budget", () => {
 	it("lets a full-width non-fullscreen overlay replace Unicode image placeholder rows", async () => {
 		const originalGraphics = { ...getKittyGraphics() };
 		const term = new VirtualTerminal(40, 12);
-		const writes: string[] = [];
-		const realWrite = term.write.bind(term);
-		vi.spyOn(term, "write").mockImplementation((data: string) => {
-			writes.push(data);
-			realWrite(data);
-		});
 
 		setKittyGraphics({ unicodePlaceholders: true });
 		const tui = new TUI(term);
@@ -1807,7 +1810,6 @@ describe("TUI inline-image budget", () => {
 		try {
 			tui.start();
 			await settle(term);
-			writes.length = 0;
 
 			const overlay = tui.showOverlay(new Text("MODEL SELECTOR\nMODEL ROW 2\nMODEL ROW 3\nMODEL ROW 4", 0, 0), {
 				anchor: "top-left",
@@ -1816,13 +1818,10 @@ describe("TUI inline-image budget", () => {
 			});
 			await settle(term);
 
-			const modalOutput = writes.join("");
-			expect(modalOutput).not.toContain("\x1b[?1049h");
 			const modalViewport = term.getViewport().join("\n");
 			expect(modalViewport).toContain("MODEL SELECTOR");
 			expect(modalViewport).not.toContain(KITTY_PLACEHOLDER);
 
-			writes.length = 0;
 			overlay.hide();
 			await settle(term);
 

@@ -1,6 +1,6 @@
 // Real ProcessTerminal + Composer chat surface for bottom-anchored-chat-pty.test.ts.
 // Each command byte on stdin runs one deterministic step (no timers, no model);
-// every normal-screen paint reports `{"pty":<steps handled>,"columns","rows"}`
+// every paint reports `{"pty":<steps handled>,"columns","rows"}`
 // in the window title so the test knows which step a frame belongs to.
 import { Container, type OverlayHandle } from "@oh-my-pi/pi-tui";
 import { TranscriptContainer } from "@oh-my-pi/pi-tui/chrome/transcript-container";
@@ -112,7 +112,7 @@ terminal.onStep = key => {
 	return true;
 };
 composer.ui.addPaintListener(paint => {
-	if (!paint.alt) terminal.setTitle(JSON.stringify({ pty: handled, columns: paint.columns, rows: paint.rows }));
+	terminal.setTitle(JSON.stringify({ pty: handled, columns: paint.columns, rows: paint.rows }));
 });
 composer.start({ playWelcomeIntro: false });
 // The test quits with `q`; this bounds an orphaned fixture.

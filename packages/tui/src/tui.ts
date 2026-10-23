@@ -883,7 +883,7 @@ export class TUI extends Container {
 	// `top - length + i`. Rows above the first entry and `undefined` entries
 	// hold content this TUI cannot reproduce (a shell screen, reflowed rows).
 	// Overlay rows painted over history are restored from here.
-	#screenHistory: (PreparedLine | undefined)[] = [];
+	#screenHistory: readonly (PreparedLine | undefined)[] = NO_PREPARED_ROWS;
 	// Overlay rows painted outside the mutable viewport, by physical row. Each
 	// is restored before any write can scroll it into native scrollback.
 	#overlayOuterRows: ReadonlyMap<number, PreparedLine> = NO_OUTER_ROWS;
@@ -3418,7 +3418,8 @@ export class TUI extends Container {
 		moved: readonly PreparedLine[],
 		movedCount: number,
 		keep: number,
-	): (PreparedLine | undefined)[] {
+	): readonly (PreparedLine | undefined)[] {
+		if (keep === 0) return NO_PREPARED_ROWS;
 		const prior = this.#screenHistory;
 		const priorStart = this.#providerViewportTop - prior.length;
 		const movedStart = startTop + appended.length;
@@ -4238,6 +4239,8 @@ export class TUI extends Container {
 			// provider repaint can overwrite history at the stale row.
 			if (width !== this.#altEnterWidth || height !== this.#altEnterHeight) {
 				if (this.#frameProvider !== undefined) {
+					this.#resizeProbeWindow = this.#providerWindow;
+					this.#resizeProbeOffset = this.#parkedViewportOffset;
 					this.#beginResizeAnchorProbe();
 					return;
 				}
