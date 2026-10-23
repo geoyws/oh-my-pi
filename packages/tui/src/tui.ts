@@ -675,6 +675,51 @@ interface PreparedLines {
 	rows: PreparedLine[];
 }
 
+/** One overlay row in physical screen coordinates, rendered inside the image-budget pass. */
+interface OverlayRowPatch {
+	readonly row: number;
+	readonly col: number;
+	readonly width: number;
+	readonly line: string;
+}
+
+const NO_OVERLAYS: readonly OverlayRowPatch[] = [];
+const NO_OUTER_ROWS: ReadonlyMap<number, PreparedLine> = new Map();
+const NO_PREPARED_ROWS: readonly PreparedLine[] = [];
+const NO_PREPARED_MEMO: ReadonlyMap<string, PreparedLine> = new Map();
+
+/** Whether a row owns cells outside its own text: an image or a scaled OSC 66 span. */
+function paintsBeyondRow(row: PreparedLine): boolean {
+	return row.isImage || isOsc66Line(row.line);
+}
+
+/**
+ * Whether an overlay may paint over on-screen history row `index` and later
+ * restore it by rewriting that row. Unknown rows cannot be rewritten. Images
+ * and scaled OSC 66 text own cells beyond their row — a SIXEL lifts into the
+ * blank rows above it, a Kitty placement and a scaled heading cover the blank
+ * rows below — so neither they nor a blank run touching them is restorable.
+ */
+function overlayCanRestoreRow(rows: readonly (PreparedLine | undefined)[], index: number): boolean {
+	const row = rows[index];
+	if (row === undefined) return false;
+	if (row.line !== "") return !paintsBeyondRow(row);
+	for (let above = index - 1; above >= 0; above--) {
+		const neighbour = rows[above];
+		if (neighbour === undefined) return false;
+		if (neighbour.line === "") continue;
+		if (paintsBeyondRow(neighbour)) return false;
+		break;
+	}
+	for (let below = index + 1; below < rows.length; below++) {
+		const neighbour = rows[below];
+		if (neighbour === undefined) return false;
+		if (neighbour.line === "") continue;
+		return !paintsBeyondRow(neighbour);
+	}
+	return true;
+}
+
 interface LineClassification {
 	asciiWidth: number | undefined;
 	isImage: boolean;
@@ -825,13 +870,23 @@ export class TUI extends Container {
 	#providerViewportTop = 0;
 	// Net composer-space offset of the published hit-test origin behind the
 	// painted top, from the last paint: replay-replaced rows minus viewport
-	// rows the paint prepended for a short viewport. Negative while prepended
-	// blanks outweigh replaced rows; zero on ordinary frames.
+	// rows the paint prepended for a short viewport or for an overlay that
+	// could not cover the history above it. Negative while prepended blanks
+	// outweigh replaced rows; zero on ordinary frames.
 	#providerViewportPadTop = 0;
 	// Whether native history holds rows the provider committed since the last
 	// destructive reset. Only paints write history and only a destructive reset
 	// erases it; an `append` resize replay keeps the rows it replays beneath.
 	#providerHistoryWritten = false;
+	// Prepared rows the last paints left on screen above the mutable viewport,
+	// bottom-aligned to `#providerViewportTop`: entry `i` is physical row
+	// `top - length + i`. Rows above the first entry and `undefined` entries
+	// hold content this TUI cannot reproduce (a shell screen, reflowed rows).
+	// Overlay rows painted over history are restored from here.
+	#screenHistory: (PreparedLine | undefined)[] = [];
+	// Overlay rows painted outside the mutable viewport, by physical row. Each
+	// is restored before any write can scroll it into native scrollback.
+	#overlayOuterRows: ReadonlyMap<number, PreparedLine> = NO_OUTER_ROWS;
 	// Viewport-relative row of the hardware cursor after the last normal paint
 	// (0 = parked at the viewport top). A resize reflows the normal buffer
 	// before the app hears about it; terminals keep the cursor attached to its
@@ -2327,7 +2382,29 @@ export class TUI extends Container {
 			const msg = `[${new Date().toISOString()}] resize anchor: size=${width}x${height} cpr=${reportedRow ?? "timeout"} park=${probe.offset} stale=${staleRows} old=${this.#providerViewportTop} top=${top}\n`;
 			fs.appendFileSync(getDebugLogPath(), msg);
 		}
+		const previousTop = this.#providerViewportTop;
 		this.#providerViewportTop = Math.min(top, Math.max(0, height - 1));
+		// Rows above the viewport keep their place relative to it through a
+		// height-only change: pulled-down scrollback arrives above them and a
+		// push drops the oldest. A width change rewraps them, so neither the
+		// recorded rows nor the overlay rows painted over them match the screen.
+		if (width !== this.#previousWidth) {
+			this.#screenHistory = [];
+			this.#overlayOuterRows = NO_OUTER_ROWS;
+		} else {
+			const anchor = this.#providerViewportTop;
+			if (this.#screenHistory.length > anchor) {
+				this.#screenHistory = this.#screenHistory.slice(this.#screenHistory.length - anchor);
+			}
+			const delta = anchor - previousTop;
+			if (delta !== 0 && this.#overlayOuterRows.size > 0) {
+				const moved = new Map<number, PreparedLine>();
+				for (const [row, line] of this.#overlayOuterRows) {
+					if (row + delta >= 0 && row + delta < height) moved.set(row + delta, line);
+				}
+				this.#overlayOuterRows = moved;
+			}
+		}
 		// Resolved geometry invalidates the replay offset with the old anchor;
 		// the forced repaint recomputes it (usually zero).
 		this.#providerViewportPadTop = 0;
@@ -2592,12 +2669,11 @@ export class TUI extends Container {
 	 * Retire every eligible history batch into native scrollback before quitting.
 	 *
 	 * The only frame path that deliberately does not composite overlays. Its
-	 * output is the transcript the shell prompt lands under, and it forces
-	 * commits that {@link #compositeOverlaysIntoWindow} otherwise relies on being
-	 * frozen while an overlay is up — so a modal painted here would leave debris
-	 * above the prompt and could reach native scrollback. `stop()` drops the
-	 * alternate buffer without unstacking the overlay, so leaving it in would also
-	 * charge a no-longer-painted modal's images against the cap and delete the
+	 * output is the transcript the shell prompt lands under, so a modal painted
+	 * here would leave debris above the prompt; a flushed frame instead restores
+	 * the rows earlier overlay paints covered. `stop()` drops the alternate
+	 * buffer without unstacking the overlay, so leaving it in would also charge
+	 * a no-longer-painted modal's images against the cap and delete the
 	 * transcript's visible graphics on the way out.
 	 */
 	#flushHistoryBeforeStop(): void {
@@ -2618,7 +2694,7 @@ export class TUI extends Container {
 			} while (this.#imageBudget.endPass());
 			if (plan.history === undefined) return;
 			const acceptedBefore = this.#acceptedHistoryBatchId;
-			this.#emitPlanFrame(width, height, viewport, plan.history, provider);
+			this.#emitPlanFrame(width, height, viewport, plan.history, provider, NO_OVERLAYS);
 			if (plan.history.id > acceptedBefore && this.#acceptedHistoryBatchId === acceptedBefore) {
 				throw new Error("History flush did not accept the offered batch");
 			}
@@ -2763,13 +2839,6 @@ export class TUI extends Container {
 			return;
 		}
 		this.#requestOrdinaryRender();
-	}
-
-	/** Run `callback` after `delayMs` on the render scheduler's clock, unless the TUI has stopped. */
-	scheduleAfter(delayMs: number, callback: () => void): RenderTimer {
-		return this.#renderScheduler.scheduleRender(() => {
-			if (!this.#stopped) callback();
-		}, delayMs);
 	}
 
 	/**
@@ -3224,27 +3293,16 @@ export class TUI extends Container {
 	}
 
 	/**
-	 * Composite all visible overlays into the window slice (screen
-	 * coordinates, in stack order, later = on top). Overlays never touch the
-	 * frame: composited rows exist only in the painted window, and commits are
-	 * frozen while an overlay is visible, so overlay pixels can never enter
-	 * native scrollback.
+	 * Render every visible overlay into screen-coordinate rows (stack order,
+	 * later = on top). Callers run this inside their image-budget pass so the
+	 * frame's whole image set — transcript plus modal — reaches one reconcile,
+	 * instead of leaving the overlay's graphics outside the cap for as long as
+	 * it stays up. Placing the rows is the paint's job: it knows where the
+	 * mutable viewport lands on the physical screen.
 	 */
-	/**
-	 * Composite the visible overlays onto a full-height copy of `viewport`, or
-	 * hand it back untouched when nothing is stacked. Callers run this inside
-	 * their image-budget pass so the frame's whole image set — transcript plus
-	 * modal — reaches one reconcile, instead of leaving the overlay's graphics
-	 * outside the cap for as long as it stays up.
-	 */
-	#compositeVisibleOverlays(viewport: string[], width: number, height: number): string[] {
-		if (this.#getTopmostVisibleOverlay() === undefined) return viewport;
-		while (viewport.length < height) viewport.push("");
-		return this.#compositeOverlaysIntoWindow(viewport, width, height);
-	}
-
-	#compositeOverlaysIntoWindow(window: string[], termWidth: number, termHeight: number): string[] {
-		const result = [...window];
+	#renderOverlayRows(termWidth: number, termHeight: number): readonly OverlayRowPatch[] {
+		if (this.#getTopmostVisibleOverlay() === undefined) return NO_OVERLAYS;
+		const patches: OverlayRowPatch[] = [];
 		for (const entry of this.overlayStack) {
 			if (!this.#isOverlayVisible(entry)) continue;
 			const { component, options } = entry;
@@ -3262,28 +3320,150 @@ export class TUI extends Container {
 			const { row, col } = this.#resolveOverlayLayout(options, overlayLines.length, termWidth, termHeight);
 			for (let i = 0; i < overlayLines.length; i++) {
 				const idx = row + i;
-				if (idx < 0 || idx >= result.length) continue;
-				const truncatedOverlayLine =
+				if (idx < 0 || idx >= termHeight) continue;
+				const line =
 					visibleWidth(overlayLines[i]) > width ? sliceByColumn(overlayLines[i], 0, width, true) : overlayLines[i];
-				result[idx] = compositeLineAt(result[idx], truncatedOverlayLine, col, width, termWidth);
+				patches.push({ row: idx, col, width, line });
 			}
 		}
-		return result;
+		return patches;
+	}
+
+	/**
+	 * Composite the overlay rows that land on `lines[start..]`, whose first
+	 * entry sits on physical row `top`. Mutates `lines`.
+	 */
+	#compositeOverlayRows(
+		lines: string[],
+		top: number,
+		start: number,
+		overlays: readonly OverlayRowPatch[],
+		termWidth: number,
+	): void {
+		for (const patch of overlays) {
+			const index = patch.row - top;
+			if (index < start || index >= lines.length) continue;
+			lines[index] = compositeLineAt(lines[index]!, patch.line, patch.col, patch.width, termWidth);
+		}
+	}
+
+	/**
+	 * Prepare the overlay rows that land outside the mutable viewport
+	 * `[viewportTop, viewportEnd)`. Rows above it composite over the history
+	 * `screen` leaves there (bottom-aligned to `viewportTop`); rows below it
+	 * composite over blank rows. Cursor markers are stripped into `markers` in
+	 * physical rows.
+	 */
+	#prepareOuterOverlayRows(
+		overlays: readonly OverlayRowPatch[],
+		viewportTop: number,
+		viewportEnd: number,
+		screen: readonly (PreparedLine | undefined)[],
+		width: number,
+		markers: { row: number; col: number }[],
+	): ReadonlyMap<number, PreparedLine> {
+		if (overlays.length === 0) return NO_OUTER_ROWS;
+		const composed = new Map<number, string>();
+		const screenStart = viewportTop - screen.length;
+		for (const patch of overlays) {
+			if (patch.row >= viewportTop && patch.row < viewportEnd) continue;
+			const base =
+				composed.get(patch.row) ?? (patch.row < viewportTop ? (screen[patch.row - screenStart]?.line ?? "") : "");
+			composed.set(patch.row, compositeLineAt(base, patch.line, patch.col, patch.width, width));
+		}
+		if (composed.size === 0) return NO_OUTER_ROWS;
+		const outer = new Map<number, PreparedLine>();
+		const widthEpoch = getWidthConfigEpoch();
+		const imageProtocol = TERMINAL.imageProtocol;
+		for (const [row, line] of composed) {
+			const raw = this.#stripCursorMarkers(line, row, markers);
+			outer.set(
+				row,
+				this.#reusablePreparedLine(
+					this.#overlayOuterRows.get(row),
+					NO_PREPARED_MEMO,
+					raw,
+					width,
+					widthEpoch,
+					imageProtocol,
+				) ?? this.#prepareLine(raw, width, widthEpoch, imageProtocol),
+			);
+		}
+		return outer;
+	}
+
+	/**
+	 * Rewrite one physical row an overlay painted outside the last mutable
+	 * viewport with what it covered: the history row recorded there, or a blank
+	 * row below the viewport. Reads the pre-frame anchor, so it runs before the
+	 * frame moves it.
+	 */
+	#restoreOverlayRowSequence(row: number, width: number): string {
+		const top = this.#providerViewportTop;
+		const screen = this.#screenHistory;
+		const base = row < top ? screen[row - (top - screen.length)] : undefined;
+		if (base === undefined) return `\x1b[${row + 1};1H${SEGMENT_RESET}${ERASE_LINE}`;
+		return `\x1b[${row + 1};1H${this.#lineRewriteSequence(base, width, row)}`;
+	}
+
+	/**
+	 * Physical rows left above a viewport whose top lands on `keep` once
+	 * `appended` and then the first `movedCount` rows of `moved` are written at
+	 * `startTop`, below the rows {@link #screenHistory} records. `undefined`
+	 * marks a row this TUI did not write.
+	 */
+	#projectScreenHistory(
+		startTop: number,
+		appended: readonly PreparedLine[],
+		moved: readonly PreparedLine[],
+		movedCount: number,
+		keep: number,
+	): (PreparedLine | undefined)[] {
+		const prior = this.#screenHistory;
+		const priorStart = this.#providerViewportTop - prior.length;
+		const movedStart = startTop + appended.length;
+		const first = movedStart + movedCount - keep;
+		// oxlint-disable-next-line unicorn/no-new-array -- screen-height preallocation
+		const screen = new Array<PreparedLine | undefined>(keep);
+		for (let row = 0; row < keep; row++) {
+			const index = first + row;
+			if (index >= movedStart) screen[row] = moved[index - movedStart];
+			else if (index >= startTop) screen[row] = appended[index - startTop];
+			else screen[row] = index >= priorStart ? prior[index - priorStart] : undefined;
+		}
+		return screen;
+	}
+
+	/**
+	 * Whether a stable-geometry frame may reuse the old viewport rows after
+	 * scrolling them, instead of repainting every row. Images track their
+	 * placements by screen row and scaled OSC 66 spans own the rows below them,
+	 * so either one keeps the full repaint.
+	 */
+	#canShiftViewport(rows: readonly PreparedLine[]): boolean {
+		if (this.#screenImagePlacements.size > 0) return false;
+		for (const row of this.#providerPreparedRows) if (paintsBeyondRow(row)) return false;
+		for (const row of rows) if (paintsBeyondRow(row)) return false;
+		return true;
 	}
 
 	/**
 	 * Remove placements before their viewport cells are replaced. History uses
 	 * separate placement ids, so deleting a live copy cannot erase scrollback.
+	 * `outer` holds this frame's overlay rows outside the viewport, which own
+	 * live placements by physical row too.
 	 */
 	#retireImagePlacements(
 		placements: Map<number, LiveImagePlacement>,
 		lines: readonly string[],
 		top: number,
 		repaint: boolean,
+		outer: ReadonlyMap<number, PreparedLine> = NO_OUTER_ROWS,
 	): string {
 		let output = "";
 		for (const [row, placement] of placements) {
-			if (!repaint && lines[row - top] === placement.line) continue;
+			const line = row >= top && row < top + lines.length ? lines[row - top] : outer.get(row)?.line;
+			if (!repaint && line === placement.line) continue;
 			output += encodeKittyDeletePlacement(placement.imageId, placement.placementId);
 			placements.delete(row);
 		}
@@ -3408,6 +3588,7 @@ export class TUI extends Container {
 		this.#debugNextWindowTop = 0;
 		let plan: TerminalFramePlan;
 		let viewport: string[];
+		let overlays: readonly OverlayRowPatch[];
 		do {
 			this.#imageBudget.beginPass();
 			plan = provider.renderFrame({ columns: width, rows: height });
@@ -3418,10 +3599,10 @@ export class TUI extends Container {
 				logger.error("TUI layout contract violated", { rows: viewport.length, height });
 				viewport = viewport.slice(0, height);
 			}
-			viewport = this.#compositeVisibleOverlays(viewport, width, height);
+			overlays = this.#renderOverlayRows(width, height);
 		} while (this.#imageBudget.endPass());
 		if (this.#maybeDeferGhosttyInitialImagePaint()) return;
-		this.#emitPlanFrame(width, height, viewport, plan.history, provider);
+		this.#emitPlanFrame(width, height, viewport, plan.history, provider, overlays);
 	}
 	/**
 	 * Re-offer finalized history once after a settled resize.
@@ -3545,6 +3726,13 @@ export class TUI extends Container {
 	 * Physical write transaction: append an ordinary batch, or bottom-split one
 	 * complete replay into a history remainder and final viewport, then serialize
 	 * the whole result in one terminal write before acknowledgement.
+	 *
+	 * `overlays` are screen-coordinate rows. Rows landing on the mutable
+	 * viewport composite into it; rows above it paint over the history still on
+	 * screen, rows below it over blank rows. Every such outer row is restored
+	 * from {@link #screenHistory} before any write can scroll it into native
+	 * scrollback, so overlay pixels never become history and never move the
+	 * viewport.
 	 */
 	#emitPlanFrame(
 		width: number,
@@ -3552,11 +3740,12 @@ export class TUI extends Container {
 		viewportRows: string[],
 		offered: HistoryBatch | undefined,
 		provider: TerminalFrameProvider | undefined,
+		overlays: readonly OverlayRowPatch[],
 	): void {
-		// Callers composite their overlays inside the budget pass, so `viewportRows`
-		// is already the complete frame. Bound the store here rather than at
-		// endPass(): this is the last point before the purge and transmit bytes go
-		// out, and it runs once per emitted frame instead of once per retry.
+		// Callers render their overlays inside the budget pass, so `overlays`
+		// carries the frame's complete image set. Bound the store here rather than
+		// at endPass(): this is the last point before the purge and transmit bytes
+		// go out, and it runs once per emitted frame instead of once per retry.
 		let viewport = viewportRows;
 		this.#imageBudget.limitResidentImages();
 		const history = offered !== undefined && offered.id > this.#acceptedHistoryBatchId ? offered : undefined;
@@ -3574,37 +3763,81 @@ export class TUI extends Container {
 			while (leadingBlankRows < viewport.length && !/\S/.test(viewport[leadingBlankRows]!)) {
 				leadingBlankRows++;
 			}
-			const moved = Math.min(historyRows.length, leadingBlankRows);
+			let moved = Math.min(historyRows.length, leadingBlankRows);
+			// Moved rows land on screen rows `[0, moved)` above the mutable
+			// viewport; an overlay covering one of them restores it from the
+			// ledger later. A row that cannot be rewritten keeps the whole ledger
+			// in the history write, so the overlay covers only mutable rows.
+			if (moved > 0 && overlays.length > 0) {
+				const movedRows = this.#prepareLinesArray(historyRows.slice(historyRows.length - moved), width).rows;
+				for (const patch of overlays) {
+					if (patch.row < moved && !overlayCanRestoreRow(movedRows, patch.row)) {
+						moved = 0;
+						break;
+					}
+				}
+			}
 			if (moved > 0) {
 				viewport = [...historyRows.slice(historyRows.length - moved), ...viewport.slice(moved)];
 				historyRows = historyRows.slice(0, historyRows.length - moved);
 				replayViewportRows = moved;
 			}
 		}
-		// History first: it reuses the previous viewport's rows by content, and
-		// the viewport pass replaces that memo with its own rows.
-		const preparedHistory = this.#prepareLinesArray(historyRows, width);
-		const markers: { row: number; col: number }[] = [];
-		const prepared = this.#prepareLinesArray(viewport, width, this.#providerPreparedRows, viewport.length, markers);
-		const rows = prepared.lines.length;
 		// Destructive reset (session replace, /tree, explicit clear, or a settled
 		// resize in rebuild mode): erase native history and the viewport,
 		// then repaint from row zero.
 		const destructiveReset = this.#clearScrollbackOnNextRender;
 		const compactReplay = destructiveReset && classifyTerminalMultiplexerModule()?.expandsRepPadding === true;
+		// The reset erases every overlay row with the rest of the screen.
+		const previousOuter = destructiveReset ? NO_OUTER_ROWS : this.#overlayOuterRows;
 		if (destructiveReset) {
 			this.#providerViewportTop = 0;
 			this.#providerWindow = [];
 			this.#providerPreparedRows = [];
 			this.#providerHistoryWritten = false;
+			this.#screenHistory = [];
 		}
+		// History first: it reuses the previous viewport's rows by content, and
+		// the viewport pass replaces that memo with its own rows.
+		const preparedHistory = this.#prepareLinesArray(historyRows, width);
 		// The viewport stays anchored directly below whatever history remains on
 		// screen. Appending K history rows moves the anchor down by K; the write
 		// scrolls only when history + viewport overflow the physical screen, and
 		// the rows that scroll off the top are exactly the oldest history rows.
 		const geometryStable = this.#hasEverRendered && this.#previousWidth === width && this.#previousHeight === height;
 		const startTop = destructiveReset ? 0 : Math.min(this.#providerViewportTop, Math.max(0, height - 1));
-		const newTop = Math.max(0, Math.min(startTop + historyRows.length, height - rows));
+		let newTop = Math.max(0, Math.min(startTop + historyRows.length, height - viewport.length));
+		// An overlay row above the viewport paints over the history row left
+		// there. When that row cannot be restored (unknown, image, OSC 66),
+		// extend the viewport upward with blank rows instead: the extra scroll
+		// pushes the covered history into scrollback intact, and the overlay
+		// lands on rows the viewport owns.
+		let viewportPad = 0;
+		while (newTop > 0 && overlays.length > 0) {
+			const screen = this.#projectScreenHistory(startTop, preparedHistory.rows, NO_PREPARED_ROWS, 0, newTop);
+			let blocked = -1;
+			for (const patch of overlays) {
+				if (patch.row < newTop && patch.row > blocked && !overlayCanRestoreRow(screen, patch.row)) blocked = patch.row;
+			}
+			if (blocked < 0) break;
+			viewportPad = height - blocked - viewport.length;
+			newTop = Math.max(0, Math.min(startTop + historyRows.length, blocked));
+		}
+		if (viewportPad > 0) viewport = [...Array<string>(viewportPad).fill(""), ...viewport];
+		const rows = viewport.length;
+		const mutableTop = newTop + replayViewportRows;
+		this.#compositeOverlayRows(viewport, newTop, replayViewportRows, overlays, width);
+		const markers: { row: number; col: number }[] = [];
+		const prepared = this.#prepareLinesArray(viewport, width, this.#providerPreparedRows, rows, markers);
+		const screenAfter =
+			historyRows.length === 0 &&
+			replayViewportRows === 0 &&
+			newTop === startTop &&
+			startTop === this.#providerViewportTop
+				? this.#screenHistory
+				: this.#projectScreenHistory(startTop, preparedHistory.rows, prepared.rows, replayViewportRows, mutableTop);
+		const outerMarkers: { row: number; col: number }[] = [];
+		const outer = this.#prepareOuterOverlayRows(overlays, mutableTop, newTop + rows, screenAfter, width, outerMarkers);
 		const pendingAltExit = this.#pendingAltExit;
 		// A fused resize exit whose borrow never painted still owes its entry.
 		let buffer = this.#paintBeginSequence + (pendingAltExit ? this.#takePendingAltEnter() : "") + pendingAltExit;
@@ -3656,21 +3889,36 @@ export class TUI extends Container {
 		// image the terminal no longer had and every inline image vanished
 		// after a settled width resize.
 		if (destructiveReset) buffer += `${LINE_TERMINATOR}\x1b[H\x1b[2J\x1b[3J`;
-		const diffable =
+		const reusable =
 			geometryStable &&
-			historyRows.length === 0 &&
-			startTop === newTop &&
 			!this.#forceViewportRepaintOnNextRender &&
 			!destructiveReset &&
 			this.#providerWindow.length > 0;
-		buffer += this.#retireImagePlacements(this.#screenImagePlacements, prepared.lines, newTop, !diffable);
+		// In place: no history and no scroll, so every old viewport row is still
+		// where it was painted.
+		const inPlace = reusable && historyRows.length === 0 && startTop === newTop;
+		// Shifted: an appended batch or a viewport growth scrolls the screen by a
+		// known amount, so old viewport row `index + historyRows.length` lands on
+		// new row `index`; only rows whose content differs are rewritten.
+		const shifted = reusable && !inPlace && history?.kind !== "replay" && this.#canShiftViewport(prepared.rows);
+		buffer += this.#retireImagePlacements(this.#screenImagePlacements, prepared.lines, newTop, !inPlace, outer);
+		// Put back what earlier overlay rows covered before anything below can
+		// scroll them away. In place, rows painted again or now owned by the
+		// viewport are simply overwritten.
+		for (const row of previousOuter.keys()) {
+			if (row >= height) continue;
+			if (inPlace && (outer.has(row) || (row >= newTop && row < newTop + rows))) continue;
+			buffer += this.#restoreOverlayRowSequence(row, width);
+		}
 		for (const sequence of this.#imageBudget.takeTransmits()) append(sequence);
-		if (diffable) {
+		let tailErased = false;
+		if (inPlace) {
 			for (let index = 0; index < rows; index++) {
 				if (
 					!this.#rowNeedsRewrite(
 						this.#providerWindow,
 						this.#providerPreparedRows,
+						index,
 						prepared.lines,
 						prepared.rows,
 						index,
@@ -3688,6 +3936,56 @@ export class TUI extends Container {
 				)}`;
 			}
 			if (this.#providerWindow.length > rows && newTop + rows < height) {
+				buffer += `\x1b[${newTop + rows + 1};1H\x1b[J`;
+				tailErased = true;
+			}
+		} else if (shifted) {
+			// Append the batch exactly like a full paint: it overwrites the old
+			// viewport's leading rows, so every row a later scroll pushes is
+			// history. Then line-feed on the bottom row for the rest of the scroll.
+			if (preparedHistory.lines.length > 0) buffer += `\x1b[${startTop + 1};1H`;
+			for (let index = 0; index < preparedHistory.lines.length; index++) {
+				if (index > 0) buffer += "\n";
+				append(
+					this.#lineRewriteSequence(
+						preparedHistory.rows[index]!,
+						width,
+						Math.min(startTop + index, height - 1),
+						this.#osc66SpacerGlyphWidth(preparedHistory.lines, index),
+					),
+				);
+			}
+			const historyScroll = Math.max(0, startTop + historyRows.length - height);
+			const scroll = startTop + historyRows.length - newTop;
+			if (scroll > historyScroll) buffer += `\x1b[${height};1H${"\n".repeat(scroll - historyScroll)}`;
+			const previousLength = this.#providerWindow.length;
+			for (let index = 0; index < rows; index++) {
+				const previousIndex = index + historyRows.length;
+				// Past the old viewport the physical row is blank: erased below the
+				// last paint, or scrolled in by the line feeds above.
+				if (
+					previousIndex >= previousLength
+						? prepared.lines[index] === ""
+						: !this.#rowNeedsRewrite(
+								this.#providerWindow,
+								this.#providerPreparedRows,
+								previousIndex,
+								prepared.lines,
+								prepared.rows,
+								index,
+							)
+				) {
+					continue;
+				}
+				buffer += `\x1b[${newTop + index + 1};1H${this.#lineRewriteSequence(
+					prepared.rows[index]!,
+					width,
+					newTop + index,
+					this.#osc66SpacerGlyphWidth(prepared.lines, index),
+					{ imagePlacements: this.#screenImagePlacements },
+				)}`;
+			}
+			if (newTop + rows < height && previousLength > historyRows.length + rows) {
 				buffer += `\x1b[${newTop + rows + 1};1H\x1b[J`;
 			}
 		} else {
@@ -3734,14 +4032,27 @@ export class TUI extends Container {
 			}
 			if (newTop + rows < height) buffer += `\x1b[${newTop + rows + 1};1H\x1b[J`;
 		}
-		const mutableTop = newTop + replayViewportRows;
+		// Overlay rows outside the viewport paint last, over the rows written
+		// above. In place, an unchanged row is still on screen unless the tail
+		// erase just cleared it.
+		for (const [row, line] of outer) {
+			if (inPlace && previousOuter.get(row) === line && !(tailErased && row >= newTop + rows)) continue;
+			buffer += `\x1b[${row + 1};1H${this.#lineRewriteSequence(line, width, row, -1, {
+				imagePlacements: this.#screenImagePlacements,
+				imageRow: row,
+			})}`;
+		}
 		const mutablePreparedLines = replayViewportRows > 0 ? prepared.lines.slice(replayViewportRows) : prepared.lines;
 		const mutablePreparedRows = replayViewportRows > 0 ? prepared.rows.slice(replayViewportRows) : prepared.rows;
+		// Markers are bottom-most first; the hardware cursor follows the lowest
+		// one on the physical screen, wherever its overlay row landed.
 		const marker = markers[0];
-		const target =
-			marker !== undefined && rows > 0
-				? this.#targetHardwareCursorState({ row: newTop + Math.min(marker.row, rows - 1), col: marker.col }, height)
-				: null;
+		let cursor =
+			marker !== undefined && rows > 0 ? { row: newTop + Math.min(marker.row, rows - 1), col: marker.col } : null;
+		for (const outerMarker of outerMarkers) {
+			if (cursor === null || outerMarker.row > cursor.row) cursor = outerMarker;
+		}
+		const target = this.#targetHardwareCursorState(cursor, height);
 		if (target) {
 			buffer += `\x1b[${target.row + 1};${target.col + 1}H${target.visible ? "\x1b[?25h" : "\x1b[?25l"}`;
 			this.#parkedViewportOffset = Math.max(0, target.row - mutableTop);
@@ -3779,7 +4090,9 @@ export class TUI extends Container {
 		this.#providerWindow = mutablePreparedLines;
 		this.#providerPreparedRows = mutablePreparedRows;
 		this.#providerViewportTop = mutableTop;
-		this.#providerViewportPadTop = replayViewportRows - replayPrependedBlanks;
+		this.#providerViewportPadTop = replayViewportRows - replayPrependedBlanks - viewportPad;
+		this.#screenHistory = screenAfter;
+		this.#overlayOuterRows = outer;
 		this.#previousWidth = width;
 		this.#previousHeight = height;
 		this.#resizeBurstGrew = false;
@@ -3963,15 +4276,16 @@ export class TUI extends Container {
 	 */
 	#renderChildrenFrame(width: number, height: number): void {
 		let viewport: string[];
+		let overlays: readonly OverlayRowPatch[];
 		do {
 			this.#imageBudget.beginPass();
 			const composed = this.render(width);
 			this.#debugNextWindowTop = Math.max(0, composed.length - height);
 			viewport = composed.length > height ? composed.slice(composed.length - height) : Array.from(composed);
-			viewport = this.#compositeVisibleOverlays(viewport, width, height);
+			overlays = this.#renderOverlayRows(width, height);
 		} while (this.#imageBudget.endPass());
 		if (this.#maybeDeferGhosttyInitialImagePaint()) return;
-		this.#emitPlanFrame(width, height, viewport, undefined, undefined);
+		this.#emitPlanFrame(width, height, viewport, undefined, undefined, overlays);
 	}
 
 	/**
@@ -4012,16 +4326,8 @@ export class TUI extends Container {
 			if (row === undefined) {
 				let raw = source;
 				if (markers !== undefined) {
-					let markerIndex = source.indexOf(CURSOR_MARKER);
-					if (markerIndex !== -1) {
-						markers.push({ row: i, col: visibleWidth(source.slice(0, markerIndex)) });
-						// Resume the search just before the splice so a marker that the
-						// removal itself joins together is stripped too; reusable rows
-						// must stay marker-free.
-						while (markerIndex !== -1) {
-							raw = raw.slice(0, markerIndex) + raw.slice(markerIndex + CURSOR_MARKER.length);
-							markerIndex = raw.indexOf(CURSOR_MARKER, Math.max(0, markerIndex - CURSOR_MARKER.length + 1));
-						}
+					raw = this.#stripCursorMarkers(source, i, markers);
+					if (raw !== source) {
 						row = this.#reusablePreparedLine(previous[i], memo, raw, width, widthEpoch, imageProtocol);
 					}
 				}
@@ -4038,6 +4344,25 @@ export class TUI extends Container {
 			markers?.reverse();
 		}
 		return { lines: prepared, rows };
+	}
+
+	/**
+	 * Strip every CURSOR_MARKER from `source`, recording the first one's cell
+	 * position on `row`. Returns `source` itself when it carries none.
+	 */
+	#stripCursorMarkers(source: string, row: number, markers: { row: number; col: number }[]): string {
+		let markerIndex = source.indexOf(CURSOR_MARKER);
+		if (markerIndex === -1) return source;
+		markers.push({ row, col: visibleWidth(source.slice(0, markerIndex)) });
+		// Resume the search just before the splice so a marker that the removal
+		// itself joins together is stripped too; reusable rows must stay
+		// marker-free.
+		let raw = source;
+		while (markerIndex !== -1) {
+			raw = raw.slice(0, markerIndex) + raw.slice(markerIndex + CURSOR_MARKER.length);
+			markerIndex = raw.indexOf(CURSOR_MARKER, Math.max(0, markerIndex - CURSOR_MARKER.length + 1));
+		}
+		return raw;
 	}
 
 	#reusablePreparedLine(
@@ -4322,21 +4647,22 @@ export class TUI extends Container {
 	}
 
 	/**
-	 * Whether screen row `index` must be rewritten to turn the previously painted
-	 * frame into this one: its line, or the preparation it was painted with,
-	 * changed.
+	 * Whether new row `index` must be rewritten over previously painted row
+	 * `previousIndex` (the same index unless the screen scrolled between them):
+	 * its line, or the preparation it was painted with, changed.
 	 */
 	#rowNeedsRewrite(
 		previousLines: readonly string[],
 		previousRows: readonly PreparedLine[],
+		previousIndex: number,
 		lines: readonly string[],
 		rows: readonly PreparedLine[],
 		index: number,
 	): boolean {
-		const previous = previousRows[index];
+		const previous = previousRows[previousIndex];
 		const current = rows[index]!;
 		return (
-			previousLines[index] !== lines[index] ||
+			previousLines[previousIndex] !== lines[index] ||
 			previous === undefined ||
 			previous.width !== current.width ||
 			previous.widthEpoch !== current.widthEpoch ||
@@ -4454,7 +4780,8 @@ export class TUI extends Container {
 		let lines: string[];
 		do {
 			this.#imageBudget.beginPass(false, true);
-			lines = this.#compositeOverlaysIntoWindow(base, width, height);
+			lines = base.slice();
+			this.#compositeOverlayRows(lines, 0, 0, this.#renderOverlayRows(width, height), width);
 		} while (this.#imageBudget.endPass());
 		const markers: { row: number; col: number }[] = [];
 		const prepared = this.#prepareLinesArray(lines, width, this.#altPreparedRows, height, markers);
@@ -4514,7 +4841,7 @@ export class TUI extends Container {
 			this.#altPreviousLines.length !== height ||
 			((this.#altPreviousLines.some(isOsc66Line) || prepared.lines.some(isOsc66Line)) &&
 				prepared.rows.some((_row, r) =>
-					this.#rowNeedsRewrite(this.#altPreviousLines, this.#altPreparedRows, prepared.lines, prepared.rows, r),
+					this.#rowNeedsRewrite(this.#altPreviousLines, this.#altPreparedRows, r, prepared.lines, prepared.rows, r),
 				));
 		prelude += this.#retireImagePlacements(this.#altImagePlacements, prepared.lines, 0, full);
 		let rowsBuffer = "";
@@ -4522,7 +4849,7 @@ export class TUI extends Container {
 			if (full) {
 				if (r > 0) rowsBuffer += "\n";
 			} else if (
-				this.#rowNeedsRewrite(this.#altPreviousLines, this.#altPreparedRows, prepared.lines, prepared.rows, r)
+				this.#rowNeedsRewrite(this.#altPreviousLines, this.#altPreparedRows, r, prepared.lines, prepared.rows, r)
 			) {
 				rowsBuffer += `\x1b[${r + 1};1H`;
 			} else {
