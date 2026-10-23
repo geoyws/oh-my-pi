@@ -2128,11 +2128,14 @@ export class TurnRecovery {
 							);
 						const sessions = this.#host.modelRegistry.authStorage.sessions;
 						if (account && !account.selected) {
-							// Route to the account the decision names: an exact OAuth pin
-							// inside the session's restriction, else re-rank.
+							// Route to the account the decision names: an automatic (warm,
+							// non-user) OAuth affinity inside the session's restriction, so
+							// ranking and per-account reserve still apply; else re-rank.
 							if (
 								account.credentialType !== "oauth" ||
-								!sessions.pin(candidateModel.provider, this.#host.sessionId(), account.credentialId)
+								!sessions.pin(candidateModel.provider, this.#host.sessionId(), account.credentialId, {
+									restoredAtMs: Date.now(),
+								})
 							) {
 								sessions.release(candidateModel.provider, this.#host.sessionId());
 							}
@@ -2580,7 +2583,8 @@ export class TurnRecovery {
 		if (account) {
 			if (!sessions.permits(provider, sessionId, account.credentialId)) return false;
 			if (account.credentialType === "oauth") {
-				if (!sessions.pin(provider, sessionId, account.credentialId)) return false;
+				// Automatic affinity, not a user pin: reserve policy and ranking keep applying.
+				if (!sessions.pin(provider, sessionId, account.credentialId, { restoredAtMs: Date.now() })) return false;
 			} else if (!account.selected) {
 				// Stored API keys cannot be pinned; re-rank so selection reaches the account with quota.
 				sessions.release(provider, sessionId);

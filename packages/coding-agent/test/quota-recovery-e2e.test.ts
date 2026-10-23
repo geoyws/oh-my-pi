@@ -120,6 +120,8 @@ interface RunResult {
 	exitCode: number;
 	timedOut: boolean;
 	cancel?: { at: number; childWasRunning: boolean; exitedAt: number };
+	/** Persisted session affinity per provider; `explicit` marks a user pin. */
+	affinity: Array<{ provider: string; explicit: boolean }>;
 }
 
 function sse(events: Array<Record<string, unknown>>): string {
@@ -425,6 +427,18 @@ async function runScenario(scenario: Scenario): Promise<RunResult> {
 		}
 
 		const [stdout, stderr, exitCode] = await Promise.all([stdoutText, stderrText, exited]);
+		// Read the affinity the child persisted, the same rows a later process or
+		// revived subagent inherits. `include` only observes; nothing is copied.
+		const affinity: RunResult["affinity"] = [];
+		const after = await AuthStorage.create(getAgentDbPath(root));
+		try {
+			after.sessions.inherit(ALPHA_FIRST_SESSION_ID, "quota-recovery-e2e-pin-probe", (provider, explicit) => {
+				affinity.push({ provider, explicit });
+				return false;
+			});
+		} finally {
+			after.close();
+		}
 		return {
 			t0: clock.t0,
 			inference,
@@ -436,6 +450,7 @@ async function runScenario(scenario: Scenario): Promise<RunResult> {
 			exitCode,
 			timedOut,
 			cancel,
+			affinity,
 		};
 	} finally {
 		clearTimeout(deadline);
@@ -550,6 +565,12 @@ function expectCleanRecovery(run: RunResult): void {
 	for (const account of Object.keys(ACCOUNT) as AccountName[]) {
 		expect(refusals(run, account).length, `${account} refused more than once\n${diag}`).toBeLessThanOrEqual(1);
 	}
+	// Recovery routes by automatic affinity: a user pin would switch off the
+	// per-account reserve policy and follow revived subagents.
+	expect(
+		run.affinity.filter(entry => entry.explicit),
+		diag,
+	).toEqual([]);
 }
 
 function expectServedOnce(run: RunResult, account: AccountName): InferenceRecord {
@@ -589,6 +610,8 @@ test("an account whose later window still blocks loses to a sibling that is usab
 	expect(served.at - t0, diagnostics(run)).toBeGreaterThanOrEqual(6_000);
 	expect(served.at - t0, diagnostics(run)).toBeLessThan(11_000);
 	expectWakeAnnounced(run, PRIMARY, "bravo", t0 + 6_000);
+	// The planner's account choice persists as automatic affinity, not a user pin.
+	expect(run.affinity, diagnostics(run)).toContainEqual({ provider: "anthropic", explicit: false });
 	// No visible recovery line schedules alpha at its 5-hour reset alone.
 	for (const stamps of announcedWakes(run, PRIMARY, "alpha")) {
 		expect(Math.max(...stamps), diagnostics(run)).toBeGreaterThanOrEqual(t0 + 11_000 - WAKE_EARLY_TOLERANCE_MS);
