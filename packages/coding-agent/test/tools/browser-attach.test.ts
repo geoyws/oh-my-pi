@@ -729,11 +729,8 @@ describe("pickElectronTarget", () => {
 				),
 			);
 			expect(error).toBeInstanceOf(Error);
-			expect(error).toMatchObject({
-				message: expect.stringContaining(
-					`WebSocket connection to 'ws://127.0.0.1:${cdp.port}/devtools/browser/gone'`,
-				),
-			});
+			expect((error as Error).message).toContain(`ws://127.0.0.1:${cdp.port}/devtools/browser/gone`);
+			expect((error as Error).message).toContain("404");
 		} finally {
 			cdp.stop(true);
 		}
