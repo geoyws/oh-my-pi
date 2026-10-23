@@ -2,6 +2,8 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { YAML } from "bun";
+import { Effort } from "@oh-my-pi/pi-ai";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
@@ -13,12 +15,17 @@ import { ALL_SCENES, runSetupWizard, selectSetupScenes } from "@oh-my-pi/pi-codi
 import { cfgDisplayHideToolActivity, cfgSetupVersion } from "@oh-my-pi/pi-coding-agent/modes/settings";
 import { cfgDefaultThinkingLevel, cfgHideThinkingBlock } from "@oh-my-pi/pi-coding-agent/session/settings";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { type SettingItem, SettingsList } from "@oh-my-pi/pi-tui";
 import { SettingsSelectorComponent } from "@oh-my-pi/pi-tui/overlays/settings-selector";
+import * as modelHubModule from "@oh-my-pi/pi-tui/overlays/model-hub";
 import { getThemeByName, initTheme, setThemeInstance } from "@oh-my-pi/pi-tui/theme";
 import { AUTO_THINKING } from "@oh-my-pi/pi-tui/thinking";
-import { getProjectAgentDir, isRecord, TempDir } from "@oh-my-pi/pi-utils";
+import { getProjectAgentDir, isRecord, setAgentDir, setProjectDir, TempDir } from "@oh-my-pi/pi-utils";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
 
 const READ_ONLY_BYTES = "config:\n  readOnly: true\n# managed bytes\nhideThinkingBlock: false\n";
@@ -352,5 +359,206 @@ describe("/model default role clear under the global read-only policy", () => {
 			smol: reopened.getProjectModelRole("smol"),
 		}).toEqual({ projectDefault: undefined, effectiveDefault: globalSelector, smol: "provider/keep:low" });
 		expect(project.autoResume).toBe(false);
+	});
+});
+
+describe("/model effort persistence across project and global scopes", () => {
+	const initialSelector = "anthropic/claude-sonnet-4-5";
+	const pickedSelector = "anthropic/claude-opus-4-5";
+	const reviewerSelector = "anthropic/claude-sonnet-4-5:high";
+	let authStorage: AuthStorage | undefined;
+	let hub: modelHubModule.ModelHubComponent | undefined;
+	let sessions: AgentSession[];
+	let loadedSettings: Settings[];
+
+	beforeEach(() => {
+		sessions = [];
+		loadedSettings = [];
+	});
+
+	afterEach(async () => {
+		hub?.dispose();
+		hub = undefined;
+		for (const session of sessions) await session.dispose();
+		for (const settings of loadedSettings) settings.cancelPendingSaves();
+		authStorage?.close();
+		authStorage = undefined;
+		vi.restoreAllMocks();
+	});
+
+	async function profile(kind: "personal" | "ifca") {
+		setAgentDir(agentDir);
+		setProjectDir(cwd);
+		const bytes =
+			"# managed global defaults\nmodelRoleStorage: project\ndefaultThinkingLevel: medium\n" +
+			`modelRoles:\n  default: ${initialSelector}\n  reviewer: ${reviewerSelector}\n`;
+		await Bun.write(config, bytes);
+		const projectConfig = path.join(getProjectAgentDir(cwd), "config.yml");
+		await Bun.write(projectConfig, `autoResume: false\nmodelRoles:\n  default: ${initialSelector}\n`);
+		// Both profiles pin the effective fallback effort. IFCA additionally owns
+		// the default role in an overlay, exercising the shadowed-project branch.
+		const overlay = temp.join(`${kind}-overlay.yml`);
+		const overlayBytes =
+			"defaultThinkingLevel: medium\n" +
+			(kind === "ifca" ? `modelRoles:\n  default: ${initialSelector}\n  reviewer: ${reviewerSelector}\n` : "");
+		await Bun.write(overlay, overlayBytes);
+		instance = await Settings.init({ cwd, agentDir, configFiles: [overlay] });
+		const settings = instance;
+		authStorage = await AuthStorage.create(temp.join("picker-auth.db"));
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		const registry = new ModelRegistry(authStorage, temp.join("models.yml"));
+		const picked = registry.find("anthropic", "claude-opus-4-5");
+		if (!picked) throw new Error("Expected bundled opus model");
+		// Keep provider metadata discovery offline; model/effort setters and
+		// their persistence are deliberately not mocked.
+		vi.spyOn(registry, "refreshSelectedModelMetadata").mockImplementation(async model => model);
+
+		async function startup(currentSettings: Settings): Promise<AgentSession> {
+			const created = await createAgentSession({
+				cwd,
+				agentDir,
+				authStorage,
+				modelRegistry: registry,
+				settings: currentSettings,
+				sessionManager: SessionManager.inMemory(cwd),
+				disableExtensionDiscovery: true,
+				toolNames: [],
+				restrictToolNames: true,
+				enableIrc: false,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				skipPythonPreflight: true,
+			});
+			sessions.push(created.session);
+			return created.session;
+		}
+
+		const session = await startup(settings);
+		expect(session.configuredThinkingLevel()).toBe(Effort.Medium);
+		expect(await Bun.file(config).text()).toBe(bytes);
+		expect(settings.getModelRoleProvenance("default")).toBe(kind === "ifca" ? "overlay" : "project");
+		const testTheme = await getThemeByName("dark");
+		if (!testTheme) throw new Error("Expected dark theme");
+		setThemeInstance(testTheme);
+		let callbacks: modelHubModule.ModelHubCallbacks | undefined;
+		const Hub = modelHubModule.ModelHubComponent;
+		vi.spyOn(modelHubModule, "ModelHubComponent").mockImplementation(function (
+			...args: ConstructorParameters<typeof Hub>
+		) {
+			callbacks = args[4];
+			hub = new Hub(...args);
+			return hub;
+		});
+		const showError = vi.fn();
+		const controller = new SelectorController({
+			ui: {
+				requestRender: vi.fn(),
+				setFocus: vi.fn(),
+				showOverlay: vi.fn(() => ({ hide: vi.fn() })),
+				terminal: { rows: 40 },
+			},
+			editorContainer: { clear: vi.fn(), addChild: vi.fn(), children: [] },
+			editor: {},
+			settings,
+			session,
+			statusLine: { invalidate: vi.fn() },
+			updateEditorBorderColor: vi.fn(),
+			routeUserModelSwitch: () => "apply",
+			keybindings: { getKeys: () => [], getDisplayString: () => "" },
+			showStatus: vi.fn(),
+			showError,
+		} as unknown as InteractiveModeContext);
+		controller.showModelSelector();
+		if (!callbacks) throw new Error("Expected real model hub callbacks");
+		const assign = callbacks.onAssign;
+		return {
+			settings,
+			session,
+			bytes,
+			projectConfig,
+			async pick(role: string, effort: typeof AUTO_THINKING | Effort, scope: "project" | "global") {
+				expect(await assign(picked, role, effort, pickedSelector, scope)).toBe(true);
+				expect(showError).not.toHaveBeenCalled();
+				await settings.flush();
+			},
+			async reload() {
+				const reopened = await Settings.loadIsolated({ cwd, agentDir, configFiles: [overlay] });
+				loadedSettings.push(reopened);
+				return { settings: reopened, session: await startup(reopened) };
+			},
+			async expectOverlayUnchanged() {
+				expect(await Bun.file(overlay).text()).toBe(overlayBytes);
+			},
+		};
+	}
+
+	it("personal project auto preserves global bytes and survives a fresh session under a medium overlay", async () => {
+		const p = await profile("personal");
+		await p.pick("default", AUTO_THINKING, "project");
+		expect(p.session.configuredThinkingLevel()).toBe(AUTO_THINKING);
+		expect(await Bun.file(config).text()).toBe(p.bytes);
+		const reopened = await p.reload();
+		expect(reopened.settings.getProjectModelRole("default")).toBe(`${pickedSelector}:auto`);
+		expect(reopened.session.model?.id).toBe("claude-opus-4-5");
+		expect(reopened.session.configuredThinkingLevel()).toBe(AUTO_THINKING);
+		expect(reopened.settings.getModelRole("reviewer")).toBe(reviewerSelector);
+		await p.expectOverlayUnchanged();
+	});
+
+	it("IFCA overlay-shadowed project auto persists locally without changing the global or effective overlay role", async () => {
+		const p = await profile("ifca");
+		await p.pick("default", AUTO_THINKING, "project");
+		expect(p.session.model?.id).toBe("claude-sonnet-4-5");
+		expect(await Bun.file(config).text()).toBe(p.bytes);
+		const reopened = await p.reload();
+		expect(reopened.settings.getProjectModelRole("default")).toBe(`${pickedSelector}:auto`);
+		expect(reopened.settings.getModelRole("default")).toBe(initialSelector);
+		expect(reopened.settings.getModelRoleProvenance("default")).toBe("overlay");
+		expect(reopened.session.configuredThinkingLevel()).toBe(Effort.Medium);
+		expect(reopened.settings.getModelRole("reviewer")).toBe(reviewerSelector);
+		await p.expectOverlayUnchanged();
+	});
+
+	it("explicit global auto persists while settings and startup honestly retain the medium overlay", async () => {
+		const p = await profile("personal");
+		const projectBefore = await Bun.file(p.projectConfig).text();
+		await p.pick("default", AUTO_THINKING, "global");
+		const global: unknown = YAML.parse(await Bun.file(config).text());
+		if (!isRecord(global) || !isRecord(global.modelRoles)) throw new Error("Expected global roles");
+		expect(global.defaultThinkingLevel).toBe(AUTO_THINKING);
+		expect(global.modelRoles.default).toBe(pickedSelector);
+		expect(global.modelRoles.reviewer).toBe(reviewerSelector);
+		expect(await Bun.file(p.projectConfig).text()).toBe(projectBefore);
+		expect(createSettingsHost().get("defaultThinkingLevel")).toBe(Effort.Medium);
+		expect(cfgDefaultThinkingLevel.provenance(p.settings)).toBe("overlay");
+		const reopened = await p.reload();
+		expect(reopened.session.configuredThinkingLevel()).toBe(Effort.Medium);
+		expect(reopened.settings.getModelRole("default")).toBe(initialSelector);
+		await p.expectOverlayUnchanged();
+	});
+
+	it("project reviewer auto and explicit effort leave the running default and global reviewer isolated", async () => {
+		const p = await profile("personal");
+		await p.pick("reviewer", AUTO_THINKING, "project");
+		expect(await Bun.file(config).text()).toBe(p.bytes);
+		expect(p.session.configuredThinkingLevel()).toBe(Effort.Medium);
+		const auto = await p.reload();
+		expect(auto.settings.getProjectModelRole("reviewer")).toBe(`${pickedSelector}:auto`);
+		expect(auto.session.model?.id).toBe("claude-sonnet-4-5");
+		expect(auto.session.configuredThinkingLevel()).toBe(Effort.Medium);
+		await p.pick("reviewer", Effort.High, "project");
+		expect(await Bun.file(config).text()).toBe(p.bytes);
+		expect(p.session.model?.id).toBe("claude-sonnet-4-5");
+		expect(p.session.configuredThinkingLevel()).toBe(Effort.Medium);
+		const reopened = await p.reload();
+		expect(reopened.settings.getProjectModelRole("reviewer")).toBe(`${pickedSelector}:high`);
+		expect(reopened.settings.getModelRole("reviewer")).toBe(`${pickedSelector}:high`);
+		expect(reopened.session.model?.id).toBe("claude-sonnet-4-5");
+		expect(reopened.session.configuredThinkingLevel()).toBe(Effort.Medium);
+		await p.expectOverlayUnchanged();
 	});
 });
