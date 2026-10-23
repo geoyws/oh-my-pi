@@ -212,16 +212,10 @@ describe("bottom-anchored chat rendering (t-d6c9e119)", () => {
 		}
 	});
 
-	for (const chrome of ["self-clearing HUD", "expanded editor draft"] as const) {
+	for (const chrome of ["turn HUD", "expanded editor draft"] as const) {
 		it(`keeps every transcript row reachable while a ${chrome} displaces the live tail`, async () => {
-			const rig = createChatRig({
-				columns: 100,
-				rows: 30,
-				settled: 60,
-				prefix: "QZH",
-				selfClearingHud: chrome === "self-clearing HUD",
-			});
-			const block = chrome === "self-clearing HUD" ? rig.hud : rig.draft;
+			const rig = createChatRig({ columns: 100, rows: 30, settled: 60, prefix: "QZH" });
+			const block = chrome === "turn HUD" ? rig.hud : rig.draft;
 			const chromeRows = (): string[] => ledger(rig.terminal, new RegExp(`\\b${block.label}-\\d+\\b`));
 			try {
 				await rig.scheduler.settle(rig.terminal);
@@ -252,7 +246,7 @@ describe("bottom-anchored chat rendering (t-d6c9e119)", () => {
 		});
 	}
 
-	it("keeps the editor on the bottom row when promoted idle chrome goes away", async () => {
+	it("keeps shell history and the bottom editor when chrome that grew over a filling session contracts", async () => {
 		const rows = 30;
 		const shell = Array.from({ length: 12 }, (_, index) => `shell${index}`);
 		const rig = createChatRig({ columns: 100, rows, settled: 0, prefix: "QZP", shell });
@@ -263,19 +257,16 @@ describe("bottom-anchored chat rendering (t-d6c9e119)", () => {
 				.filter(row => /^(?:shell\d+|QZP\d{4})$/.test(row));
 		try {
 			await rig.scheduler.settle(rig.terminal);
-			rig.composer.setRunActive(true);
 			rig.hud.rows = 7;
 			for (let step = 0; step < 55; step++) {
 				rig.addLines(2);
 				rig.composer.ui.requestRender();
 				await rig.scheduler.settle(rig.terminal);
 			}
-			rig.composer.setRunActive(false);
-			// The extension widget outlives the turn and settles into the floor.
 			await rig.scheduler.advance(rig.terminal, 300);
 			expect(history()).toEqual([...shell, ...rig.emitted]);
 			expect(ledger(rig.terminal, /\bHUD-\d\b/)).toHaveLength(7);
-			expectFullSurface(rig, "promoted widget");
+			expectFullSurface(rig, "grown widget");
 
 			rig.hud.rows = 0;
 			rig.composer.ui.requestRender();
