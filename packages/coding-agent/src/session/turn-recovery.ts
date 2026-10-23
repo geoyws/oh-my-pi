@@ -2071,7 +2071,9 @@ export class TurnRecovery {
 		}
 		if (!cfgRetryModelFallback.get(this.#host.settings)) return false;
 
-		let fallback: { role: string; selector: RetryFallbackSelector; apiKey: string } | undefined;
+		let fallback:
+			| { role: string; selector: RetryFallbackSelector; apiKey: string; model: Model; account?: ModelUsageAccountHealth }
+			| undefined;
 		const ceiling = this.#host.thinkingLevelCeiling();
 		const chainKeys = this.retryFallbackChainKeys(currentSelector, currentModel);
 		for (const role of chainKeys) {
@@ -2085,6 +2087,7 @@ export class TurnRecovery {
 				// hold the live context so we never switch onto an oversized request
 				// (issue #8065).
 				if (!this.#host.contextFitsModel(candidateModel)) continue;
+				let account: ModelUsageAccountHealth | undefined;
 				try {
 					const candidateHealth = await this.#host.modelRegistry.authStorage.health.model(
 						candidateModel.provider,
@@ -2098,22 +2101,41 @@ export class TurnRecovery {
 					);
 					if (signal.aborted || !modelsAreEqual(this.#host.model(), currentModel)) return false;
 					if (candidateHealth.state === "depleted" || candidateHealth.state === "reserve") continue;
+					// Leaving a depleted model is quota recovery: an account with
+					// unknown quota is no evidence of quota. A provider that tracks
+					// no quota at all (no accounts) stays a configured fallback.
+					if (
+						health.state === "depleted" &&
+						candidateHealth.state === "unknown" &&
+						candidateHealth.accounts.length > 0
+					) {
+						continue;
+					}
 					if (candidateHealth.state === "healthy") {
-						const selected = candidateHealth.accounts.find(account => account.selected);
-						if (
-							selected &&
-							selected.state !== "healthy" &&
-							candidateHealth.accounts.some(account => account.state === "healthy")
-						) {
-							this.#host.modelRegistry.authStorage.sessions.release(
-								candidateModel.provider,
-								this.#host.sessionId(),
+						const healthyAccounts = candidateHealth.accounts.filter(entry => entry.state === "healthy");
+						account =
+							healthyAccounts.find(entry => entry.selected) ??
+							healthyAccounts.reduce<ModelUsageAccountHealth | undefined>(
+								(best, entry) =>
+									!best || (entry.remainingFraction ?? 0) > (best.remainingFraction ?? 0) ? entry : best,
+								undefined,
 							);
+						const sessions = this.#host.modelRegistry.authStorage.sessions;
+						if (account && !account.selected) {
+							// Route to the account the decision names: an exact OAuth pin
+							// inside the session's restriction, else re-rank.
+							if (
+								account.credentialType !== "oauth" ||
+								!sessions.pin(candidateModel.provider, this.#host.sessionId(), account.credentialId)
+							) {
+								sessions.release(candidateModel.provider, this.#host.sessionId());
+							}
 						}
 					}
 				} catch {
 					if (signal.aborted || !modelsAreEqual(this.#host.model(), currentModel)) return false;
-					// Unknown usage fails open for an otherwise valid fallback.
+					// Unknown usage fails open for a reserve fallback, never for a depleted model.
+					if (health.state === "depleted") continue;
 				}
 				if (signal.aborted || !modelsAreEqual(this.#host.model(), currentModel)) return false;
 				let apiKey: string | undefined;
@@ -2125,7 +2147,7 @@ export class TurnRecovery {
 				}
 				if (signal.aborted || !modelsAreEqual(this.#host.model(), currentModel)) return false;
 				if (!apiKey) continue;
-				fallback = { role, selector: candidate, apiKey };
+				fallback = { role, selector: candidate, apiKey, model: candidateModel, account };
 				break;
 			}
 			if (fallback) break;
@@ -2162,12 +2184,20 @@ export class TurnRecovery {
 			return false;
 		}
 		this.#usageReserveApproval = undefined;
-		return this.applyRetryFallbackCandidate(fallback.role, fallback.selector, currentSelector, {
+		const reason = describeUsageFallback(health, cfgRetryUsageReservePct.get(this.#host.settings));
+		const applied = await this.applyRetryFallbackCandidate(fallback.role, fallback.selector, currentSelector, {
 			pinFallback: true,
 			apiKey: fallback.apiKey,
 			signal,
-			reason: describeUsageFallback(health, cfgRetryUsageReservePct.get(this.#host.settings)),
+			reason,
 		});
+		if (applied) {
+			await this.#emitQuotaRecoveryNotice(
+				"info",
+				`using ${this.#describeQuotaChoice({ candidate: { model: fallback.model }, account: fallback.account })} now. Reason: ${currentSelector} ${health.state === "depleted" ? "hit its usage limit" : "reached its usage reserve"}; ${reason}.`,
+			);
+		}
+		return applied;
 	}
 
 	async #confirmUsageFallback(

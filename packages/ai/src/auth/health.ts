@@ -279,10 +279,30 @@ export class CredentialHealth implements HealthApi {
 				}
 				const evidence = report ? evaluateQuotaWindows(strategy, report, rankingContext, nowMs) : undefined;
 				if (blockedUntil !== undefined) {
+					const timed = isTimed(blockedUntil);
+					// A heuristic backoff guess (a hintless 429) is not provider timing.
+					// When a complete report proves when every exhausted window resets
+					// and that report can heal the block, the report is the wake time,
+					// in both directions: the guess must not delay or advance it.
+					if (
+						!timed &&
+						evidence?.kind === "exhausted" &&
+						evidence.complete &&
+						evidence.resetsAt !== undefined &&
+						this.#deps.blocks.canHeal(provider, providerKey, index, blockScopes)
+					) {
+						return {
+							credentialId: entry.id,
+							credentialType,
+							state: "depleted",
+							resetsAt: evidence.resetsAt,
+							resetIsAuthoritative: true,
+						};
+					}
 					// The block and every exhausted window must all have lifted.
 					const quotaResetsAt = evidence?.kind === "exhausted" ? evidence.resetsAt : undefined;
 					const authoritative =
-						isTimed(blockedUntil) && evidence !== undefined && evidence.kind !== "unknown" && evidence.complete;
+						timed && evidence !== undefined && evidence.kind !== "unknown" && evidence.complete;
 					return {
 						credentialId: entry.id,
 						credentialType,
