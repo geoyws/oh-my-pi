@@ -48,24 +48,28 @@ describe("explicit owner checkpoint", () => {
 		);
 		expect(reopened).toBeDefined();
 	});
-	it.each(["isStreaming", "isBashRunning", "isEvalRunning", "hasAdmittedSubmission", "isCompacting", "isGeneratingHandoff"] as const)(
-		"preserves %s work",
-		async field => {
-			const { state, session, manager } = await fixture();
-			state[field] = true;
-			await expect(
-				checkpointOwnerSession(
-					session,
-					async () => {
-						throw new Error("must not close");
-					},
-					() => false,
-					identity,
-				),
-			).rejects.toThrow("idle");
-			expect(manager.isSessionOnDisk()).toBe(false);
-		},
-	);
+	it.each([
+		"isStreaming",
+		"isBashRunning",
+		"isEvalRunning",
+		"hasAdmittedSubmission",
+		"isCompacting",
+		"isGeneratingHandoff",
+	] as const)("preserves %s work", async field => {
+		const { state, session, manager } = await fixture();
+		state[field] = true;
+		await expect(
+			checkpointOwnerSession(
+				session,
+				async () => {
+					throw new Error("must not close");
+				},
+				() => false,
+				identity,
+			),
+		).rejects.toThrow("idle");
+		expect(manager.isSessionOnDisk()).toBe(false);
+	});
 	it.each(["queued", "async", "submission"])("preserves pending %s work", async kind => {
 		const { state, session } = await fixture();
 		if (kind === "queued") state.queuedMessageCount = 1;
@@ -122,23 +126,26 @@ describe("explicit owner checkpoint", () => {
 			),
 		).rejects.toThrow("identifiable");
 	});
-	it.each(["isStreaming", "isBashRunning", "isEvalRunning"] as const)("does not close if %s starts during persistence", async field => {
-		const { state, session } = await fixture();
-		let reads = 0;
-		await expect(
-			checkpointOwnerSession(
-				session,
-				async () => {
-					throw new Error("must not close");
-				},
-				() => false,
-				() => {
-					if (++reads === 2) state[field] = true;
-					return identity();
-				},
-			),
-		).rejects.toThrow("identity or activity changed");
-	});
+	it.each(["isStreaming", "isBashRunning", "isEvalRunning"] as const)(
+		"does not close if %s starts during persistence",
+		async field => {
+			const { state, session } = await fixture();
+			let reads = 0;
+			await expect(
+				checkpointOwnerSession(
+					session,
+					async () => {
+						throw new Error("must not close");
+					},
+					() => false,
+					() => {
+						if (++reads === 2) state[field] = true;
+						return identity();
+					},
+				),
+			).rejects.toThrow("identity or activity changed");
+		},
+	);
 	it("never advertises an in-memory session as resumable", async () => {
 		const { state } = await fixture();
 		state.sessionManager = SessionManager.inMemory();

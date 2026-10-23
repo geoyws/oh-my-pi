@@ -22,6 +22,8 @@ export async function checkpointOwnerSession(
 	const idle = () =>
 		!hasPendingSubmission() &&
 		!session.isStreaming &&
+		!session.isBashRunning &&
+		!session.isEvalRunning &&
 		!session.hasAdmittedSubmission &&
 		session.queuedMessageCount === 0 &&
 		!session.hasPendingAsyncWork() &&
@@ -30,7 +32,7 @@ export async function checkpointOwnerSession(
 	const owner = readIdentity();
 	if (!owner || !idle())
 		throw new Error("Checkpoint refused: this owner must be identifiable and idle; active work is untouched.");
-	await session.sessionManager.ensureOnDisk();
+	await session.sessionManager.ensureOnDisk({ preserveOnClose: true });
 	await session.sessionManager.flush();
 	if (!session.sessionManager.isSessionOnDisk())
 		throw new Error("Checkpoint refused: no durable transcript to resume.");

@@ -2692,12 +2692,16 @@ export class SessionManager {
 	/**
 	 * Force the session onto disk even with no assistant message yet (ACP
 	 * session/new must create a discoverable file immediately).
+	 * Explicit checkpoints preserve even resumed draft-only files through close.
 	 */
-	async ensureOnDisk(): Promise<void> {
+	async ensureOnDisk(options?: { preserveOnClose?: boolean }): Promise<void> {
 		if (!this.#persist || !this.#sessionFile) return;
 		this.#forceFileCreation = true;
-		if (this.#fileIsCurrent && !this.#rewriteRequired) return;
-		await this.#rewriteAtomically();
+		if (!this.#fileIsCurrent || this.#rewriteRequired) await this.#rewriteAtomically();
+		if (options?.preserveOnClose) {
+			await this.#clearDraftOnlySessionMarker();
+			this.#draftOnlySessionCleanupArmed = false;
+		}
 	}
 
 	/** Persist this session's transcript as a newly identified OMP session. */
