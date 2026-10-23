@@ -448,15 +448,44 @@ export interface UsageLimitMarkResult {
 /** Combined model availability state across stored accounts. */
 export type ModelUsageHealthState = "healthy" | "reserve" | "depleted" | "unknown";
 
-/** Usage health of one stored credential for a model. */
+/**
+ * Usage health of one stored credential for a model.
+ *
+ * Only credentials the requesting session may use are reported. Every quota
+ * window limiting the model counts: an exhausted window in any of them makes
+ * the account `depleted`, and it is usable again only once all of them reset.
+ */
 export interface ModelUsageAccountHealth {
 	credentialId: number;
 	credentialType: AuthCredential["type"];
 	/** True when this credential is currently sticky for options.sessionId. */
 	selected?: true;
+	/**
+	 * `healthy`: a report current in every limiting window shows none exhausted
+	 * and reserve-scope headroom outside the reserve. `reserve`: current windows
+	 * sit inside the reserve margin.
+	 * `depleted`: an exhausted window or a live block stops the account.
+	 * `unknown`: no current evidence either way; never proof of usable quota.
+	 */
 	state: ModelUsageHealthState;
+	/** Headroom of the most consumed reserve-scope window, as a fraction of its cap. */
 	remainingFraction?: number;
+	/**
+	 * For `depleted`: the earliest time the account can be usable as far as
+	 * known — the latest of its live block and every exhausted window reset
+	 * with a known time. A lower bound, possibly a heuristic backoff guess,
+	 * unless {@link resetIsAuthoritative} is set. Absent when no exhausted
+	 * window reports a reset time.
+	 */
 	resetsAt?: number;
+	/**
+	 * Set only when {@link resetsAt} is a provider-proven wake time: every
+	 * limiting window is current, every exhausted window has a finite future
+	 * reset, and any live block carries provider-stated timing alongside such
+	 * a report. Absent means the time is heuristic or a lower bound; refresh
+	 * usage when it arrives instead of assuming the account recovered.
+	 */
+	resetIsAuthoritative?: true;
 }
 
 /** Aggregate model usage health and account detail. */

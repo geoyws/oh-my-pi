@@ -2,9 +2,11 @@ import type { Provider } from "../types";
 import { isWithinUsageReserve, resolveUsedFraction } from "../usage";
 import type {
 	CredentialRankingContext,
+	CredentialRankingStrategy,
 	UsageCredential,
 	UsageFetchContext,
 	UsageFetchParams,
+	UsageLimit,
 	UsageReport,
 } from "../usage";
 import type { RankingStrategyResolver } from "../usage/registry";
@@ -31,7 +33,88 @@ import type { UsageService } from "./usage";
 import { REMOTE_REFRESH_SENTINEL } from "./types";
 import { oauthUsageRequest, usageCacheIdentity, usageRequest } from "./usage-cache";
 import type { UsageRequestDescriptor } from "./usage-cache";
-import { isUsageLimitExhausted, reserveUsageLimits, usageReportMetadataValue } from "./usage-report";
+import {
+	isUsageLimitExhausted,
+	reserveUsageLimits,
+	scopedUsageLimits,
+	usageReportMetadataValue,
+	windowResetAt,
+} from "./usage-report";
+
+/** What one usage report proves about the quota windows limiting a model. */
+type QuotaEvidence =
+	| { kind: "unknown" }
+	| {
+			kind: "exhausted";
+			/** Latest finite future reset among the exhausted windows; a lower bound unless `complete`. */
+			resetsAt: number | undefined;
+			/** Every limiting window is current and every exhausted one has a finite future reset. */
+			complete: boolean;
+	  }
+	| {
+			kind: "available";
+			/** Headroom of the most consumed current reserve-scope window, when any reports a fraction. */
+			remainingFraction: number | undefined;
+			/** Every limiting window is current (none outlived its reset before the report was fetched). */
+			complete: boolean;
+	  };
+
+/**
+ * Evaluate every quota window limiting the requested model: the hard-block
+ * scope ({@link CredentialRankingStrategy.scopeLimits}) together with the
+ * reserve scope ({@link CredentialRankingStrategy.scopeLimitsForReserve}).
+ *
+ * An exhausted window in either scope blocks the account, and the account is
+ * usable again only once every exhausted window has reset, so the wake time is
+ * the latest exhausted reset, never the earliest. An exhausted window without a
+ * finite future reset leaves the wake unknown. A window whose reset passed
+ * before the report was fetched says nothing about its current state, so it
+ * makes the evidence incomplete instead of counting as fresh headroom.
+ * Headroom stays measured on the reserve scope alone.
+ */
+function evaluateQuotaWindows(
+	strategy: CredentialRankingStrategy | undefined,
+	report: UsageReport,
+	rankingContext: CredentialRankingContext,
+	nowMs: number,
+): QuotaEvidence {
+	const reserveLimits = new Set(reserveUsageLimits(strategy, report, rankingContext));
+	const limiting = new Set<UsageLimit>(strategy ? scopedUsageLimits(strategy, report, rankingContext) : []);
+	for (const limit of reserveLimits) limiting.add(limit);
+	if (limiting.size === 0) return { kind: "unknown" };
+
+	const current = [...limiting].filter(limit => {
+		const resetsAt = windowResetAt(limit.window);
+		return resetsAt === undefined || resetsAt > nowMs || report.fetchedAt >= resetsAt;
+	});
+	if (current.length === 0) return { kind: "unknown" };
+	const allCurrent = current.length === limiting.size;
+
+	const exhausted = current.filter(limit => isUsageLimitExhausted(limit));
+	if (exhausted.length > 0) {
+		let resetsAt: number | undefined;
+		let everyResetKnown = true;
+		for (const limit of exhausted) {
+			const reset = windowResetAt(limit.window);
+			if (reset === undefined || reset <= nowMs) {
+				everyResetKnown = false;
+				continue;
+			}
+			if (resetsAt === undefined || reset > resetsAt) resetsAt = reset;
+		}
+		return { kind: "exhausted", resetsAt, complete: everyResetKnown && allCurrent };
+	}
+
+	const usedFractions = current
+		.filter(limit => reserveLimits.has(limit))
+		.map(resolveUsedFraction)
+		.filter((fraction): fraction is number => fraction !== undefined);
+	return {
+		kind: "available",
+		remainingFraction: usedFractions.length === 0 ? undefined : Math.max(0, 1 - Math.max(...usedFractions)),
+		complete: allCurrent,
+	};
+}
 
 /** Dependencies for model pool health and stored credential probes. */
 export interface CredentialHealthDeps {
@@ -86,6 +169,9 @@ export class CredentialHealth implements HealthApi {
 	 * Inspect the credential pool that {@link getApiKey} would use for one model
 	 * without advancing round-robin state or changing session stickiness.
 	 *
+	 * Only credentials the session may use ({@link SessionAffinity.allows}) are
+	 * evaluated, so a restricted session never sees another account's quota.
+	 *
 	 * Pool aggregation is deliberately conservative: one healthy sibling makes
 	 * the model healthy, while any unknown sibling prevents a depleted/reserve
 	 * conclusion. Static runtime/config/env credentials return unknown because
@@ -114,7 +200,9 @@ export class CredentialHealth implements HealthApi {
 		const loginApiKeyPool = apiKeyPool.filter(
 			({ entry }) => entry.credential.type === "api_key" && entry.credential.source === "login",
 		);
-		const pool = origin.kind === "oauth" ? oauthPool : loginApiKeyPool;
+		const pool = (origin.kind === "oauth" ? oauthPool : loginApiKeyPool).filter(({ entry }) =>
+			this.#deps.affinity.allows(provider, options.sessionId, entry.credential),
+		);
 		if (pool.length === 0) return { state: "unknown", accounts: [] };
 		const sessionCredential = this.#deps.affinity.get(provider, options.sessionId);
 		const selectedCredentialId =
@@ -145,12 +233,20 @@ export class CredentialHealth implements HealthApi {
 			pool.map(async ({ entry, index }): Promise<ModelUsageAccountHealth> => {
 				const credentialType = entry.credential.type;
 				const providerKey = providerTypeKey(provider, credentialType);
+				const isTimed = (deadline: number): boolean =>
+					this.#deps.blocks.isTimed(providerKey, blockScopes, entry.id, deadline);
 				let blockedUntil = this.#deps.blocks.blockedUntil(provider, providerKey, index, blockScopes);
 				// A block under a scope the strategy can vouch for must still fetch
 				// a probe report, or it outlives the recovery that report would
 				// prove: no report means no reconciliation, so the credential idles
-				// until the clock runs out even after quota is restored.
-				if (blockedUntil !== undefined && !this.#deps.blocks.canHeal(provider, providerKey, index, blockScopes)) {
+				// until the clock runs out even after quota is restored. A
+				// provider-timed block also fetches one, because only a timed block
+				// plus complete quota evidence yields an authoritative wake time.
+				if (
+					blockedUntil !== undefined &&
+					!this.#deps.blocks.canHeal(provider, providerKey, index, blockScopes) &&
+					!isTimed(blockedUntil)
+				) {
 					return {
 						credentialId: entry.id,
 						credentialType,
@@ -181,52 +277,47 @@ export class CredentialHealth implements HealthApi {
 				if (this.#deps.blocks.supportsHealing(provider)) {
 					blockedUntil = this.#deps.blocks.blockedUntil(provider, providerKey, index, blockScopes);
 				}
+				const evidence = report ? evaluateQuotaWindows(strategy, report, rankingContext, nowMs) : undefined;
 				if (blockedUntil !== undefined) {
+					// The block and every exhausted window must all have lifted.
+					const quotaResetsAt = evidence?.kind === "exhausted" ? evidence.resetsAt : undefined;
+					const authoritative =
+						isTimed(blockedUntil) && evidence !== undefined && evidence.kind !== "unknown" && evidence.complete;
 					return {
 						credentialId: entry.id,
 						credentialType,
 						state: "depleted",
-						resetsAt: blockedUntil,
+						resetsAt: quotaResetsAt === undefined ? blockedUntil : Math.max(blockedUntil, quotaResetsAt),
+						...(authoritative ? { resetIsAuthoritative: true as const } : {}),
 					};
 				}
-				if (!report) return { credentialId: entry.id, credentialType, state: "unknown" };
-
-				const limits = reserveUsageLimits(strategy, report, rankingContext);
-				if (limits.length === 0) return { credentialId: entry.id, credentialType, state: "unknown" };
-
-				const currentLimits = limits.filter(limit => {
-					const resetsAt = limit.window?.resetsAt;
-					return resetsAt === undefined || resetsAt > nowMs || report.fetchedAt >= resetsAt;
-				});
-				if (currentLimits.length === 0) {
+				if (!evidence || evidence.kind === "unknown") {
 					return { credentialId: entry.id, credentialType, state: "unknown" };
 				}
-				const activeExhausted = currentLimits.filter(limit => isUsageLimitExhausted(limit));
-				if (activeExhausted.length > 0) {
-					const futureResets = activeExhausted
-						.map(limit => limit.window?.resetsAt)
-						.filter((resetsAt): resetsAt is number => resetsAt !== undefined && resetsAt > nowMs);
+				if (evidence.kind === "exhausted") {
 					return {
 						credentialId: entry.id,
 						credentialType,
 						state: "depleted",
-						resetsAt: futureResets.length > 0 ? Math.min(...futureResets) : undefined,
+						resetsAt: evidence.resetsAt,
+						...(evidence.complete ? { resetIsAuthoritative: true as const } : {}),
 					};
 				}
 
-				const usedFractions = currentLimits
-					.map(resolveUsedFraction)
-					.filter((fraction): fraction is number => fraction !== undefined);
-				if (usedFractions.length === 0) {
+				const { remainingFraction } = evidence;
+				if (remainingFraction === undefined) {
 					return { credentialId: entry.id, credentialType, state: "unknown" };
 				}
-				const remainingFraction = Math.max(0, 1 - Math.max(...usedFractions));
-				return {
-					credentialId: entry.id,
-					credentialType,
-					state: isWithinUsageReserve(remainingFraction, resolveReserveFraction(entry)) ? "reserve" : "healthy",
-					remainingFraction,
-				};
+				// Current windows already inside the reserve bound the account at
+				// reserve or worse; claiming healthy needs every window current.
+				const state = isWithinUsageReserve(remainingFraction, resolveReserveFraction(entry))
+					? "reserve"
+					: evidence.complete
+						? "healthy"
+						: "unknown";
+				return state === "unknown"
+					? { credentialId: entry.id, credentialType, state }
+					: { credentialId: entry.id, credentialType, state, remainingFraction };
 			}),
 		);
 		if (planGate) {
