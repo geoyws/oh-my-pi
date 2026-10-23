@@ -5,19 +5,42 @@ import { AsyncJobError, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/
 import { buildAsyncResultBatchMessage } from "@oh-my-pi/pi-coding-agent/session/async-job-delivery";
 
 async function waitForJobEviction(manager: AsyncJobManager, jobId: string): Promise<void> {
-	const deadline = Date.now() + 2_000;
+	// performance.now, not Date.now: tests may hold Date.now still (see holdDeliveryRetryClock).
+	const deadline = performance.now() + 2_000;
 	while (manager.getJob(jobId)) {
-		if (Date.now() >= deadline) throw new Error(`Timed out waiting for job eviction: ${jobId}`);
+		if (performance.now() >= deadline) throw new Error(`Timed out waiting for job eviction: ${jobId}`);
 		await scheduler.yield();
 	}
 }
 
 async function waitForCondition(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
+	const deadline = performance.now() + timeoutMs;
 	while (!predicate()) {
-		if (Date.now() >= deadline) throw new Error("Timed out waiting for condition");
+		if (performance.now() >= deadline) throw new Error("Timed out waiting for condition");
 		await scheduler.yield();
 	}
+}
+
+/**
+ * Hold `Date.now` still from `hold()` until `release()`. A failed delivery's
+ * retry is due at `Date.now() + backoff`, so holding the clock from the failed
+ * attempt keeps the retry from running until the test has observed the row's
+ * retention eviction. Both run on real timers, so without the hold a loaded
+ * host can fire the 25 ms eviction after the ≥500 ms retry and the retry sees
+ * the live row instead of the rebuilt one.
+ */
+function holdDeliveryRetryClock(): { hold(): void; release(): void } {
+	const realNow = Date.now.bind(Date);
+	let heldAt: number | undefined;
+	vi.spyOn(Date, "now").mockImplementation(() => heldAt ?? realNow());
+	return {
+		hold: () => {
+			heldAt = realNow();
+		},
+		release: () => {
+			heldAt = undefined;
+		},
+	};
 }
 
 /** Resolve positive-duration sleeps immediately so grace-period waits don't cost real wall-clock time. */
@@ -141,12 +164,16 @@ describe("AsyncJobManager", () => {
 			data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
 		};
 		let sinkCalls = 0;
+		const retryClock = holdDeliveryRetryClock();
 		const delivered: Array<{ jobId: string; structured: unknown; images: ImageContent[] | undefined }> = [];
 		const manager = new AsyncJobManager({
 			retentionMs: 25,
 			onJobComplete: async (jobId, _text, job) => {
 				sinkCalls += 1;
-				if (sinkCalls === 1) throw new Error("simulated delivery failure");
+				if (sinkCalls === 1) {
+					retryClock.hold();
+					throw new Error("simulated delivery failure");
+				}
 				delivered.push({ jobId, structured: job?.structured, images: job?.latestDetails?.images });
 			},
 		});
@@ -161,6 +188,7 @@ describe("AsyncJobManager", () => {
 
 		await manager.waitForAll();
 		await waitForJobEviction(manager, jobId);
+		retryClock.release();
 		await manager.drainDeliveries({ timeoutMs: 2_000 });
 
 		// The job row is gone by the time the retried delivery lands, but the
@@ -182,6 +210,7 @@ describe("AsyncJobManager", () => {
 		// short test-only retention to evict the live row, then inspect the
 		// reconstructed AsyncJob received by the successful sink.
 		let sinkCalls = 0;
+		const retryClock = holdDeliveryRetryClock();
 		const delivered: Array<{
 			jobId: string;
 			reconstructedJobId: string | undefined;
@@ -193,7 +222,10 @@ describe("AsyncJobManager", () => {
 			retentionMs: 25,
 			onJobComplete: async (jobId, text, job) => {
 				sinkCalls += 1;
-				if (sinkCalls === 1) throw new Error("simulated delivery failure");
+				if (sinkCalls === 1) {
+					retryClock.hold();
+					throw new Error("simulated delivery failure");
+				}
 				expect(manager.getJob(jobId)).toBeUndefined();
 				const message = buildAsyncResultBatchMessage([
 					{ jobId, result: text, job, durationMs: job ? Date.now() - job.startTime : undefined, epoch: 0 },
@@ -215,6 +247,7 @@ describe("AsyncJobManager", () => {
 
 		await manager.waitForAll();
 		await waitForJobEviction(manager, jobId);
+		retryClock.release();
 		await manager.drainDeliveries({ timeoutMs: 2_000 });
 
 		expect(sinkCalls).toBe(2);
