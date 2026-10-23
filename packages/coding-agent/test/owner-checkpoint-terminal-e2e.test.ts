@@ -22,7 +22,7 @@ describe("owner checkpoint terminal flow", () => {
 	beforeAll(() => initTheme());
 	beforeEach(async () => {
 		resetSettingsForTest();
-		dir = TempDir.createSync("omp-owner-park-e2e-");
+		dir = TempDir.createSync("@omp-owner-park-e2e-");
 		await Settings.init({ inMemory: true, cwd: dir.path() });
 		auth = await AuthStorage.create(":memory:");
 		const registry = new ModelRegistry(auth);
