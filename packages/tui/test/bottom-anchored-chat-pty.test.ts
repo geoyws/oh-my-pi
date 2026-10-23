@@ -153,7 +153,7 @@ class PtyChat {
 	 * so an output-idle window on the real clock is the only completion test.
 	 */
 	async #quiet(ms: number): Promise<void> {
-		for (let idle = ms - (performance.now() - this.#lastChunkAt); idle > 0; ) {
+		for (let idle = ms - (performance.now() - this.#lastChunkAt); idle > 0;) {
 			await Bun.sleep(idle);
 			idle = ms - (performance.now() - this.#lastChunkAt);
 		}
@@ -161,11 +161,7 @@ class PtyChat {
 	}
 
 	async started(columns: number, rows: number): Promise<string> {
-		await this.#waitFor(
-			() => this.#state?.columns === columns && this.#state.rows === rows,
-			"first paint",
-			30_000,
-		);
+		await this.#waitFor(() => this.#state?.columns === columns && this.#state.rows === rows, "first paint", 30_000);
 		await this.#quiet(300);
 		return this.#take();
 	}

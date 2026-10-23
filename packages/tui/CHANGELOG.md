@@ -14,7 +14,7 @@
 
 - The usage dashboard now labels Anthropic accounts as Claude.
 - Fixed transcript rows clipped by growing chrome being missing from both the screen and scrollback until the chrome shrank; composer input and status stay at the terminal bottom from startup through short sessions and chrome contraction
-- Fixed inline overlays on a short viewport padding it to full height, which scrolled on-screen history away and moved the input to the top; overlay rows now composite at their screen position and covered history rows are restored before they can scroll
+- Fixed inline overlays moving a short viewport and losing covered history during resize; short-viewport overlays now borrow the alternate buffer over a text snapshot, preserving the underlying native history
 - Stable-geometry history appends now scroll the screen and rewrite only the viewport rows whose content changed, instead of repainting the whole viewport
 - Task progress shows a subagent's provider-internal retry wait (`provider retrying N/M in …`) instead of a stalled running row ([#12785](https://github.com/can1357/oh-my-pi/pull/12785))
 ## [18.12.3] - 2026-10-19

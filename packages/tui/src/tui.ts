@@ -3817,7 +3817,8 @@ export class TUI extends Container {
 			const screen = this.#projectScreenHistory(startTop, preparedHistory.rows, NO_PREPARED_ROWS, 0, newTop);
 			let blocked = -1;
 			for (const patch of overlays) {
-				if (patch.row < newTop && patch.row > blocked && !overlayCanRestoreRow(screen, patch.row)) blocked = patch.row;
+				if (patch.row < newTop && patch.row > blocked && !overlayCanRestoreRow(screen, patch.row))
+					blocked = patch.row;
 			}
 			if (blocked < 0) break;
 			viewportPad = height - blocked - viewport.length;
@@ -3837,7 +3838,14 @@ export class TUI extends Container {
 				? this.#screenHistory
 				: this.#projectScreenHistory(startTop, preparedHistory.rows, prepared.rows, replayViewportRows, mutableTop);
 		const outerMarkers: { row: number; col: number }[] = [];
-		const outer = this.#prepareOuterOverlayRows(overlays, mutableTop, newTop + rows, screenAfter, width, outerMarkers);
+		const outer = this.#prepareOuterOverlayRows(
+			overlays,
+			mutableTop,
+			newTop + rows,
+			screenAfter,
+			width,
+			outerMarkers,
+		);
 		const pendingAltExit = this.#pendingAltExit;
 		// A fused resize exit whose borrow never painted still owes its entry.
 		let buffer = this.#paintBeginSequence + (pendingAltExit ? this.#takePendingAltEnter() : "") + pendingAltExit;
@@ -4153,17 +4161,21 @@ export class TUI extends Container {
 			return;
 		}
 
-		// Fullscreen alt-screen short-circuit. While the topmost visible overlay
-		// requests it, borrow the terminal's alternate buffer and paint only the
-		// modal there; the normal screen and all accounting stay untouched.
+		// Inline overlays over a short normal viewport borrow the alternate
+		// buffer too: a terminal can reflow covered history before SIGWINCH
+		// reaches us, so overpainting those rows cannot be restored safely.
 		const topOverlay = this.#getTopmostVisibleOverlay();
-		const wantAlt = topOverlay?.options?.fullscreen === true;
+		const wantAlt =
+			topOverlay !== undefined &&
+			(topOverlay.options?.fullscreen === true ||
+				this.#providerViewportTop > 0 ||
+				this.#providerWindow.length < height);
 		const wantMouse: MouseTrackingState =
 			topOverlay === undefined
 				? this.#inlineMouseProvider?.() === true
 					? "inline"
 					: "off"
-				: wantAlt && topOverlay.options?.mouseTracking !== false
+				: topOverlay.options?.fullscreen === true && topOverlay.options?.mouseTracking !== false
 					? "full"
 					: "off";
 		if (wantAlt && !this.#altActive) {
@@ -4769,14 +4781,24 @@ export class TUI extends Container {
 	}
 
 	/**
-	 * Compose and paint a single fullscreen overlay frame on the alt buffer.
-	 * Cursor markers are stripped from the frame, but only a focused cursor-mode
-	 * component owned by the fullscreen overlay may position the hardware cursor.
-	 * The normal transcript is never composited into the alternate buffer.
+	 * Paint a fullscreen modal, or an inline modal over a short-viewport
+	 * snapshot. Neither path puts modal cells in the normal history buffer.
 	 */
 	#renderAltFrame(width: number, height: number): void {
 		// oxlint-disable-next-line unicorn/no-new-array -- alt-frame length preallocation
 		const base: string[] = new Array(Math.max(0, height)).fill("");
+		if (this.#getTopmostVisibleOverlay()?.options?.fullscreen !== true) {
+			const top = this.#providerViewportTop;
+			const historyStart = top - this.#screenHistory.length;
+			for (let index = 0; index < this.#screenHistory.length; index++) {
+				const row = historyStart + index;
+				const line = this.#screenHistory[index];
+				if (row >= 0 && row < height && line !== undefined && !paintsBeyondRow(line)) base[row] = line.line;
+			}
+			for (let index = 0; index < this.#providerWindow.length && top + index < height; index++) {
+				if (!paintsBeyondRow(this.#providerPreparedRows[index]!)) base[top + index] = this.#providerWindow[index]!;
+			}
+		}
 		let lines: string[];
 		do {
 			this.#imageBudget.beginPass(false, true);
@@ -4841,7 +4863,14 @@ export class TUI extends Container {
 			this.#altPreviousLines.length !== height ||
 			((this.#altPreviousLines.some(isOsc66Line) || prepared.lines.some(isOsc66Line)) &&
 				prepared.rows.some((_row, r) =>
-					this.#rowNeedsRewrite(this.#altPreviousLines, this.#altPreparedRows, r, prepared.lines, prepared.rows, r),
+					this.#rowNeedsRewrite(
+						this.#altPreviousLines,
+						this.#altPreparedRows,
+						r,
+						prepared.lines,
+						prepared.rows,
+						r,
+					),
 				));
 		prelude += this.#retireImagePlacements(this.#altImagePlacements, prepared.lines, 0, full);
 		let rowsBuffer = "";

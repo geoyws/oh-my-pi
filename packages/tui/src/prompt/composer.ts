@@ -409,7 +409,10 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		const slack =
 			history?.kind === "replay"
 				? 0
-				: Math.max(0, rows - Math.min(rows, (filledHistoryRows ?? 0) + (history?.rows.length ?? 0)) - mutable.length);
+				: Math.max(
+						0,
+						rows - Math.min(rows, (filledHistoryRows ?? 0) + (history?.rows.length ?? 0)) - mutable.length,
+					);
 		// Park the slack below the live rows rather than above them. Above, it
 		// splits the on-screen history from the live tail and reads as a hole
 		// punched into whatever was streaming — a table's rows included — and

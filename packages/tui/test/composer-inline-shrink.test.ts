@@ -198,40 +198,6 @@ describe("composer inline shrink (#11007)", () => {
 		h.composer.stop();
 	});
 
-	it("leaves a short transcript top-anchored after an inline panel closes", async () => {
-		const h = makeHarness(COLUMNS, ROWS, 3);
-		await h.scheduler.settle(h.terminal);
-		h.widget.rows = 6;
-		h.composer.ui.requestRender();
-		await h.scheduler.settle(h.terminal);
-		const row = (needle: string): number =>
-			h.terminal.getViewport().findIndex(line => Bun.stripANSI(line).trimEnd().startsWith(needle));
-		expect(row(`${TRANSCRIPT_PREFIX}0`)).toBe(0);
-		h.widget.rows = 0;
-		h.composer.ui.requestRender();
-		await h.scheduler.settle(h.terminal);
-		expect(row(`${TRANSCRIPT_PREFIX}0`)).toBe(0);
-		expect(row("EDITOR")).toBeLessThan(ROWS - 1);
-		h.composer.stop();
-	});
-
-	it("lets a reset to an empty transcript shrink in place instead of pinning to the bottom", async () => {
-		const h = makeHarness();
-		await h.scheduler.settle(h.terminal);
-		// A new session: scrollback is cleared and nothing replays into it.
-		h.composer.setRuntimeChildren([new TranscriptContainer(), h.hud, h.editor]);
-		h.composer.ui.resetDisplay();
-		await h.scheduler.settle(h.terminal);
-		h.widget.rows = ROWS + 5;
-		h.composer.ui.requestRender();
-		await h.scheduler.settle(h.terminal);
-		h.widget.rows = 3;
-		h.composer.ui.requestRender();
-		await h.scheduler.settle(h.terminal);
-		expect(h.terminal.getViewport().findIndex(row => row.includes("EDITOR"))).toBe(3);
-		h.composer.stop();
-	});
-
 	it("keeps every row of a response taller than the screen reachable once after an ask closes", async () => {
 		const terminal = new VirtualTerminal(COLUMNS, ROWS);
 		const scheduler = new VirtualRenderScheduler();

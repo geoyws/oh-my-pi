@@ -94,16 +94,14 @@ differs from the row now under them are rewritten. A frame whose old or new
 viewport holds an image or a scaled OSC 66 span, a replay, a reset, a forced
 repaint, or a geometry change repaints the whole viewport instead.
 
-Visible overlays are screen-coordinate content and never move the viewport.
-Overlay rows that land on the viewport composite into it. Rows above it paint
-over the history still on screen, rows below it over blank rows; the renderer
-records the history rows it wrote on screen and restores each covered row
-before any later write could scroll it into scrollback, so overlay pixels never
-become history. When a covered history row cannot be rewritten (content the
-renderer did not write, an image, or a scaled OSC 66 span), the viewport
-instead extends upward with blank rows, scrolling that history into scrollback
-intact so the overlay lands on viewport-owned rows. Showing, updating, or
-closing an overlay otherwise only repaints the affected rows.
+Visible overlays use physical screen coordinates. Over a full mutable viewport,
+only the affected rows are composited and repainted. An inline overlay over a
+short viewport instead borrows the alternate buffer with a text snapshot behind
+it; the normal history and viewport remain untouched until it closes. Terminals
+can reflow normal-buffer rows before delivering a resize event, so overpainting
+history and trying to restore it after SIGWINCH is not safe. Images and scaled
+text in that snapshot are omitted rather than copied into another buffer.
+Fullscreen overlays keep their existing modal-only alternate-buffer surface.
 
 ## 3. Reset and resize behavior
 
