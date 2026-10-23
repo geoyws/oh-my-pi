@@ -2310,6 +2310,7 @@ export async function runRootCommand(
 		sessionOptions.modelRegistry = modelRegistry;
 		sessionOptions.hasUI = isInteractive || mode === "rpc-ui";
 		sessionOptions.allowSessionModelFallback = isInteractive;
+		sessionOptions.failFastOnRefusedEndpoint = !isInteractive && !isProtocolMode;
 		sessionOptions.settingsApproval = isInteractive;
 		sessionOptions.tuiTranscript = isInteractive;
 		sessionOptions.autoTitle = isInteractive;

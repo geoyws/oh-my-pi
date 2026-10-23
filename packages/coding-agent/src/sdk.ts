@@ -900,6 +900,14 @@ export interface CreateAgentSessionOptions {
 	/** Keep `ask` advertised in a headless fork sharing a parent's tool-schema prefix; calls still fail without UI. */
 	advertiseHeadlessAsk?: boolean;
 	/**
+	 * End the turn with the provider error when the model endpoint refuses the
+	 * connection (no server listening, or an egress sandbox denying the host)
+	 * instead of scheduling automatic retries. Model fallback still runs. The CLI
+	 * sets this for print mode (`omp -p`) so a dead endpoint exits non-zero
+	 * promptly. Default: false.
+	 */
+	failFastOnRefusedEndpoint?: boolean;
+	/**
 	 * The user approves agent `cfg://` settings writes through the process-global
 	 * host (`setCfgApprovalHost`). Only the top-level TUI session sets this; every
 	 * other session gets no `cfg://` in its prompt and has writes refused. Default: false.
@@ -4834,6 +4842,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			modelRegistry,
 			allowSessionModelFallback: options.hasUI === true && options.allowSessionModelFallback !== false,
 			interactivePrompts: options.interactivePrompts,
+			failFastOnRefusedEndpoint: options.failFastOnRefusedEndpoint,
 			rebindModelAfterDiscovery: options.model === undefined || options.rebindModelAfterDiscovery === true,
 			toolRegistry,
 			reconcileBrowserMcpFilter: mcpManager

@@ -312,6 +312,15 @@ export interface TurnRecoveryOptions {
 	 * seconds; production never sets it.
 	 */
 	unexpectedStopJudgeTimeoutMs?: number;
+	/**
+	 * Surface a refused connection to the model endpoint instead of scheduling
+	 * automatic retries. Set for single-shot print runs (`omp -p`), where a
+	 * refused endpoint — no server listening, or an egress sandbox denying the
+	 * host — would otherwise hold the process for minutes across the nested
+	 * transport, provider and session retry layers with no one to cancel it.
+	 * Model fallback still runs first. Default: false (retry as usual).
+	 */
+	failFastOnRefusedEndpoint?: boolean;
 }
 
 type PendingRetryError = {
@@ -350,6 +359,7 @@ type UsageLimitOutcome = {
 export class TurnRecovery {
 	readonly #host: TurnRecoveryHost;
 	readonly #unexpectedStopJudgeTimeoutMs: number;
+	readonly #failFastOnRefusedEndpoint: boolean;
 	#retryAbortController: AbortController | undefined;
 	#retryAttempt = 0;
 	// Exhausted-budget replays spent in this saga. Unlike #retryAttempt this
@@ -420,6 +430,7 @@ export class TurnRecovery {
 	constructor(host: TurnRecoveryHost, options: TurnRecoveryOptions = {}) {
 		this.#host = host;
 		this.#unexpectedStopJudgeTimeoutMs = options.unexpectedStopJudgeTimeoutMs ?? UNEXPECTED_STOP_TIMEOUT_MS;
+		this.#failFastOnRefusedEndpoint = options.failFastOnRefusedEndpoint === true;
 		if (options.initialRetryFallback) {
 			this.#activeRetryFallback = {
 				...options.initialRetryFallback,
@@ -2931,6 +2942,26 @@ export class TurnRecovery {
 			// `auto_retry_end` so subscribers tracking retry-outstanding state
 			// (e.g. suppressing a duplicate error toast) don't stay latched on
 			// an announcement that never resolves.
+			if (this.#retryAttempt > 1) {
+				await this.#closeRetrySaga(
+					{ success: false, attempt: this.#retryAttempt - 1, finalError: errorMessage },
+					{ terminalTurn: message },
+				);
+			}
+			this.#resetSagaRetryCounters();
+			this.resolveRetry();
+			return false;
+		}
+		// Fail-fast for single-shot print runs: a refused connection means no
+		// server answered at all, and each session retry re-runs the transport's
+		// own retry ladder, so the retries only delay a deterministic failure.
+		// The fallback consult above already had its chance to switch models.
+		if (
+			this.#failFastOnRefusedEndpoint &&
+			!switchedModel &&
+			!switchedCredential &&
+			AIError.classifyNetworkCause(errorMessage)?.kind === "refused"
+		) {
 			if (this.#retryAttempt > 1) {
 				await this.#closeRetrySaga(
 					{ success: false, attempt: this.#retryAttempt - 1, finalError: errorMessage },
