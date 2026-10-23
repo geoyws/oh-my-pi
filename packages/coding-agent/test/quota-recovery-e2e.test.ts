@@ -441,7 +441,8 @@ async function runScenario(scenario: Scenario): Promise<RunResult> {
 				if (!row.value) continue;
 				const provider = row.key.slice(SESSION_STICKY_CACHE_PREFIX.length).split(":")[0] ?? "";
 				const parsed: unknown = JSON.parse(row.value);
-				const explicit = typeof parsed === "object" && parsed !== null && "explicit" in parsed && parsed.explicit === true;
+				const explicit =
+					typeof parsed === "object" && parsed !== null && "explicit" in parsed && parsed.explicit === true;
 				affinity.push({ provider, explicit });
 			}
 		} finally {
