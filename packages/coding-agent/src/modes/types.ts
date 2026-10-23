@@ -315,6 +315,7 @@ export interface InteractiveModeContext {
 	/** Request graceful shutdown at the next fully settled boundary, including background turns. */
 	requestShutdown(): void;
 	checkShutdownRequested(): Promise<void>;
+	hasPendingSubmission(): boolean;
 
 	// Extension UI integration
 	setToolUIContext(uiContext: ExtensionUIContext, hasUI: boolean): void;

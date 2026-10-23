@@ -419,7 +419,8 @@ import { cfgStreamRedactPatterns } from "../stream/settings";
 import { cfgSttEnabled } from "../stt/settings";
 import { combine, type SettingValueOf } from "../config/registry";
 import { cfgAdvisorEnabled, cfgAdvisorMaxNotesPerUpdate } from "../advisor/settings";
-import { cfgTierAdvisor } from "../session/settings";
+import { cfgSessionIdleCheckpointMs, cfgTierAdvisor } from "../session/settings";
+import { checkpointOwnerSession } from "../session/owner-checkpoint";
 import {
 	cfgCompactionEnabled,
 	cfgCompactionIdleEnabled,
@@ -494,6 +495,8 @@ const STILL_CLOSING_DELAY_MS = 3_000;
 const JUDGMENT_BATCH_PROGRESS_RETAIN_MS = 1_000;
 /** Startup emits several status-bar changes within a second; persist only the settled one. */
 const COMPOSER_STATUS_PERSIST_DELAY_MS = 1_000;
+/** Largest delay `setTimeout` honors; longer delays overflow and fire immediately. */
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 const DEFAULT_WORKING_MESSAGE = "Working…";
 /** Native working-message shimmer under a session accent: the hue itself is the terminal's `accent`. */
 const NATIVE_ACCENT_SHIMMER: ShimmerPalette = { low: "dim", mid: "accent", high: "accent", bold: true };
@@ -1676,6 +1679,9 @@ export class InteractiveMode implements InteractiveModeContext {
 	#vibeSkillInFlight = 0;
 	#vibeScopeSuspendedForSwitch = false;
 	#goalContinuationTimer: NodeJS.Timeout | undefined;
+	/** Bounded-idle owner checkpoint: one timer, re-armed for the remainder after activity. */
+	#idleCheckpointTimer: NodeJS.Timeout | undefined;
+	#lastActivityAt = Date.now();
 	/** Submitted continuation turns awaiting their asynchronously delivered `agent_end`. */
 	#pendingGoalContinuationTurns = 0;
 	#previousGoalContinuationActivity: string | undefined;
@@ -2685,6 +2691,22 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.ui.requestRender();
 			}),
 		);
+		// Bounded-idle owner checkpoint. Any terminal input or session event is
+		// activity; the timer only re-checks the remaining idle window when it
+		// fires, so streaming events never churn timers.
+		this.#lastActivityAt = Date.now();
+		this.#eventBusUnsubscribers.push(
+			this.ui.addInputListener(() => {
+				this.#lastActivityAt = Date.now();
+				return undefined;
+			}),
+			this.session.subscribe(() => {
+				this.#lastActivityAt = Date.now();
+			}),
+			cfgSessionIdleCheckpointMs.listen(this.settings, () => this.#armIdleCheckpoint()),
+			() => this.#cancelIdleCheckpoint(),
+		);
+		this.#armIdleCheckpoint();
 		// Set up theme file watcher
 		this.#eventBusUnsubscribers.push(
 			onThemeChange(event => {
@@ -3146,6 +3168,76 @@ export class InteractiveMode implements InteractiveModeContext {
 			clearTimeout(this.#goalContinuationTimer);
 			this.#goalContinuationTimer = undefined;
 		}
+	}
+
+	#cancelIdleCheckpoint(): void {
+		clearTimeout(this.#idleCheckpointTimer);
+		this.#idleCheckpointTimer = undefined;
+	}
+
+	/** Arm the one idle-checkpoint timer for the rest of the current idle window. */
+	#armIdleCheckpoint(): void {
+		this.#cancelIdleCheckpoint();
+		const boundMs = cfgSessionIdleCheckpointMs.get(this.settings);
+		if (!Number.isFinite(boundMs) || boundMs <= 0 || this.isShuttingDown) return;
+		// setTimeout overflows above 2^31-1 ms (~24.8 days) and fires at once;
+		// an early wake just re-checks the window and re-arms.
+		const remainingMs = Math.min(MAX_TIMER_DELAY_MS, Math.max(0, this.#lastActivityAt + boundMs - Date.now()));
+		this.#idleCheckpointTimer = setTimeout(() => {
+			this.#idleCheckpointTimer = undefined;
+			void this.#maybeIdleCheckpoint(boundMs);
+		}, remainingMs);
+		// Never keeps the process alive on its own.
+		this.#idleCheckpointTimer.unref?.();
+	}
+
+	/**
+	 * Checkpoint and exit this owner once it has been idle for the bound. Only
+	 * this process acts on itself: nothing signals another PID. A pending draft,
+	 * open dialog, selector or prompt (anything off the composer), or running
+	 * work keeps the session live and re-arms for another full window.
+	 */
+	async #maybeIdleCheckpoint(boundMs: number): Promise<void> {
+		if (this.isShuttingDown) return;
+		if (Date.now() - this.#lastActivityAt < boundMs) {
+			this.#armIdleCheckpoint();
+			return;
+		}
+		if (!this.#composerIdleForCheckpoint()) {
+			this.#lastActivityAt = Date.now();
+			this.#armIdleCheckpoint();
+			return;
+		}
+		const idleSince = this.#lastActivityAt;
+		try {
+			await checkpointOwnerSession(
+				this.session,
+				() => {
+					// Synchronous last look before the close latch: input or a dialog
+					// that arrived while the transcript was flushing keeps the owner live.
+					if (this.#lastActivityAt !== idleSince || !this.#composerIdleForCheckpoint()) {
+						throw new Error("Idle checkpoint refused: activity resumed during the checkpoint.");
+					}
+					return this.shutdown({ unattended: true });
+				},
+				() => this.hasPendingSubmission(),
+			);
+		} catch (error) {
+			// Active work, or identity/activity changed mid-checkpoint: stay live.
+			logger.debug("Idle checkpoint deferred", { error: error instanceof Error ? error.message : String(error) });
+			this.#lastActivityAt = Date.now();
+			this.#armIdleCheckpoint();
+		}
+	}
+
+	/** The composer is focused and empty: no draft, attachment, dialog, selector or prompt is open. */
+	#composerIdleForCheckpoint(): boolean {
+		return (
+			!this.ui.hasOverlay() &&
+			this.ui.getFocused() === this.editor &&
+			this.editor.getText().trim().length === 0 &&
+			(this.editor.pendingImages?.length ?? 0) === 0
+		);
 	}
 
 	/** Idle bare Esc: drop a pending continuation tick and hold continuation like an interrupt. */
@@ -7504,7 +7596,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.isInitialized = false;
 	}
 
-	async shutdown(): Promise<void> {
+	/**
+	 * Tear down, print the resume command and exit. `unattended` (the idle
+	 * checkpoint) leaves owned worktrees in place: no one is present to answer a
+	 * `worktree.onExit` prompt, and the resumed session still needs its worktree.
+	 */
+	async shutdown(options: { unattended?: boolean } = {}): Promise<void> {
 		if (this.#isShuttingDown) return;
 		// The previous graceful teardown failed AT the memoized session.dispose()
 		// (the session is already disposing), so it re-rejects identically forever
@@ -7523,7 +7620,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 		this.#beginClose();
-		const worktreePlan = await this.#planOwnedWorktreeExit();
+		const worktreePlan = options.unattended ? [] : await this.#planOwnedWorktreeExit();
 		try {
 			await this.#teardown();
 		} catch (error) {
