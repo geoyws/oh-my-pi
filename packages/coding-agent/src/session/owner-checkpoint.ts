@@ -12,7 +12,7 @@ function readOwnerIdentity(): OwnerIdentity | undefined {
 	return { pid: process.pid, startTime: owner.startTime };
 }
 
-/** Explicit owner request only. Never accepts a target PID or signals another process. */
+/** Owner self-checkpoint (`/park` or the bounded-idle timer). Never accepts a target PID or signals another process. */
 export async function checkpointOwnerSession(
 	session: AgentSession,
 	close: () => Promise<void>,
