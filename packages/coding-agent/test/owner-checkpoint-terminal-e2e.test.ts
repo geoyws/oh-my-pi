@@ -8,6 +8,7 @@ import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
 import { cfgSessionIdleCheckpointMs } from "../src/session/settings";
+import { cfgWorktreeOnExit } from "../src/task/settings";
 import { Composer } from "@oh-my-pi/pi-tui/prompt/composer";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { postmortem, TempDir } from "@oh-my-pi/pi-utils";
@@ -297,5 +298,64 @@ describe("owner checkpoint terminal flow", () => {
 			expect(mode.isShuttingDown).toBe(false);
 			expect(quit).not.toHaveBeenCalled();
 		}, 15_000);
+
+		it("waits out a bound beyond the setTimeout ceiling without spinning or warning", async () => {
+			const quit = vi.spyOn(postmortem, "quit").mockResolvedValue();
+			const warnings: string[] = [];
+			const onWarning = (warning: Error) => warnings.push(warning.name);
+			process.on("warning", onWarning);
+			const stderr: string[] = [];
+			vi.spyOn(process.stderr, "write").mockImplementation(chunk => {
+				stderr.push(String(chunk));
+				return true;
+			});
+			try {
+				cfgSessionIdleCheckpointMs.set(session.settings, 30 * 24 * 60 * 60 * 1000);
+				await mode.init({ suppressWelcomeIntro: true });
+				void mode.getUserInput();
+				await terminal.waitForRender();
+				await Bun.sleep(SEVERAL_WINDOWS_MS);
+			} finally {
+				process.off("warning", onWarning);
+			}
+			expect(warnings).not.toContain("TimeoutOverflowWarning");
+			expect(stderr.join("")).not.toContain("TimeoutOverflowWarning");
+			expect(mode.isShuttingDown).toBe(false);
+			expect(quit).not.toHaveBeenCalled();
+		}, 15_000);
+
+		it("leaves an owned worktree in place when it retires unattended under worktree.onExit=remove", async () => {
+			const launchCwd = process.cwd();
+			const repo = dir.path();
+			for (const args of [
+				["init", "-q"],
+				["add", "-A"],
+				["-c", "user.name=t", "-c", "user.email=t@localhost", "commit", "-q", "--allow-empty", "-m", "base"],
+			]) {
+				const git = Bun.spawnSync(["git", ...args], { cwd: repo });
+				expect(git.exitCode, git.stderr.toString()).toBe(0);
+			}
+			const quit = Promise.withResolvers<void>();
+			vi.spyOn(postmortem, "quit").mockImplementation(async () => quit.resolve());
+			vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+			cfgWorktreeOnExit.set(session.settings, "remove");
+			let worktree: string | undefined;
+			try {
+				await mode.init({ suppressWelcomeIntro: true });
+				void mode.getUserInput();
+				await terminal.waitForRender();
+				await mode.handleWorktreeCommand("idle-keep");
+				worktree = manager.getCwd();
+				expect(path.resolve(worktree)).not.toBe(path.resolve(repo));
+				// Arm only after the worktree exists so the bound measures pure idleness.
+				cfgSessionIdleCheckpointMs.set(session.settings, IDLE_MS);
+				await quit.promise;
+				expect(mode.isShuttingDown).toBe(true);
+				expect(await Bun.file(path.join(worktree, ".git")).exists()).toBe(true);
+			} finally {
+				process.chdir(launchCwd);
+				if (worktree) Bun.spawnSync(["git", "worktree", "remove", "--force", worktree], { cwd: repo });
+			}
+		}, 20_000);
 	});
 });

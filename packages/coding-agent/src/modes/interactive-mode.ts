@@ -495,6 +495,8 @@ const STILL_CLOSING_DELAY_MS = 3_000;
 const JUDGMENT_BATCH_PROGRESS_RETAIN_MS = 1_000;
 /** Startup emits several status-bar changes within a second; persist only the settled one. */
 const COMPOSER_STATUS_PERSIST_DELAY_MS = 1_000;
+/** Largest delay `setTimeout` honors; longer delays overflow and fire immediately. */
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 const DEFAULT_WORKING_MESSAGE = "Working…";
 /** Native working-message shimmer under a session accent: the hue itself is the terminal's `accent`. */
 const NATIVE_ACCENT_SHIMMER: ShimmerPalette = { low: "dim", mid: "accent", high: "accent", bold: true };
@@ -3178,7 +3180,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#cancelIdleCheckpoint();
 		const boundMs = cfgSessionIdleCheckpointMs.get(this.settings);
 		if (!Number.isFinite(boundMs) || boundMs <= 0 || this.isShuttingDown) return;
-		const remainingMs = Math.max(0, this.#lastActivityAt + boundMs - Date.now());
+		// setTimeout overflows above 2^31-1 ms (~24.8 days) and fires at once;
+		// an early wake just re-checks the window and re-arms.
+		const remainingMs = Math.min(MAX_TIMER_DELAY_MS, Math.max(0, this.#lastActivityAt + boundMs - Date.now()));
 		this.#idleCheckpointTimer = setTimeout(() => {
 			this.#idleCheckpointTimer = undefined;
 			void this.#maybeIdleCheckpoint(boundMs);
@@ -3214,7 +3218,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					if (this.#lastActivityAt !== idleSince || !this.#composerIdleForCheckpoint()) {
 						throw new Error("Idle checkpoint refused: activity resumed during the checkpoint.");
 					}
-					return this.shutdown();
+					return this.shutdown({ unattended: true });
 				},
 				() => this.hasPendingSubmission(),
 			);
@@ -7592,7 +7596,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.isInitialized = false;
 	}
 
-	async shutdown(): Promise<void> {
+	/**
+	 * Tear down, print the resume command and exit. `unattended` (the idle
+	 * checkpoint) leaves owned worktrees in place: no one is present to answer a
+	 * `worktree.onExit` prompt, and the resumed session still needs its worktree.
+	 */
+	async shutdown(options: { unattended?: boolean } = {}): Promise<void> {
 		if (this.#isShuttingDown) return;
 		// The previous graceful teardown failed AT the memoized session.dispose()
 		// (the session is already disposing), so it re-rejects identically forever
@@ -7611,7 +7620,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 		this.#beginClose();
-		const worktreePlan = await this.#planOwnedWorktreeExit();
+		const worktreePlan = options.unattended ? [] : await this.#planOwnedWorktreeExit();
 		try {
 			await this.#teardown();
 		} catch (error) {
