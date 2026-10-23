@@ -219,7 +219,6 @@ export function createInteractiveModeContext(overrides: ContextOverrides = {}): 
 	};
 	const ctx = {
 		ui,
-		composer: { setRunActive: vi.fn() },
 		chatContainer,
 		statusContainer: new Container(),
 		editorContainer: new Container(),

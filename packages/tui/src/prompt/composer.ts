@@ -342,6 +342,13 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		const transcriptIndex = roots.findIndex(root => root instanceof TranscriptContainer);
 		if (transcriptIndex < 0) {
 			this.#lastClickSpans = [];
+			if (!this.#runtimeMounted) {
+				const editorIndex = roots.indexOf(this.editor);
+				const before = this.#renderRoots(roots.slice(0, editorIndex), width);
+				const after = this.#renderRoots(roots.slice(editorIndex), width);
+				const slack = Math.max(0, rows - before.length - after.length);
+				return { viewport: [...before, ...Array<string>(slack).fill(""), ...after].slice(-rows) };
+			}
 			const viewport = this.#renderRoots(roots, width);
 			return { viewport: viewport.slice(-rows) };
 		}
@@ -393,16 +400,16 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		// live area hold committed history still on screen, so the live rows
 		// cannot move up into them, and replaying those rows would duplicate them
 		// while clearing history would lose them. Replays position themselves.
-		// Without native history the live viewport is the whole document and
-		// shrinks in place.
+		// Short documents also leave slack above the chrome, keeping startup
+		// and the first messages anchored to the same bottom rows.
 		const filledHistoryRows =
 			history?.kind === "replay" || !(history !== undefined || this.ui.hasProviderHistory())
 				? undefined
 				: this.ui.getFilledHistoryRows();
 		const slack =
-			filledHistoryRows === undefined
+			history?.kind === "replay"
 				? 0
-				: Math.max(0, rows - Math.min(rows, filledHistoryRows + (history?.rows.length ?? 0)) - mutable.length);
+				: Math.max(0, rows - Math.min(rows, (filledHistoryRows ?? 0) + (history?.rows.length ?? 0)) - mutable.length);
 		// Park the slack below the live rows rather than above them. Above, it
 		// splits the on-screen history from the live tail and reads as a hole
 		// punched into whatever was streaming — a table's rows included — and

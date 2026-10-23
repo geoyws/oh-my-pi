@@ -59,11 +59,11 @@ retirement writes only its un-emitted suffix.
 The coding agent's `Composer` bills that pressure against the chrome actually
 painted below the transcript in the same frame (editor, dialogs, HUDs, status
 line). Rows a growing chrome displaces therefore retire to history at once; no
-transcript row is ever clipped out of both the screen and scrollback. Once a
-paint has reached the bottom row over native history, a shrinking frame keeps
-the editor and status line on the bottom row: the freed rows become blank
-slack between the live transcript tail and the chrome until new output fills
-them, because rows already in scrollback cannot be pulled back.
+eligible settled transcript row is clipped out of both the screen and scrollback.
+The editor and status line stay on the bottom row from startup, including short
+sessions. A shrinking frame leaves blank slack between the live transcript tail
+and the chrome until new output fills it; rows already in scrollback cannot be
+pulled back. Open Markdown remains mutable until its producer publishes a stable prefix.
 
 ## 2. Rendering a frame
 

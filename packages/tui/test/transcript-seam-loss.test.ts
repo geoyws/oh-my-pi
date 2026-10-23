@@ -79,7 +79,6 @@ describe("transcript rows under chrome that outlives the turn", () => {
 			message.updateContent(reply(lines.join("\n\n")));
 			message.markTranscriptBlockFinalized();
 			composer.ui.requestRender();
-			// Past the idle-chrome settle window, the chrome that outlived the turn is permanent.
 			await scheduler.advance(terminal, 300);
 
 			const counts = new Map<number, number>();
@@ -123,8 +122,8 @@ describe("transcript rows under chrome that outlives the turn", () => {
 			try {
 				await scheduler.advance(terminal, 300);
 				if (mounting === "runtime remount") {
-					// Replacing session-aware roots resets floor bookkeeping, but
-					// does not imply another agent run or erase existing history.
+					// Replacing session-aware roots does not imply another agent run
+					// or erase existing history.
 					composer.setRuntimeChildren([transcript, chrome, editor]);
 					await scheduler.advance(terminal, 300);
 				}
@@ -150,7 +149,6 @@ describe("transcript rows under chrome that outlives the turn", () => {
 				await scheduler.advance(terminal, 300);
 				const editorRow = terminal.getViewport().findIndex(row => row.includes("EDITOR"));
 				expect(editorRow).toBeGreaterThanOrEqual(0);
-				expect(editorRow).toBeLessThan(rows - 1);
 				expect(history()).toEqual([...shell, ...lines]);
 			} finally {
 				composer.stop();
@@ -158,17 +156,16 @@ describe("transcript rows under chrome that outlives the turn", () => {
 		});
 	}
 
-	/** Stream {@link REPLY_LINES} lines under 7 rows of persistent chrome, then let the idle chrome settle. */
+	/** Stream {@link REPLY_LINES} lines under 7 rows of persistent chrome, then settle. */
 	async function streamUnderChrome(composer: Composer, scheduler: VirtualRenderScheduler, terminal: VirtualTerminal) {
 		const transcript = new TranscriptContainer();
 		const chrome = new TurnChrome();
 		const editorRoot = new Container();
 		editorRoot.addChild(composer.editor);
-		composer.setRuntimeChildren([transcript, chrome, editorRoot], { transientChrome: [editorRoot] });
+		composer.setRuntimeChildren([transcript, chrome, editorRoot]);
 		await scheduler.settle(terminal);
 		return async (beforeStream?: () => Promise<void>): Promise<string[]> => {
 			await beforeStream?.();
-			composer.setRunActive(true);
 			const message = new AssistantMessageComponent();
 			transcript.addChild(message);
 			chrome.rows = 7;
@@ -180,7 +177,6 @@ describe("transcript rows under chrome that outlives the turn", () => {
 			}
 			message.updateContent(reply(lines.join("\n\n")));
 			message.markTranscriptBlockFinalized();
-			composer.setRunActive(false);
 			composer.ui.requestRender();
 			await scheduler.advance(terminal, 300);
 			const seen = new Set<string>();

@@ -39,10 +39,7 @@ const hud = new RowsBlock("HUD");
 const status = new StatusLine();
 const editor = new Container();
 editor.addChild(new EditorStub());
-composer.setRuntimeChildren([transcript, hud, status, editor], {
-	transientChrome: [editor],
-	selfClearingChrome: [hud],
-});
+composer.setRuntimeChildren([transcript, hud, status, editor]);
 
 let lines = 0;
 const addLines = (count: number): void => {

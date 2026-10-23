@@ -87,8 +87,6 @@ export interface ChatRigOptions {
 	settled: number;
 	/** Ledger token prefix; tokens are `${prefix}${4-digit index}`. */
 	prefix: string;
-	/** The HUD clears itself (todo/subagent HUD) instead of being persistent chrome. */
-	selfClearingHud?: boolean;
 	/** Lines written to the terminal before the composer starts, scrolled into native history. */
 	shell?: readonly string[];
 }
@@ -96,7 +94,7 @@ export interface ChatRigOptions {
 /**
  * Composer chat surface: transcript, HUD, a one-line status and the editor at
  * the bottom (its draft rows above the input), prefilled with `settled`
- * finalized lines. The editor surface is transient chrome, as in the app.
+ * finalized lines.
  */
 export function createChatRig(options: ChatRigOptions): ChatRig {
 	const terminal = new RecordingTerminal(options.columns, options.rows, options.scrollback ?? 10_000);
@@ -116,10 +114,7 @@ export function createChatRig(options: ChatRigOptions): ChatRig {
 	const editor = new Container();
 	editor.addChild(draft);
 	editor.addChild(new EditorStub());
-	composer.setRuntimeChildren([transcript, hud, status, editor], {
-		transientChrome: [editor],
-		...(options.selfClearingHud === true ? { selfClearingChrome: [hud] } : {}),
-	});
+	composer.setRuntimeChildren([transcript, hud, status, editor]);
 	const paints: TuiPaint[] = [];
 	composer.ui.addPaintListener(paint => {
 		paints.push(paint);
