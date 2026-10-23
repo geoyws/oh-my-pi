@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Removed `ComposerPreferences.completeScrollback`, `RuntimeChildrenOptions.transientChrome`/`selfClearingChrome`, `Composer.setRunActive()` and `TUI.scheduleAfter()`: the composer always bills retirement against the chrome painted in the frame, so rows displaced by growing chrome go to scrollback at once and the input stays on the bottom row when it shrinks
+
 ### Added
 
 - `StatusLineComponent.setPendingModelSwitch()` and `SegmentContext.pendingModelSwitch`: while the session streams, the `model` segment renders a queued switch as `A -> B` followed by a dim ` (after this turn)`; `StatusLineComponent.hasSegment()` reports whether the effective layout shows a segment
@@ -9,6 +13,9 @@
 ### Fixed
 
 - The usage dashboard now labels Anthropic accounts as Claude.
+- Fixed transcript rows clipped by growing chrome being missing from both the screen and scrollback until the chrome shrank
+- Fixed inline overlays on a short viewport padding it to full height, which scrolled on-screen history away and moved the input to the top; overlay rows now composite at their screen position and covered history rows are restored before they can scroll
+- Stable-geometry history appends now scroll the screen and rewrite only the viewport rows whose content changed, instead of repainting the whole viewport
 - Task progress shows a subagent's provider-internal retry wait (`provider retrying N/M in …`) instead of a stalled running row ([#12785](https://github.com/can1357/oh-my-pi/pull/12785))
 ## [18.12.3] - 2026-10-19
 

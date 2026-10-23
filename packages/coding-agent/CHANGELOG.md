@@ -7,6 +7,7 @@
 - Isolated task and eval `agent()` changes are now retained as patch or branch artifacts by default instead of being applied to the parent checkout: `task.isolation.apply` defaults to `false`, and enabling it (or passing `apply: true` to `agent()`) is the explicit acceptance that integrates successful isolated changes. Previously an isolated run could copy its edits into a caller tree holding unrelated work and report `Applied patches: yes`.
 - Eval `agent()` now honors `task.isolation.apply` when `apply` is omitted instead of always applying; a per-call `apply: false` still forces artifact-only delivery.
 - Fork defaults now ship the standard look: built-in `dark-catppuccin-omp` / `light-catppuccin-omp` themes (`theme.dark` / `theme.light`, with `selectedBg` one step lighter than the pending-tool tint so hover and selection bands stay visible), `symbolPreset: nerd`, `composer.shape: borderless`, the `custom` status line (`powerline` separator, left `status, model, context_pct, mode, subagents`, right `session_name, usage, cost`, `contextLine: off`, `compactThinkingLevel: false`, `showHookStatus: false`), `startup.quiet: true`, `startup.checkUpdate: false` and `task.showResolvedModelBadge: true`. `startup.setupWizard` now defaults to `false`, so a fresh install starts without the onboarding wizard (and without loading it); `/setup` still opens it. Set the old values in config to restore the previous look.
+- Removed the `tui.completeScrollback` setting: transcript rows pushed off screen by a growing HUD, dialog or draft now always go straight to scrollback, and the input stays on the bottom row when that chrome shrinks.
 
 ### Added
 
@@ -18,6 +19,9 @@
 
 ### Fixed
 
+- Fixed transcript rows going missing from both the screen and scrollback while a HUD, dialog or multi-line draft was open, and the input lifting off the bottom row after settled chrome shrank.
+- Fixed opening a selector or other inline overlay over a short screen moving the input to the top of the terminal and scrolling on-screen history away; overlays now draw over the screen in place and the rows they covered come back when they close.
+- Reduced terminal output while streaming: appending finished rows to scrollback no longer repaints every visible row, only rows whose content changed.
 - Browser CDP connection failures retain the discovered debugger websocket URL and the transport failure reason even when Bun reports a bare handshake error.
 - Fixed `omp -p` hanging for minutes on `Working...` when the model endpoint refuses the connection (no server listening, or an egress sandbox such as NVIDIA OpenShell denying the host): each automatic retry re-ran the transport's own retry ladder against an endpoint that never answered. Print mode now ends the turn on a refused connection after the transport's retries (and any configured model fallback) and exits non-zero; interactive, RPC and ACP sessions keep retrying as before. The Anthropic client's `Couldn't connect to … (connection refused)` message is now also classified as a refused connection.
 - Exit waits for supervised services now include log closure, metadata persistence and completion notification, so resuming the owning session after an exit wait cannot race its completion replay. The existing wait timeout and cancellation still bound settlement.

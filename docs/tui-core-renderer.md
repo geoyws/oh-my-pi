@@ -56,6 +56,15 @@ current width; open Markdown and the current partial suffix remain mutable. Unde
 only the current logical head can emit enough stable rows to relieve overflow without finalizing. Final
 retirement writes only its un-emitted suffix.
 
+The coding agent's `Composer` bills that pressure against the chrome actually
+painted below the transcript in the same frame (editor, dialogs, HUDs, status
+line). Rows a growing chrome displaces therefore retire to history at once; no
+transcript row is ever clipped out of both the screen and scrollback. Once a
+paint has reached the bottom row over native history, a shrinking frame keeps
+the editor and status line on the bottom row: the freed rows become blank
+slack between the live transcript tail and the chrome until new output fills
+them, because rows already in scrollback cannot be pulled back.
+
 ## 2. Rendering a frame
 
 For every frame the TUI:
@@ -77,9 +86,24 @@ history remainder, prepares `remainder || finalViewport`, and performs one
 synchronous `terminal.write`. No block-at-a-time replay frames are observable.
 Ordinary renders never audit or rewrite terminal history.
 
-Visible overlays are screen-coordinate content. They composite over the
-viewport and never become history. Showing, updating, or closing an overlay
-only repaints the viewport.
+At stable geometry an append (or a viewport growing past the bottom row)
+scrolls the screen by a known amount: the batch overwrites the old viewport's
+leading rows, line feeds on the bottom row supply the rest of the scroll, and
+old viewport row `i + appended` lands on new row `i`. Only rows whose content
+differs from the row now under them are rewritten. A frame whose old or new
+viewport holds an image or a scaled OSC 66 span, a replay, a reset, a forced
+repaint, or a geometry change repaints the whole viewport instead.
+
+Visible overlays are screen-coordinate content and never move the viewport.
+Overlay rows that land on the viewport composite into it. Rows above it paint
+over the history still on screen, rows below it over blank rows; the renderer
+records the history rows it wrote on screen and restores each covered row
+before any later write could scroll it into scrollback, so overlay pixels never
+become history. When a covered history row cannot be rewritten (content the
+renderer did not write, an image, or a scaled OSC 66 span), the viewport
+instead extends upward with blank rows, scrolling that history into scrollback
+intact so the overlay lands on viewport-owned rows. Showing, updating, or
+closing an overlay otherwise only repaints the affected rows.
 
 ## 3. Reset and resize behavior
 
@@ -275,7 +299,9 @@ image environment settings.
    history from cross-width physical row arithmetic.
 5. Only explicit display resets and `rebuild` resize mode destructively clear
    native history.
-6. Overlays and image-budget changes remain viewport-local.
+6. Image-budget changes remain viewport-local. Overlays composite at their
+   screen rows; a covered on-screen history row is only overdrawn while the
+   overlay shows and is rewritten with its own content before it can scroll.
 7. Width handling uses the shared ANSI-aware helpers and clamps rather than
    throwing in the render hot path.
 8. The renderer never probes terminal scroll position. Terminal/multiplexer
