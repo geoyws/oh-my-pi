@@ -18,6 +18,7 @@
 
 ### Fixed
 
+- Browser CDP connection failures retain the discovered debugger websocket URL and the transport failure reason even when Bun reports a bare handshake error.
 - Fixed `omp -p` hanging for minutes on `Working...` when the model endpoint refuses the connection (no server listening, or an egress sandbox such as NVIDIA OpenShell denying the host): each automatic retry re-ran the transport's own retry ladder against an endpoint that never answered. Print mode now ends the turn on a refused connection after the transport's retries (and any configured model fallback) and exits non-zero; interactive, RPC and ACP sessions keep retrying as before. The Anthropic client's `Couldn't connect to … (connection refused)` message is now also classified as a refused connection.
 - Exit waits for supervised services now include log closure, metadata persistence and completion notification, so resuming the owning session after an exit wait cannot race its completion replay. The existing wait timeout and cancellation still bound settlement.
 - Fixed `omp --smoke-test` exiting 1 with "command ended before completing" right after the speech-to-text worker answered its ping: a worker `terminate()` awaited the reap of its `unref`'d subprocess behind a confirm timer that was `unref`'d too, so the event loop drained with the termination still pending. The bounded confirm window now holds the loop.

@@ -224,15 +224,27 @@ export async function loadPuppeteerInWorker(safeDir: string): Promise<typeof Pup
 
 /** Normalize transport event rejections before they cross browser or worker boundaries. */
 export async function connectPuppeteer(puppeteer: typeof Puppeteer, options: ConnectOptions): Promise<Browser> {
+	let endpoint = options.browserWSEndpoint ?? options.browserURL;
 	try {
+		// Resolve once here instead of inside Puppeteer so transport errors retain the actual websocket URL.
+		if (options.browserURL && !options.browserWSEndpoint && !options.transport) {
+			const response = await fetch(new URL("/json/version", options.browserURL));
+			if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
+			const { webSocketDebuggerUrl } = (await response.json()) as { webSocketDebuggerUrl: string };
+			endpoint = webSocketDebuggerUrl;
+			options = { ...options, browserURL: undefined, browserWSEndpoint: endpoint };
+		}
 		return await puppeteer.connect(options);
 	} catch (error) {
 		// The WebSocket transports can reject with ErrorEvent rather than Error.
-		// Its message includes the actual debugger endpoint and handshake failure.
-		if (!(error instanceof Error) && isRecord(error) && typeof error.message === "string") {
-			throw new Error(error.message, { cause: error });
+		const failure =
+			!(error instanceof Error) && isRecord(error) && typeof error.message === "string"
+				? new Error(error.message, { cause: error })
+				: toError(error);
+		if (endpoint && !failure.message.includes(endpoint)) {
+			throw new Error(`CDP connection to '${endpoint}' failed: ${failure.message}`, { cause: error });
 		}
-		throw toError(error);
+		throw failure;
 	}
 }
 
