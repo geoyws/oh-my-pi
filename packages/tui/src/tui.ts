@@ -1442,19 +1442,17 @@ export class TUI extends Container {
 	}
 
 	/**
-	 * Rows of native history the last paint left on screen above a mutable
-	 * viewport that reached the bottom row, or `undefined` when that paint left
-	 * rows free below it (or none happened, or a destructive reset will repaint
-	 * from row zero). Rows above a bottom-reaching viewport may already sit in
-	 * native scrollback, which a later shrink cannot pull back down.
+	 * Rows of native history the last paint left on screen above its mutable
+	 * viewport, or `undefined` when no viewport was painted (or a destructive
+	 * reset will repaint from row zero). Those rows can never be pulled back
+	 * down: above a bottom-reaching viewport they may already sit in native
+	 * scrollback, and above a viewport a terminal grow left short they are
+	 * still on screen, so any slack added beneath them would scroll them away.
 	 */
 	getFilledHistoryRows(): number | undefined {
 		if (!this.#hasEverRendered || this.#clearScrollbackOnNextRender) return undefined;
-		const height = this.terminal.rows;
-		if (this.#providerWindow.length === 0 || this.#providerViewportTop + this.#providerWindow.length < height) {
-			return undefined;
-		}
-		return Math.min(this.#providerViewportTop, height);
+		if (this.#providerWindow.length === 0) return undefined;
+		return Math.min(this.#providerViewportTop, this.terminal.rows);
 	}
 
 	/** Whether native history holds rows the frame provider committed since the last destructive reset. */

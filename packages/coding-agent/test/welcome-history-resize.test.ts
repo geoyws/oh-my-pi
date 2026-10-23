@@ -207,7 +207,10 @@ describe("composer welcome native-history resize", () => {
 		let settledViewport = terminal.getViewport().map(row => Bun.stripANSI(row));
 		expect(countRows(settledViewport, "vtest")).toBe(1);
 		expect(rowOf(settledViewport, "vtest")).toBe(rowOf(lastTransient, "vtest"));
-		expect(expectOneExactEditor(settledViewport, tail.status)).toBe(expectOneExactEditor(lastTransient, tail.status));
+		// The grow left the editor short of the new bottom; the settled frame
+		// re-anchors it there beneath the welcome, which stays on screen.
+		expect(expectOneExactEditor(settledViewport, tail.status)).toBe(settledViewport.length - 3);
+		expect(countRows(settledViewport, "Tip:")).toBe(1);
 		expect(countRows(plainBuffer(terminal), "EDITOR TOP")).toBe(1);
 		scheduler.advance(101);
 

@@ -16,6 +16,7 @@
 - Fixed transcript rows clipped by growing chrome being missing from both the screen and scrollback until the chrome shrank; composer input and status stay at the terminal bottom from startup through short sessions and chrome contraction
 - Fixed inline overlays moving a short viewport and losing covered history during resize; short-viewport overlays borrow the alternate buffer over a text snapshot, and closing a resized overlay recovers the original viewport cursor offset before repainting
 - Added `RuntimeChildrenOptions.dismissibleChrome`: below-transcript panels listed there, and the editor's autocomplete dropdown, cover the transcript tail while open instead of retiring the rows they displace, so closing them puts those rows back in place with no blank band above the input (`Editor.takeRenderedAutocompleteRows()` reports the dropdown rows a frame painted)
+- Fixed growing the terminal over a short session scrolling the on-screen welcome and history away behind a blank screen once the resize settled; the input re-anchors to the new bottom row beneath the rows still on screen
 - Stable-geometry history appends now scroll the screen and rewrite only the viewport rows whose content changed, instead of repainting the whole viewport
 - Task progress shows a subagent's provider-internal retry wait (`provider retrying N/M in …`) instead of a stalled running row ([#12785](https://github.com/can1357/oh-my-pi/pull/12785))
 ## [18.12.3] - 2026-10-19
