@@ -99,4 +99,70 @@ describe("owner checkpoint terminal flow", () => {
 			session.agent.state.isStreaming = false;
 		}
 	}, 15_000);
+
+	it.each(["shell", "Python"] as const)("refuses /park without aborting a real foreground %s execution", async kind => {
+		const quit = vi.spyOn(postmortem, "quit").mockResolvedValue();
+		await mode.init({ suppressWelcomeIntro: true });
+		void mode.getUserInput();
+		await terminal.waitForRender();
+		const releaseFile = path.join(dir.path(), "release-foreground");
+		const ready = Promise.withResolvers<void>();
+		const onChunk = (chunk: string) => { if (chunk.includes("owner-ready")) ready.resolve(); };
+		const execution = kind === "shell"
+			? session.executeBash("printf owner-ready; while [ ! -f " + JSON.stringify(releaseFile) + " ]; do sleep 0.01; done; printf owner-finished", onChunk, { useUserShell: false })
+			: session.executePython("import os, time\nprint('owner-ready', flush=True)\nwhile not os.path.exists(" + JSON.stringify(releaseFile) + "):\n    time.sleep(0.01)\nprint('owner-finished', flush=True)", onChunk);
+		try {
+			await Promise.race([ready.promise, execution.then(result => { throw new Error("Foreground execution ended before readiness: " + result.output); })]);
+			expect(kind === "shell" ? session.isBashRunning : session.isEvalRunning).toBe(true);
+			terminal.sendInput("/park");
+			await terminal.waitForRender();
+			terminal.sendInput("\r");
+			await terminal.waitForRender(() => mode.isShuttingDown || terminal.getViewport().some(row => Bun.stripANSI(row).includes("Checkpoint refused")));
+			expect(mode.isShuttingDown).toBe(false);
+			expect(quit).not.toHaveBeenCalled();
+			expect(kind === "shell" ? session.isBashRunning : session.isEvalRunning).toBe(true);
+			await Bun.write(releaseFile, "release");
+			const result = await execution;
+			expect(result.exitCode).toBe(0);
+			expect(result.output).toContain("owner-finished");
+		} finally {
+			await Bun.write(releaseFile, "release");
+			await execution;
+		}
+	}, 20_000);
+
+	it("keeps a resumed draft-only owner resumable after /park disposes and closes it", async () => {
+		await manager.saveDraft("resumed draft");
+		const file = manager.getSessionFile()!;
+		const id = manager.getSessionId();
+		await manager.close();
+		await manager.setSessionFile(file);
+		const quit = Promise.withResolvers<void>();
+		vi.spyOn(postmortem, "quit").mockImplementation(async code => {
+			expect(code).toBe(0);
+			quit.resolve();
+		});
+		await mode.init({ suppressWelcomeIntro: true });
+		void mode.getUserInput();
+		await terminal.waitForRender();
+		expect(terminal.getViewport().join("\n")).toContain("resumed draft");
+		terminal.sendInput("\x15");
+		await terminal.waitForRender();
+		terminal.sendInput("/park");
+		await terminal.waitForRender();
+		terminal.sendInput("\r");
+		await quit.promise;
+		expect(mode.isShuttingDown).toBe(true);
+		expect(manager.isSessionOnDisk()).toBe(true);
+		const reopened = await SessionManager.open(file);
+		try {
+			expect(reopened.getSessionId()).toBe(id);
+			expect(reopened.getSessionFile()).toBe(file);
+			await reopened.close();
+			expect(reopened.isSessionOnDisk()).toBe(true);
+		} finally {
+			await reopened.close();
+		}
+	}, 15_000);
+
 });

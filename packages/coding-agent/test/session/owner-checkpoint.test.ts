@@ -20,6 +20,8 @@ async function fixture() {
 	const state = {
 		sessionManager: manager,
 		isStreaming: false,
+		isBashRunning: false,
+		isEvalRunning: false,
 		hasAdmittedSubmission: false,
 		queuedMessageCount: 0,
 		isCompacting: false,
@@ -46,7 +48,7 @@ describe("explicit owner checkpoint", () => {
 		);
 		expect(reopened).toBeDefined();
 	});
-	it.each(["isStreaming", "hasAdmittedSubmission", "isCompacting", "isGeneratingHandoff"] as const)(
+	it.each(["isStreaming", "isBashRunning", "isEvalRunning", "hasAdmittedSubmission", "isCompacting", "isGeneratingHandoff"] as const)(
 		"preserves %s work",
 		async field => {
 			const { state, session, manager } = await fixture();
@@ -120,7 +122,7 @@ describe("explicit owner checkpoint", () => {
 			),
 		).rejects.toThrow("identifiable");
 	});
-	it("does not close if work arrives while the checkpoint becomes durable", async () => {
+	it.each(["isStreaming", "isBashRunning", "isEvalRunning"] as const)("does not close if %s starts during persistence", async field => {
 		const { state, session } = await fixture();
 		let reads = 0;
 		await expect(
@@ -131,7 +133,7 @@ describe("explicit owner checkpoint", () => {
 				},
 				() => false,
 				() => {
-					if (++reads === 2) state.isStreaming = true;
+					if (++reads === 2) state[field] = true;
 					return identity();
 				},
 			),
