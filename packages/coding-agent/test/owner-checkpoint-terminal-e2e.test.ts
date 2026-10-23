@@ -66,7 +66,9 @@ describe("owner checkpoint terminal flow", () => {
 		void mode.getUserInput();
 		await terminal.waitForRender();
 		const id = manager.getSessionId();
-		terminal.sendInput("/park\r");
+		terminal.sendInput("/park");
+		await terminal.waitForRender();
+		terminal.sendInput("\r");
 		await quit.promise;
 		expect(mode.isShuttingDown).toBe(true);
 		expect(manager.isSessionOnDisk()).toBe(true);
@@ -84,7 +86,9 @@ describe("owner checkpoint terminal flow", () => {
 		await terminal.waitForRender();
 		session.agent.state.isStreaming = true;
 		try {
-			terminal.sendInput("/park\r");
+			terminal.sendInput("/park");
+			await terminal.waitForRender();
+			terminal.sendInput("\r");
 			await terminal.waitForRender(() =>
 				terminal.getViewport().some(row => Bun.stripANSI(row).includes("Checkpoint refused")),
 			);
