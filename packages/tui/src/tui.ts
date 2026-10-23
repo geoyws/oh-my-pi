@@ -1442,16 +1442,16 @@ export class TUI extends Container {
 	}
 
 	/**
-	 * Rows of native history the last paint left on screen above its mutable
-	 * viewport, or `undefined` when no viewport was painted (or a destructive
-	 * reset will repaint from row zero). Those rows can never be pulled back
-	 * down: above a bottom-reaching viewport they may already sit in native
-	 * scrollback, and above a viewport a terminal grow left short they are
-	 * still on screen, so any slack added beneath them would scroll them away.
+	 * Rows of native history on screen above the mutable viewport, or
+	 * `undefined` before the first paint or when a destructive reset will
+	 * repaint from row zero. Those rows can never be pulled back down: above a
+	 * bottom-reaching viewport they may already sit in native scrollback, and
+	 * above a viewport a terminal grow left short they are still on screen, so
+	 * slack added beneath them must not scroll them away. A settling resize
+	 * empties the window but keeps its recovered anchor in the viewport top.
 	 */
 	getFilledHistoryRows(): number | undefined {
 		if (!this.#hasEverRendered || this.#clearScrollbackOnNextRender) return undefined;
-		if (this.#providerWindow.length === 0) return undefined;
 		return Math.min(this.#providerViewportTop, this.terminal.rows);
 	}
 
