@@ -2072,7 +2072,13 @@ export class TurnRecovery {
 		if (!cfgRetryModelFallback.get(this.#host.settings)) return false;
 
 		let fallback:
-			| { role: string; selector: RetryFallbackSelector; apiKey: string; model: Model; account?: ModelUsageAccountHealth }
+			| {
+					role: string;
+					selector: RetryFallbackSelector;
+					apiKey: string;
+					model: Model;
+					account?: ModelUsageAccountHealth;
+			  }
 			| undefined;
 		const ceiling = this.#host.thinkingLevelCeiling();
 		const chainKeys = this.retryFallbackChainKeys(currentSelector, currentModel);
