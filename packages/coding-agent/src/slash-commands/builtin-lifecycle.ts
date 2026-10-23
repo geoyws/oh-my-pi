@@ -139,13 +139,20 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		name: "park",
 		icon: "pause",
 		description: "Checkpoint this idle terminal session and exit; resume when pressure clears",
-		getTuiAutocompleteDescription: runtime => runtime.ctx.session.isStreaming
-			? "Park: wait for active work to finish" : "Park: save and exit this owner only",
-		handle: async (_command, runtime) => usage("Use /park in the owning terminal; no remote process will be stopped.", runtime),
+		getTuiAutocompleteDescription: runtime =>
+			runtime.ctx.session.isStreaming
+				? "Park: wait for active work to finish"
+				: "Park: save and exit this owner only",
+		handle: async (_command, runtime) =>
+			usage("Use /park in the owning terminal; no remote process will be stopped.", runtime),
 		handleTui: async (command, runtime) => {
 			clearSubmittedText(runtime);
 			try {
-				await checkpointOwnerSession(runtime.ctx.session, () => runtime.ctx.shutdown(), () => runtime.ctx.hasPendingSubmission());
+				await checkpointOwnerSession(
+					runtime.ctx.session,
+					() => runtime.ctx.shutdown(),
+					() => runtime.ctx.hasPendingSubmission(),
+				);
 			} catch (error) {
 				runtime.ctx.showError(errorMessage(error));
 				restoreRefusedLine(runtime.ctx.editor, command.text, runtime.input?.images, runtime.input?.imageLinks);

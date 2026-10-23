@@ -302,10 +302,18 @@ export class AgentLifecycleManager {
 
 	#canReclaim(ref: AgentRef): boolean {
 		const session = ref.session;
-		return ref.status === "idle" && !!ref.sessionFile && !!session &&
+		return (
+			ref.status === "idle" &&
+			!!ref.sessionFile &&
+			!!session &&
 			session.sessionManager.getSessionFile() === ref.sessionFile &&
-			!session.isStreaming && !session.hasAdmittedSubmission && session.queuedMessageCount === 0 &&
-			!session.hasPendingAsyncWork() && !session.isCompacting && !session.isGeneratingHandoff;
+			!session.isStreaming &&
+			!session.hasAdmittedSubmission &&
+			session.queuedMessageCount === 0 &&
+			!session.hasPendingAsyncWork() &&
+			!session.isCompacting &&
+			!session.isGeneratingHandoff
+		);
 	}
 
 	async #park(id: string, idleOnly: boolean): Promise<void> {

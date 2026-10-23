@@ -14,17 +14,21 @@ type AdmissionRunner = (command: string) => Promise<AdmissionResult>;
 function runAdmission(command: string): Promise<AdmissionResult> {
 	const { promise, resolve, reject } = Promise.withResolvers<AdmissionResult>();
 	execFile(command, [], { timeout: 12_000, maxBuffer: 65_536, encoding: "utf8" }, (error, stdout, stderr) => {
-		if (error && (typeof error.code !== "number" || error.killed)) {
+		const code = error ? error.code : 0;
+		if (typeof code !== "number" || error?.killed) {
 			reject(error);
 			return;
 		}
-		resolve({ code: error?.code ?? 0, stdout, stderr });
+		resolve({ code, stdout, stderr });
 	});
 	return promise;
 }
 
 export class PressureAdmissionError extends Error {
-	constructor(readonly exitCode: 75 | 78, detail: string) {
+	constructor(
+		readonly exitCode: 75 | 78,
+		detail: string,
+	) {
 		super(`New agent refused: ${detail}. Existing sessions can finish and checkpoint; no session was killed.`);
 		this.name = "PressureAdmissionError";
 	}
@@ -49,10 +53,15 @@ export async function requireNewAgentAdmission(
 	try {
 		const report = JSON.parse(result.stdout);
 		if (
-			result.code !== 0 || report?.schema !== 1 || report.admitted !== true ||
-			typeof report.reason !== "string" || typeof report.measuredAt !== "string" ||
-			!("memory" in report) || !("pressureLevel" in report)
-		) throw new Error("invalid policy response or exit status");
+			result.code !== 0 ||
+			report?.schema !== 1 ||
+			report.admitted !== true ||
+			typeof report.reason !== "string" ||
+			typeof report.measuredAt !== "string" ||
+			!("memory" in report) ||
+			!("pressureLevel" in report)
+		)
+			throw new Error("invalid policy response or exit status");
 	} catch (error) {
 		throw new PressureAdmissionError(78, `medic admission unavailable (${String(error)})`);
 	}

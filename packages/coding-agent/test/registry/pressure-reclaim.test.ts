@@ -25,13 +25,26 @@ async function fixture() {
 	lifecycles.push(lifecycle);
 	let disposed = false;
 	const state = {
-		sessionManager: manager, isStreaming: false, hasAdmittedSubmission: false,
-		queuedMessageCount: 0, isCompacting: false, isGeneratingHandoff: false,
+		sessionManager: manager,
+		isStreaming: false,
+		hasAdmittedSubmission: false,
+		queuedMessageCount: 0,
+		isCompacting: false,
+		isGeneratingHandoff: false,
 		hasPendingAsyncWork: () => false,
-		dispose: async () => { disposed = true; await manager.close(); },
+		dispose: async () => {
+			disposed = true;
+			await manager.close();
+		},
 	};
-	const ref = registry.register({ id: "worker", displayName: "worker", kind: "sub", status: "idle",
-		session: state as unknown as AgentSession, sessionFile: manager.getSessionFile() });
+	const ref = registry.register({
+		id: "worker",
+		displayName: "worker",
+		kind: "sub",
+		status: "idle",
+		session: state as unknown as AgentSession,
+		sessionFile: manager.getSessionFile(),
+	});
 	lifecycle.adopt(ref.id, { idleTtlMs: 0 }, ref);
 	return { registry, lifecycle, ref, state, manager, disposed: () => disposed };
 }
@@ -47,13 +60,16 @@ describe("pressure reclaim", () => {
 		managers.push(reopened);
 		expect(reopened.getSessionId()).toBe(f.manager.getSessionId());
 	});
-	it.each(["isStreaming", "hasAdmittedSubmission", "isCompacting", "isGeneratingHandoff"] as const)("does not reclaim %s work", async field => {
-		const f = await fixture();
-		f.state[field] = true;
-		await f.lifecycle.reclaimIdle();
-		expect(f.ref.status).toBe("idle");
-		expect(f.disposed()).toBe(false);
-	});
+	it.each(["isStreaming", "hasAdmittedSubmission", "isCompacting", "isGeneratingHandoff"] as const)(
+		"does not reclaim %s work",
+		async field => {
+			const f = await fixture();
+			f.state[field] = true;
+			await f.lifecycle.reclaimIdle();
+			expect(f.ref.status).toBe("idle");
+			expect(f.disposed()).toBe(false);
+		},
+	);
 	it("preserves an agent which becomes active during the parking cancel window", async () => {
 		const f = await fixture();
 		const reclaim = f.lifecycle.reclaimIdle();
@@ -66,16 +82,31 @@ describe("pressure reclaim", () => {
 		const f = await fixture();
 		const reclaim = f.lifecycle.reclaimIdle();
 		f.registry.unregister(f.ref.id, f.ref);
-		const replacement = f.registry.register({ id: f.ref.id, displayName: "new", kind: "sub", status: "running", session: null });
+		const replacement = f.registry.register({
+			id: f.ref.id,
+			displayName: "new",
+			kind: "sub",
+			status: "running",
+			session: null,
+		});
 		await reclaim;
 		expect(f.registry.get(f.ref.id)).toBe(replacement);
 		expect(replacement.status).toBe("running");
 	});
 	it("does not reclaim idle sessions this manager does not own", async () => {
 		const f = await fixture();
-		const foreign = f.registry.register({ id: "foreign", displayName: "foreign", kind: "sub", status: "idle", session: f.state as unknown as AgentSession });
+		const other = await fixture();
+		const foreign = f.registry.register({
+			id: "foreign",
+			displayName: "foreign",
+			kind: "sub",
+			status: "idle",
+			session: other.state as unknown as AgentSession,
+			sessionFile: other.ref.sessionFile,
+		});
 		await f.lifecycle.reclaimIdle();
-		expect(foreign.session).toBe(f.state as unknown as AgentSession);
+		expect(foreign.session).toBe(other.state as unknown as AgentSession);
+		expect(other.disposed()).toBe(false);
 		expect(foreign.status).toBe("idle");
 	});
 	it("coalesces concurrent owner reclaim requests", async () => {

@@ -34,52 +34,122 @@ describe("explicit owner checkpoint", () => {
 	it("materializes a resumable transcript before closing the actual owner", async () => {
 		const { session, manager } = await fixture();
 		let reopened: SessionManager | undefined;
-		await checkpointOwnerSession(session, async () => {
-			expect(manager.isSessionOnDisk()).toBe(true);
-			reopened = await SessionManager.open(manager.getSessionFile()!);
-			managers.push(reopened);
-			expect(reopened.getSessionId()).toBe(manager.getSessionId());
-		}, () => false);
+		await checkpointOwnerSession(
+			session,
+			async () => {
+				expect(manager.isSessionOnDisk()).toBe(true);
+				reopened = await SessionManager.open(manager.getSessionFile()!);
+				managers.push(reopened);
+				expect(reopened.getSessionId()).toBe(manager.getSessionId());
+			},
+			() => false,
+		);
 		expect(reopened).toBeDefined();
 	});
-	it.each(["isStreaming", "hasAdmittedSubmission", "isCompacting", "isGeneratingHandoff"] as const)("preserves %s work", async field => {
-		const { state, session, manager } = await fixture();
-		state[field] = true;
-		await expect(checkpointOwnerSession(session, async () => { throw new Error("must not close"); }, () => false, identity)).rejects.toThrow("idle");
-		expect(manager.isSessionOnDisk()).toBe(false);
-	});
+	it.each(["isStreaming", "hasAdmittedSubmission", "isCompacting", "isGeneratingHandoff"] as const)(
+		"preserves %s work",
+		async field => {
+			const { state, session, manager } = await fixture();
+			state[field] = true;
+			await expect(
+				checkpointOwnerSession(
+					session,
+					async () => {
+						throw new Error("must not close");
+					},
+					() => false,
+					identity,
+				),
+			).rejects.toThrow("idle");
+			expect(manager.isSessionOnDisk()).toBe(false);
+		},
+	);
 	it.each(["queued", "async", "submission"])("preserves pending %s work", async kind => {
 		const { state, session } = await fixture();
 		if (kind === "queued") state.queuedMessageCount = 1;
 		if (kind === "async") state.hasPendingAsyncWork = () => true;
-		await expect(checkpointOwnerSession(session, async () => { throw new Error("must not close"); }, () => kind === "submission", identity)).rejects.toThrow("idle");
+		await expect(
+			checkpointOwnerSession(
+				session,
+				async () => {
+					throw new Error("must not close");
+				},
+				() => kind === "submission",
+				identity,
+			),
+		).rejects.toThrow("idle");
 	});
 	it("refuses PID reuse after persistence without closing", async () => {
 		const { session } = await fixture();
 		let reads = 0;
-		await expect(checkpointOwnerSession(session, async () => { throw new Error("must not close"); }, () => false,
-			() => ({ pid: 42, startTime: reads++ === 0 ? 100 : 101 }))).rejects.toThrow("identity or activity changed");
+		await expect(
+			checkpointOwnerSession(
+				session,
+				async () => {
+					throw new Error("must not close");
+				},
+				() => false,
+				() => ({ pid: 42, startTime: reads++ === 0 ? 100 : 101 }),
+			),
+		).rejects.toThrow("identity or activity changed");
 	});
 	it("refuses a changed PID after persistence", async () => {
 		const { session } = await fixture();
 		let reads = 0;
-		await expect(checkpointOwnerSession(session, async () => { throw new Error("must not close"); }, () => false,
-			() => ({ pid: reads++ === 0 ? 42 : 43, startTime: 100 }))).rejects.toThrow("identity or activity changed");
+		await expect(
+			checkpointOwnerSession(
+				session,
+				async () => {
+					throw new Error("must not close");
+				},
+				() => false,
+				() => ({ pid: reads++ === 0 ? 42 : 43, startTime: 100 }),
+			),
+		).rejects.toThrow("identity or activity changed");
 	});
 	it("refuses an unidentifiable owner", async () => {
 		const { session } = await fixture();
-		await expect(checkpointOwnerSession(session, async () => { throw new Error("must not close"); }, () => false, () => undefined)).rejects.toThrow("identifiable");
+		await expect(
+			checkpointOwnerSession(
+				session,
+				async () => {
+					throw new Error("must not close");
+				},
+				() => false,
+				() => undefined,
+			),
+		).rejects.toThrow("identifiable");
 	});
 	it("does not close if work arrives while the checkpoint becomes durable", async () => {
 		const { state, session } = await fixture();
 		let reads = 0;
-		await expect(checkpointOwnerSession(session, async () => { throw new Error("must not close"); }, () => false,
-			() => { if (++reads === 2) state.isStreaming = true; return identity(); })).rejects.toThrow("identity or activity changed");
+		await expect(
+			checkpointOwnerSession(
+				session,
+				async () => {
+					throw new Error("must not close");
+				},
+				() => false,
+				() => {
+					if (++reads === 2) state.isStreaming = true;
+					return identity();
+				},
+			),
+		).rejects.toThrow("identity or activity changed");
 	});
 	it("never advertises an in-memory session as resumable", async () => {
 		const { state } = await fixture();
 		state.sessionManager = SessionManager.inMemory();
 		managers.push(state.sessionManager);
-		await expect(checkpointOwnerSession(state as unknown as AgentSession, async () => { throw new Error("must not close"); }, () => false, identity)).rejects.toThrow("no durable transcript");
+		await expect(
+			checkpointOwnerSession(
+				state as unknown as AgentSession,
+				async () => {
+					throw new Error("must not close");
+				},
+				() => false,
+				identity,
+			),
+		).rejects.toThrow("no durable transcript");
 	});
 });
