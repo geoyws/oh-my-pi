@@ -289,6 +289,26 @@ export class AgentLifecycleManager {
 	 * arrives before detach cancels the park and keeps the live session.
 	 */
 	async park(id: string): Promise<void> {
+		return this.#park(id, false);
+	}
+
+	/** Owner-confirmed idle sessions only; persistence and generation are revalidated before detach. */
+	async reclaimIdle(): Promise<void> {
+		for (const [id, adoption] of this.#adopted) {
+			if (this.#registry.get(id) !== adoption.ref || !this.#canReclaim(adoption.ref)) continue;
+			await this.#park(id, true);
+		}
+	}
+
+	#canReclaim(ref: AgentRef): boolean {
+		const session = ref.session;
+		return ref.status === "idle" && !!ref.sessionFile && !!session &&
+			session.sessionManager.getSessionFile() === ref.sessionFile &&
+			!session.isStreaming && !session.hasAdmittedSubmission && session.queuedMessageCount === 0 &&
+			!session.hasPendingAsyncWork() && !session.isCompacting && !session.isGeneratingHandoff;
+	}
+
+	async #park(id: string, idleOnly: boolean): Promise<void> {
 		const existing = this.#parks.get(id);
 		if (existing) return existing.promise;
 
@@ -298,6 +318,7 @@ export class AgentLifecycleManager {
 		if (!ref || adopted.ref !== ref) return;
 		const session = ref.session;
 		if (!session) return;
+		if (idleOnly && !this.#canReclaim(ref)) return;
 
 		if (adopted.timer) {
 			clearTimeout(adopted.timer);
@@ -326,6 +347,12 @@ export class AgentLifecycleManager {
 				// commit to dispose. Deterministic with Promise microtasks; no timers.
 				await Promise.resolve();
 				if (cancelled) return;
+				if (idleOnly) {
+					if (!this.#canReclaim(ref)) return;
+					await session.sessionManager.ensureOnDisk();
+					await session.sessionManager.flush();
+					if (cancelled || !this.#canReclaim(ref) || !session.sessionManager.isSessionOnDisk()) return;
+				}
 
 				// Re-check liveness: release/unregister/replace may have raced us.
 				const live = this.#registry.get(id);

@@ -166,6 +166,7 @@ import type { MnemopiSessionState } from "./mnemopi/state";
 import mcpXdevGuidanceTemplate from "./prompts/system/mcp-xdev-guidance.md" with { type: "text" };
 import lateDiagnosticTemplate from "./prompts/tools/lsp-late-diagnostic.md" with { type: "text" };
 import { AgentLifecycleManager } from "./registry/agent-lifecycle";
+import { PressureAdmissionError, requireNewAgentAdmission } from "./session/pressure-admission";
 import { type AgentKind, type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "./registry/agent-registry";
 import {
 	buildSecretObfuscator,
@@ -1753,6 +1754,15 @@ export function createAutoLearnCaptureRunner(
  * ```
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
+	try {
+		await requireNewAgentAdmission();
+	} catch (error) {
+		// Reclaim only this runtime's adopted, durable idle sessions. Never signal another process.
+		if (error instanceof PressureAdmissionError && !options.agentRegistry) {
+			await AgentLifecycleManager.global().reclaimIdle();
+		}
+		throw error;
+	}
 	registerLocalInferenceApi();
 	await loadRuntimeIdentity();
 	const extensionRoots = options.extensionRoots?.();
