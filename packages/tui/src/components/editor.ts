@@ -877,9 +877,6 @@ export class Editor implements Component, Focusable {
 	setPromptGutter(promptGutter: string | undefined): void {
 		this.#promptGutter = promptGutter;
 	}
-	getBorderStyle(): EditorBorderStyle {
-		return this.#borderStyle;
-	}
 
 	setBorderStyle(style: EditorBorderStyle): void {
 		if (this.#borderStyle === style) return;
