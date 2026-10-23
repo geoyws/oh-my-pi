@@ -12,6 +12,7 @@ import type {
 	CodexCompactionContext,
 	Effort,
 	Model,
+	ModelUsageAccountHealth,
 	ModelUsageHealth,
 	TextContent,
 	ToolChoice,
@@ -354,6 +355,45 @@ type UsageLimitOutcome = {
 	priorBlockedUntilTimed: boolean | undefined;
 	reportResetAtMs: number | undefined;
 };
+
+/** The active model or one fallback rung quota recovery may route to. */
+type QuotaRecoveryCandidate = {
+	model: Model;
+	/** The chain rung; `undefined` for the active model. */
+	fallback?: { role: string; selector: RetryFallbackSelector };
+};
+
+/** A candidate and the managed account it would use; no account for a route without quota tracking. */
+type QuotaRecoveryChoice = {
+	candidate: QuotaRecoveryCandidate;
+	account?: ModelUsageAccountHealth;
+};
+
+/**
+ * Quota recovery's comparison of every eligible candidate: the routes that can
+ * serve now, in configured order, and the earliest provider-stated reset after
+ * which an exhausted account can serve again.
+ */
+type QuotaRecoveryPlan = {
+	usableNow: QuotaRecoveryChoice[];
+	wake?: { choice: QuotaRecoveryChoice; wakeAtMs: number };
+	compared: number;
+};
+
+/** An armed quota-recovery wake: what it waits for, and everything it re-checks at wake. */
+type QuotaRecoveryWait = {
+	choice: QuotaRecoveryChoice;
+	wakeAtMs: number;
+	candidates: QuotaRecoveryCandidate[];
+	failedSelector: string;
+	activeModel: Model;
+	sessionId: string;
+	/** The usage-limit error that started the wait, for the failed selector's cooldown. */
+	errorMessage: string;
+};
+
+/** How an armed quota wake settled once its timer fired. */
+type QuotaRecoveryWakeOutcome = { outcome: "resumed" | "superseded" } | { outcome: "exhausted"; detail: string };
 
 /** Owns terminal-stop recovery, automatic retries, and fallback routing. */
 export class TurnRecovery {
@@ -2254,18 +2294,22 @@ export class TurnRecovery {
 		return true;
 	}
 
-	async #tryRetryModelFallback(
+	/**
+	 * Fallback rungs {@link #tryRetryModelFallback} may apply, in walk order and
+	 * before credential resolution: resolved, not cooling down, a real change of
+	 * request, within the effort ceiling, fitting the retry context, and safe for
+	 * the latest assistant turn. Quota recovery compares exactly these rungs.
+	 */
+	*#retryFallbackRungs(
 		currentSelector: string,
 		failedMessage: AssistantMessage,
 		options?: {
 			excludeProvider?: string;
-			pinFallback?: boolean;
 			preserveFailedTurn?: boolean;
 			wrapAround?: boolean;
-			/** This hop is a classifier-refusal walk, which visits each model at most once per turn. */
 			refusalWalk?: boolean;
 		},
-	): Promise<boolean> {
+	): Generator<{ role: string; selector: RetryFallbackSelector; candidate: Model; canRedeemFallbackCredit: boolean }> {
 		const ceiling = this.#host.thinkingLevelCeiling();
 		const latestAssistant = options?.preserveFailedTurn
 			? failedMessage
@@ -2334,49 +2378,263 @@ export class TurnRecovery {
 				if (!this.#host.contextFitsModel(candidate, options?.preserveFailedTurn ? undefined : failedMessage)) {
 					continue;
 				}
-				// A session restricted to an OAuth account pool throws for a provider
-				// none of its pooled accounts can serve; that candidate is unavailable,
-				// exactly like one without a credential.
-				let apiKey: string | undefined;
-				try {
-					apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
-				} catch (error) {
-					if (!(error instanceof AIError.MissingApiKeyError)) throw error;
-				}
-				if (!apiKey) continue;
-				const previousEditMode = this.#host.resolveActiveEditMode();
-				const previousSystemPrompt = [...this.#host.agent.state.systemPrompt];
-				const previousTools = [...this.#host.agent.state.tools];
-				const applied = await this.applyRetryFallbackCandidate(role, selector, currentSelector, {
-					...options,
-					reason: `Request failed: ${failedMessage.errorMessage ?? "provider returned an error without details"}`,
-				});
-				// Redemption replays the refused request's frozen `system` and `tools`. If the
-				// swap rebuilt either, the fallback model would be prompted with, and call tools
-				// through, a surface the agent no longer runs: send a fresh request instead.
-				const { systemPrompt, tools } = this.#host.agent.state;
-				const requestSurfaceUnchanged =
-					this.#host.resolveActiveEditMode() === previousEditMode &&
-					Bun.deepEquals(systemPrompt, previousSystemPrompt) &&
-					tools.length === previousTools.length &&
-					tools.every((tool, index) => tool === previousTools[index]);
-				if (
-					applied &&
-					options?.pinFallback === true &&
-					creditHandle !== undefined &&
-					canRedeemFallbackCredit &&
-					requestSurfaceUnchanged
-				) {
-					this.#activeFallbackCreditRedemption = {
-						targetSelector: `${candidate.provider}/${candidate.id}`,
-						handle: creditHandle,
-					};
-				}
-				return applied;
+				yield { role, selector, candidate, canRedeemFallbackCredit };
 			}
+		}
+	}
+
+	/**
+	 * The API key a fallback rung would send, or `undefined` when it has none. A
+	 * session restricted to an OAuth account pool throws for a provider none of its
+	 * pooled accounts can serve; that candidate is unavailable, exactly like one
+	 * without a credential.
+	 */
+	async #retryFallbackApiKey(candidate: Model): Promise<string | undefined> {
+		try {
+			return await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
+		} catch (error) {
+			if (!(error instanceof AIError.MissingApiKeyError)) throw error;
+			return undefined;
+		}
+	}
+
+	async #tryRetryModelFallback(
+		currentSelector: string,
+		failedMessage: AssistantMessage,
+		options?: {
+			excludeProvider?: string;
+			pinFallback?: boolean;
+			preserveFailedTurn?: boolean;
+			wrapAround?: boolean;
+			/** This hop is a classifier-refusal walk, which visits each model at most once per turn. */
+			refusalWalk?: boolean;
+		},
+	): Promise<boolean> {
+		const creditHandle = failedMessage.fallbackCreditHandle;
+		for (const { role, selector, candidate, canRedeemFallbackCredit } of this.#retryFallbackRungs(
+			currentSelector,
+			failedMessage,
+			options,
+		)) {
+			const apiKey = await this.#retryFallbackApiKey(candidate);
+			if (!apiKey) continue;
+			const previousEditMode = this.#host.resolveActiveEditMode();
+			const previousSystemPrompt = [...this.#host.agent.state.systemPrompt];
+			const previousTools = [...this.#host.agent.state.tools];
+			const applied = await this.applyRetryFallbackCandidate(role, selector, currentSelector, {
+				...options,
+				reason: `Request failed: ${failedMessage.errorMessage ?? "provider returned an error without details"}`,
+			});
+			// Redemption replays the refused request's frozen `system` and `tools`. If the
+			// swap rebuilt either, the fallback model would be prompted with, and call tools
+			// through, a surface the agent no longer runs: send a fresh request instead.
+			const { systemPrompt, tools } = this.#host.agent.state;
+			const requestSurfaceUnchanged =
+				this.#host.resolveActiveEditMode() === previousEditMode &&
+				Bun.deepEquals(systemPrompt, previousSystemPrompt) &&
+				tools.length === previousTools.length &&
+				tools.every((tool, index) => tool === previousTools[index]);
+			if (
+				applied &&
+				options?.pinFallback === true &&
+				creditHandle !== undefined &&
+				canRedeemFallbackCredit &&
+				requestSurfaceUnchanged
+			) {
+				this.#activeFallbackCreditRedemption = {
+					targetSelector: `${candidate.provider}/${candidate.id}`,
+					handle: creditHandle,
+				};
+			}
+			return applied;
 		}
 
 		return false;
+	}
+
+	/**
+	 * Compare live account health across quota-recovery candidates. A route can
+	 * serve now only on known available quota (`healthy`), or — for a fallback
+	 * rung — when its provider tracks no quota at all, which the configured chain
+	 * alone authorizes. An exhausted account is a wake target only when the
+	 * provider stated when every limiting window clears (`resetIsAuthoritative`).
+	 * Exhausted accounts without that, `reserve`, and `unknown` accounts are
+	 * neither usable now nor a wake: unknown quota is never evidence of quota.
+	 * Ties keep configured order: the active model, then chain order.
+	 */
+	async #planQuotaRecovery(
+		candidates: readonly QuotaRecoveryCandidate[],
+		signal: AbortSignal,
+	): Promise<QuotaRecoveryPlan> {
+		const authStorage = this.#host.modelRegistry.authStorage;
+		const sessionId = this.#host.sessionId();
+		// The usage reserve belongs to usage-aware routing; without it, only
+		// per-account reserve policy marks an account as held back.
+		const reserveFraction = cfgRetryUsageAwareFallback.get(this.#host.settings)
+			? cfgRetryUsageReservePct.get(this.#host.settings) / 100
+			: 0;
+		const plan: QuotaRecoveryPlan = { usableNow: [], compared: candidates.length };
+		for (const candidate of candidates) {
+			const { provider, id: modelId, baseUrl } = candidate.model;
+			let health: ModelUsageHealth;
+			try {
+				health = await authStorage.health.model(provider, { modelId, sessionId, baseUrl, reserveFraction, signal });
+			} catch (error) {
+				signal.throwIfAborted();
+				logger.debug("Quota recovery could not read usage health", { provider, model: modelId, error: String(error) });
+				continue;
+			}
+			signal.throwIfAborted();
+			if (health.accounts.length === 0) {
+				if (candidate.fallback && health.state === "unknown") plan.usableNow.push({ candidate });
+				continue;
+			}
+			const nowMs = Date.now();
+			let usable: ModelUsageAccountHealth | undefined;
+			for (const account of health.accounts) {
+				if (!authStorage.sessions.permits(provider, sessionId, account.credentialId)) continue;
+				if (account.state === "healthy") {
+					if (
+						!usable ||
+						(account.selected && !usable.selected) ||
+						(!usable.selected && (account.remainingFraction ?? 0) > (usable.remainingFraction ?? 0))
+					) {
+						usable = account;
+					}
+					continue;
+				}
+				const resetsAt = account.resetsAt;
+				if (
+					account.state !== "depleted" ||
+					account.resetIsAuthoritative !== true ||
+					resetsAt === undefined ||
+					!Number.isFinite(resetsAt) ||
+					resetsAt <= nowMs
+				) {
+					continue;
+				}
+				if (!plan.wake || resetsAt < plan.wake.wakeAtMs) {
+					plan.wake = { choice: { candidate, account }, wakeAtMs: resetsAt };
+				}
+			}
+			if (usable) plan.usableNow.push({ candidate, account: usable });
+		}
+		return plan;
+	}
+
+	/**
+	 * Route the session to a planned choice: select its account exactly (an OAuth
+	 * pin inside the session's account restriction), then switch models when the
+	 * choice is a fallback rung. Returns whether the session now targets it.
+	 */
+	async #applyQuotaRecoveryChoice(
+		choice: QuotaRecoveryChoice,
+		failedSelector: string,
+		reason: string,
+		signal: AbortSignal,
+	): Promise<boolean> {
+		const { candidate, account } = choice;
+		const provider = candidate.model.provider;
+		const sessionId = this.#host.sessionId();
+		const sessions = this.#host.modelRegistry.authStorage.sessions;
+		if (account) {
+			if (!sessions.permits(provider, sessionId, account.credentialId)) return false;
+			if (account.credentialType === "oauth") {
+				if (!sessions.pin(provider, sessionId, account.credentialId)) return false;
+			} else if (!account.selected) {
+				// Stored API keys cannot be pinned; re-rank so selection reaches the account with quota.
+				sessions.release(provider, sessionId);
+			}
+		}
+		if (!candidate.fallback) return true;
+		const apiKey = await this.#retryFallbackApiKey(candidate.model);
+		if (!apiKey || signal.aborted) return false;
+		return this.applyRetryFallbackCandidate(candidate.fallback.role, candidate.fallback.selector, failedSelector, {
+			apiKey,
+			signal,
+			reason,
+		});
+	}
+
+	/** `provider/model account #<credential id>`; credential ids are safe to show. */
+	#describeQuotaChoice({ candidate, account }: QuotaRecoveryChoice): string {
+		const model = `${candidate.model.provider}/${candidate.model.id}`;
+		return account ? `${model} account #${account.credentialId}` : `${model} (no tracked quota)`;
+	}
+
+	async #emitQuotaRecoveryNotice(level: "info" | "warning", message: string): Promise<void> {
+		await this.#host.emitSessionEvent({ type: "notice", level, message, source: "quota-recovery" });
+	}
+
+	/**
+	 * Settle an armed quota-recovery wake after its timer fired: refresh usage for
+	 * every compared provider, then route to a choice that can serve now. When the
+	 * earliest reset moved later, re-arm the same abortable wait instead of
+	 * resuming onto exhausted quota. A reset no later than the armed one is the
+	 * provider-stated wake that just elapsed, so its choice resumes. Waiting never
+	 * spends a retry attempt and never redeems a saved reset.
+	 */
+	async #awaitQuotaRecoveryWake(
+		wait: QuotaRecoveryWait,
+		generation: number,
+		retrySettings: { maxDelayMs: number; waitForUsageReset?: boolean },
+		signal: AbortSignal,
+	): Promise<QuotaRecoveryWakeOutcome> {
+		const usage = this.#host.modelRegistry.authStorage.usage;
+		let armed = wait;
+		for (;;) {
+			for (const provider of new Set(armed.candidates.map(candidate => candidate.model.provider))) {
+				await usage.invalidate(provider, signal);
+			}
+			const plan = await this.#planQuotaRecovery(armed.candidates, signal);
+			if (
+				this.#host.isDisposed() ||
+				this.#host.abortInProgress() ||
+				this.#host.promptGeneration() !== generation ||
+				this.#host.sessionManager.getSessionId() !== armed.sessionId ||
+				!modelsAreEqual(this.#host.model(), armed.activeModel)
+			) {
+				return { outcome: "superseded" };
+			}
+			const wokeAt = new Date().toISOString();
+			const routes = plan.usableNow.map(choice => ({ choice, reason: "refreshed usage shows available quota" }));
+			if (plan.wake && plan.wake.wakeAtMs <= armed.wakeAtMs) {
+				routes.push({ choice: plan.wake.choice, reason: "the provider-stated reset it waited for is due" });
+			}
+			for (const { choice, reason } of routes) {
+				if (choice.candidate.fallback) {
+					this.noteRetryFallbackCooldown(armed.failedSelector, undefined, armed.errorMessage);
+				}
+				if (await this.#applyQuotaRecoveryChoice(choice, armed.failedSelector, reason, signal)) {
+					await this.#emitQuotaRecoveryNotice(
+						"info",
+						`woke at ${wokeAt}; resuming on ${this.#describeQuotaChoice(choice)}. Reason: ${reason}.`,
+					);
+					return { outcome: "resumed" };
+				}
+				signal.throwIfAborted();
+			}
+			if (!plan.wake || plan.wake.wakeAtMs <= armed.wakeAtMs) {
+				return {
+					outcome: "exhausted",
+					detail: `no compared account had usable quota or a provider-stated reset after the wake at ${wokeAt}`,
+				};
+			}
+			const wakeAt = new Date(plan.wake.wakeAtMs).toISOString();
+			const delayMs = Math.max(0, plan.wake.wakeAtMs - Date.now());
+			if (retrySettings.maxDelayMs > 0 && delayMs > retrySettings.maxDelayMs && retrySettings.waitForUsageReset !== true) {
+				return {
+					outcome: "exhausted",
+					detail: `the earliest reset moved to ${wakeAt} for ${this.#describeQuotaChoice(plan.wake.choice)}, past retry.maxDelayMs (${retrySettings.maxDelayMs}ms)`,
+				};
+			}
+			armed = { ...armed, choice: plan.wake.choice, wakeAtMs: plan.wake.wakeAtMs };
+			await this.#emitQuotaRecoveryNotice(
+				"warning",
+				`refreshed usage at ${wokeAt} moved the earliest reset; waiting for ${this.#describeQuotaChoice(armed.choice)}. Reason: no compared account has quota yet. Wake at ${wakeAt}.`,
+			);
+			await sleepLong(delayMs, signal);
+		}
 	}
 
 	/** The active model when it is a Fireworks Fast (`-fast`) variant, else undefined. */
@@ -2853,6 +3111,103 @@ export class TurnRecovery {
 			/\bGoUsageLimitError\b/.test(errorMessage) &&
 			(!this.#hasReplayUnsafeOutput(message) || this.#unexecutedToolCallsReplaySafe(message));
 
+		// Quota recovery: a usage limit that no rotation or consented saved
+		// reset cleared compares every eligible account of the active model and
+		// of each allowed fallback rung, then routes to one that can serve now or
+		// arms one wake for the earliest provider-stated reset. A short sibling
+		// unblock keeps its own wait. This planning never redeems saved resets.
+		let quotaPlan: QuotaRecoveryPlan | undefined;
+		let quotaWait: QuotaRecoveryWait | undefined;
+		if (
+			AIError.is(id, AIError.Flag.UsageLimit) &&
+			recordedUsageLimitOutcome !== undefined &&
+			!staleOpenAIResponsesReplayError &&
+			!switchedCredential &&
+			currentModel !== undefined &&
+			currentSelector !== undefined &&
+			!deadlineRetriesExhausted &&
+			!waitForSiblingCredential
+		) {
+			const candidates: QuotaRecoveryCandidate[] = [{ model: currentModel }];
+			if (
+				allowModelFallback &&
+				retrySettings.modelFallback &&
+				retryFallbackAdmits(retrySettings.fallbackOn, true) &&
+				!sameModelSteerReplay &&
+				!this.#isFirstAttemptMidStreamSocketDrop(message, id, retryBudgetExhausted)
+			) {
+				const seen = new Set([formatModelStringWithRouting(currentModel)]);
+				for (const rung of this.#retryFallbackRungs(currentSelector, message, {
+					excludeProvider: longUsageLimitFallback ? currentModel.provider : undefined,
+					preserveFailedTurn,
+					wrapAround: longUsageLimitFallback,
+				})) {
+					const routed = formatModelStringWithRouting(rung.candidate);
+					if (seen.has(routed) || !this.#host.modelRegistry.hasConfiguredAuth(rung.candidate)) continue;
+					seen.add(routed);
+					candidates.push({ model: rung.candidate, fallback: { role: rung.role, selector: rung.selector } });
+				}
+			}
+			// Same cooldown the chain walk records: the usage wait already knows
+			// when this provider can serve the session again.
+			const usageCooldownMs = recordedUsageLimitOutcome.switchedCredential ? undefined : usageLimitWaitMs;
+			const planAbortController = new AbortController();
+			this.#retryAbortController?.abort();
+			this.#retryAbortController = planAbortController;
+			try {
+				quotaPlan = await this.#planQuotaRecovery(candidates, planAbortController.signal);
+				for (const choice of quotaPlan.usableNow) {
+					// Past the budget a same-model account switch would keep retrying
+					// without bound (switches bypass the budget); only a model switch
+					// or a confirmed reset may continue, as with rotation above.
+					if (!choice.candidate.fallback && retryBudgetExhausted) continue;
+					const reason = choice.account
+						? `${currentSelector} hit its usage limit; ${this.#describeQuotaChoice(choice)} has available quota (${quotaPlan.compared} candidates compared)`
+						: `${currentSelector} hit its usage limit; ${this.#describeQuotaChoice(choice)} is the next configured fallback (${quotaPlan.compared} candidates compared)`;
+					if (choice.candidate.fallback) {
+						this.noteRetryFallbackCooldown(currentSelector, usageCooldownMs ?? parsedRetryAfterMs, errorMessage);
+					}
+					const applied = await this.#applyQuotaRecoveryChoice(
+						choice,
+						currentSelector,
+						reason,
+						planAbortController.signal,
+					);
+					planAbortController.signal.throwIfAborted();
+					if (!applied) continue;
+					if (choice.candidate.fallback) switchedModel = true;
+					else switchedCredential = true;
+					delayMs = 0;
+					await this.#emitQuotaRecoveryNotice(
+						"info",
+						`using ${this.#describeQuotaChoice(choice)} now. Reason: ${reason}.`,
+					);
+					break;
+				}
+			} catch (error) {
+				if (!planAbortController.signal.aborted) throw error;
+				if (this.#retryAbortController !== planAbortController) return false;
+				return this.#endCancelledRetry();
+			} finally {
+				if (this.#retryAbortController === planAbortController) this.#retryAbortController = undefined;
+			}
+			const wakePlan = quotaPlan?.wake;
+			if (!switchedModel && !switchedCredential && wakePlan) {
+				if (wakePlan.choice.candidate.fallback) {
+					this.noteRetryFallbackCooldown(currentSelector, usageCooldownMs ?? parsedRetryAfterMs, errorMessage);
+				}
+				quotaWait = {
+					choice: wakePlan.choice,
+					wakeAtMs: wakePlan.wakeAtMs,
+					candidates,
+					failedSelector: currentSelector,
+					activeModel: currentModel,
+					sessionId: this.#host.sessionManager.getSessionId(),
+					errorMessage,
+				};
+			}
+		}
+
 		// A spent operation-budget bound suppresses the fallback consult below:
 		// every replay costs another whole budget, so letting an exhausted
 		// error fail over would refund the bound once per fallback-chain
@@ -2873,7 +3228,10 @@ export class TurnRecovery {
 			// chains say.
 			const refusalWalkKey = this.#refusalWalkKey(currentSelector);
 			const refusalWalkRepeats = classifierRefusal && this.#refusalWalkTried.has(refusalWalkKey);
+			// Quota recovery already compared every rung: those it did not route to
+			// have no known quota now, so the walk must not switch onto them.
 			if (
+				quotaPlan === undefined &&
 				allowModelFallback &&
 				retrySettings.modelFallback &&
 				retryFallbackAdmits(retrySettings.fallbackOn, AIError.is(id, AIError.Flag.UsageLimit)) &&
@@ -2915,9 +3273,12 @@ export class TurnRecovery {
 				delayMs = parsedRetryAfterMs;
 			}
 		}
+		// The armed quota wake replaces the active account's own wait: it is the
+		// earliest moment any compared account can serve again.
+		if (quotaWait) delayMs = Math.max(0, quotaWait.wakeAtMs - Date.now());
 
 		if (retryBudgetExhausted) {
-			if (!switchedModel && !switchedCredential) {
+			if (!switchedModel && !switchedCredential && !quotaWait) {
 				const attempt = this.#retryAttempt - 1;
 				message.errorMessage = `Retry budget exhausted after ${attempt} ${attempt === 1 ? "retry" : "retries"}: ${errorMessage}`;
 				await this.#closeRetrySaga(
@@ -2928,11 +3289,13 @@ export class TurnRecovery {
 			}
 			// A fallback model gets a fresh generic retry budget. Credential rotation
 			// instead keeps the cumulative attempt count while bypassing the
-			// same-route budget: every distinct account must be tried first.
+			// same-route budget: every distinct account must be tried first. A
+			// quota wake resumes only after a refreshed usage read at its
+			// provider-stated reset, so waiting for it never spends the budget.
 			// Exhausted-budget replays are the exception: #operationDeadlineRetries
 			// is deliberately NOT reset here, so the deadline bound holds across
 			// the whole fallback chain (each replay costs another whole budget).
-			if (switchedModel) this.#retryAttempt = 1;
+			if (switchedModel || quotaWait) this.#retryAttempt = 1;
 		}
 		if ((classifierRefusal || accountPolicyDenial) && !switchedCredential && !switchedModel) {
 			// A prior attempt in this saga already announced `auto_retry_start`
@@ -3011,22 +3374,26 @@ export class TurnRecovery {
 		// permanent error (402 balance, dead spend cap) would hold the session
 		// through repeated heuristic sleeps instead of surfacing it. Bounded
 		// by the stated wait so an unrelated large backoff cannot sneak
-		// through.
+		// through. An armed quota wake is provider-stated timing by construction.
 		const maxDelayMs = retrySettings.maxDelayMs;
 		const waitForUsageReset =
 			retrySettings.waitForUsageReset === true &&
-			recordedUsageLimitOutcome !== undefined &&
-			(parsedRetryAfterMs !== undefined || recordedUsageLimitOutcome.reportResetAtMs !== undefined) &&
-			effectiveUsageLimitWaitMs !== undefined &&
-			delayMs <= effectiveUsageLimitWaitMs;
+			(quotaWait !== undefined ||
+				(recordedUsageLimitOutcome !== undefined &&
+					(parsedRetryAfterMs !== undefined || recordedUsageLimitOutcome.reportResetAtMs !== undefined) &&
+					effectiveUsageLimitWaitMs !== undefined &&
+					delayMs <= effectiveUsageLimitWaitMs));
 		if (maxDelayMs > 0 && delayMs > maxDelayMs && !switchedCredential && !switchedModel && !waitForUsageReset) {
 			const attempt = this.#retryAttempt;
 			this.#resetSagaRetryCounters();
+			const quotaDetail = quotaWait
+				? ` Earliest usable reset: ${this.#describeQuotaChoice(quotaWait.choice)} at ${new Date(quotaWait.wakeAtMs).toISOString()}.`
+				: "";
 			await this.#closeRetrySaga(
 				{
 					success: false,
 					attempt,
-					finalError: `Provider requested ${Math.ceil(delayMs)}ms wait, exceeds retry.maxDelayMs (${maxDelayMs}ms). Original error: ${errorMessage}`,
+					finalError: `Provider requested ${Math.ceil(delayMs)}ms wait, exceeds retry.maxDelayMs (${maxDelayMs}ms).${quotaDetail} Original error: ${errorMessage}`,
 				},
 				{ terminalTurn: message },
 			);
@@ -3045,6 +3412,12 @@ export class TurnRecovery {
 		});
 		if (this.#host.abortInProgress() || this.#host.promptGeneration() !== generation) {
 			return this.#endCancelledRetry();
+		}
+		if (quotaWait) {
+			await this.#emitQuotaRecoveryNotice(
+				"warning",
+				`waiting for ${this.#describeQuotaChoice(quotaWait.choice)}. Reason: ${quotaWait.failedSelector} hit its usage limit and none of ${quotaPlan?.compared ?? quotaWait.candidates.length} compared candidates has quota now; this account has the earliest provider-stated reset. Wake at ${new Date(quotaWait.wakeAtMs).toISOString()}.`,
+			);
 		}
 
 		// Resolved stream-stall tools and proven-unexecuted malformed/refused
@@ -3074,6 +3447,37 @@ export class TurnRecovery {
 			}
 			// Aborted during sleep - emit end event so UI can clean up
 			return this.#endCancelledRetry();
+		}
+		if (quotaWait) {
+			// The wake reuses this saga's abort controller, so abortRetry(),
+			// dispose and a new prompt cancel every re-armed wait as well.
+			let wake: QuotaRecoveryWakeOutcome;
+			try {
+				wake = await this.#awaitQuotaRecoveryWake(quotaWait, generation, retrySettings, retryAbortController.signal);
+			} catch (error) {
+				if (!retryAbortController.signal.aborted) {
+					if (this.#retryAbortController === retryAbortController) this.#retryAbortController = undefined;
+					throw error;
+				}
+				if (this.#retryAbortController !== retryAbortController) return false;
+				return this.#endCancelledRetry();
+			}
+			if (wake.outcome === "superseded") {
+				if (this.#retryAbortController !== retryAbortController) return false;
+				return this.#endCancelledRetry();
+			}
+			if (wake.outcome === "exhausted") {
+				if (this.#retryAbortController === retryAbortController) this.#retryAbortController = undefined;
+				await this.#closeRetrySaga(
+					{
+						success: false,
+						attempt: this.#retryAttempt,
+						finalError: `Quota recovery: ${wake.detail}. Original error: ${errorMessage}`,
+					},
+					{ terminalTurn: message },
+				);
+				return false;
+			}
 		}
 		if (this.#retryAbortController === retryAbortController) {
 			this.#retryAbortController = undefined;
