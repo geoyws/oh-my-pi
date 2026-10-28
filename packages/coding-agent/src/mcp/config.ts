@@ -4,7 +4,8 @@
  * Uses the capability system to load MCP servers from multiple sources.
  */
 
-import { getMCPConfigPath, logger } from "@oh-my-pi/pi-utils";
+import { getMCPConfigPath, logger, stableStringifyJson } from "@oh-my-pi/pi-utils";
+import { fingerprintProjectSurface, isProjectSurfaceTrusted } from "@oh-my-pi/pi-utils/project-trust";
 import { mcpCapability } from "../capability/mcp";
 import type { EffectiveExtensionRoots, SourceMeta } from "../capability/types";
 import type { MCPServer } from "../discovery";
@@ -32,6 +33,16 @@ export interface LoadMCPConfigsResult {
 	exaApiKeys: string[];
 	/** Source metadata for each server */
 	sources: Record<string, SourceMeta>;
+	/**
+	 * Project-level MCP servers and their approval state. Project servers run
+	 * only when `omp trust` approved this exact fingerprint for `cwd`
+	 * (kb omp t-f77ec1f5); otherwise they are dropped and listed here.
+	 */
+	projectTrust?: {
+		fingerprint: string;
+		trusted: boolean;
+		servers: Array<{ name: string; source: string; config: MCPServerConfig }>;
+	};
 }
 
 /**
@@ -144,7 +155,7 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 		return false;
 	};
 
-	const result = await loadCapability<MCPServer>(mcpCapability.id, {
+	let result = await loadCapability<MCPServer>(mcpCapability.id, {
 		cwd,
 		extensionRoots: options?.extensionRoots,
 		filter: includeServer,
@@ -155,6 +166,28 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 	// Code's 1000ms minimum) must reach the user, not vanish with the
 	// CapabilityResult.
 	for (const warning of result.warnings) logger.warn(warning);
+
+	// A repository's MCP servers are commands it chose, launched with the
+	// user's environment and file access. They run only after `omp trust`
+	// approved exactly this set (name, source file, full config).
+	const projectServers = result.items
+		.filter(server => server._source.level === "project")
+		.map(server => ({ name: server.name, source: server._source.path, config: convertToLegacyConfig(server) }));
+	const projectFingerprint = fingerprintProjectSurface(
+		projectServers.map(({ name, source, config }) => [name, stableStringifyJson({ source, config })] as const),
+	);
+	const projectTrusted = isProjectSurfaceTrusted(cwd, "mcp", projectFingerprint);
+	if (!projectTrusted) {
+		logger.warn(
+			`Project MCP servers not started: ${projectServers.map(s => s.name).join(", ")} — this project is not trusted for MCP. Review its MCP config, then run \`omp trust\` in ${cwd}.`,
+		);
+		result = await loadCapability<MCPServer>(mcpCapability.id, {
+			cwd,
+			extensionRoots: options?.extensionRoots,
+			filter: server => server._source.level !== "project" && includeServer(server),
+			suppress: suppressServer,
+		});
+	}
 
 	// Convert to legacy format and preserve source metadata.
 	let configs: Record<string, MCPServerConfig> = {};
@@ -179,7 +212,12 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 		sources = browserResult.sources;
 	}
 
-	return { configs, exaApiKeys, sources };
+	return {
+		configs,
+		exaApiKeys,
+		sources,
+		projectTrust: { fingerprint: projectFingerprint, trusted: projectTrusted, servers: projectServers },
+	};
 }
 
 /** Pattern to match Exa MCP servers */

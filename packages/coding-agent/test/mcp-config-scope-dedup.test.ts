@@ -17,6 +17,7 @@ import * as path from "node:path";
 import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
 import { loadAllMCPConfigs } from "@oh-my-pi/pi-coding-agent/mcp/config";
 import { getConfigRootDir, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
+import { approveProjectSurfaces } from "@oh-my-pi/pi-utils/project-trust";
 import "@oh-my-pi/pi-coding-agent/discovery";
 
 const originalAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
@@ -46,6 +47,11 @@ describe("MCP scope filtering precedes connection-equivalence deduplication", ()
 		// Same connection identity under two distinct names, one per scope.
 		await writeMcpJson(path.join(projectDir, ".omp"), { projcontext: CONNECTION });
 		await writeMcpJson(userAgentDir, { usercontext: CONNECTION });
+		// These cases pin scope/dedup ordering for a project the user approved
+		// with `omp trust`; the untrusted path is covered by project-trust tests.
+		const { projectTrust } = await loadAllMCPConfigs(projectDir, { enableProjectConfig: true, filterExa: false });
+		if (projectTrust) approveProjectSurfaces(projectDir, { mcp: projectTrust.fingerprint });
+		clearFsCache();
 	});
 
 	afterEach(async () => {
