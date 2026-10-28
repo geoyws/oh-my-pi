@@ -158,7 +158,7 @@ Examples:
 		if (!values.json && !values.sync) {
 			// The dashboard ingests sessions in the background and streams progress to the page.
 			const { port: actualPort } = await startServer(values.port, values.host);
-			console.log(`Dashboard available at: ${statsDashboardLaunchUrl(values.host, actualPort)}`);
+			console.log(`Dashboard available at: ${await statsDashboardLaunchUrl(values.host, actualPort)}`);
 			console.log("Press Ctrl+C to stop\n");
 			process.on("SIGINT", () => {
 				console.log("\nShutting down...");

@@ -26,8 +26,8 @@ export const STATS_DASHBOARD_CHALLENGE_HEADER = "x-omp-stats-challenge";
 /** Response header answering the challenge with proof the server holds this user's capability. */
 export const STATS_DASHBOARD_PROOF_HEADER = "x-omp-stats-proof";
 
-/** Identity-header value for dashboards requiring the capability token and answering proof challenges. */
-export const STATS_DASHBOARD_SECURITY_VERSION = "5";
+/** Identity-header value for dashboards requiring the capability token, answering proof challenges and issuing per-listener launch secrets. */
+export const STATS_DASHBOARD_SECURITY_VERSION = "6";
 
 /** IPv4 loopback address shared by the dashboard server and reuse probe. */
 export const STATS_DASHBOARD_HOSTNAME = "127.0.0.1";
@@ -48,6 +48,58 @@ export function statsDashboardProof(token: string, hostname: string, port: numbe
 		.digest("base64url");
 }
 
+/** Body field of a credential-less `/api/launch` answer carrying a single-use nonce. */
+export const STATS_LAUNCH_NONCE_FIELD = "nonce";
+
+/**
+ * HMAC a client presents to `/api/launch` for `nonce`, under the capability `token`, bound to the
+ * bind host and port of the dashboard it means: a dashboard checks it against its own, so an
+ * exchange relayed from any other address or port is refused. The token never travels.
+ */
+export function statsLaunchMac(token: string, hostname: string, port: number, nonce: string): string {
+	return crypto
+		.createHmac("sha256", token)
+		.update(`omp-stats-launch\n${hostname}\n${port}\n${nonce}`)
+		.digest("base64url");
+}
+
+/** The address a same-user client dials for a dashboard bound to `hostname` (wildcards map to loopback). */
+function dashboardDialBase(hostname: string, port: number): string {
+	const dialHostname = hostname === "0.0.0.0" ? STATS_DASHBOARD_HOSTNAME : hostname === "::" ? "::1" : hostname;
+	return `http://${dialHostname.includes(":") ? `[${dialHostname}]` : dialHostname}:${port}`;
+}
+
+/**
+ * The launch secret of the dashboard listening on `hostname:port`, obtained without sending the
+ * capability: a credential-less `/api/launch` returns a single-use nonce, and the HMAC over it
+ * (see {@link statsLaunchMac}) earns that listener's launch secret, which dies with the listener.
+ */
+export async function fetchStatsLaunchSecret(hostname: string, port: number): Promise<string> {
+	const base = dashboardDialBase(hostname, port);
+	const challenge = await fetch(`${base}/api/launch`, { signal: AbortSignal.timeout(STATS_PROBE_TIMEOUT_MS * 4) });
+	const offered: unknown = await challenge.json().catch(() => null);
+	const nonce =
+		challenge.status === 401 && typeof offered === "object" && offered !== null
+			? (offered as Record<string, unknown>)[STATS_LAUNCH_NONCE_FIELD]
+			: undefined;
+	if (typeof nonce !== "string" || nonce.length === 0) {
+		throw new Error(`The stats dashboard at ${base} did not offer a launch credential.`);
+	}
+	const mac = statsLaunchMac(loadOrCreateCapabilityToken(getStatsDashboardTokenPath()), hostname, port, nonce);
+	const response = await fetch(
+		`${base}/api/launch?nonce=${encodeURIComponent(nonce)}&mac=${encodeURIComponent(mac)}`,
+		{
+			signal: AbortSignal.timeout(STATS_PROBE_TIMEOUT_MS * 4),
+		},
+	);
+	const body: unknown = await response.json().catch(() => null);
+	const launch = typeof body === "object" && body !== null ? (body as Record<string, unknown>).launch : undefined;
+	if (!response.ok || typeof launch !== "string" || launch.length === 0) {
+		throw new Error(`The stats dashboard at ${base} refused this user's launch request (HTTP ${response.status}).`);
+	}
+	return launch;
+}
+
 type StatsDashboardProbe = "reusable" | "replaceable" | "occupied" | "unreachable";
 
 /**
@@ -56,11 +108,10 @@ type StatsDashboardProbe = "reusable" | "replaceable" | "occupied" | "unreachabl
  * An unauthenticated legacy dashboard (version 1–3, answering 200 without a token) is replaceable.
  */
 async function probeStatsDashboard(port: number, hostname: string): Promise<StatsDashboardProbe> {
-	const probeHostname = hostname === "0.0.0.0" ? STATS_DASHBOARD_HOSTNAME : hostname === "::" ? "::1" : hostname;
-	const urlHostname = probeHostname.includes(":") ? `[${probeHostname}]` : probeHostname;
+	const urlBase = dashboardDialBase(hostname, port);
 	try {
 		const challenge = crypto.randomBytes(24).toString("base64url");
-		const response = await fetch(`http://${urlHostname}:${port}/api/stats/models`, {
+		const response = await fetch(`${urlBase}/api/stats/models`, {
 			signal: AbortSignal.timeout(STATS_PROBE_TIMEOUT_MS),
 			headers: { [STATS_DASHBOARD_CHALLENGE_HEADER]: challenge },
 		});

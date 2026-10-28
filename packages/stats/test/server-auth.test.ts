@@ -15,9 +15,10 @@ import {
 	STATS_DASHBOARD_HOSTNAME_HEADER,
 	STATS_DASHBOARD_PROOF_HEADER,
 	STATS_DASHBOARD_SECURITY_VERSION,
+	fetchStatsLaunchSecret,
 	statsDashboardProof,
 } from "../src/port-conflict";
-import { startServer } from "../src/server";
+import { startServer, statsDashboardLaunchUrl } from "../src/server";
 import { installStatsTestIsolation } from "./helpers/temp-agent";
 
 installStatsTestIsolation("@pi-stats-auth-");
@@ -138,7 +139,9 @@ describe("stats dashboard auth", () => {
 			const firstBase = `http://${first.hostname}:${first.port}`;
 			const secondBase = `http://${second.hostname}:${second.port}`;
 			const { session } = (await (await exchangeSession(firstBase, dashboardToken())).json()) as { session: string };
-			const stale = await fetch(`${secondBase}/api/stats/models`, { headers: { Authorization: `Bearer ${session}` } });
+			const stale = await fetch(`${secondBase}/api/stats/models`, {
+				headers: { Authorization: `Bearer ${session}` },
+			});
 			expect(stale.status).toBe(401);
 			await stale.body?.cancel();
 		} finally {
@@ -198,7 +201,9 @@ describe("stats dashboard auth", () => {
 			hostname: STATS_DASHBOARD_HOSTNAME,
 			fetch: async request => {
 				const upstream = await fetch(`http://${genuine.hostname}:${genuine.port}/api/stats/models`, {
-					headers: { [STATS_DASHBOARD_CHALLENGE_HEADER]: request.headers.get(STATS_DASHBOARD_CHALLENGE_HEADER) ?? "" },
+					headers: {
+						[STATS_DASHBOARD_CHALLENGE_HEADER]: request.headers.get(STATS_DASHBOARD_CHALLENGE_HEADER) ?? "",
+					},
 				});
 				await upstream.body?.cancel();
 				return new Response("relayed", { status: 401, headers: upstream.headers });
@@ -254,6 +259,77 @@ describe("stats dashboard auth", () => {
 			expect(STATS_DASHBOARD_HOSTNAME).toBe(server.hostname);
 			expect(await recoverStatsPort(server.port)).toBe("reuse");
 		} finally {
+			server.stop();
+		}
+	});
+});
+
+describe("stats dashboard launch URLs", () => {
+	const launchOf = (url: string): string => new URL(url).searchParams.get("token") ?? "";
+	const exchange = (base: string, bearer: string) =>
+		fetch(`${base}/api/session`, { method: "POST", headers: { Authorization: `Bearer ${bearer}` } });
+
+	it("carry a per-listener launch secret, never the capability, that dies with the listener", async () => {
+		const first = await startServer(0);
+		const port = first.port;
+		const base = `http://${first.hostname}:${port}`;
+		const url = await statsDashboardLaunchUrl(first.hostname, port, "#/traces?s=x");
+		const launch = launchOf(url);
+		expect(url).not.toContain(dashboardToken());
+		expect(url).toEndWith("#/traces?s=x");
+		expect((await exchange(base, launch)).status).toBe(200);
+		first.stop();
+
+		// The printed link reopened against a later dashboard on the same port is dead.
+		const second = await startServer(port);
+		try {
+			expect((await exchange(base, launch)).status).toBe(401);
+			const fresh = launchOf(await statsDashboardLaunchUrl(second.hostname, port));
+			expect(fresh).not.toBe(launch);
+			expect((await exchange(base, fresh)).status).toBe(200);
+		} finally {
+			second.stop();
+		}
+	});
+
+	it("lets another process obtain the launch secret by nonce HMAC, without sending the capability", async () => {
+		const server = await startServer(0);
+		try {
+			const inProcess = launchOf(await statsDashboardLaunchUrl(server.hostname, server.port));
+			expect(await fetchStatsLaunchSecret(server.hostname, server.port)).toBe(inProcess);
+			// A replayed exchange is refused: each nonce works once.
+			const offer = (await (await fetch(`http://${server.hostname}:${server.port}/api/launch`)).json()) as {
+				nonce: string;
+			};
+			const wrong = await fetch(
+				`http://${server.hostname}:${server.port}/api/launch?nonce=${offer.nonce}&mac=forged`,
+			);
+			expect(wrong.status).toBe(401);
+			expect(await wrong.text()).not.toContain(inProcess);
+		} finally {
+			server.stop();
+		}
+	});
+
+	it("refuses a squatter on another port that relays the exchange to this user's dashboard", async () => {
+		const server = await startServer(0);
+		const seen: string[] = [];
+		const squatter = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: async request => {
+				const url = new URL(request.url);
+				seen.push(request.url, request.headers.get("authorization") ?? "");
+				const upstream = await fetch(`http://${server.hostname}:${server.port}${url.pathname}${url.search}`);
+				return new Response(await upstream.text(), { status: upstream.status });
+			},
+		});
+		try {
+			await expect(fetchStatsLaunchSecret("127.0.0.1", squatter.port!)).rejects.toThrow(/refused/);
+			expect(seen.length).toBeGreaterThan(0);
+			expect(seen.join("\n")).not.toContain(dashboardToken());
+		} finally {
+			squatter.stop(true);
 			server.stop();
 		}
 	});

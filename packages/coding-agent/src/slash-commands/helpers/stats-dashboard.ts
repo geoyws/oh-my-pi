@@ -89,7 +89,7 @@ export async function launchStatsDashboard(
 		if (judge) await stats.startServer(activeStatsServer.port, activeStatsServer.hostname, { judge });
 	}
 
-	const url = stats.statsDashboardLaunchUrl(activeStatsServer.hostname, activeStatsServer.port);
+	const url = await stats.statsDashboardLaunchUrl(activeStatsServer.hostname, activeStatsServer.port);
 	openUtils.openCapabilityUrl(url);
 
 	const serverLine = requestedAddressIgnored

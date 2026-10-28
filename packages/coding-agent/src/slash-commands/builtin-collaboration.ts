@@ -215,7 +215,7 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 				// matching src/cli/stats-cli.ts, to keep CLI startup fast.
 				const { startServer, statsDashboardLaunchUrl } = await import("@oh-my-pi/omp-stats");
 				const { hostname, port } = await startServer();
-				const url = statsDashboardLaunchUrl(hostname, port, `#/traces?s=${encodeURIComponent(sessionFile)}`);
+				const url = await statsDashboardLaunchUrl(hostname, port, `#/traces?s=${encodeURIComponent(sessionFile)}`);
 				await runtime.output(url);
 				return commandConsumed();
 			} catch (err) {

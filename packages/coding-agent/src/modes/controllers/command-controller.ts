@@ -369,7 +369,7 @@ export class CommandController {
 			// matching src/cli/stats-cli.ts, to keep CLI startup fast.
 			const { startServer, statsDashboardLaunchUrl } = await import("@oh-my-pi/omp-stats");
 			const { hostname, port } = await startServer();
-			const url = statsDashboardLaunchUrl(hostname, port, `#/traces?s=${encodeURIComponent(sessionFile)}`);
+			const url = await statsDashboardLaunchUrl(hostname, port, `#/traces?s=${encodeURIComponent(sessionFile)}`);
 			openCapabilityUrl(url);
 			this.ctx.showStatus(`Trace: ${url}`);
 		} catch (error: unknown) {

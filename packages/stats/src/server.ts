@@ -39,6 +39,7 @@ import {
 import { getGainDashboardStats } from "./gain-aggregator";
 import { statsLive } from "./live";
 import {
+	fetchStatsLaunchSecret,
 	prepareStatsPort,
 	recoverStatsPort,
 	STATS_DASHBOARD_CHALLENGE_HEADER,
@@ -47,7 +48,9 @@ import {
 	STATS_DASHBOARD_HOSTNAME_HEADER,
 	STATS_DASHBOARD_PROOF_HEADER,
 	STATS_DASHBOARD_SECURITY_VERSION,
+	STATS_LAUNCH_NONCE_FIELD,
 	statsDashboardProof,
+	statsLaunchMac,
 } from "./port-conflict";
 import { getStatsByModel, getTimeSeries } from "./rollup";
 import {
@@ -389,24 +392,34 @@ function bearerToken(req: Request): string | null {
 	return match ? match[1].trim() : null;
 }
 
+/** Launch secrets of the dashboards this process serves, keyed by `hostname:port`. */
+const localLaunchSecrets = new Map<string, string>();
+
 /**
- * Dashboard URL that authenticates the browser. The page stores the `?token=`
- * in its own origin's storage (origin includes the port, so no other local
- * server can read it, unlike a host-wide cookie) and strips it from the
- * address bar; API calls then send it as a bearer header. `fragment` (e.g.
- * `#/traces?s=...`) stays after the query. The token in the URL is intended
- * for the same user; never log it anywhere else.
+ * Dashboard URL that authenticates the browser. `?token=` carries the listener's launch secret,
+ * never the user's reusable capability: it is valid only while that dashboard runs, so a printed
+ * link reopened after another user took the port hands that user a dead credential. The page
+ * swaps it for a session secret at once and strips it from the address bar. `fragment` (e.g.
+ * `#/traces?s=...`) stays after the query. For a dashboard another omp process serves, the
+ * launch secret is obtained with a nonce HMAC that never sends the capability.
  */
-export function statsDashboardLaunchUrl(hostname: string, port: number, fragment = ""): string {
-	const token = loadOrCreateCapabilityToken(getStatsDashboardTokenPath());
-	return `${formatStatsDashboardUrl(hostname, port)}/?token=${token}${fragment}`;
+export async function statsDashboardLaunchUrl(hostname: string, port: number, fragment = ""): Promise<string> {
+	const launch = localLaunchSecrets.get(`${hostname}:${port}`) ?? (await fetchStatsLaunchSecret(hostname, port));
+	return `${formatStatsDashboardUrl(hostname, port)}/?token=${launch}${fragment}`;
 }
+
+const LAUNCH_NONCE_TTL_MS = 30_000;
+const MAX_LAUNCH_NONCES = 64;
 
 function createDashboardServer(port: number, hostname: string): Server<undefined> {
 	const token = loadOrCreateCapabilityToken(getStatsDashboardTokenPath());
-	// The browser never keeps the reusable capability: it swaps the launch token
-	// for this secret, which dies with this listener. Origin storage is shared
-	// with whoever binds the same port later, so only a dead credential may sit there.
+	// Printed launch URLs carry this, never the capability; it dies with this listener.
+	const launch = crypto.randomBytes(32).toString("base64url");
+	// Single-use nonces for `/api/launch`, oldest dropped beyond the cap.
+	const launchNonces = new Map<string, number>();
+	// The browser never keeps the launch secret either: it swaps it for this secret,
+	// which also dies with this listener. Origin storage is shared with whoever binds
+	// the same port later, so only a dead credential may sit there.
 	const session = crypto.randomBytes(32).toString("base64url");
 	const server = Bun.serve({
 		port,
@@ -441,16 +454,46 @@ function createDashboardServer(port: number, hostname: string): Server<undefined
 			const origin = req.headers.get("origin");
 			if (origin !== null && origin !== `http://${hostHeader}`) return deny(403, "Forbidden: unexpected Origin.");
 
-			// Every data path needs a credential as a bearer header: the capability
-			// (native clients, and the page's one-time exchange) or this listener's
+			// A credential-less `/api/launch` gets a single-use nonce; the HMAC over it under
+			// the capability, bound to this listener's host and port, earns the launch secret.
+			if (path === "/api/launch") {
+				if (req.method !== "GET") return deny(405, "Method not allowed.");
+				const nonce = url.searchParams.get("nonce");
+				const expires = nonce === null ? undefined : launchNonces.get(nonce);
+				if (nonce !== null) launchNonces.delete(nonce);
+				const mac = url.searchParams.get("mac");
+				if (
+					nonce !== null &&
+					expires !== undefined &&
+					expires >= Date.now() &&
+					capabilityTokenMatches(statsLaunchMac(token, hostname, server.port ?? port, nonce), mac)
+				) {
+					return Response.json({ launch }, { headers: { ...dashboardHeaders, "Cache-Control": "no-store" } });
+				}
+				const issued = crypto.randomBytes(24).toString("base64url");
+				launchNonces.set(issued, Date.now() + LAUNCH_NONCE_TTL_MS);
+				for (const oldest of launchNonces.keys()) {
+					if (launchNonces.size <= MAX_LAUNCH_NONCES) break;
+					launchNonces.delete(oldest);
+				}
+				return Response.json(
+					{ [STATS_LAUNCH_NONCE_FIELD]: issued },
+					{ status: 401, headers: { ...dashboardHeaders, "Cache-Control": "no-store" } },
+				);
+			}
+
+			// Every data path needs a credential as a bearer header: the capability (native
+			// clients), this listener's launch secret (the page's one-time exchange), or its
 			// session secret (the page). EventSource cannot set headers, so the event
 			// stream alone takes the session secret as `?session=`. Static assets hold no data.
 			if (path.startsWith("/api/")) {
 				const bearer = bearerToken(req);
-				const viaCapability = capabilityTokenMatches(token, bearer);
+				const viaCapability = capabilityTokenMatches(token, bearer) || capabilityTokenMatches(launch, bearer);
 				const viaSession =
 					capabilityTokenMatches(session, bearer) ||
-					(path === "/api/events" && req.method === "GET" && capabilityTokenMatches(session, url.searchParams.get("session")));
+					(path === "/api/events" &&
+						req.method === "GET" &&
+						capabilityTokenMatches(session, url.searchParams.get("session")));
 				if (!viaCapability && !viaSession) return deny(401, STATS_AUTH_HINT);
 				if (path === "/api/session") {
 					if (req.method !== "POST" || !viaCapability) return deny(401, STATS_AUTH_HINT);
@@ -496,6 +539,7 @@ function createDashboardServer(port: number, hostname: string): Server<undefined
 			}
 		},
 	});
+	localLaunchSecrets.set(`${hostname}:${server.port ?? port}`, launch);
 	return server;
 }
 
@@ -596,6 +640,7 @@ export async function startServer(
 			port: server.port ?? port,
 			stop: () => {
 				activeServers.delete(activeKey);
+				localLaunchSecrets.delete(`${hostname}:${server.port ?? port}`);
 				server.stop(true);
 				if (stopped) return;
 				stopped = true;

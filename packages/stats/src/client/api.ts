@@ -21,12 +21,13 @@ import type {
 const API_BASE = "/api";
 
 /**
- * The page's credential. `omp stats` opens `/?token=<capability>`; the page
+ * The page's credential. `omp stats` opens `/?token=<launch secret>` (valid only
+ * while that dashboard runs, never the user's reusable capability); the page
  * strips it from the address bar and at once swaps it (`POST /api/session`) for
- * the listener's session secret, which dies when that dashboard stops. Only the
- * session secret is stored (this origin's localStorage): an origin is just
+ * the listener's session secret, which also dies when that dashboard stops. Only
+ * the session secret is stored (this origin's localStorage): an origin is just
  * host and port, so a later listener on the same port could read it, and a
- * dead secret is worth nothing to it. The reusable capability is never stored.
+ * dead secret is worth nothing to it.
  */
 const SESSION_STORAGE_KEY = "omp-stats-session";
 let sessionPromise: Promise<string | null> | undefined;
