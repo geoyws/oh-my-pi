@@ -5,6 +5,7 @@ import type { SessionData } from "../src/export/html";
 import {
 	buildShareSnapshot,
 	normalizeShareServerUrl,
+	resolveShareObfuscator,
 	SERVER_MAX_SEALED_BYTES,
 	sealToFit,
 	shareSession,
@@ -577,6 +578,54 @@ describe("normalizeShareServerUrl", () => {
 		expect(normalizeShareServerUrl("https://example.com/s///")).toBe("https://example.com/s");
 		expect(normalizeShareServerUrl(undefined)).toBe("https://my.omp.sh/s");
 		expect(normalizeShareServerUrl("   ")).toBe("https://my.omp.sh/s");
+	});
+});
+
+describe("resolveShareObfuscator", () => {
+	const LITERAL = "projlit-share-7f3a9c";
+
+	async function projectWithLiteral(dir: string): Promise<void> {
+		await Bun.write(
+			path.join(dir, ".omp", "secrets.yml"),
+			`- type: plain\n  content: ${LITERAL}\n  mode: replace\n  replacement: "GONE"\n`,
+		);
+	}
+
+	function snapshotText(obfuscator: SecretObfuscator | undefined): string {
+		const entries = [messageEntry("e1", null, `key is ${LITERAL}`)];
+		const sm = {
+			getHeader: () => sessionData([], "x").header,
+			getEntries: () => entries,
+			getLeafId: () => "e1",
+		} as unknown as SessionManager;
+		return JSON.stringify(buildShareSnapshot(sm, { obfuscator }));
+	}
+
+	test("builds a redactor from the project when the session has none (secrets.enabled off)", async () => {
+		using tempDir = TempDir.createSync("@omp-share-resolve-");
+		await projectWithLiteral(tempDir.path());
+		const obfuscator = await resolveShareObfuscator({
+			redact: true,
+			cwd: tempDir.path(),
+			session: new SecretObfuscator([]),
+		});
+		const text = snapshotText(obfuscator);
+		expect(text).not.toContain(LITERAL);
+		expect(text).toContain("GONE");
+	});
+
+	test("reuses a live session obfuscator that has secrets", async () => {
+		using tempDir = TempDir.createSync("@omp-share-resolve-");
+		const session = new SecretObfuscator([{ type: "plain", content: LITERAL }]);
+		expect(await resolveShareObfuscator({ redact: true, cwd: tempDir.path(), session })).toBe(session);
+	});
+
+	test("returns nothing when share.redactSecrets is off", async () => {
+		using tempDir = TempDir.createSync("@omp-share-resolve-");
+		await projectWithLiteral(tempDir.path());
+		const obfuscator = await resolveShareObfuscator({ redact: false, cwd: tempDir.path() });
+		expect(obfuscator).toBeUndefined();
+		expect(snapshotText(obfuscator)).toContain(LITERAL);
 	});
 });
 

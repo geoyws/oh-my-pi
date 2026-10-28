@@ -661,6 +661,15 @@ export function getLogsDir(): string {
 }
 
 /**
+ * Get the private directory `PI_REQ_DEBUG=1` writes request/response dumps to
+ * (~/.omp/debug-requests). Dumps hold prompts and provider responses, so they
+ * never go to the working tree.
+ */
+export function getRequestDebugDir(): string {
+	return dirs.rootSubdir("debug-requests", "state");
+}
+
+/**
  * Local-timezone `YYYY-MM-DD` day key (zero-padded), formatted exactly like
  * the rotating log sink's file naming: log files are named `omp.<day>.<pid>.log`
  * with the LOCAL day, not the UTC day `toISOString()` yields. Anything that

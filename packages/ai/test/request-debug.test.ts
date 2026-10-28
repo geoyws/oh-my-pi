@@ -14,14 +14,21 @@ import { removeWithRetries } from "../../utils/src/temp";
 const enc = new TextEncoder();
 
 let previousDebugFlag: string | undefined;
+let previousDebugDir: string | undefined;
 let previousCwd: string;
 let tempDir: string | undefined;
+let cwdDir: string | undefined;
 
 beforeEach(async () => {
 	previousDebugFlag = Bun.env.PI_REQ_DEBUG;
+	previousDebugDir = Bun.env.PI_REQ_DEBUG_DIR;
 	previousCwd = process.cwd();
 	tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-req-debug-"));
-	process.chdir(tempDir);
+	await fs.chmod(tempDir, 0o700);
+	Bun.env.PI_REQ_DEBUG_DIR = tempDir;
+	// Dumps must never land in the working tree; a separate cwd proves it.
+	cwdDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-req-debug-cwd-"));
+	process.chdir(cwdDir);
 });
 
 afterEach(async () => {
@@ -29,8 +36,12 @@ afterEach(async () => {
 	process.chdir(previousCwd);
 	if (previousDebugFlag === undefined) delete Bun.env.PI_REQ_DEBUG;
 	else Bun.env.PI_REQ_DEBUG = previousDebugFlag;
+	if (previousDebugDir === undefined) delete Bun.env.PI_REQ_DEBUG_DIR;
+	else Bun.env.PI_REQ_DEBUG_DIR = previousDebugDir;
 	if (tempDir) await removeWithRetries(tempDir);
+	if (cwdDir) await removeWithRetries(cwdDir);
 	tempDir = undefined;
+	cwdDir = undefined;
 });
 
 function chunkedResponse(chunks: Uint8Array[]): Response {
@@ -72,22 +83,19 @@ function splitResponseLog(bytes: Uint8Array): { headers: string; body: Uint8Arra
 	};
 }
 
-/** Find the latest rr-session-*.json written to the temp dir by PI_REQ_DEBUG
- * and derive its matching .res.log (rr-session-N.res.log, not .json.res.log). */
+const DUMP_RE = /^rr-session-\d+-(\d+)\.json$/;
+
+/** Find the latest rr-session-<pid>-<n>.json written to the dump dir by PI_REQ_DEBUG
+ * and derive its matching .res.log (rr-session-<pid>-<n>.res.log, not .json.res.log). */
 async function findDebugFiles(): Promise<{ requestPath: string; responsePath: string }> {
 	const entries = await fs.readdir(tempDir!);
-	const jsonFiles = entries.filter(f => /^rr-session-\d+\.json$/.test(f));
+	const jsonFiles = entries.filter(f => DUMP_RE.test(f));
 	expect(jsonFiles.length).toBeGreaterThan(0);
-	jsonFiles.sort((a, b) => {
-		const na = Number(a.match(/\d+/)![0]);
-		const nb = Number(b.match(/\d+/)![0]);
-		return na - nb;
-	});
+	jsonFiles.sort((a, b) => Number(a.match(DUMP_RE)![1]) - Number(b.match(DUMP_RE)![1]));
 	const latest = jsonFiles[jsonFiles.length - 1]!;
-	const id = latest.match(/\d+/)![0];
 	return {
 		requestPath: path.join(tempDir!, latest),
-		responsePath: path.join(tempDir!, `rr-session-${id}.res.log`),
+		responsePath: path.join(tempDir!, latest.replace(/\.json$/, ".res.log")),
 	};
 }
 
@@ -98,6 +106,93 @@ describe("PI_REQ_DEBUG request/response recording", () => {
 		const response = await transportFetch(debugModel(), fetchImpl)("https://provider.test/off", { method: "POST" });
 		await response.text();
 		expect(await fs.readdir(tempDir!)).toEqual([]);
+		expect(await fs.readdir(cwdDir!)).toEqual([]);
+	});
+
+	it("writes 0600 dumps into the private dump dir, never the working directory", async () => {
+		Bun.env.PI_REQ_DEBUG = "1";
+		const fetchImpl: FetchImpl = async () => new Response("ok");
+		const response = await transportFetch(debugModel(), fetchImpl)("https://provider.test/private", {
+			method: "POST",
+			body: "{}",
+		});
+		await response.text();
+		expect(await fs.readdir(cwdDir!)).toEqual([]);
+		const { requestPath, responsePath } = await findDebugFiles();
+		if (process.platform !== "win32") {
+			expect((await fs.stat(requestPath)).mode & 0o777).toBe(0o600);
+			expect((await fs.stat(responsePath)).mode & 0o777).toBe(0o600);
+		}
+	});
+
+	it.if(process.platform !== "win32")("refuses a dump dir other users can read", async () => {
+		Bun.env.PI_REQ_DEBUG = "1";
+		await fs.chmod(tempDir!, 0o755);
+		const fetchImpl: FetchImpl = async () => new Response("ok");
+		const failure = await transportFetch(debugModel(), fetchImpl)("https://provider.test/open-dir", {
+			method: "POST",
+		}).then(
+			() => null,
+			(error: unknown) => error,
+		);
+		expect(String(failure)).toContain("PI_REQ_DEBUG_DIR");
+		expect(await fs.readdir(tempDir!)).toEqual([]);
+	});
+
+	it("redacts OAuth form credentials and never logs the token response body", async () => {
+		Bun.env.PI_REQ_DEBUG = "1";
+		const tokenResponse = JSON.stringify({ access_token: "fresh-access-secret", expires_in: 3599 });
+		const fetchImpl: FetchImpl = async () =>
+			new Response(tokenResponse, { headers: { "content-type": "application/json", "x-request-id": "tok-1" } });
+		const response = await transportFetch(debugModel(), fetchImpl)("https://oauth2.googleapis.com/token", {
+			method: "POST",
+			body: new URLSearchParams({
+				client_id: "client-id-public",
+				client_secret: "client-secret-value",
+				refresh_token: "refresh-secret-value",
+				grant_type: "refresh_token",
+			}),
+		});
+		// The caller still receives the full token response.
+		expect(await response.text()).toBe(tokenResponse);
+
+		const { requestPath, responsePath } = await findDebugFiles();
+		const dump = (await fs.readFile(requestPath, "utf8")) + (await fs.readFile(responsePath, "utf8"));
+		for (const secret of ["client-secret-value", "refresh-secret-value", "fresh-access-secret"]) {
+			expect(dump).not.toContain(secret);
+		}
+		const request = JSON.parse(await fs.readFile(requestPath, "utf8")) as { bodyText: string };
+		const params = new URLSearchParams(request.bodyText);
+		expect(params.get("client_id")).toBe("client-id-public");
+		expect(params.get("grant_type")).toBe("refresh_token");
+		expect(params.get("refresh_token")).toBe("[redacted]");
+		const log = splitResponseLog(await fs.readFile(responsePath));
+		expect(log.headers).toContain("x-request-id: tok-1");
+		expect(new TextDecoder().decode(log.body)).toBe("[response body omitted: credential exchange]\n");
+	});
+
+	it("redacts credential fields in JSON bodies at any depth but keeps ordinary tool arguments", async () => {
+		Bun.env.PI_REQ_DEBUG = "1";
+		const fetchImpl: FetchImpl = async () => new Response("ok");
+		const response = await transportFetch(debugModel(), fetchImpl)("https://provider.test/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				auth: { refresh_token: "nested-refresh-secret", nested: [{ client_secret: "nested-client-secret" }] },
+				messages: [{ role: "assistant", content: [{ type: "tool_use", input: { code: "print(1)", token: "t" } }] }],
+			}),
+		});
+		await response.text();
+
+		const { requestPath } = await findDebugFiles();
+		const raw = await fs.readFile(requestPath, "utf8");
+		expect(raw).not.toContain("nested-refresh-secret");
+		expect(raw).not.toContain("nested-client-secret");
+		const body = (JSON.parse(raw) as { body: Record<string, unknown> }).body;
+		expect(body.auth).toEqual({ refresh_token: "[redacted]", nested: [{ client_secret: "[redacted]" }] });
+		expect(body.messages).toEqual([
+			{ role: "assistant", content: [{ type: "tool_use", input: { code: "print(1)", token: "t" } }] },
+		]);
 	});
 
 	it("records every fetch while the env flag is enabled", async () => {
@@ -283,7 +378,7 @@ describe("PI_REQ_DEBUG request/response recording", () => {
 
 		expect(calls).toBe(1);
 		const entries = await fs.readdir(tempDir!);
-		expect(entries.filter(f => /^rr-session-\d+\.json$/.test(f))).toHaveLength(1);
+		expect(entries.filter(f => DUMP_RE.test(f))).toHaveLength(1);
 	});
 });
 

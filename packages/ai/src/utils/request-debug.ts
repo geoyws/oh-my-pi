@@ -1,11 +1,28 @@
 import { Buffer } from "node:buffer";
 import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { getRequestDebugDir } from "@oh-my-pi/pi-utils";
 import { redactHeaders } from "./http-inspector";
 import { decodeRequestBodyBytes } from "./request-body";
 
 const REQUEST_DEBUG_ENV = "PI_REQ_DEBUG";
+/** Absolute directory override for the dumps; it must already be private (no group/other access). */
+const REQUEST_DEBUG_DIR_ENV = "PI_REQ_DEBUG_DIR";
 const textEncoder = new TextEncoder();
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
+
+/** JSON body fields that always carry credentials; redacted in every dump. */
+const CREDENTIAL_FIELD_RE =
+	/^(?:refresh_token|access_token|id_token|client_secret|client_assertion|code_verifier|device_code|subject_token|actor_token|password|private_key|api_?key)$/i;
+/**
+ * Fields that carry credentials in form bodies and OAuth/token exchanges, where generic names such as
+ * `code`, `assertion` and `token` are credentials too (in a model request they are ordinary tool arguments).
+ */
+const EXCHANGE_CREDENTIAL_FIELD_RE =
+	/^(?:refresh_token|access_token|id_token|client_secret|client_assertion|code_verifier|device_code|subject_token|actor_token|password|private_key|api_?key|assertion|code|token)$/i;
+const REDACTED = "[redacted]";
+/** Paths of OAuth/token endpoints whose responses hold fresh credentials. */
+const TOKEN_ENDPOINT_PATH_RE = /\/(?:oauth2?\/)?(?:v\d+\/)?token$/i;
 
 let nextSessionId = 1;
 
@@ -65,8 +82,10 @@ export async function createRequestDebugSession(payload: RequestDebugPayload): P
 	};
 	const headers = redactHeaders(headersToRecord(payload.headers));
 	if (headers) requestDump.headers = headers;
-	if (payload.body !== undefined) requestDump.body = payload.body;
-	if (payload.bodyText !== undefined) requestDump.bodyText = payload.bodyText;
+	const exchange = isCredentialExchange(payload);
+	const fields = exchange ? EXCHANGE_CREDENTIAL_FIELD_RE : CREDENTIAL_FIELD_RE;
+	if (payload.body !== undefined) requestDump.body = redactCredentialFields(payload.body, fields);
+	if (payload.bodyText !== undefined) requestDump.bodyText = redactFormCredentials(payload.bodyText);
 	if (payload.bodyBase64 !== undefined) requestDump.bodyBase64 = payload.bodyBase64;
 	if (payload.bodyUnavailable !== undefined) requestDump.bodyUnavailable = payload.bodyUnavailable;
 
@@ -76,7 +95,7 @@ export async function createRequestDebugSession(payload: RequestDebugPayload): P
 		await handle.close();
 	}
 
-	return new FileRequestDebugSession(id, requestPath, responsePath, overwrite);
+	return new FileRequestDebugSession(id, requestPath, responsePath, overwrite, exchange);
 }
 
 /**
@@ -103,18 +122,32 @@ class FileRequestDebugSession implements RequestDebugSession {
 	readonly requestPath: string;
 	readonly responsePath: string;
 	readonly #overwriteResponseLog: boolean;
+	/** A token exchange's response body is fresh credentials: log its status and headers only. */
+	readonly #omitResponseBody: boolean;
 
-	constructor(id: number, requestPath: string, responsePath: string, overwriteResponseLog: boolean) {
+	constructor(
+		id: number,
+		requestPath: string,
+		responsePath: string,
+		overwriteResponseLog: boolean,
+		omitResponseBody: boolean,
+	) {
 		this.id = id;
 		this.requestPath = requestPath;
 		this.responsePath = responsePath;
 		this.#overwriteResponseLog = overwriteResponseLog;
+		this.#omitResponseBody = omitResponseBody;
 	}
 
 	async openResponseLog(statusLine: string, headers?: RequestDebugHeaders): Promise<RequestDebugResponseLog> {
-		const handle = await fs.open(this.responsePath, this.#overwriteResponseLog ? "w" : "wx");
+		const handle = await fs.open(this.responsePath, this.#overwriteResponseLog ? "w" : "wx", 0o600);
 		const headerBlock = formatResponseHeaderBlock(statusLine, headers);
 		await handle.write(textEncoder.encode(headerBlock));
+		if (this.#omitResponseBody) {
+			await handle.write(textEncoder.encode("[response body omitted: credential exchange]\n"));
+			await handle.close();
+			return { write() {}, close: async () => {} };
+		}
 		return new FileRequestDebugResponseLog(handle);
 	}
 
@@ -208,18 +241,84 @@ export function copyResponseMetadata(target: Response, source: Response): void {
 	}
 }
 
+/**
+ * The dump directory, created 0700. The default lives under omp's state root;
+ * a `PI_REQ_DEBUG_DIR` override must already deny group and other access,
+ * since dumps hold prompts, responses and request bodies.
+ */
+async function requestDebugDir(): Promise<string> {
+	const override = Bun.env[REQUEST_DEBUG_DIR_ENV]?.trim();
+	if (override) {
+		if (!path.isAbsolute(override)) throw new Error(`${REQUEST_DEBUG_DIR_ENV} must be an absolute path`);
+		await fs.mkdir(override, { recursive: true, mode: 0o700 });
+		const stat = await fs.stat(override);
+		if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) {
+			throw new Error(`${REQUEST_DEBUG_DIR_ENV} ${override} is readable by other users; chmod 700 it`);
+		}
+		return override;
+	}
+	const dir = getRequestDebugDir();
+	await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+	if (process.platform !== "win32") await fs.chmod(dir, 0o700);
+	return dir;
+}
+
 async function reserveRequestDebugFile(): Promise<ReservedRequestDebugFile> {
+	const dir = await requestDebugDir();
 	for (;;) {
 		const id = nextSessionId++;
-		const requestPath = `rr-session-${id}.json`;
+		const requestPath = path.join(dir, `rr-session-${process.pid}-${id}.json`);
 		try {
-			const handle = await fs.open(requestPath, "wx");
-			return { id, requestPath, responsePath: `rr-session-${id}.res.log`, handle, overwrite: false };
+			const handle = await fs.open(requestPath, "wx", 0o600);
+			return {
+				id,
+				requestPath,
+				responsePath: path.join(dir, `rr-session-${process.pid}-${id}.res.log`),
+				handle,
+				overwrite: false,
+			};
 		} catch (error) {
 			if (isFileExistsError(error)) continue;
 			throw error;
 		}
 	}
+}
+
+/** Replace the value of every field named by `fields`, at any depth, with a marker. */
+function redactCredentialFields(value: unknown, fields: RegExp): unknown {
+	if (Array.isArray(value)) return value.map(item => redactCredentialFields(item, fields));
+	if (typeof value !== "object" || value === null) return value;
+	const out: Record<string, unknown> = {};
+	for (const [key, field] of Object.entries(value)) {
+		out[key] = fields.test(key) ? REDACTED : redactCredentialFields(field, fields);
+	}
+	return out;
+}
+
+/**
+ * Redact credential fields of an `application/x-www-form-urlencoded` body
+ * (the shape OAuth token endpoints take). Text that is not a plain form body
+ * is returned unchanged.
+ */
+function redactFormCredentials(text: string): string {
+	if (!/^[^\s=&]+=[^\s]*$/.test(text)) return text;
+	const params = new URLSearchParams(text);
+	let redacted = false;
+	for (const key of new Set(params.keys())) {
+		if (!EXCHANGE_CREDENTIAL_FIELD_RE.test(key)) continue;
+		params.set(key, REDACTED);
+		redacted = true;
+	}
+	return redacted ? params.toString() : text;
+}
+
+/** True for an OAuth/token exchange: a `grant_type` in the body, or a request to a token endpoint. */
+function isCredentialExchange(payload: RequestDebugPayload): boolean {
+	try {
+		if (TOKEN_ENDPOINT_PATH_RE.test(new URL(payload.url).pathname)) return true;
+	} catch {}
+	if (typeof payload.body === "object" && payload.body !== null && "grant_type" in payload.body) return true;
+	return payload.bodyText !== undefined && /(?:^|&)grant_type=/.test(payload.bodyText);
 }
 
 function resolveRequestMethod(input: string | URL | Request, init: RequestInit | undefined): string {
