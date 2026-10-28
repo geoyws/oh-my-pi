@@ -213,9 +213,9 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 			try {
 				// Lazy: the stats dashboard (server + sqlite) loads on demand only,
 				// matching src/cli/stats-cli.ts, to keep CLI startup fast.
-				const { formatStatsDashboardUrl, startServer } = await import("@oh-my-pi/omp-stats");
+				const { startServer, statsDashboardLaunchUrl } = await import("@oh-my-pi/omp-stats");
 				const { hostname, port } = await startServer();
-				const url = `${formatStatsDashboardUrl(hostname, port)}/#/traces?s=${encodeURIComponent(sessionFile)}`;
+				const url = statsDashboardLaunchUrl(hostname, port, `#/traces?s=${encodeURIComponent(sessionFile)}`);
 				await runtime.output(url);
 				return commandConsumed();
 			} catch (err) {

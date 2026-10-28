@@ -89,7 +89,7 @@ export async function launchStatsDashboard(
 		if (judge) await stats.startServer(activeStatsServer.port, activeStatsServer.hostname, { judge });
 	}
 
-	const url = stats.formatStatsDashboardUrl(activeStatsServer.hostname, activeStatsServer.port);
+	const url = stats.statsDashboardLaunchUrl(activeStatsServer.hostname, activeStatsServer.port);
 	openUtils.openPath(url);
 
 	const serverLine = requestedAddressIgnored
