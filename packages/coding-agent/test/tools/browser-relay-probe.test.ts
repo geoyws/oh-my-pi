@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { VERSION } from "@oh-my-pi/pi-utils/dirs";
 import { findFreeCdpPort } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
+import { RELAY_NONCE_FIELD } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/auth";
 import { waitForRelayExtension } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/probe";
 import { DISCARDED_TABS_PROTOCOL_VERSION } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/protocol";
 import {
@@ -77,18 +78,18 @@ describe("waitForRelayExtension", () => {
 			ompRelayVersion: VERSION,
 			disconnectedMs: 120_000,
 		};
-		let probes = 0;
+		let requests = 0;
 		fake = Bun.serve({
 			hostname: "127.0.0.1",
 			port: 0,
-			fetch: request => {
-				// Each poll first sends a token-less challenge; count the polls themselves.
-				if (!new URL(request.url).searchParams.has("challenge")) probes++;
+			fetch: () => {
+				requests++;
 				return Response.json(info, { status: 503 });
 			},
 		});
 		expect(await waitForRelayExtension(`http://127.0.0.1:${fake.port}`)).toBe("extension-gone");
-		expect(probes).toBe(1);
+		// One poll: the token-less nonce request, then the discovery request itself.
+		expect(requests).toBe(2);
 	});
 
 	it("reports a stale relay before blaming an extension that has been gone past the redial window", async () => {
@@ -231,18 +232,25 @@ describe("waitForRelayExtension", () => {
 		expect(performance.now() - started).toBeLessThan(2_000);
 	});
 
-	it("never sends the capability to a port holder that cannot prove it is this user's relay", async () => {
+	it("never sends the capability to a port holder, even one that hands out a nonce", async () => {
 		const seen: string[] = [];
 		fake = Bun.serve({
 			hostname: "127.0.0.1",
 			port: 0,
 			fetch: request => {
 				seen.push(request.url, ...[...request.headers].map(([name, value]) => `${name}: ${value}`));
-				return Response.json({ ompRelayVersion: VERSION, error: "relay capability token required" }, { status: 401 });
+				return Response.json(
+					{
+						ompRelayVersion: VERSION,
+						error: "relay capability token required",
+						[RELAY_NONCE_FIELD]: "squatter-nonce",
+					},
+					{ status: 401 },
+				);
 			},
 		});
 		expect(await waitForRelayExtension(`http://127.0.0.1:${fake.port}`)).toBe("unauthorized");
-		expect(seen.length).toBeGreaterThan(0);
+		expect(seen.some(line => line.includes("mac="))).toBeTrue();
 		expect(seen.join("\n")).not.toContain(CDP_TOKEN);
 	});
 

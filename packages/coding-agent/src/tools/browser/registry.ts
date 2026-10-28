@@ -19,7 +19,7 @@ import {
 	gracefulKillTreeOnce,
 	probeCdpResponse,
 	resolveSpawnArgs,
-	verifiedRelayDiscoveryUrl,
+	authenticatedRelayDiscoveryUrl,
 	waitForCdp,
 } from "./attach";
 import type { CmuxKind } from "./cmux/rpc";
@@ -337,9 +337,9 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 				`The browser relay at ${cdpUrl} refused this omp's capability token. It belongs to another OS user or was started with a different token; this user's token lives in ${getBrowserRelayCdpTokenPath()} (a client on another machine sets PI_BROWSER_RELAY_CDP_TOKEN to its content).`,
 			);
 		}
-		// Discovery carries the capability token only once the listener proved it is this user's
-		// relay; the WebSocket URL it returns carries it too.
-		const discoveryUrl = await verifiedRelayDiscoveryUrl(cdpUrl, "/json/version", {
+		// Discovery proves the capability token with a nonce HMAC and never sends it; the WebSocket
+		// URL it returns carries a relay-issued ticket instead of the token.
+		const discoveryUrl = await authenticatedRelayDiscoveryUrl(cdpUrl, "/json/version", {
 			timeoutMs: RELAY_DISCOVERY_TIMEOUT_MS,
 			signal: opts.signal,
 		});

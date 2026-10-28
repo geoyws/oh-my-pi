@@ -97,7 +97,7 @@ import {
 } from "../../utils/changelog";
 import { copyToClipboard } from "../../utils/clipboard";
 import { formatDumpArchiveReport, type SessionDumpArchive } from "../../session/session-dump-format";
-import { openPath } from "../../utils/open";
+import { openCapabilityUrl, openPath } from "../../utils/open";
 import { resumeCommand } from "../../utils/resume-command";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 import {
@@ -370,7 +370,7 @@ export class CommandController {
 			const { startServer, statsDashboardLaunchUrl } = await import("@oh-my-pi/omp-stats");
 			const { hostname, port } = await startServer();
 			const url = statsDashboardLaunchUrl(hostname, port, `#/traces?s=${encodeURIComponent(sessionFile)}`);
-			this.openInBrowser(url);
+			openCapabilityUrl(url);
 			this.ctx.showStatus(`Trace: ${url}`);
 		} catch (error: unknown) {
 			this.ctx.showError(`Failed to open trace: ${error instanceof Error ? error.message : "Unknown error"}`);

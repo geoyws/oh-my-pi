@@ -90,7 +90,7 @@ export async function launchStatsDashboard(
 	}
 
 	const url = stats.statsDashboardLaunchUrl(activeStatsServer.hostname, activeStatsServer.port);
-	openUtils.openPath(url);
+	openUtils.openCapabilityUrl(url);
 
 	const serverLine = requestedAddressIgnored
 		? `Dashboard already running at: ${url} (requested ${args.host}:${args.port} ignored)`

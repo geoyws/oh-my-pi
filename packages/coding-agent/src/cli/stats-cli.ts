@@ -8,7 +8,7 @@ import { formatKeyHint } from "@oh-my-pi/pi-tui/key-hint-format";
 import { truncateToWidth } from "@oh-my-pi/pi-tui/utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { openStandaloneJudge } from "../judgment/standalone";
-import { openPath } from "../utils/open";
+import { openCapabilityUrl } from "../utils/open";
 
 /**
  * Single-line TTY progress bar. On a non-TTY stream we just stay quiet -
@@ -107,8 +107,8 @@ export async function runStatsCommand(cmd: StatsCommandArgs): Promise<void> {
 	const url = statsDashboardLaunchUrl(hostname, port);
 	console.log(chalk.green(`Dashboard available at: ${url}`));
 
-	// Open browser
-	openPath(url);
+	// Open browser (the URL carries the dashboard capability: keep it out of the opener's argv)
+	openCapabilityUrl(url);
 
 	console.log(`Press ${formatKeyHint("ctrl+c")} to stop\n`);
 

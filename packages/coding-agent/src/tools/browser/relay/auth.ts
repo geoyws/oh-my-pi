@@ -2,62 +2,117 @@
  * Capability token for the relay's CDP side (discovery and `/cdp`).
  *
  * The relay drives the user's logged-in Chrome, so loopback binding alone is
- * not enough: any local OS user could connect. Every CDP-side request must
- * carry the per-user token from a 0600 file; the server and every omp client
- * of this user read the same file. The extension's `/ext` leg keeps its own
- * optional `--token`. A client on another machine (reaching the relay through
- * a port forward) cannot read that file; it sets `PI_BROWSER_RELAY_CDP_TOKEN`
- * to the file's content instead.
+ * not enough: any local OS user could connect. Every CDP-side request must be
+ * authorized by the per-user token from a 0600 file; the server and every omp
+ * client of this user read the same file. The extension's `/ext` leg keeps its
+ * own optional `--token`. A client on another machine (reaching the relay
+ * through a port forward that keeps the relay's port number) cannot read that
+ * file; it sets `PI_BROWSER_RELAY_CDP_TOKEN` to the file's content instead.
  *
- * A client never sends the token to a listener it has not verified: another
- * OS user can bind the relay port first. Discovery starts with a token-less
- * `/json/version?challenge=<random>`, and only a relay that answers with
- * {@link relayListenerProof} for this port is sent the token.
+ * omp clients never send the token itself: another OS user may hold the port.
+ * A token-less discovery request is answered with a single-use nonce, and the
+ * client proves the token with an HMAC over that nonce, the port it contacted
+ * and the endpoint. The relay checks the HMAC against its own port, so a
+ * squatter relaying the exchange to a genuine relay on another port is refused,
+ * and nothing it sees can be replayed. The WebSocket URL the relay then
+ * advertises carries a ticket, not the token: Puppeteer reconnects through
+ * that URL (tab workers), so a ticket is reusable, but only for as long as that
+ * relay process runs.
  */
 import * as crypto from "node:crypto";
-import { getBrowserRelayCdpTokenPath, loadOrCreateCapabilityToken } from "@oh-my-pi/pi-utils";
+import { capabilityTokenMatches, getBrowserRelayCdpTokenPath, loadOrCreateCapabilityToken } from "@oh-my-pi/pi-utils";
 
-/** Body field of a relay's `/json/version` answer carrying the challenge proof. */
-export const RELAY_PROOF_FIELD = "ompRelayProof";
-/** Body field naming the port the proving relay listens on. */
-export const RELAY_PORT_FIELD = "ompRelayPort";
+/** Body field of a token-less discovery answer carrying a single-use nonce. */
+export const RELAY_NONCE_FIELD = "ompRelayNonce";
 
-const CHALLENGE_RE = /^[A-Za-z0-9_-]{22,128}$/;
+export type RelayDiscoveryEndpoint = "/json" | "/json/version" | "/json/list";
 
 /** This user's relay CDP token, created on first use. Read on every call so a rotated file takes effect. */
 export function relayCdpToken(): string {
 	return process.env.PI_BROWSER_RELAY_CDP_TOKEN?.trim() || loadOrCreateCapabilityToken(getBrowserRelayCdpTokenPath());
 }
 
-/**
- * Proof that a relay holds `token`, bound to the port it answers on: a squatter that forwards the
- * challenge to a genuine relay on another port gets that port's proof, which the client rejects.
- * The token itself never leaves the relay. Null for a malformed challenge.
- */
-export function relayListenerProof(token: string, port: number, challenge: string): string | null {
-	if (!CHALLENGE_RE.test(challenge)) return null;
-	return crypto.createHmac("sha256", token).update(`omp-relay-proof\n${port}\n${challenge}`).digest("base64url");
+/** HMAC a client presents for `nonce` on `endpoint`, bound to the relay port it contacted. */
+export function relayRequestMac(token: string, port: number, nonce: string, endpoint: RelayDiscoveryEndpoint): string {
+	return crypto
+		.createHmac("sha256", token)
+		.update(`omp-relay-auth\n${port}\n${nonce}\n${endpoint}`)
+		.digest("base64url");
 }
 
-/** A fresh random challenge for {@link relayListenerProof}. */
-export function newRelayChallenge(): string {
-	return crypto.randomBytes(24).toString("base64url");
+const NONCE_TTL_MS = 30_000;
+/** Outstanding nonces kept per relay; the oldest is dropped beyond it. */
+const MAX_OUTSTANDING = 256;
+
+/** Single-use random values with a time to live, oldest evicted first. */
+class SingleUseStore {
+	readonly #entries = new Map<string, number>();
+	constructor(readonly ttlMs: number) {}
+
+	issue(): string {
+		const value = crypto.randomBytes(24).toString("base64url");
+		this.#entries.set(value, Date.now() + this.ttlMs);
+		while (this.#entries.size > MAX_OUTSTANDING) {
+			const oldest = this.#entries.keys().next().value;
+			if (oldest === undefined) break;
+			this.#entries.delete(oldest);
+		}
+		return value;
+	}
+
+	/** True once for an issued, unexpired value; it is spent either way. */
+	consume(value: string | null | undefined): boolean {
+		if (!value) return false;
+		const expires = this.#entries.get(value);
+		if (expires === undefined) return false;
+		this.#entries.delete(value);
+		return expires >= Date.now();
+	}
 }
 
-/**
- * True when a challenge answer proves this user's relay listens on `urlPort`. A client using the
- * local token file requires the proof for its own URL port. One with `PI_BROWSER_RELAY_CDP_TOKEN`
- * set reaches a relay on another machine through a port forward, whose port differs, so it checks
- * the proof against the port the relay reports instead; no genuine relay of its user can serve on
- * this machine to be relayed from.
- */
-export function relayProofMatches(urlPort: number, challenge: string, answer: Record<string, unknown>): boolean {
-	const presented = answer[RELAY_PROOF_FIELD];
-	if (typeof presented !== "string") return false;
-	const remote = Boolean(process.env.PI_BROWSER_RELAY_CDP_TOKEN?.trim());
-	const reported = answer[RELAY_PORT_FIELD];
-	const port = remote && typeof reported === "number" && Number.isSafeInteger(reported) ? reported : urlPort;
-	const expected = relayListenerProof(relayCdpToken(), port, challenge);
-	if (expected === null || presented.length !== expected.length) return false;
-	return crypto.timingSafeEqual(Buffer.from(presented), Buffer.from(expected));
+/** Server side of the relay's CDP authentication. */
+export class RelayCdpAuth {
+	readonly #nonces = new SingleUseStore(NONCE_TTL_MS);
+	/** Signs tickets; lives and dies with this relay process. */
+	readonly #ticketKey = crypto.randomBytes(32);
+
+	constructor(
+		readonly token: string,
+		readonly port: () => number,
+	) {}
+
+	/** A fresh single-use nonce for a token-less discovery request. */
+	issueNonce(): string {
+		return this.#nonces.issue();
+	}
+
+	/** A `/cdp` ticket valid while this relay process runs. */
+	issueTicket(): string {
+		const id = crypto.randomBytes(16).toString("base64url");
+		return `${id}.${this.#signTicket(id)}`;
+	}
+
+	#signTicket(id: string): string {
+		return crypto.createHmac("sha256", this.#ticketKey).update(id).digest("base64url");
+	}
+
+	/**
+	 * True when `params` carry a valid `nonce`+`mac` for `endpoint` (the nonce is spent), or the
+	 * token itself as `token`/`bearer` (manual clients such as the smoke script).
+	 */
+	authorizesDiscovery(endpoint: RelayDiscoveryEndpoint, params: URLSearchParams, bearer: string | undefined): boolean {
+		if (capabilityTokenMatches(this.token, params.get("token") ?? bearer)) return true;
+		const nonce = params.get("nonce");
+		const mac = params.get("mac");
+		if (!nonce || !mac || !this.#nonces.consume(nonce)) return false;
+		return capabilityTokenMatches(relayRequestMac(this.token, this.port(), nonce, endpoint), mac);
+	}
+
+	/** True for a ticket this relay process issued, or the token itself. */
+	authorizesCdp(params: URLSearchParams, bearer: string | undefined): boolean {
+		if (capabilityTokenMatches(this.token, params.get("token") ?? bearer)) return true;
+		const [id, signature, extra] = (params.get("ticket") ?? "").split(".");
+		if (!id || !signature || extra !== undefined) return false;
+		return capabilityTokenMatches(this.#signTicket(id), signature);
+	}
 }

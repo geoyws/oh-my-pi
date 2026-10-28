@@ -119,25 +119,31 @@ describe("browser relay discovery endpoint", () => {
 		return port;
 	}
 
-	it("advertises the requested Host authority, with the capability, so a remote Puppeteer client dials the relay", async () => {
+	/** The advertised WebSocket URL carries a relay ticket, never the capability token. */
+	function expectTicketedCdpUrl(url: string, authority: string): void {
+		expect(url).toStartWith(`ws://${authority}/cdp?ticket=`);
+		expect(url).not.toContain(CDP_TOKEN);
+	}
+
+	it("advertises the requested Host authority, with a ticket, so a remote Puppeteer client dials the relay", async () => {
 		const port = await startReadyRelay();
 		const response = await rawGet(
 			port,
 			`GET /json/version?${AUTH} HTTP/1.1\r\nHost: 100.100.92.97:12803\r\nConnection: close\r\n\r\n`,
 		);
-		expect(parseVersion(response).webSocketDebuggerUrl).toBe(`ws://100.100.92.97:12803/cdp?${AUTH}`);
+		expectTicketedCdpUrl(parseVersion(response).webSocketDebuggerUrl, "100.100.92.97:12803");
 	});
 
 	it("uses the loopback discovery URL when an HTTP/1.0 request has no Host header", async () => {
 		const port = await startReadyRelay();
 		const response = await rawGet(port, `GET /json/version?${AUTH} HTTP/1.0\r\n\r\n`);
-		expect(parseVersion(response).webSocketDebuggerUrl).toBe(`ws://127.0.0.1:${port}/cdp?${AUTH}`);
+		expectTicketedCdpUrl(parseVersion(response).webSocketDebuggerUrl, `127.0.0.1:${port}`);
 	});
 
 	it("uses the loopback discovery URL when Host is empty", async () => {
 		const port = await startReadyRelay();
 		const response = await rawGet(port, `GET /json/version?${AUTH} HTTP/1.1\r\nHost: \r\nConnection: close\r\n\r\n`);
-		expect(parseVersion(response).webSocketDebuggerUrl).toBe(`ws://127.0.0.1:${port}/cdp?${AUTH}`);
+		expectTicketedCdpUrl(parseVersion(response).webSocketDebuggerUrl, `127.0.0.1:${port}`);
 	});
 
 	it("refuses a Host that names a domain, even with the capability (DNS rebinding)", async () => {
@@ -187,25 +193,31 @@ describe("browser relay discovery endpoint", () => {
 		expect(response.status).toBe(403);
 	});
 
-	it("refuses a /cdp WebSocket without the capability and accepts the advertised URL", async () => {
+	it("refuses a /cdp WebSocket without the capability or with a forged ticket, and reuses the advertised URL", async () => {
 		const port = await startReadyRelay();
-		for (const query of ["", `?token=${"x".repeat(43)}`]) {
-			const rejected = new WebSocket(`ws://127.0.0.1:${port}/cdp${query}`);
+		const opens = async (url: string) => {
+			const socket = new WebSocket(url);
 			const outcome = Promise.withResolvers<"open" | "refused">();
-			rejected.addEventListener("open", () => outcome.resolve("open"), { once: true });
-			rejected.addEventListener("error", () => outcome.resolve("refused"), { once: true });
-			expect(await outcome.promise).toBe("refused");
+			socket.addEventListener("open", () => outcome.resolve("open"), { once: true });
+			socket.addEventListener("error", () => outcome.resolve("refused"), { once: true });
+			const result = await outcome.promise;
+			socket.close();
+			return result;
+		};
+		for (const query of ["", `?token=${"x".repeat(43)}`, "?ticket=forged.forged", "?ticket="]) {
+			expect(await opens(`ws://127.0.0.1:${port}/cdp${query}`)).toBe("refused");
 			expect(relay!.bridge.cdpClientCount).toBe(0);
 		}
 		const advertised = (await (await fetch(`http://127.0.0.1:${port}/json/version?${AUTH}`)).json()) as {
 			webSocketDebuggerUrl: string;
 		};
-		const client = new WebSocket(advertised.webSocketDebuggerUrl);
-		const opened = Promise.withResolvers<void>();
-		client.addEventListener("open", () => opened.resolve(), { once: true });
-		client.addEventListener("error", () => opened.reject(new Error("advertised /cdp URL refused")), { once: true });
-		await opened.promise;
-		client.close();
+		// Puppeteer's tab workers reconnect through the same advertised URL.
+		expect(await opens(advertised.webSocketDebuggerUrl)).toBe("open");
+		expect(await opens(advertised.webSocketDebuggerUrl)).toBe("open");
+		// A ticket whose signature was altered is refused.
+		const ticket = new URL(advertised.webSocketDebuggerUrl).searchParams.get("ticket")!;
+		const [id, signature] = ticket.split(".");
+		expect(await opens(`ws://127.0.0.1:${port}/cdp?ticket=${id}.${signature!.slice(1)}x`)).toBe("refused");
 	});
 
 	it("reports 503 with extensionSeen=false while no extension has ever handshaken", async () => {

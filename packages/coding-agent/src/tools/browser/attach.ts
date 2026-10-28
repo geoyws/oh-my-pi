@@ -8,7 +8,7 @@ import type { Browser, Page, Target } from "puppeteer-core";
 import { throwIfAborted } from "../tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { isPuppeteerTimeout } from "./launch";
-import { newRelayChallenge, relayCdpToken, relayProofMatches } from "./relay/auth";
+import { RELAY_NONCE_FIELD, type RelayDiscoveryEndpoint, relayCdpToken, relayRequestMac } from "./relay/auth";
 
 const ATTACH_TARGET_SKIP_PATTERN =
 	/request[\s_-]?handler|devtools|background[\s_-]?(?:page|host)|service[\s_-]?worker/i;
@@ -163,34 +163,37 @@ export function probeCdpResponse(
 }
 
 /**
- * Relay discovery URL for `endpoint` under `cdpUrl`, carrying this user's capability token only
- * when the listener first proves it holds that token: a token-less `/json/version?challenge=…`
- * must answer with this user's port-bound proof. Anything else — a listener another OS user bound
- * first, a relay of another user, or a legacy relay predating the token — gets the URL without
- * the token, so the token is never disclosed to an unverified port holder.
+ * Single-use relay discovery URL for `endpoint` under `cdpUrl` that never carries the capability
+ * token. A token-less `/json/version` makes an omp relay answer 401 with a single-use nonce; the URL
+ * then carries that nonce and an HMAC of it under this user's token, bound to the port contacted
+ * here, so a listener another OS user bound first learns nothing reusable and cannot relay the
+ * exchange to a relay on another port. Anything that does not hand out a nonce (Chrome, a legacy
+ * relay) gets the plain URL. Fetch the returned URL once: the relay spends the nonce.
  */
-export async function verifiedRelayDiscoveryUrl(
+export async function authenticatedRelayDiscoveryUrl(
 	cdpUrl: string,
-	endpoint: "/json" | "/json/version" | "/json/list",
+	endpoint: RelayDiscoveryEndpoint,
 	opts: { timeoutMs: number; signal?: AbortSignal },
 ): Promise<string> {
 	const base = cdpUrl.replace(/\/+$/, "");
-	const challenge = newRelayChallenge();
-	const response = await probeCdpResponse(`${base}/json/version?challenge=${challenge}`, opts);
+	const plain = `${base}${endpoint}`;
 	let port: number;
 	try {
 		const target = new URL(base);
 		port = target.port ? Number(target.port) : 80;
 	} catch {
-		return `${base}${endpoint}`;
+		return plain;
 	}
-	let answer: Record<string, unknown> = {};
+	const response = await probeCdpResponse(`${base}/json/version`, opts);
+	if (response?.status !== 401) return plain;
+	let nonce: unknown;
 	try {
-		const body: unknown = response ? JSON.parse(Buffer.from(response.body, "latin1").toString("utf8")) : null;
-		if (isRecord(body)) answer = body;
+		const body: unknown = JSON.parse(Buffer.from(response.body, "latin1").toString("utf8"));
+		if (isRecord(body)) nonce = body[RELAY_NONCE_FIELD];
 	} catch {}
-	if (!relayProofMatches(port, challenge, answer)) return `${base}${endpoint}`;
-	return `${base}${endpoint}?token=${encodeURIComponent(relayCdpToken())}`;
+	if (typeof nonce !== "string" || nonce.length === 0) return plain;
+	const mac = relayRequestMac(relayCdpToken(), port, nonce, endpoint);
+	return `${plain}?nonce=${encodeURIComponent(nonce)}&mac=${encodeURIComponent(mac)}`;
 }
 
 /** Poll `${cdpUrl}/json/version` until it responds with 200, with abort + timeout support. */
@@ -560,7 +563,7 @@ async function fetchRelayEntries(
 	timeoutMs = RELAY_JSON_TIMEOUT_MS,
 ): Promise<RelayJsonEntry[] | null> {
 	try {
-		const url = await verifiedRelayDiscoveryUrl(relayJson, "/json", { timeoutMs, signal });
+		const url = await authenticatedRelayDiscoveryUrl(relayJson, "/json", { timeoutMs, signal });
 		const res = await probeCdpResponse(url, { timeoutMs, signal });
 		if (!res || res.status < 200 || res.status >= 300) return null;
 		const body: unknown = JSON.parse(Buffer.from(res.body, "latin1").toString("utf8"));

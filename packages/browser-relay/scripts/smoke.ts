@@ -3,18 +3,47 @@
  * connection pattern against a live relay + extension.
  *
  * The tool opens TWO puppeteer connections per driven tab — the supervisor
- * (`puppeteer.connect({browserURL})`, picks a target) and a tab worker
- * (`puppeteer.connect({browserWSEndpoint})`, adopts that target by id) — so
- * this script does exactly that, then exercises evaluate/navigate/screenshot,
+ * (authenticated `/json/version` discovery, then `puppeteer.connect({browserWSEndpoint})`,
+ * picks a target) and a tab worker (the same advertised endpoint, adopts that target
+ * by id) — so this script does exactly that, then exercises evaluate/navigate/screenshot,
  * an extra CDP session, and the createTarget/closeTarget path.
  *
  * Usage: bun scripts/smoke.ts [relay-url] [target-substring]
+ * The relay capability comes from `PI_BROWSER_RELAY_CDP_TOKEN`, else `~/.omp/run/browser-relay-cdp.token`.
  */
+import * as crypto from "node:crypto";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { Target } from "puppeteer-core";
 import puppeteer from "puppeteer-core";
 
-const relayUrl = Bun.argv[2] ?? "http://127.0.0.1:9224";
+const relayUrl = (Bun.argv[2] ?? "http://127.0.0.1:9224").replace(/\/+$/, "");
 const matcher = Bun.argv[3] ?? "Relay Smoke Page";
+
+/** This user's relay capability, as omp reads it: the env override, else the token file. */
+async function relayToken(): Promise<string> {
+	const fromEnv = process.env.PI_BROWSER_RELAY_CDP_TOKEN?.trim();
+	if (fromEnv) return fromEnv;
+	return (await Bun.file(path.join(os.homedir(), ".omp", "run", "browser-relay-cdp.token")).text()).trim();
+}
+
+/**
+ * The relay's `webSocketDebuggerUrl`, discovered the way omp does it: the relay hands a token-less
+ * request a single-use nonce, and the HMAC over it proves the token without sending it.
+ */
+async function discoverWsEndpoint(): Promise<string> {
+	const challenge = await fetch(`${relayUrl}/json/version`);
+	const { ompRelayNonce: nonce } = (await challenge.json()) as { ompRelayNonce?: string };
+	if (challenge.status !== 401 || !nonce) throw new Error(`${relayUrl} did not issue a relay nonce`);
+	const port = new URL(relayUrl).port || "80";
+	const mac = crypto
+		.createHmac("sha256", await relayToken())
+		.update(`omp-relay-auth\n${port}\n${nonce}\n/json/version`)
+		.digest("base64url");
+	const response = await fetch(`${relayUrl}/json/version?nonce=${encodeURIComponent(nonce)}&mac=${mac}`);
+	if (!response.ok) throw new Error(`relay discovery failed: HTTP ${response.status} ${await response.text()}`);
+	return ((await response.json()) as { webSocketDebuggerUrl: string }).webSocketDebuggerUrl;
+}
 
 /** Puppeteer keeps the CDP target id on an internal field; same access the omp tab supervisor uses (`targetIdForPage`). */
 function targetIdOf(target: Target): string {
@@ -27,8 +56,12 @@ function step(name: string): void {
 	console.log(`\n== ${name}`);
 }
 
-step("supervisor: connect via browserURL");
-const supervisor = await puppeteer.connect({ browserURL: relayUrl, defaultViewport: null, protocolTimeout: 20_000 });
+step("supervisor: authenticated discovery, connect via browserWSEndpoint");
+const supervisor = await puppeteer.connect({
+	browserWSEndpoint: await discoverWsEndpoint(),
+	defaultViewport: null,
+	protocolTimeout: 20_000,
+});
 console.log("version:", await supervisor.version());
 
 step("supervisor: discover targets");

@@ -18,7 +18,7 @@ import { daemonClientForGlobal } from "../../../launch/client";
 import { describeQuietly, stopQuietly, waitReady } from "../../../launch/ensure";
 import { resolveWorkerSpawnCmd } from "../../../subprocess/worker-client";
 import { throwIfAborted } from "../../tool-errors";
-import { probeCdpResponse, probeCdpStatus, verifiedRelayDiscoveryUrl } from "../attach";
+import { authenticatedRelayDiscoveryUrl, probeCdpResponse, probeCdpStatus } from "../attach";
 import { DEFAULT_RELAY_URL } from "./kind";
 import { isOlderRelayVersion, relayCdpClientsOf, relayVersionOf } from "./probe";
 
@@ -193,7 +193,7 @@ async function relayStatusAt(
 	cdpUrl: string,
 	signal: AbortSignal | undefined,
 ): Promise<{ version: string; cdpClients: number | null } | null> {
-	const url = await verifiedRelayDiscoveryUrl(cdpUrl, "/json/version", { timeoutMs: PROBE_TIMEOUT_MS, signal });
+	const url = await authenticatedRelayDiscoveryUrl(cdpUrl, "/json/version", { timeoutMs: PROBE_TIMEOUT_MS, signal });
 	throwIfAborted(signal);
 	const response = await probeCdpResponse(url, { timeoutMs: PROBE_TIMEOUT_MS, signal });
 	throwIfAborted(signal);

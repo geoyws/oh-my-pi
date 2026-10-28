@@ -16,9 +16,9 @@
  * `Bearer` header on discovery; see `./auth`), and every request naming a
  * domain in its Host header is refused, which defeats DNS rebinding.
  */
-import { capabilityTokenMatches, isRebindingSafeHost } from "@oh-my-pi/pi-utils";
+import { isRebindingSafeHost } from "@oh-my-pi/pi-utils";
 import { VERSION } from "@oh-my-pi/pi-utils/dirs";
-import { RELAY_PORT_FIELD, RELAY_PROOF_FIELD, relayCdpToken, relayListenerProof } from "./auth";
+import { RELAY_NONCE_FIELD, RelayCdpAuth, relayCdpToken } from "./auth";
 import { RelayBridge } from "./bridge";
 
 /** Options for {@link startRelayServer}. */
@@ -84,7 +84,7 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 	const group =
 		opts.group === false ? null : opts.group === true || opts.group === undefined ? DEFAULT_GROUP : opts.group;
 	const bridge = new RelayBridge({ log, group });
-	const cdpToken = opts.cdpToken ?? relayCdpToken();
+	const auth = new RelayCdpAuth(opts.cdpToken ?? relayCdpToken(), () => server.port ?? opts.port);
 	const sockets = new Set<RelayWebSocket>();
 	const startedAt = Date.now();
 
@@ -105,12 +105,11 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 			const url = new URL(requestUrl, `http://${fallback}`);
 			const path = url.pathname.replace(/\/+$/, "") || "/";
 			const bearer = req.headers.get("authorization")?.match(/^Bearer\s+(\S+)$/i)?.[1];
-			const cdpAuthorized = capabilityTokenMatches(cdpToken, url.searchParams.get("token") ?? bearer);
 			if (path === "/cdp") {
 				// Browsers set Origin on websocket upgrades; native CDP clients
 				// don't. Reject any Origin so a web page can't drive the relay.
 				if (req.headers.get("origin")) return new Response("Forbidden", { status: 403 });
-				if (!cdpAuthorized) return new Response("Unauthorized", { status: 401 });
+				if (!auth.authorizesCdp(url.searchParams, bearer)) return new Response("Unauthorized", { status: 401 });
 				const data: SocketData = { role: "cdp" };
 				if (srv.upgrade(req, { data })) return undefined;
 				return new Response("websocket upgrade required", { status: 426 });
@@ -130,17 +129,14 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 			if (req.method !== "GET") return new Response("Method not allowed", { status: 405 });
 			if (path === "/json/version" || path === "/json" || path === "/json/list") {
 				if (req.headers.get("origin")) return new Response("Forbidden", { status: 403 });
-				if (!cdpAuthorized) {
-					// A token-less `?challenge=` lets a client verify this is its user's relay
-					// before it sends the token: answer with the port-bound proof, never the token.
-					const challenge = path === "/json/version" ? url.searchParams.get("challenge") : null;
-					const port = srv.port ?? opts.port;
-					const proof = challenge === null ? null : relayListenerProof(cdpToken, port, challenge);
+				if (!auth.authorizesDiscovery(path, url.searchParams, bearer)) {
+					// The single-use nonce lets an omp client prove the token with an HMAC
+					// instead of sending it to a listener it cannot yet trust.
 					return Response.json(
 						{
 							ompRelayVersion: VERSION,
 							error: "relay capability token required",
-							...(proof === null ? {} : { [RELAY_PROOF_FIELD]: proof, [RELAY_PORT_FIELD]: port }),
+							[RELAY_NONCE_FIELD]: auth.issueNonce(),
 						},
 						{ status: 401 },
 					);
@@ -159,7 +155,8 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 					};
 					return Response.json(info, { status: 503 });
 				}
-				return Response.json(bridge.versionInfo(`ws://${host}/cdp?token=${encodeURIComponent(cdpToken)}`));
+				// A single-use ticket, never the token: whoever reads this URL gets one connection at most.
+				return Response.json(bridge.versionInfo(`ws://${host}/cdp?ticket=${auth.issueTicket()}`));
 			}
 			if (path === "/json" || path === "/json/list") {
 				return Response.json(bridge.listTargets());

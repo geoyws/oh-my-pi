@@ -15,7 +15,7 @@
  */
 import { VERSION } from "@oh-my-pi/pi-utils/dirs";
 import { throwIfAborted } from "../../tool-errors";
-import { probeCdpResponse, verifiedRelayDiscoveryUrl } from "../attach";
+import { authenticatedRelayDiscoveryUrl, probeCdpResponse } from "../attach";
 import type { RelayUnavailableInfo } from "./server";
 import { DISCARDED_TABS_PROTOCOL_VERSION } from "./protocol";
 
@@ -134,8 +134,11 @@ export async function waitForRelayExtension(cdpUrl: string, signal?: AbortSignal
 	let staleRelay = false;
 	for (;;) {
 		throwIfAborted(signal);
-		// Re-verified every poll: the listener on the port can change between polls.
-		const probeUrl = await verifiedRelayDiscoveryUrl(cdpUrl, "/json/version", { timeoutMs: PROBE_TIMEOUT_MS, signal });
+		// A fresh nonce every poll: each one is single-use, and the listener can change between polls.
+		const probeUrl = await authenticatedRelayDiscoveryUrl(cdpUrl, "/json/version", {
+			timeoutMs: PROBE_TIMEOUT_MS,
+			signal,
+		});
 		throwIfAborted(signal);
 		const response = await probeCdpResponse(probeUrl, { timeoutMs: PROBE_TIMEOUT_MS, signal });
 		throwIfAborted(signal);
