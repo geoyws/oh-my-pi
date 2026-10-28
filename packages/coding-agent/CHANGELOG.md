@@ -45,6 +45,7 @@
 ### Security
 
 - The stats dashboard no longer serves session content to anyone who can reach its loopback port: every dashboard request now requires the per-user capability token (the `omp stats`, `/stats`, and `/trace` URLs carry a one-time `?token=` that sets an `HttpOnly; SameSite=Strict` cookie on first open), and requests with a non-loopback `Host` or a cross-origin `Origin` are refused, closing DNS-rebinding reads. Older unauthenticated dashboards are reclaimed on next start.
+- The browser relay's CDP side no longer lets any local process drive your logged-in Chrome: `/json/version`, `/json`, `/json/list` and the `/cdp` WebSocket now require this user's capability token, kept in a `0600` file under omp's state directory (`run/browser-relay-cdp.token`) and read by every omp client of that user; the advertised `webSocketDebuggerUrl` carries it. Requests with a domain `Host` (DNS rebinding) or any `Origin` on discovery are refused. A client on another machine that reaches the relay through a port forward sets `PI_BROWSER_RELAY_CDP_TOKEN` to the file's content. The extension's `/ext` leg and its optional `--token` are unchanged.
 
 ### Changed
 
