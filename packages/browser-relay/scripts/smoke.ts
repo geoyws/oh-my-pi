@@ -17,7 +17,8 @@ import * as path from "node:path";
 import type { Target } from "puppeteer-core";
 import puppeteer from "puppeteer-core";
 
-const relayUrl = (Bun.argv[2] ?? "http://127.0.0.1:9224").replace(/\/+$/, "");
+// `localhost` is dialled as 127.0.0.1, as omp does, so it cannot resolve to a squatter on ::1.
+const relayUrl = (Bun.argv[2] ?? "http://127.0.0.1:9224").replace(/\/+$/, "").replace("//localhost:", "//127.0.0.1:");
 const matcher = Bun.argv[3] ?? "Relay Smoke Page";
 
 /** This user's relay capability, as omp reads it: the env override, else the token file. */
@@ -29,16 +30,18 @@ async function relayToken(): Promise<string> {
 
 /**
  * The relay's `webSocketDebuggerUrl`, discovered the way omp does it: the relay hands a token-less
- * request a single-use nonce, and the HMAC over it proves the token without sending it.
+ * request a single-use nonce, and an HMAC over it and the authority dialled proves the token
+ * without sending it.
  */
 async function discoverWsEndpoint(): Promise<string> {
 	const challenge = await fetch(`${relayUrl}/json/version`);
 	const { ompRelayNonce: nonce } = (await challenge.json()) as { ompRelayNonce?: string };
 	if (challenge.status !== 401 || !nonce) throw new Error(`${relayUrl} did not issue a relay nonce`);
-	const port = new URL(relayUrl).port || "80";
+	const target = new URL(relayUrl);
+	const authority = `${target.hostname}:${target.port || "80"}`;
 	const mac = crypto
 		.createHmac("sha256", await relayToken())
-		.update(`omp-relay-auth\n${port}\n${nonce}\n/json/version`)
+		.update(`omp-relay-auth\n${authority}\n${nonce}\n/json/version`)
 		.digest("base64url");
 	const response = await fetch(`${relayUrl}/json/version?nonce=${encodeURIComponent(nonce)}&mac=${mac}`);
 	if (!response.ok) throw new Error(`relay discovery failed: HTTP ${response.status} ${await response.text()}`);

@@ -8,7 +8,13 @@ import type { Browser, Page, Target } from "puppeteer-core";
 import { throwIfAborted } from "../tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { isPuppeteerTimeout } from "./launch";
-import { RELAY_NONCE_FIELD, type RelayDiscoveryEndpoint, relayCdpToken, relayRequestMac } from "./relay/auth";
+import {
+	RELAY_LISTEN_HOST,
+	RELAY_NONCE_FIELD,
+	type RelayDiscoveryEndpoint,
+	relayCdpToken,
+	relayRequestMac,
+} from "./relay/auth";
 
 const ATTACH_TARGET_SKIP_PATTERN =
 	/request[\s_-]?handler|devtools|background[\s_-]?(?:page|host)|service[\s_-]?worker/i;
@@ -165,25 +171,31 @@ export function probeCdpResponse(
 /**
  * Single-use relay discovery URL for `endpoint` under `cdpUrl` that never carries the capability
  * token. A token-less `/json/version` makes an omp relay answer 401 with a single-use nonce; the URL
- * then carries that nonce and an HMAC of it under this user's token, bound to the port contacted
- * here, so a listener another OS user bound first learns nothing reusable and cannot relay the
- * exchange to a relay on another port. Anything that does not hand out a nonce (Chrome, a legacy
- * relay) gets the plain URL. Fetch the returned URL once: the relay spends the nonce.
+ * then carries that nonce and an HMAC of it under this user's token, bound to the exact authority
+ * (`host:port`) dialled here. The relay accepts only its own `127.0.0.1:<port>`, so a listener
+ * another OS user holds on any other address or port learns nothing reusable and cannot relay the
+ * exchange to the genuine relay. `localhost` is dialled as `127.0.0.1` so it cannot resolve to a
+ * squatter on `::1`. Anything that does not hand out a nonce (Chrome, a legacy relay) gets the plain
+ * URL. Fetch the returned URL once: the relay spends the nonce.
  */
 export async function authenticatedRelayDiscoveryUrl(
 	cdpUrl: string,
 	endpoint: RelayDiscoveryEndpoint,
 	opts: { timeoutMs: number; signal?: AbortSignal },
 ): Promise<string> {
-	const base = cdpUrl.replace(/\/+$/, "");
-	const plain = `${base}${endpoint}`;
-	let port: number;
+	let base = cdpUrl.replace(/\/+$/, "");
+	let authority: string;
 	try {
 		const target = new URL(base);
-		port = target.port ? Number(target.port) : 80;
+		if (target.hostname === "localhost") {
+			target.hostname = RELAY_LISTEN_HOST;
+			base = target.origin;
+		}
+		authority = `${target.hostname}:${target.port || "80"}`;
 	} catch {
-		return plain;
+		return `${base}${endpoint}`;
 	}
+	const plain = `${base}${endpoint}`;
 	const response = await probeCdpResponse(`${base}/json/version`, opts);
 	if (response?.status !== 401) return plain;
 	let nonce: unknown;
@@ -192,7 +204,7 @@ export async function authenticatedRelayDiscoveryUrl(
 		if (isRecord(body)) nonce = body[RELAY_NONCE_FIELD];
 	} catch {}
 	if (typeof nonce !== "string" || nonce.length === 0) return plain;
-	const mac = relayRequestMac(relayCdpToken(), port, nonce, endpoint);
+	const mac = relayRequestMac(relayCdpToken(), authority, nonce, endpoint);
 	return `${plain}?nonce=${encodeURIComponent(nonce)}&mac=${encodeURIComponent(mac)}`;
 }
 

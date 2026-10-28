@@ -245,9 +245,9 @@ export async function connectPuppeteer(puppeteer: typeof Puppeteer, options: Con
 			endpoint && !failure.message.includes(endpoint)
 				? `CDP connection to '${endpoint}' failed: ${failure.message}`
 				: failure.message;
-		// Relay WebSocket URLs carry a capability token; never let it reach an error
-		// (or the cause chain, which loggers serialize).
-		const redacted = message.replace(/([?&]token=)[^&\s'"]+/g, "$1***");
+		// Relay WebSocket URLs carry a reusable ticket (or, from manual configs, the capability
+		// token); never let either reach an error (or the cause chain, which loggers serialize).
+		const redacted = message.replace(/([?&](?:token|ticket)=)[^&\s'"]+/g, "$1***");
 		if (redacted !== message) throw new Error(redacted);
 		if (redacted === failure.message) throw failure;
 		throw new Error(redacted, { cause: error });

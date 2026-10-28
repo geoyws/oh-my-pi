@@ -6,21 +6,26 @@
  * authorized by the per-user token from a 0600 file; the server and every omp
  * client of this user read the same file. The extension's `/ext` leg keeps its
  * own optional `--token`. A client on another machine (reaching the relay
- * through a port forward that keeps the relay's port number) cannot read that
- * file; it sets `PI_BROWSER_RELAY_CDP_TOKEN` to the file's content instead.
+ * through a port forward to `127.0.0.1` that keeps the relay's port number)
+ * cannot read that file; it sets `PI_BROWSER_RELAY_CDP_TOKEN` to the file's
+ * content instead.
  *
- * omp clients never send the token itself: another OS user may hold the port.
- * A token-less discovery request is answered with a single-use nonce, and the
- * client proves the token with an HMAC over that nonce, the port it contacted
- * and the endpoint. The relay checks the HMAC against its own port, so a
- * squatter relaying the exchange to a genuine relay on another port is refused,
- * and nothing it sees can be replayed. The WebSocket URL the relay then
- * advertises carries a ticket, not the token: Puppeteer reconnects through
- * that URL (tab workers), so a ticket is reusable, but only for as long as that
- * relay process runs.
+ * omp clients never send the token itself: another OS user may hold the
+ * address they dial. A token-less discovery request is answered with a
+ * single-use nonce, and the client proves the token with an HMAC over that
+ * nonce, the authority (`host:port`) it dialled and the endpoint. The relay
+ * checks the HMAC against the one authority it listens on, `127.0.0.1:<port>`,
+ * so a squatter on any other address or port that relays the exchange to the
+ * genuine relay is refused and never sees a ticket, and nothing it sees can be
+ * replayed. The WebSocket URL the relay then advertises carries a ticket, not
+ * the token: Puppeteer reconnects through that URL (tab workers), so a ticket
+ * is reusable, but only for as long as that relay process runs.
  */
 import * as crypto from "node:crypto";
 import { capabilityTokenMatches, getBrowserRelayCdpTokenPath, loadOrCreateCapabilityToken } from "@oh-my-pi/pi-utils";
+
+/** The only address the relay listens on; HMACs are bound to it. */
+export const RELAY_LISTEN_HOST = "127.0.0.1";
 
 /** Body field of a token-less discovery answer carrying a single-use nonce. */
 export const RELAY_NONCE_FIELD = "ompRelayNonce";
@@ -32,11 +37,16 @@ export function relayCdpToken(): string {
 	return process.env.PI_BROWSER_RELAY_CDP_TOKEN?.trim() || loadOrCreateCapabilityToken(getBrowserRelayCdpTokenPath());
 }
 
-/** HMAC a client presents for `nonce` on `endpoint`, bound to the relay port it contacted. */
-export function relayRequestMac(token: string, port: number, nonce: string, endpoint: RelayDiscoveryEndpoint): string {
+/** HMAC a client presents for `nonce` on `endpoint`, bound to the relay authority (`host:port`) it dialled. */
+export function relayRequestMac(
+	token: string,
+	authority: string,
+	nonce: string,
+	endpoint: RelayDiscoveryEndpoint,
+): string {
 	return crypto
 		.createHmac("sha256", token)
-		.update(`omp-relay-auth\n${port}\n${nonce}\n${endpoint}`)
+		.update(`omp-relay-auth\n${authority}\n${nonce}\n${endpoint}`)
 		.digest("base64url");
 }
 
@@ -78,7 +88,8 @@ export class RelayCdpAuth {
 
 	constructor(
 		readonly token: string,
-		readonly port: () => number,
+		/** The relay's own listen authority, `127.0.0.1:<port>`. */
+		readonly authority: () => string,
 	) {}
 
 	/** A fresh single-use nonce for a token-less discovery request. */
@@ -105,7 +116,7 @@ export class RelayCdpAuth {
 		const nonce = params.get("nonce");
 		const mac = params.get("mac");
 		if (!nonce || !mac || !this.#nonces.consume(nonce)) return false;
-		return capabilityTokenMatches(relayRequestMac(this.token, this.port(), nonce, endpoint), mac);
+		return capabilityTokenMatches(relayRequestMac(this.token, this.authority(), nonce, endpoint), mac);
 	}
 
 	/** True for a ticket this relay process issued, or the token itself. */

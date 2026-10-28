@@ -18,7 +18,7 @@
  */
 import { isRebindingSafeHost } from "@oh-my-pi/pi-utils";
 import { VERSION } from "@oh-my-pi/pi-utils/dirs";
-import { RELAY_NONCE_FIELD, RelayCdpAuth, relayCdpToken } from "./auth";
+import { RELAY_LISTEN_HOST, RELAY_NONCE_FIELD, RelayCdpAuth, relayCdpToken } from "./auth";
 import { RelayBridge } from "./bridge";
 
 /** Options for {@link startRelayServer}. */
@@ -84,12 +84,15 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 	const group =
 		opts.group === false ? null : opts.group === true || opts.group === undefined ? DEFAULT_GROUP : opts.group;
 	const bridge = new RelayBridge({ log, group });
-	const auth = new RelayCdpAuth(opts.cdpToken ?? relayCdpToken(), () => server.port ?? opts.port);
+	const auth = new RelayCdpAuth(
+		opts.cdpToken ?? relayCdpToken(),
+		() => `${RELAY_LISTEN_HOST}:${server.port ?? opts.port}`,
+	);
 	const sockets = new Set<RelayWebSocket>();
 	const startedAt = Date.now();
 
 	const server = Bun.serve({
-		hostname: "127.0.0.1",
+		hostname: RELAY_LISTEN_HOST,
 		port: opts.port,
 		fetch(req, srv): Response | undefined {
 			const fallback = `127.0.0.1:${opts.port}`;
