@@ -81,8 +81,9 @@ describe("waitForRelayExtension", () => {
 		fake = Bun.serve({
 			hostname: "127.0.0.1",
 			port: 0,
-			fetch: () => {
-				probes++;
+			fetch: request => {
+				// Each poll first sends a token-less challenge; count the polls themselves.
+				if (!new URL(request.url).searchParams.has("challenge")) probes++;
 				return Response.json(info, { status: 503 });
 			},
 		});
@@ -228,6 +229,21 @@ describe("waitForRelayExtension", () => {
 		const started = performance.now();
 		expect(await waitForRelayExtension(`http://127.0.0.1:${port}`)).toBe("unauthorized");
 		expect(performance.now() - started).toBeLessThan(2_000);
+	});
+
+	it("never sends the capability to a port holder that cannot prove it is this user's relay", async () => {
+		const seen: string[] = [];
+		fake = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: request => {
+				seen.push(request.url, ...[...request.headers].map(([name, value]) => `${name}: ${value}`));
+				return Response.json({ ompRelayVersion: VERSION, error: "relay capability token required" }, { status: 401 });
+			},
+		});
+		expect(await waitForRelayExtension(`http://127.0.0.1:${fake.port}`)).toBe("unauthorized");
+		expect(seen.length).toBeGreaterThan(0);
+		expect(seen.join("\n")).not.toContain(CDP_TOKEN);
 	});
 
 	it("keeps polling a young relay and reports ready once the extension handshakes", async () => {

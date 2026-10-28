@@ -1,10 +1,10 @@
 import "./styles.css";
 import { createRoot } from "react-dom/client";
 import App from "./App";
-import { dashboardToken } from "./api";
+import { dashboardSession } from "./api";
 
-// Adopt the launch token first so it leaves the address bar before anything renders.
-dashboardToken();
+// Swap the launch token for a session first, so it leaves the address bar before anything renders.
+void dashboardSession();
 
 const root = document.getElementById("root");
 if (!root) throw new Error("missing #root");

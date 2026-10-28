@@ -670,7 +670,7 @@ import { declareWorkerHostEntry } from ${utils("worker-host.ts")};
 import { closeDaemonClients, daemonClientForGlobal } from ${source("launch/client.ts")};
 import { acquireBrowser, releaseBrowser } from ${source("tools/browser/registry.ts")};
 import { DISCARDED_TABS_PROTOCOL_VERSION } from ${source("tools/browser/relay/protocol.ts")};
-import { relayDiscoveryUrl } from ${source("tools/browser/relay/auth.ts")};
+import { verifiedRelayDiscoveryUrl } from ${source("tools/browser/attach.ts")};
 import { startRelayServer } from ${source("tools/browser/relay/server.ts")};
 
 if (process.argv[2] === "browser-relay") {
@@ -719,7 +719,7 @@ if (process.argv[2] === "browser-relay") {
 		declareWorkerHostEntry();
 		const extension = connectExtension();
 		const handle = await acquireBrowser({ kind: "relay", cdpUrl }, { cwd: process.cwd() });
-		const body: unknown = await (await fetch(relayDiscoveryUrl(cdpUrl, "/json/version"))).json();
+		const body: unknown = await (await fetch(await verifiedRelayDiscoveryUrl(cdpUrl, "/json/version", { timeoutMs: 2_000 }))).json();
 		const current = (await client.request({ op: "describe", name })).daemon;
 		process.stdout.write(
 			JSON.stringify({

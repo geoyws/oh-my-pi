@@ -18,8 +18,7 @@ import { daemonClientForGlobal } from "../../../launch/client";
 import { describeQuietly, stopQuietly, waitReady } from "../../../launch/ensure";
 import { resolveWorkerSpawnCmd } from "../../../subprocess/worker-client";
 import { throwIfAborted } from "../../tool-errors";
-import { probeCdpResponse, probeCdpStatus } from "../attach";
-import { relayDiscoveryUrl } from "./auth";
+import { probeCdpResponse, probeCdpStatus, verifiedRelayDiscoveryUrl } from "../attach";
 import { DEFAULT_RELAY_URL } from "./kind";
 import { isOlderRelayVersion, relayCdpClientsOf, relayVersionOf } from "./probe";
 
@@ -48,10 +47,11 @@ const ENSURE_ATTEMPTS = 3;
 
 /**
  * True when the relay HTTP server answers /json/version at all (200 = extension connected, 503 = waiting for it,
- * 401 = serving but refusing this user's token, which the caller's wait reports rather than fighting the bind).
+ * 401 = serving but refusing a token-less request, which the caller's wait reports rather than fighting the bind).
+ * Sends no token: whatever holds the port may not be this user's relay.
  */
 export async function probeRelayServer(cdpUrl: string): Promise<boolean> {
-	const status = await probeCdpStatus(relayDiscoveryUrl(cdpUrl, "/json/version"), { timeoutMs: PROBE_TIMEOUT_MS });
+	const status = await probeCdpStatus(`${cdpUrl.replace(/\/+$/, "")}/json/version`, { timeoutMs: PROBE_TIMEOUT_MS });
 	return status === 503 || status === 401 || (status !== null && status >= 200 && status < 300);
 }
 
@@ -193,10 +193,9 @@ async function relayStatusAt(
 	cdpUrl: string,
 	signal: AbortSignal | undefined,
 ): Promise<{ version: string; cdpClients: number | null } | null> {
-	const response = await probeCdpResponse(relayDiscoveryUrl(cdpUrl, "/json/version"), {
-		timeoutMs: PROBE_TIMEOUT_MS,
-		signal,
-	});
+	const url = await verifiedRelayDiscoveryUrl(cdpUrl, "/json/version", { timeoutMs: PROBE_TIMEOUT_MS, signal });
+	throwIfAborted(signal);
+	const response = await probeCdpResponse(url, { timeoutMs: PROBE_TIMEOUT_MS, signal });
 	throwIfAborted(signal);
 	if (!response) return null;
 	try {

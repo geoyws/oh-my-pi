@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -403,6 +404,10 @@ export function statsDashboardLaunchUrl(hostname: string, port: number, fragment
 
 function createDashboardServer(port: number, hostname: string): Server<undefined> {
 	const token = loadOrCreateCapabilityToken(getStatsDashboardTokenPath());
+	// The browser never keeps the reusable capability: it swaps the launch token
+	// for this secret, which dies with this listener. Origin storage is shared
+	// with whoever binds the same port later, so only a dead credential may sit there.
+	const session = crypto.randomBytes(32).toString("base64url");
 	const server = Bun.serve({
 		port,
 		hostname,
@@ -436,14 +441,21 @@ function createDashboardServer(port: number, hostname: string): Server<undefined
 			const origin = req.headers.get("origin");
 			if (origin !== null && origin !== `http://${hostHeader}`) return deny(403, "Forbidden: unexpected Origin.");
 
-			// Every data path needs the capability as a bearer header. EventSource
-			// cannot set headers, so the event stream alone also takes `?token=`
-			// (a URL only this origin's page builds). Static assets hold no data.
+			// Every data path needs a credential as a bearer header: the capability
+			// (native clients, and the page's one-time exchange) or this listener's
+			// session secret (the page). EventSource cannot set headers, so the event
+			// stream alone takes the session secret as `?session=`. Static assets hold no data.
 			if (path.startsWith("/api/")) {
-				const presented =
-					bearerToken(req) ??
-					(path === "/api/events" && req.method === "GET" ? url.searchParams.get("token") : null);
-				if (!capabilityTokenMatches(token, presented)) return deny(401, STATS_AUTH_HINT);
+				const bearer = bearerToken(req);
+				const viaCapability = capabilityTokenMatches(token, bearer);
+				const viaSession =
+					capabilityTokenMatches(session, bearer) ||
+					(path === "/api/events" && req.method === "GET" && capabilityTokenMatches(session, url.searchParams.get("session")));
+				if (!viaCapability && !viaSession) return deny(401, STATS_AUTH_HINT);
+				if (path === "/api/session") {
+					if (req.method !== "POST" || !viaCapability) return deny(401, STATS_AUTH_HINT);
+					return Response.json({ session }, { headers: { ...dashboardHeaders, "Cache-Control": "no-store" } });
+				}
 			}
 
 			if (req.method === "OPTIONS") {

@@ -18,7 +18,7 @@
  */
 import { capabilityTokenMatches, isRebindingSafeHost } from "@oh-my-pi/pi-utils";
 import { VERSION } from "@oh-my-pi/pi-utils/dirs";
-import { relayCdpToken } from "./auth";
+import { RELAY_PORT_FIELD, RELAY_PROOF_FIELD, relayCdpToken, relayListenerProof } from "./auth";
 import { RelayBridge } from "./bridge";
 
 /** Options for {@link startRelayServer}. */
@@ -131,8 +131,17 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 			if (path === "/json/version" || path === "/json" || path === "/json/list") {
 				if (req.headers.get("origin")) return new Response("Forbidden", { status: 403 });
 				if (!cdpAuthorized) {
+					// A token-less `?challenge=` lets a client verify this is its user's relay
+					// before it sends the token: answer with the port-bound proof, never the token.
+					const challenge = path === "/json/version" ? url.searchParams.get("challenge") : null;
+					const port = srv.port ?? opts.port;
+					const proof = challenge === null ? null : relayListenerProof(cdpToken, port, challenge);
 					return Response.json(
-						{ ompRelayVersion: VERSION, error: "relay capability token required" },
+						{
+							ompRelayVersion: VERSION,
+							error: "relay capability token required",
+							...(proof === null ? {} : { [RELAY_PROOF_FIELD]: proof, [RELAY_PORT_FIELD]: port }),
+						},
 						{ status: 401 },
 					);
 				}

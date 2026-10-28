@@ -96,23 +96,54 @@ describe("stats dashboard auth", () => {
 		}
 	});
 
-	it("accepts a ?token= query only for the event stream", async () => {
+	async function exchangeSession(base: string, bearer: string): Promise<Response> {
+		return fetch(`${base}/api/session`, { method: "POST", headers: { Authorization: `Bearer ${bearer}` } });
+	}
+
+	it("swaps the capability for a listener session the page can use, including on the event stream", async () => {
 		const server = await startServer(0);
 		try {
 			const base = `http://${server.hostname}:${server.port}`;
-			const events = await fetch(`${base}/api/events?token=${dashboardToken()}`);
+			const exchanged = await exchangeSession(base, dashboardToken());
+			expect(exchanged.status).toBe(200);
+			expect(exchanged.headers.get("cache-control")).toBe("no-store");
+			const { session } = (await exchanged.json()) as { session: string };
+			expect(session).toMatch(/^[A-Za-z0-9_-]{43}$/);
+			expect(session).not.toBe(dashboardToken());
+
+			const api = await fetch(`${base}/api/stats/models`, { headers: { Authorization: `Bearer ${session}` } });
+			expect(api.status).toBe(200);
+			await api.body?.cancel();
+			const events = await fetch(`${base}/api/events?session=${session}`);
 			expect(events.status).toBe(200);
 			await events.body?.cancel();
 
-			const wrong = await fetch(`${base}/api/events?token=wrong-token`);
-			expect(wrong.status).toBe(401);
-			await wrong.body?.cancel();
-
-			const otherApi = await fetch(`${base}/api/stats/models?token=${dashboardToken()}`);
-			expect(otherApi.status).toBe(401);
-			await otherApi.body?.cancel();
+			// A session cannot mint sessions, and the capability never rides in a URL.
+			expect((await exchangeSession(base, session)).status).toBe(401);
+			const capabilityInUrl = await fetch(`${base}/api/events?token=${dashboardToken()}`);
+			expect(capabilityInUrl.status).toBe(401);
+			await capabilityInUrl.body?.cancel();
+			const sessionElsewhere = await fetch(`${base}/api/stats/models?session=${session}`);
+			expect(sessionElsewhere.status).toBe(401);
+			await sessionElsewhere.body?.cancel();
 		} finally {
 			server.stop();
+		}
+	});
+
+	it("does not honour a session from another dashboard listener", async () => {
+		const first = await startServer(0);
+		const second = await startServer(0);
+		try {
+			const firstBase = `http://${first.hostname}:${first.port}`;
+			const secondBase = `http://${second.hostname}:${second.port}`;
+			const { session } = (await (await exchangeSession(firstBase, dashboardToken())).json()) as { session: string };
+			const stale = await fetch(`${secondBase}/api/stats/models`, { headers: { Authorization: `Bearer ${session}` } });
+			expect(stale.status).toBe(401);
+			await stale.body?.cancel();
+		} finally {
+			second.stop();
+			first.stop();
 		}
 	});
 

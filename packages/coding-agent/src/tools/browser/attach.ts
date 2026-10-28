@@ -8,7 +8,7 @@ import type { Browser, Page, Target } from "puppeteer-core";
 import { throwIfAborted } from "../tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { isPuppeteerTimeout } from "./launch";
-import { relayDiscoveryUrl } from "./relay/auth";
+import { newRelayChallenge, relayCdpToken, relayProofMatches } from "./relay/auth";
 
 const ATTACH_TARGET_SKIP_PATTERN =
 	/request[\s_-]?handler|devtools|background[\s_-]?(?:page|host)|service[\s_-]?worker/i;
@@ -160,6 +160,37 @@ export function probeCdpResponse(
 	opts: { timeoutMs: number; signal?: AbortSignal },
 ): Promise<CdpProbeResponse | null> {
 	return rawHttpGet(url, { ...opts, readBody: true });
+}
+
+/**
+ * Relay discovery URL for `endpoint` under `cdpUrl`, carrying this user's capability token only
+ * when the listener first proves it holds that token: a token-less `/json/version?challenge=…`
+ * must answer with this user's port-bound proof. Anything else — a listener another OS user bound
+ * first, a relay of another user, or a legacy relay predating the token — gets the URL without
+ * the token, so the token is never disclosed to an unverified port holder.
+ */
+export async function verifiedRelayDiscoveryUrl(
+	cdpUrl: string,
+	endpoint: "/json" | "/json/version" | "/json/list",
+	opts: { timeoutMs: number; signal?: AbortSignal },
+): Promise<string> {
+	const base = cdpUrl.replace(/\/+$/, "");
+	const challenge = newRelayChallenge();
+	const response = await probeCdpResponse(`${base}/json/version?challenge=${challenge}`, opts);
+	let port: number;
+	try {
+		const target = new URL(base);
+		port = target.port ? Number(target.port) : 80;
+	} catch {
+		return `${base}${endpoint}`;
+	}
+	let answer: Record<string, unknown> = {};
+	try {
+		const body: unknown = response ? JSON.parse(Buffer.from(response.body, "latin1").toString("utf8")) : null;
+		if (isRecord(body)) answer = body;
+	} catch {}
+	if (!relayProofMatches(port, challenge, answer)) return `${base}${endpoint}`;
+	return `${base}${endpoint}?token=${encodeURIComponent(relayCdpToken())}`;
 }
 
 /** Poll `${cdpUrl}/json/version` until it responds with 200, with abort + timeout support. */
@@ -529,10 +560,8 @@ async function fetchRelayEntries(
 	timeoutMs = RELAY_JSON_TIMEOUT_MS,
 ): Promise<RelayJsonEntry[] | null> {
 	try {
-		const res = await probeCdpResponse(relayDiscoveryUrl(relayJson, "/json"), {
-			timeoutMs,
-			signal,
-		});
+		const url = await verifiedRelayDiscoveryUrl(relayJson, "/json", { timeoutMs, signal });
+		const res = await probeCdpResponse(url, { timeoutMs, signal });
 		if (!res || res.status < 200 || res.status >= 300) return null;
 		const body: unknown = JSON.parse(Buffer.from(res.body, "latin1").toString("utf8"));
 		return Array.isArray(body) ? (body as RelayJsonEntry[]) : null;
