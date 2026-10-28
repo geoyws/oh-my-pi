@@ -367,9 +367,9 @@ export class CommandController {
 		try {
 			// Lazy: the stats dashboard (server + sqlite) loads on demand only,
 			// matching src/cli/stats-cli.ts, to keep CLI startup fast.
-			const { formatStatsDashboardUrl, startServer } = await import("@oh-my-pi/omp-stats");
+			const { startServer, statsDashboardLaunchUrl } = await import("@oh-my-pi/omp-stats");
 			const { hostname, port } = await startServer();
-			const url = `${formatStatsDashboardUrl(hostname, port)}/#/traces?s=${encodeURIComponent(sessionFile)}`;
+			const url = statsDashboardLaunchUrl(hostname, port, `#/traces?s=${encodeURIComponent(sessionFile)}`);
 			this.openInBrowser(url);
 			this.ctx.showStatus(`Trace: ${url}`);
 		} catch (error: unknown) {

@@ -1,7 +1,14 @@
 import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { isEnoent, logger } from "@oh-my-pi/pi-utils";
+import {
+	capabilityTokenMatches,
+	getStatsDashboardTokenPath,
+	isEnoent,
+	isRebindingSafeHost,
+	loadOrCreateCapabilityToken,
+	logger,
+} from "@oh-my-pi/pi-utils";
 import { $, type Server } from "bun";
 import {
 	getCostDashboardStats,
@@ -367,7 +374,46 @@ export function formatStatsDashboardUrl(hostname: string, port: number): string 
 	return `http://${urlHostname}:${port}`;
 }
 
+/** Cookie holding the dashboard capability token after the `?token=` bootstrap. */
+const STATS_TOKEN_COOKIE = "omp_stats_token";
+
+/** Short hint for 401 bodies: the token lives in the URL omp printed, nowhere else. */
+const STATS_AUTH_HINT = "Unauthorized: open the dashboard URL printed by `omp stats` or `/trace`.";
+
+/** Extract the capability token from the request's Cookie header, if present. */
+function cookieToken(req: Request): string | null {
+	const header = req.headers.get("cookie");
+	if (!header) return null;
+	for (const part of header.split(";")) {
+		const pair = part.trim();
+		if (pair.startsWith(`${STATS_TOKEN_COOKIE}=`)) {
+			return pair.slice(STATS_TOKEN_COOKIE.length + 1).trim() || null;
+		}
+	}
+	return null;
+}
+
+/** Extract a `Bearer` capability token from the Authorization header, if present. */
+function bearerToken(req: Request): string | null {
+	const header = req.headers.get("authorization");
+	if (!header) return null;
+	const match = /^Bearer (.+)$/.exec(header.trim());
+	return match ? match[1].trim() : null;
+}
+
+/**
+ * Dashboard URL that authenticates the browser: opening it sets the token
+ * cookie (via the `?token=` bootstrap redirect) and lands on the same page.
+ * `fragment` (e.g. `#/traces?s=...`) stays after the query. The token in the
+ * URL is intended for the same user; never log it anywhere else.
+ */
+export function statsDashboardLaunchUrl(hostname: string, port: number, fragment = ""): string {
+	const token = loadOrCreateCapabilityToken(getStatsDashboardTokenPath());
+	return `${formatStatsDashboardUrl(hostname, port)}/?token=${token}${fragment}`;
+}
+
 function createDashboardServer(port: number, hostname: string): Server<undefined> {
+	const token = loadOrCreateCapabilityToken(getStatsDashboardTokenPath());
 	const server = Bun.serve({
 		port,
 		hostname,
@@ -381,6 +427,44 @@ function createDashboardServer(port: number, hostname: string): Server<undefined
 				[STATS_DASHBOARD_HEADER]: STATS_DASHBOARD_SECURITY_VERSION,
 				[STATS_DASHBOARD_HOSTNAME_HEADER]: hostname,
 			};
+			const deny = (status: number, message: string): Response =>
+				new Response(message, {
+					status,
+					headers: { ...dashboardHeaders, "Content-Type": "text/plain; charset=utf-8" },
+				});
+
+			// Gate everything first (including OPTIONS and /api/events): a DNS-
+			// rebinding page can only reach us through a domain hostname, and a
+			// same-user client always sends a loopback Host.
+			const hostHeader = req.headers.get("host");
+			if (!isRebindingSafeHost(hostHeader)) return deny(403, "Forbidden: unexpected Host.");
+			const origin = req.headers.get("origin");
+			if (origin !== null && origin !== `http://${hostHeader}`) return deny(403, "Forbidden: unexpected Origin.");
+
+			// Bootstrap: opening the printed `?token=` URL sets the cookie and
+			// lands on the same page without the token. GET-only; anything else
+			// carrying `token` falls through to the cookie/bearer check below.
+			const tokenParam = url.searchParams.get("token");
+			if (tokenParam !== null) {
+				if (req.method === "GET" && capabilityTokenMatches(token, tokenParam)) {
+					url.searchParams.delete("token");
+					const query = url.searchParams.toString();
+					const location = `${url.pathname}${query ? `?${query}` : ""}${url.hash}`;
+					return new Response(null, {
+						status: 302,
+						headers: {
+							...dashboardHeaders,
+							Location: location,
+							"Set-Cookie": `${STATS_TOKEN_COOKIE}=${token}; HttpOnly; SameSite=Strict; Path=/`,
+							"Cache-Control": "no-store",
+						},
+					});
+				}
+				return deny(401, STATS_AUTH_HINT);
+			}
+			if (!capabilityTokenMatches(token, cookieToken(req)) && !capabilityTokenMatches(token, bearerToken(req))) {
+				return deny(401, STATS_AUTH_HINT);
+			}
 
 			if (req.method === "OPTIONS") {
 				return new Response(null, { headers: dashboardHeaders });

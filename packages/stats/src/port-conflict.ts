@@ -1,7 +1,7 @@
 import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { $which } from "@oh-my-pi/pi-utils";
+import { $which, getStatsDashboardTokenPath, loadOrCreateCapabilityToken } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
 
 const STATS_PROBE_TIMEOUT_MS = 500;
@@ -21,7 +21,7 @@ export const STATS_DASHBOARD_HEADER = "x-omp-stats-dashboard";
 export const STATS_DASHBOARD_HOSTNAME_HEADER = "x-omp-stats-hostname";
 
 /** Identity-header value for dashboards enforcing an explicit bind host and same-origin access. */
-export const STATS_DASHBOARD_SECURITY_VERSION = "3";
+export const STATS_DASHBOARD_SECURITY_VERSION = "4";
 
 /** IPv4 loopback address shared by the dashboard server and reuse probe. */
 export const STATS_DASHBOARD_HOSTNAME = "127.0.0.1";
@@ -32,8 +32,10 @@ async function probeStatsDashboard(port: number, hostname: string): Promise<Stat
 	const probeHostname = hostname === "0.0.0.0" ? STATS_DASHBOARD_HOSTNAME : hostname === "::" ? "::1" : hostname;
 	const urlHostname = probeHostname.includes(":") ? `[${probeHostname}]` : probeHostname;
 	try {
+		const token = loadOrCreateCapabilityToken(getStatsDashboardTokenPath());
 		const response = await fetch(`http://${urlHostname}:${port}/api/stats/models`, {
 			signal: AbortSignal.timeout(STATS_PROBE_TIMEOUT_MS),
+			headers: { Authorization: `Bearer ${token}` },
 		});
 		const dashboardVersionHeader = response.headers.get(STATS_DASHBOARD_HEADER);
 		const dashboardVersion = dashboardVersionHeader === null ? Number.NaN : Number(dashboardVersionHeader);

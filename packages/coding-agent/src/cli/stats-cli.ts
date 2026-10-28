@@ -71,12 +71,12 @@ export async function runStatsCommand(cmd: StatsCommandArgs): Promise<void> {
 	// Lazy import to avoid loading stats module when not needed
 	const {
 		closeDb,
-		formatStatsDashboardUrl,
 		getDashboardStats,
 		getTotalMessageCount,
 		printStatsSummary,
 		refreshRollups,
 		startServer,
+		statsDashboardLaunchUrl,
 		syncAllSessions,
 	} = await import("@oh-my-pi/omp-stats");
 
@@ -104,7 +104,7 @@ export async function runStatsCommand(cmd: StatsCommandArgs): Promise<void> {
 	const { hostname, port } = await startServer(cmd.port, cmd.host, {
 		judge: async () => (await openStandaloneJudge(cwd, "stats_frustration")).judge,
 	});
-	const url = formatStatsDashboardUrl(hostname, port);
+	const url = statsDashboardLaunchUrl(hostname, port);
 	console.log(chalk.green(`Dashboard available at: ${url}`));
 
 	// Open browser

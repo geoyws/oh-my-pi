@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { networkInterfaces } from "node:os";
 import { connect, type Subprocess } from "bun";
+import { getStatsDashboardTokenPath, loadOrCreateCapabilityToken } from "@oh-my-pi/pi-utils";
 import {
 	STATS_DASHBOARD_HEADER,
 	STATS_DASHBOARD_HOSTNAME,
@@ -88,7 +89,9 @@ describe("startServer access", () => {
 
 		try {
 			expect(server.hostname).toBe(STATS_DASHBOARD_HOSTNAME);
-			const response = await fetch(`http://${server.hostname}:${server.port}/api/stats/models`);
+			const response = await fetch(`http://${server.hostname}:${server.port}/api/stats/models`, {
+				headers: { Authorization: `Bearer ${loadOrCreateCapabilityToken(getStatsDashboardTokenPath())}` },
+			});
 			expect(response.status).toBe(200);
 			expect(response.headers.get(STATS_DASHBOARD_HEADER)).toBe(STATS_DASHBOARD_SECURITY_VERSION);
 			expect(response.headers.get(STATS_DASHBOARD_HOSTNAME_HEADER)).toBe(STATS_DASHBOARD_HOSTNAME);
@@ -113,7 +116,9 @@ describe("startServer access", () => {
 			expect(server.hostname).toBe("0.0.0.0");
 			expect(await tcpConnects(nonLoopbackHostname, server.port)).toBe(true);
 
-			const response = await fetch(`http://${STATS_DASHBOARD_HOSTNAME}:${server.port}/api/stats/models`);
+			const response = await fetch(`http://${STATS_DASHBOARD_HOSTNAME}:${server.port}/api/stats/models`, {
+				headers: { Authorization: `Bearer ${loadOrCreateCapabilityToken(getStatsDashboardTokenPath())}` },
+			});
 			expect(response.status).toBe(200);
 			expect(response.headers.get(STATS_DASHBOARD_HEADER)).toBe(STATS_DASHBOARD_SECURITY_VERSION);
 			expect(response.headers.get(STATS_DASHBOARD_HOSTNAME_HEADER)).toBe("0.0.0.0");
@@ -197,7 +202,9 @@ describe("startServer port conflicts", () => {
 
 			try {
 				expect(await holder.child.exited).not.toBe(0);
-				const response = await fetch(`http://${STATS_DASHBOARD_HOSTNAME}:${server.port}/api/stats/models`);
+				const response = await fetch(`http://${STATS_DASHBOARD_HOSTNAME}:${server.port}/api/stats/models`, {
+					headers: { Authorization: `Bearer ${loadOrCreateCapabilityToken(getStatsDashboardTokenPath())}` },
+				});
 				expect(response.headers.get(STATS_DASHBOARD_HEADER)).toBe(STATS_DASHBOARD_SECURITY_VERSION);
 				expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
 				await response.body?.cancel();

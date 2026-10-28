@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Security
+
+- The stats dashboard now requires a per-user capability token on every request (bootstrap via the printed `?token=` URL, then an `HttpOnly; SameSite=Strict` cookie or `Authorization: Bearer` header), and refuses non-loopback `Host` headers and cross-origin `Origin` values, so another local user or a DNS-rebinding page can no longer read sessions. The identity version is now 4, so older unauthenticated dashboards are reclaimed on next start.
+
 ## [18.12.0] - 2026-10-17
 
 ### Fixed
