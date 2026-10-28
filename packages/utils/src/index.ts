@@ -15,6 +15,7 @@ export * from "./incoming-json";
 export * from "./json";
 export * from "./json-parse";
 export * as logger from "./logger";
+export * from "./local-capability";
 export * from "./loop-phase";
 export * from "./math-delimiters";
 export * from "./materialize-string";

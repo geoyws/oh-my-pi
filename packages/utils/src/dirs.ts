@@ -793,6 +793,23 @@ export function getBrowserRelayDir(): string {
 	return dirs.rootSubdir("browser-relay", "data");
 }
 
+/**
+ * Get the browser relay's CDP capability token file. Profile-independent: the
+ * relay port is machine-global, so every profile's client must present the
+ * token the one relay checks.
+ */
+export function getBrowserRelayCdpTokenPath(): string {
+	return dirs.baseRootSubdir(path.join("run", "browser-relay-cdp.token"), "state");
+}
+
+/**
+ * Get the stats dashboard's capability token file. Profile-independent: the
+ * dashboard port is shared, and any profile's omp may reuse a running one.
+ */
+export function getStatsDashboardTokenPath(): string {
+	return dirs.baseRootSubdir(path.join("run", "stats-dashboard.token"), "state");
+}
+
 /** Get the profile root for Chromium browsers the browser tool spawns via `app.path` (~/.omp/browser-profiles). */
 export function getBrowserProfilesDir(): string {
 	return dirs.rootSubdir("browser-profiles", "state");
