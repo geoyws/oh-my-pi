@@ -2,7 +2,8 @@
  * Settings declared by this domain (see `config/registry.ts`). Declaration order is the
  * settings-panel order; `config/all-settings.ts` registers every domain.
  */
-import { combine, register, type SettingValueOf } from "../config/registry";
+import { setChildEnvPassthrough } from "@oh-my-pi/pi-utils/child-env";
+import { combine, effect, register, type SettingValueOf } from "../config/registry";
 
 /** One bash-interceptor rule: commands matching `pattern` are redirected to `tool`. */
 export interface BashInterceptorRule {
@@ -278,3 +279,17 @@ export const cfgBashAutoBackgroundThresholdMs = register({
 	type: "number",
 	default: 60_000,
 });
+
+const NO_ENV_PASSTHROUGH: string[] = [];
+
+/**
+ * Extra environment names every child process OMP starts (bash tool shells, JS
+ * eval workers, MCP stdio servers, plugin installs) may inherit beyond the
+ * built-in allowlist. Credentials listed here reach all of them (kb omp t-2b5e0f2c).
+ */
+export const cfgSubprocessEnvPassthrough = register({
+	id: "subprocess.envPassthrough",
+	type: "array",
+	default: NO_ENV_PASSTHROUGH,
+});
+effect(cfgSubprocessEnvPassthrough, setChildEnvPassthrough);

@@ -600,6 +600,8 @@ These affect where coding-agent stores data and which process-local settings ove
 
 (From `packages/utils/src/procmgr.ts` and coding-agent bash tool integration.)
 
+Child processes OMP starts for the agent — bash tool shells, the JS eval worker, MCP stdio servers and plugin/package installs — inherit an **allowlisted** environment, not OMP's whole environment (`packages/utils/src/child-env.ts`). They keep path, locale, terminal, editor, SSH-agent, toolchain-root and Windows system names, plus `LC_*`, `XDG_*`, `PI_*`, `OMP_*`, `npm_config_*` and `npm_package_*` names whose `_`-separated segments include no credential word (`KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASS`, `AUTH`, `COOKIE`, `CREDENTIAL(S)`, `PRIVATE`, `RING`, ...). Provider and infra credentials stay in the OMP process. To let children see a specific name, list it in the `subprocess.envPassthrough` setting (it then reaches every child); an MCP stdio server gets the credentials it needs through its config `env` block.
+
 | Variable                   | Behavior                                                                       |
 | -------------------------- | ------------------------------------------------------------------------------ |
 | `PI_BASH_NO_CI`            | Suppresses automatic `CI=true` injection into spawned shell env                |
