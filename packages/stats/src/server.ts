@@ -40,10 +40,13 @@ import { statsLive } from "./live";
 import {
 	prepareStatsPort,
 	recoverStatsPort,
+	STATS_DASHBOARD_CHALLENGE_HEADER,
 	STATS_DASHBOARD_HEADER,
 	STATS_DASHBOARD_HOSTNAME,
 	STATS_DASHBOARD_HOSTNAME_HEADER,
+	STATS_DASHBOARD_PROOF_HEADER,
 	STATS_DASHBOARD_SECURITY_VERSION,
+	statsDashboardProof,
 } from "./port-conflict";
 import { getStatsByModel, getTimeSeries } from "./rollup";
 import {
@@ -374,24 +377,8 @@ export function formatStatsDashboardUrl(hostname: string, port: number): string 
 	return `http://${urlHostname}:${port}`;
 }
 
-/** Cookie holding the dashboard capability token after the `?token=` bootstrap. */
-const STATS_TOKEN_COOKIE = "omp_stats_token";
-
 /** Short hint for 401 bodies: the token lives in the URL omp printed, nowhere else. */
 const STATS_AUTH_HINT = "Unauthorized: open the dashboard URL printed by `omp stats` or `/trace`.";
-
-/** Extract the capability token from the request's Cookie header, if present. */
-function cookieToken(req: Request): string | null {
-	const header = req.headers.get("cookie");
-	if (!header) return null;
-	for (const part of header.split(";")) {
-		const pair = part.trim();
-		if (pair.startsWith(`${STATS_TOKEN_COOKIE}=`)) {
-			return pair.slice(STATS_TOKEN_COOKIE.length + 1).trim() || null;
-		}
-	}
-	return null;
-}
 
 /** Extract a `Bearer` capability token from the Authorization header, if present. */
 function bearerToken(req: Request): string | null {
@@ -402,10 +389,12 @@ function bearerToken(req: Request): string | null {
 }
 
 /**
- * Dashboard URL that authenticates the browser: opening it sets the token
- * cookie (via the `?token=` bootstrap redirect) and lands on the same page.
- * `fragment` (e.g. `#/traces?s=...`) stays after the query. The token in the
- * URL is intended for the same user; never log it anywhere else.
+ * Dashboard URL that authenticates the browser. The page stores the `?token=`
+ * in its own origin's storage (origin includes the port, so no other local
+ * server can read it, unlike a host-wide cookie) and strips it from the
+ * address bar; API calls then send it as a bearer header. `fragment` (e.g.
+ * `#/traces?s=...`) stays after the query. The token in the URL is intended
+ * for the same user; never log it anywhere else.
  */
 export function statsDashboardLaunchUrl(hostname: string, port: number, fragment = ""): string {
 	const token = loadOrCreateCapabilityToken(getStatsDashboardTokenPath());
@@ -422,11 +411,17 @@ function createDashboardServer(port: number, hostname: string): Server<undefined
 			const path = url.pathname;
 
 			// The identity header lets another omp session's reuse probe positively
-			// recognize this dashboard without allowing cross-origin API reads.
+			// recognize this dashboard without allowing cross-origin API reads; a
+			// challenge is answered with a proof bound to this port, never the token.
+			// The page URL may carry the token, so no response ever sends a Referer.
 			const dashboardHeaders: Record<string, string> = {
 				[STATS_DASHBOARD_HEADER]: STATS_DASHBOARD_SECURITY_VERSION,
 				[STATS_DASHBOARD_HOSTNAME_HEADER]: hostname,
+				"Referrer-Policy": "no-referrer",
 			};
+			const challenge = req.headers.get(STATS_DASHBOARD_CHALLENGE_HEADER);
+			const proof = challenge === null ? null : statsDashboardProof(token, hostname, server.port ?? port, challenge);
+			if (proof !== null) dashboardHeaders[STATS_DASHBOARD_PROOF_HEADER] = proof;
 			const deny = (status: number, message: string): Response =>
 				new Response(message, {
 					status,
@@ -441,29 +436,14 @@ function createDashboardServer(port: number, hostname: string): Server<undefined
 			const origin = req.headers.get("origin");
 			if (origin !== null && origin !== `http://${hostHeader}`) return deny(403, "Forbidden: unexpected Origin.");
 
-			// Bootstrap: opening the printed `?token=` URL sets the cookie and
-			// lands on the same page without the token. GET-only; anything else
-			// carrying `token` falls through to the cookie/bearer check below.
-			const tokenParam = url.searchParams.get("token");
-			if (tokenParam !== null) {
-				if (req.method === "GET" && capabilityTokenMatches(token, tokenParam)) {
-					url.searchParams.delete("token");
-					const query = url.searchParams.toString();
-					const location = `${url.pathname}${query ? `?${query}` : ""}${url.hash}`;
-					return new Response(null, {
-						status: 302,
-						headers: {
-							...dashboardHeaders,
-							Location: location,
-							"Set-Cookie": `${STATS_TOKEN_COOKIE}=${token}; HttpOnly; SameSite=Strict; Path=/`,
-							"Cache-Control": "no-store",
-						},
-					});
-				}
-				return deny(401, STATS_AUTH_HINT);
-			}
-			if (!capabilityTokenMatches(token, cookieToken(req)) && !capabilityTokenMatches(token, bearerToken(req))) {
-				return deny(401, STATS_AUTH_HINT);
+			// Every data path needs the capability as a bearer header. EventSource
+			// cannot set headers, so the event stream alone also takes `?token=`
+			// (a URL only this origin's page builds). Static assets hold no data.
+			if (path.startsWith("/api/")) {
+				const presented =
+					bearerToken(req) ??
+					(path === "/api/events" && req.method === "GET" ? url.searchParams.get("token") : null);
+				if (!capabilityTokenMatches(token, presented)) return deny(401, STATS_AUTH_HINT);
 			}
 
 			if (req.method === "OPTIONS") {

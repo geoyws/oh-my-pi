@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -20,25 +21,63 @@ export const STATS_DASHBOARD_HEADER = "x-omp-stats-dashboard";
 /** Header recording the server's requested bind host so reuse cannot change its exposure scope. */
 export const STATS_DASHBOARD_HOSTNAME_HEADER = "x-omp-stats-hostname";
 
-/** Identity-header value for dashboards enforcing an explicit bind host and same-origin access. */
-export const STATS_DASHBOARD_SECURITY_VERSION = "4";
+/** Request header carrying the reuse probe's random challenge. */
+export const STATS_DASHBOARD_CHALLENGE_HEADER = "x-omp-stats-challenge";
+/** Response header answering the challenge with proof the server holds this user's capability. */
+export const STATS_DASHBOARD_PROOF_HEADER = "x-omp-stats-proof";
+
+/** Identity-header value for dashboards requiring the capability token and answering proof challenges. */
+export const STATS_DASHBOARD_SECURITY_VERSION = "5";
 
 /** IPv4 loopback address shared by the dashboard server and reuse probe. */
 export const STATS_DASHBOARD_HOSTNAME = "127.0.0.1";
 
+const CHALLENGE_RE = /^[A-Za-z0-9_-]{22,128}$/;
+
+/**
+ * Proof that a dashboard holds the capability `token`, bound to the bind host and the port it
+ * answers on: a relay that forwards the challenge to a genuine dashboard on another port gets a
+ * proof for that port, which the probe rejects. The token itself never leaves the server.
+ * Returns null for a malformed challenge.
+ */
+export function statsDashboardProof(token: string, hostname: string, port: number, challenge: string): string | null {
+	if (!CHALLENGE_RE.test(challenge)) return null;
+	return crypto
+		.createHmac("sha256", token)
+		.update(`omp-stats-dashboard-proof\n${hostname}\n${port}\n${challenge}`)
+		.digest("base64url");
+}
+
 type StatsDashboardProbe = "reusable" | "replaceable" | "occupied" | "unreachable";
 
+/**
+ * Classify whatever listens on `port` without disclosing the capability token: the probe sends
+ * only a random challenge, and a dashboard is reusable only when it answers with a valid proof.
+ * An unauthenticated legacy dashboard (version 1–3, answering 200 without a token) is replaceable.
+ */
 async function probeStatsDashboard(port: number, hostname: string): Promise<StatsDashboardProbe> {
 	const probeHostname = hostname === "0.0.0.0" ? STATS_DASHBOARD_HOSTNAME : hostname === "::" ? "::1" : hostname;
 	const urlHostname = probeHostname.includes(":") ? `[${probeHostname}]` : probeHostname;
 	try {
-		const token = loadOrCreateCapabilityToken(getStatsDashboardTokenPath());
+		const challenge = crypto.randomBytes(24).toString("base64url");
 		const response = await fetch(`http://${urlHostname}:${port}/api/stats/models`, {
 			signal: AbortSignal.timeout(STATS_PROBE_TIMEOUT_MS),
-			headers: { Authorization: `Bearer ${token}` },
+			headers: { [STATS_DASHBOARD_CHALLENGE_HEADER]: challenge },
 		});
 		const dashboardVersionHeader = response.headers.get(STATS_DASHBOARD_HEADER);
 		const dashboardVersion = dashboardVersionHeader === null ? Number.NaN : Number(dashboardVersionHeader);
+		const presentedProof = response.headers.get(STATS_DASHBOARD_PROOF_HEADER);
+		const expectedProof = statsDashboardProof(
+			loadOrCreateCapabilityToken(getStatsDashboardTokenPath()),
+			hostname,
+			port,
+			challenge,
+		);
+		const proven =
+			presentedProof !== null &&
+			expectedProof !== null &&
+			presentedProof.length === expectedProof.length &&
+			crypto.timingSafeEqual(Buffer.from(presentedProof), Buffer.from(expectedProof));
 		// Never replace a newer dashboard: an older CLI must not downgrade it.
 		const replaceable =
 			response.status === 200 &&
@@ -46,7 +85,7 @@ async function probeStatsDashboard(port: number, hostname: string): Promise<Stat
 			dashboardVersion > 0 &&
 			dashboardVersion <= Number(STATS_DASHBOARD_SECURITY_VERSION);
 		const reusable =
-			response.status === 200 &&
+			proven &&
 			dashboardVersionHeader === STATS_DASHBOARD_SECURITY_VERSION &&
 			response.headers.get(STATS_DASHBOARD_HOSTNAME_HEADER) === hostname &&
 			!response.headers.has("Access-Control-Allow-Origin");

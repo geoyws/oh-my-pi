@@ -20,6 +20,58 @@ import type {
 
 const API_BASE = "/api";
 
+/**
+ * The dashboard capability. `omp stats` opens `/?token=...`; the page keeps it in
+ * this origin's localStorage (scoped to scheme, host and port, so another local
+ * server cannot read it, unlike a host-wide cookie), strips it from the address
+ * bar and sends it as a bearer header on every API call.
+ */
+const TOKEN_STORAGE_KEY = "omp-stats-token";
+let adoptedToken: { value: string | null } | undefined;
+
+/**
+ * The capability for this page, adopted once: a launch `?token=` is stored and
+ * removed from the address bar, otherwise the stored one is used. The entry
+ * point calls this before rendering so the token leaves the URL at once.
+ */
+export function dashboardToken(): string | null {
+	if (adoptedToken) return adoptedToken.value;
+	adoptedToken = { value: null };
+	if (typeof window === "undefined" || !window.location?.href) return null;
+	const url = new URL(window.location.href);
+	const launched = url.searchParams.get("token");
+	if (launched !== null) {
+		url.searchParams.delete("token");
+		window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
+		adoptedToken.value = launched;
+		try {
+			window.localStorage.setItem(TOKEN_STORAGE_KEY, launched);
+		} catch {
+			// Storage unavailable: keep the token for this page only.
+		}
+		return launched;
+	}
+	try {
+		adoptedToken.value = window.localStorage.getItem(TOKEN_STORAGE_KEY);
+	} catch {}
+	return adoptedToken.value;
+}
+
+/** `init` with the capability bearer header added. */
+function withAuth(init?: RequestInit): RequestInit | undefined {
+	const token = dashboardToken();
+	if (!token) return init;
+	const headers = new Headers(init?.headers);
+	headers.set("Authorization", `Bearer ${token}`);
+	return { ...init, headers };
+}
+
+/** URL of the live event stream; EventSource cannot send headers, so the token rides in the query. */
+export function eventStreamUrl(): string {
+	const token = dashboardToken();
+	return token ? `${API_BASE}/events?token=${encodeURIComponent(token)}` : `${API_BASE}/events`;
+}
+
 export class ApiError extends Error {
 	status: number;
 	endpoint: string;
@@ -64,7 +116,7 @@ async function fetchJson<T>(endpoint: string, options?: RequestInit, previous?: 
 		headers.set("If-None-Match", etag);
 		init = { ...options, headers };
 	}
-	const res = await fetch(endpoint, init);
+	const res = await fetch(endpoint, withAuth(init));
 	if (res.status === 304 && etag) return previous as T;
 	if (!res.ok) {
 		throw new ApiError(res.status, endpoint, await readErrorMessage(res, endpoint));

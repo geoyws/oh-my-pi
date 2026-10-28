@@ -51,6 +51,27 @@ describe("loadOrCreateCapabilityToken", () => {
 		fs.writeFileSync(file, "short\n", { mode: 0o600 });
 		expect(loadOrCreateCapabilityToken(file)).toMatch(/^[A-Za-z0-9_-]{43}$/);
 	});
+
+	for (const start of ["missing", "unsafe"] as const) {
+		it(`concurrent first users of a ${start} file converge on one token`, async () => {
+			const file = path.join(dir, "cap.token");
+			if (start === "unsafe") fs.writeFileSync(file, `${"x".repeat(43)}\n`, { mode: 0o644 });
+			if (start === "unsafe" && posix) fs.chmodSync(file, 0o644);
+			const modulePath = path.join(import.meta.dir, "..", "src", "local-capability.ts");
+			const startAt = Date.now() + 750;
+			// Each child spins until the shared start time so their first reads overlap.
+			const source = `import { loadOrCreateCapabilityToken } from ${JSON.stringify(modulePath)}; while (Date.now() < ${startAt}) {} process.stdout.write(loadOrCreateCapabilityToken(${JSON.stringify(file)}));`;
+			const children = Array.from({ length: 8 }, () =>
+				Bun.spawn([process.execPath, "-e", source], { stdout: "pipe", stderr: "pipe" }),
+			);
+			const tokens = await Promise.all(children.map(child => new Response(child.stdout).text()));
+			expect(await Promise.all(children.map(child => child.exited))).toEqual(Array(8).fill(0));
+			expect(new Set(tokens).size).toBe(1);
+			expect(tokens[0]).toMatch(/^[A-Za-z0-9_-]{43}$/);
+			expect(fs.readFileSync(file, "utf8").trim()).toBe(tokens[0]);
+			expect(fs.readdirSync(dir).sort()).toEqual(["cap.token"]);
+		});
+	}
 });
 
 describe("capabilityTokenMatches", () => {

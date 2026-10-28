@@ -3,10 +3,13 @@ import { networkInterfaces } from "node:os";
 import { connect, type Subprocess } from "bun";
 import { getStatsDashboardTokenPath, loadOrCreateCapabilityToken } from "@oh-my-pi/pi-utils";
 import {
+	STATS_DASHBOARD_CHALLENGE_HEADER,
 	STATS_DASHBOARD_HEADER,
 	STATS_DASHBOARD_HOSTNAME,
 	STATS_DASHBOARD_HOSTNAME_HEADER,
+	STATS_DASHBOARD_PROOF_HEADER,
 	STATS_DASHBOARD_SECURITY_VERSION,
+	statsDashboardProof,
 } from "../src/port-conflict";
 import { startServer } from "../src/server";
 import { installStatsTestIsolation } from "./helpers/temp-agent";
@@ -149,16 +152,24 @@ describe("startServer port conflicts", () => {
 		}
 	});
 
-	it("reuses a live stats dashboard identified by its header", async () => {
+	it("reuses a live stats dashboard that proves this user's capability", async () => {
 		const existing = Bun.serve({
 			port: 0,
 			hostname: STATS_DASHBOARD_HOSTNAME,
-			fetch: request =>
+			fetch: (request, srv) =>
 				new URL(request.url).pathname === "/api/stats/models"
-					? Response.json([], {
+					? new Response("unauthorized", {
+							status: 401,
 							headers: {
 								[STATS_DASHBOARD_HEADER]: STATS_DASHBOARD_SECURITY_VERSION,
 								[STATS_DASHBOARD_HOSTNAME_HEADER]: STATS_DASHBOARD_HOSTNAME,
+								[STATS_DASHBOARD_PROOF_HEADER]:
+									statsDashboardProof(
+										loadOrCreateCapabilityToken(getStatsDashboardTokenPath()),
+										STATS_DASHBOARD_HOSTNAME,
+										srv.port ?? 0,
+										request.headers.get(STATS_DASHBOARD_CHALLENGE_HEADER) ?? "",
+									) ?? "",
 							},
 						})
 					: new Response("dashboard"),
@@ -171,7 +182,7 @@ describe("startServer port conflicts", () => {
 
 			// The existing dashboard is untouched: it still answers on the port.
 			const response = await fetch(`http://${STATS_DASHBOARD_HOSTNAME}:${existing.port}/api/stats/models`);
-			expect(response.status).toBe(200);
+			expect(response.status).toBe(401);
 			expect(response.headers.get(STATS_DASHBOARD_HEADER)).toBe(STATS_DASHBOARD_SECURITY_VERSION);
 			await response.body?.cancel();
 		} finally {

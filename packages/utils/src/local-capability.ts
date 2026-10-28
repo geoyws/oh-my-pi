@@ -45,36 +45,86 @@ function readPrivateToken(filePath: string): string | null {
 	}
 }
 
+/** A creation lock older than this belongs to a crashed creator and is broken. */
+const LOCK_STALE_MS = 10_000;
+/** How long a creator waits for another to publish before giving up. */
+const LOCK_WAIT_MS = 5_000;
+const LOCK_POLL_MS = 10;
+
+function sleepSync(ms: number): void {
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Run `fn` holding an exclusive `<filePath>.lock` (O_EXCL create), so only one
+ * process at a time decides whether to replace the token file. A lock left by a
+ * crashed creator is broken once it is older than {@link LOCK_STALE_MS}.
+ */
+function withCreationLock<T>(filePath: string, fn: () => T): T {
+	const lockPath = `${filePath}.lock`;
+	const deadline = Date.now() + LOCK_WAIT_MS;
+	for (;;) {
+		let fd: number;
+		try {
+			fd = fs.openSync(lockPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+			try {
+				if (Date.now() - fs.statSync(lockPath).mtimeMs > LOCK_STALE_MS) fs.unlinkSync(lockPath);
+			} catch {}
+			if (Date.now() > deadline) throw new Error(`Timed out waiting for capability token lock ${lockPath}`);
+			sleepSync(LOCK_POLL_MS);
+			continue;
+		}
+		fs.closeSync(fd);
+		try {
+			return fn();
+		} finally {
+			try {
+				fs.unlinkSync(lockPath);
+			} catch {}
+		}
+	}
+}
+
 /**
  * Read the capability token stored at `filePath`, creating it when it is
  * missing, malformed, or unsafe (a symlink, owned by another user, or
  * readable by group/other). A token that may have been exposed is replaced,
  * never reused. The file is created with mode 0600 and its parent with 0700.
- * Concurrent creators converge on whichever file was written first.
+ *
+ * Creation is serialized by a lock and re-checks the file under it, so
+ * concurrent first users converge on one token instead of one replacing
+ * another's; the token is written to a private temp file and renamed into
+ * place, so readers never see a partially written file.
  */
 export function loadOrCreateCapabilityToken(filePath: string): string {
 	const existing = readPrivateToken(filePath);
 	if (existing) return existing;
 	fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
-	try {
-		fs.unlinkSync(filePath);
-	} catch {}
-	const token = crypto.randomBytes(32).toString("base64url");
-	try {
-		const fd = fs.openSync(filePath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+	return withCreationLock(filePath, () => {
+		const winner = readPrivateToken(filePath);
+		if (winner) return winner;
+		const token = crypto.randomBytes(32).toString("base64url");
+		const tempPath = `${filePath}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`;
+		const fd = fs.openSync(tempPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
 		try {
 			fs.writeSync(fd, `${token}\n`);
+			fs.fsyncSync(fd);
 		} finally {
 			fs.closeSync(fd);
 		}
+		try {
+			// rename replaces a missing, malformed or unsafe file (a symlink itself, never its target).
+			fs.renameSync(tempPath, filePath);
+		} catch (err) {
+			try {
+				fs.unlinkSync(tempPath);
+			} catch {}
+			throw err;
+		}
 		return token;
-	} catch (err) {
-		if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-		// Another process created it between our unlink and open; adopt its token.
-		const winner = readPrivateToken(filePath);
-		if (winner) return winner;
-		throw new Error(`Capability token file ${filePath} is not a private file owned by this user`);
-	}
+	});
 }
 
 /** Constant-time comparison of a presented token against the expected one. */

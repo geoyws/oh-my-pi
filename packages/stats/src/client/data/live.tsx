@@ -99,7 +99,7 @@ export function currentLiveVersion(): number {
 /** Owns the `/api/events` stream; mount once at the app root. */
 export function LiveProvider({ children }: { children: ReactNode }) {
 	useEffect(() => {
-		const source = new EventSource("/api/events");
+		const source = new EventSource(api.eventStreamUrl());
 		source.onopen = () => setConnected(true);
 		source.onerror = () => setConnected(false);
 		source.onmessage = event => receive(JSON.parse(event.data) as LiveStatus);
