@@ -28,6 +28,7 @@ import {
 import { Settings } from "../config/settings";
 import { initializeWithSettings } from "../discovery";
 import { loadAmbientExtensionEntries } from "../extensibility/extensions/loader";
+import { cfgExtensions } from "../extensibility/settings";
 import { loadAllMCPConfigs } from "../mcp/config";
 import { promptLine } from "./oauth-terminal";
 
@@ -60,7 +61,13 @@ async function measureSurfaces(dir: string): Promise<SurfaceReport[]> {
 		return `${name}: ${target}  (${source})`;
 	});
 
-	const extensions = await loadAmbientExtensionEntries(dir);
+	// Same inputs as startup discovery, so approval matches what would load.
+	const extensions = await loadAmbientExtensionEntries(
+		dir,
+		{ cwd: dir },
+		true,
+		settings.extensionsSourceLevel() === "project" ? cfgExtensions.get(settings) : [],
+	);
 
 	const projectEnv = parseEnvFile(path.join(dir, ".env"));
 	const envFingerprint = fingerprintProjectRoutingEnv(projectEnv);

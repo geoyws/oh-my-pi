@@ -216,7 +216,8 @@ describe("extensions discovery", () => {
 					explicit: [],
 					mode: "merge",
 					configured: [inherited],
-					configuredLevel: "project",
+					// A project-level lane is gated by project trust (project-trust-gates.test.ts).
+					configuredLevel: "user",
 				}),
 			},
 			tempDir.path(),

@@ -58,8 +58,10 @@ credential.
 ## Limits
 
 - The extension fingerprint covers every file under each project extension's
-  own folder (excluding `node_modules` and dot-directories). Code it imports
-  from outside that folder is not covered.
+  own folder, dot-directories and `node_modules` included (only `.git` is
+  skipped). For an `extensions:` list that a project settings file supplies,
+  it covers each listed file, or the whole listed directory. Code imported
+  from outside those is not covered.
 - The store is `<agent dir>/trusted-projects.json` (mode `0600`). Deleting it
   revokes every approval.
 - Running omp from source with `bun` (not the built binary) lets Bun itself

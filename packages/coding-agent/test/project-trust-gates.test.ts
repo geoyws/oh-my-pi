@@ -11,13 +11,16 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
 import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	discoverExtensionPaths,
 	loadAmbientExtensionEntries,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { cfgExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/settings";
 import { loadAllMCPConfigs } from "@oh-my-pi/pi-coding-agent/mcp/config";
 import { lookupMcpOAuthCredentialForServer } from "@oh-my-pi/pi-coding-agent/mcp/oauth-credentials";
 import { mcpOAuthCredentialId } from "@oh-my-pi/pi-coding-agent/mcp/oauth-flow";
+import { discoverSessionExtensionPaths } from "@oh-my-pi/pi-coding-agent/sdk";
 import { getConfigRootDir, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import { approveProjectSurfaces } from "@oh-my-pi/pi-utils/project-trust";
 import "@oh-my-pi/pi-coding-agent/discovery";
@@ -124,6 +127,48 @@ describe("project extensions (OMP-CRED-008)", () => {
 		// A change to a sibling module the entry imports revokes the approval.
 		await writeExtension("export const x = 2; // exfiltrate\n");
 		expect((await discoverExtensionPaths([], projectDir)).some(isProjectExtension)).toBe(false);
+	});
+
+	test("a change inside a dot-directory the extension imports revokes the approval", async () => {
+		const dir = await writeExtension("export * from './.impl/payload';\n");
+		await fs.mkdir(path.join(dir, ".impl"));
+		await fs.writeFile(path.join(dir, ".impl", "payload.ts"), "export const x = 1;\n");
+		clearFsCache();
+		const isProjectExtension = (p: string) => p.startsWith(dir);
+
+		const approved = await loadAmbientExtensionEntries(projectDir);
+		approveProjectSurfaces(projectDir, { extensions: approved.projectFingerprint });
+		clearFsCache();
+		expect((await discoverExtensionPaths([], projectDir)).some(isProjectExtension)).toBe(true);
+
+		await fs.writeFile(path.join(dir, ".impl", "payload.ts"), "export const x = 2; // exfiltrate\n");
+		clearFsCache();
+		expect((await discoverExtensionPaths([], projectDir)).some(isProjectExtension)).toBe(false);
+	});
+
+	test("an `extensions:` path from project settings loads only under approval of its content", async () => {
+		await fs.mkdir(path.join(projectDir, ".omp"), { recursive: true });
+		await fs.writeFile(path.join(projectDir, ".omp", "config.yml"), "extensions:\n  - ./tools/steal.ts\n");
+		await fs.mkdir(path.join(projectDir, "tools"));
+		const steal = path.join(projectDir, "tools", "steal.ts");
+		await fs.writeFile(steal, "export default () => {};\n");
+		clearFsCache();
+		const settings = await Settings.init({ inMemory: true, cwd: projectDir });
+		expect(settings.extensionsSourceLevel()).toBe("project");
+
+		expect(await discoverSessionExtensionPaths({}, projectDir, settings)).not.toContain(steal);
+
+		const configured = cfgExtensions.get(settings);
+		const entries = await loadAmbientExtensionEntries(projectDir, { cwd: projectDir }, true, configured);
+		expect(entries.projectTrusted).toBe(false);
+		expect(entries.projectPaths).toContain(steal);
+		approveProjectSurfaces(projectDir, { extensions: entries.projectFingerprint });
+		clearFsCache();
+		expect(await discoverSessionExtensionPaths({}, projectDir, settings)).toContain(steal);
+
+		await fs.writeFile(steal, "export default () => { /* exfiltrate */ };\n");
+		clearFsCache();
+		expect(await discoverSessionExtensionPaths({}, projectDir, settings)).not.toContain(steal);
 	});
 });
 
