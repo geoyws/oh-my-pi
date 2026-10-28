@@ -32,6 +32,15 @@ export const STATS_DASHBOARD_SECURITY_VERSION = "6";
 /** IPv4 loopback address shared by the dashboard server and reuse probe. */
 export const STATS_DASHBOARD_HOSTNAME = "127.0.0.1";
 
+/**
+ * The numeric address a dashboard binds, keys its state by, signs and prints for `hostname`.
+ * `localhost` may resolve to `::1` or `127.0.0.1`, so a link or exchange naming it could reach
+ * another user's listener on the other family with the same port; it is pinned to `127.0.0.1`.
+ */
+export function canonicalStatsHostname(hostname: string): string {
+	return hostname.toLowerCase() === "localhost" ? STATS_DASHBOARD_HOSTNAME : hostname;
+}
+
 const CHALLENGE_RE = /^[A-Za-z0-9_-]{22,128}$/;
 
 /**
@@ -74,7 +83,8 @@ function dashboardDialBase(hostname: string, port: number): string {
  * capability: a credential-less `/api/launch` returns a single-use nonce, and the HMAC over it
  * (see {@link statsLaunchMac}) earns that listener's launch secret, which dies with the listener.
  */
-export async function fetchStatsLaunchSecret(hostname: string, port: number): Promise<string> {
+export async function fetchStatsLaunchSecret(requestedHostname: string, port: number): Promise<string> {
+	const hostname = canonicalStatsHostname(requestedHostname);
 	const base = dashboardDialBase(hostname, port);
 	const challenge = await fetch(`${base}/api/launch`, { signal: AbortSignal.timeout(STATS_PROBE_TIMEOUT_MS * 4) });
 	const offered: unknown = await challenge.json().catch(() => null);

@@ -39,6 +39,7 @@ import {
 import { getGainDashboardStats } from "./gain-aggregator";
 import { statsLive } from "./live";
 import {
+	canonicalStatsHostname,
 	fetchStatsLaunchSecret,
 	prepareStatsPort,
 	recoverStatsPort,
@@ -403,7 +404,8 @@ const localLaunchSecrets = new Map<string, string>();
  * `#/traces?s=...`) stays after the query. For a dashboard another omp process serves, the
  * launch secret is obtained with a nonce HMAC that never sends the capability.
  */
-export async function statsDashboardLaunchUrl(hostname: string, port: number, fragment = ""): Promise<string> {
+export async function statsDashboardLaunchUrl(requestedHostname: string, port: number, fragment = ""): Promise<string> {
+	const hostname = canonicalStatsHostname(requestedHostname);
 	const launch = localLaunchSecrets.get(`${hostname}:${port}`) ?? (await fetchStatsLaunchSecret(hostname, port));
 	return `${formatStatsDashboardUrl(hostname, port)}/?token=${launch}${fragment}`;
 }
@@ -618,10 +620,12 @@ export interface StartServerOptions {
 
 export async function startServer(
 	port = 3847,
-	hostname = STATS_DASHBOARD_HOSTNAME,
+	requestedHostname = STATS_DASHBOARD_HOSTNAME,
 	options: StartServerOptions = {},
 ): Promise<StatsServerHandle> {
 	if (options.judge) setStatsJudgeProvider(options.judge);
+	// Bind, key, sign and print one numeric address, never an alias that can resolve elsewhere.
+	const hostname = canonicalStatsHostname(requestedHostname);
 	const activeKey = `${hostname}:${port}`;
 	if (port !== 0) {
 		const active = activeServers.get(activeKey);

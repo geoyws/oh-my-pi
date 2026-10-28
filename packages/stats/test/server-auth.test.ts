@@ -333,4 +333,29 @@ describe("stats dashboard launch URLs", () => {
 			server.stop();
 		}
 	});
+
+	it("pins localhost to 127.0.0.1 so a squatter on ::1 with the same port never sees a launch secret", async () => {
+		const server = await startServer(0, "localhost");
+		const seen: string[] = [];
+		// The genuine dashboard binds IPv4 only, so [::1] with its port is free for another user.
+		const squatter = Bun.serve({
+			hostname: "::1",
+			port: server.port,
+			fetch: request => {
+				seen.push(request.url);
+				return new Response("squatter", { status: 401 });
+			},
+		});
+		try {
+			expect(server.hostname).toBe("127.0.0.1");
+			const url = await statsDashboardLaunchUrl("localhost", server.port);
+			expect(url).toStartWith(`http://127.0.0.1:${server.port}/?token=`);
+			expect(await fetchStatsLaunchSecret("localhost", server.port)).toBe(new URL(url).searchParams.get("token")!);
+			expect((await fetch(url)).status).toBe(200);
+			expect(seen).toEqual([]);
+		} finally {
+			squatter.stop(true);
+			server.stop();
+		}
+	});
 });
