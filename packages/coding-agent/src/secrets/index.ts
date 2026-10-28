@@ -159,16 +159,26 @@ export { type SecretEntry, SecretObfuscator } from "./obfuscator";
 export * from "./patterns";
 export { secretEntriesNeedPlaceholderKey, secretEntryNeedsPlaceholderKey } from "./placeholder";
 
+/** Options for loading secrets.yml files. */
+export interface LoadSecretsOptions {
+	/**
+	 * Throw on an unreadable or malformed file or an invalid entry instead of
+	 * warning and skipping it. A missing file is still empty. Used where a
+	 * silently dropped secret would leave the machine unredacted (sharing).
+	 */
+	strict?: boolean;
+}
+
 /**
  * Load secrets from project-local and global secrets.yml files.
  * Project-local entries override global entries with matching content.
  */
-export async function loadSecrets(cwd: string, agentDir: string): Promise<SecretEntry[]> {
+export async function loadSecrets(cwd: string, agentDir: string, options?: LoadSecretsOptions): Promise<SecretEntry[]> {
 	const projectPath = path.join(cwd, ".omp", "secrets.yml");
 	const globalPath = path.join(agentDir, "secrets.yml");
 
-	const globalEntries = await loadSecretsFile(globalPath);
-	const projectEntries = await loadSecretsFile(projectPath);
+	const globalEntries = await loadSecretsFile(globalPath, options?.strict === true);
+	const projectEntries = await loadSecretsFile(projectPath, options?.strict === true);
 
 	if (globalEntries.length === 0) return projectEntries;
 	if (projectEntries.length === 0) return globalEntries;
@@ -266,14 +276,16 @@ export function builtinCredentialSecretEntries(): SecretEntry[] {
  * there is nothing to protect.
  *
  * `keyDir` is the explicit agent dir override for the placeholder-key file
- * (default XDG/agent location when omitted).
+ * (default XDG/agent location when omitted). `options.strict` makes a broken
+ * secrets.yml throw instead of being skipped.
  */
 export async function buildSecretObfuscator(
 	cwd: string,
 	agentDir: string,
 	keyDir?: string,
+	options?: LoadSecretsOptions,
 ): Promise<SecretObfuscator | undefined> {
-	const fileEntries = await logger.time("loadSecrets", loadSecrets, cwd, agentDir);
+	const fileEntries = await logger.time("loadSecrets", loadSecrets, cwd, agentDir, options);
 	const envEntries = collectEnvSecrets();
 	// Built-in credential-pattern entries come last so user-configured entries
 	// (plain literals, custom regexes) take precedence in the scan order.
@@ -292,34 +304,40 @@ export async function buildSecretObfuscator(
 	return obfuscator;
 }
 
-async function loadSecretsFile(filePath: string): Promise<SecretEntry[]> {
+async function loadSecretsFile(filePath: string, strict: boolean): Promise<SecretEntry[]> {
+	const fail = (message: string, error?: unknown): SecretEntry[] => {
+		if (strict) throw new Error(`${message}: ${filePath}${error === undefined ? "" : ` (${String(error)})`}`);
+		logger.warn(message, { path: filePath, ...(error === undefined ? {} : { error: String(error) }) });
+		return [];
+	};
+	let raw: unknown;
 	try {
-		const text = await Bun.file(filePath).text();
-		const raw = YAML.parse(text);
-		if (!Array.isArray(raw)) {
-			logger.warn("secrets.yml must be a YAML array", { path: filePath });
-			return [];
-		}
-		const entries: SecretEntry[] = [];
-		for (let i = 0; i < raw.length; i++) {
-			const entry = raw[i];
-			if (!validateEntry(entry, filePath, i)) continue;
-			const friendlyName = loadFriendlyName(entry, filePath, i);
-			entries.push({
-				type: entry.type,
-				content: entry.content,
-				mode: entry.mode ?? "obfuscate",
-				replacement: entry.replacement,
-				flags: entry.flags,
-				friendlyName,
-			});
-		}
-		return entries;
+		raw = YAML.parse(await Bun.file(filePath).text());
 	} catch (err) {
 		if (isEnoent(err)) return [];
-		logger.warn("Failed to load secrets.yml", { path: filePath, error: String(err) });
-		return [];
+		return fail("Failed to load secrets.yml", err);
 	}
+	// An empty or comment-only file parses to null: no entries, not an error.
+	if (raw === null || raw === undefined) return [];
+	if (!Array.isArray(raw)) return fail("secrets.yml must be a YAML array");
+	const entries: SecretEntry[] = [];
+	for (let i = 0; i < raw.length; i++) {
+		const entry = raw[i];
+		if (!validateEntry(entry, filePath, i)) {
+			if (strict) throw new Error(`Invalid secrets.yml entry ${i}: ${filePath}`);
+			continue;
+		}
+		const friendlyName = loadFriendlyName(entry, filePath, i);
+		entries.push({
+			type: entry.type,
+			content: entry.content,
+			mode: entry.mode ?? "obfuscate",
+			replacement: entry.replacement,
+			flags: entry.flags,
+			friendlyName,
+		});
+	}
+	return entries;
 }
 
 // Validates the friendlyName but returns it UNSANITIZED: `SecretObfuscator`'s

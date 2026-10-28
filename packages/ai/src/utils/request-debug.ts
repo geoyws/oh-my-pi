@@ -21,8 +21,12 @@ const CREDENTIAL_FIELD_RE =
 const EXCHANGE_CREDENTIAL_FIELD_RE =
 	/^(?:refresh_token|access_token|id_token|client_secret|client_assertion|code_verifier|device_code|subject_token|actor_token|password|private_key|api_?key|assertion|code|token)$/i;
 const REDACTED = "[redacted]";
-/** Paths of OAuth/token endpoints whose responses hold fresh credentials. */
-const TOKEN_ENDPOINT_PATH_RE = /\/(?:oauth2?\/)?(?:v\d+\/)?token$/i;
+/**
+ * Paths of credential exchanges whose responses hold fresh credentials: OAuth/token endpoints and
+ * Google IAM credential mints (`serviceAccounts/<sa>:generateAccessToken`, used by impersonated ADC).
+ */
+const TOKEN_ENDPOINT_PATH_RE =
+	/(?:\/(?:oauth2?\/)?(?:v\d+\/)?token|:(?:generateAccessToken|generateIdToken|signJwt|signBlob))$/i;
 
 let nextSessionId = 1;
 

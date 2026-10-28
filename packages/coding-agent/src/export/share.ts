@@ -100,10 +100,13 @@ export function buildShareSnapshot(sm: SessionManager, options?: ShareSessionOpt
 
 /**
  * The obfuscator a share must be sealed with. `share.redactSecrets` alone decides: `secrets.enabled`
- * only governs provider requests, never whether a session leaves the machine unredacted. A live
- * session's obfuscator is reused when it has secrets; otherwise one is built from `cwd`'s and the
- * agent dir's secrets files, the environment and the built-in credential patterns. Fails closed:
- * with redaction on and no usable obfuscator it throws instead of returning nothing.
+ * only governs provider requests, never whether a session leaves the machine unredacted. The
+ * secrets files of `cwd`'s project and the agent dir are always loaded strictly, so an unreadable
+ * or malformed secrets.yml refuses the upload instead of silently dropping its entries. A live
+ * session's obfuscator is reused only while it actively redacts (it keeps placeholders consistent
+ * with what the provider saw); one switched off by `secrets.enabled: false` or without secrets is
+ * replaced by the freshly built one (files, environment, built-in credential patterns). Fails
+ * closed: with redaction on and no actively redacting obfuscator it throws.
  */
 export async function resolveShareObfuscator(options: {
 	redact: boolean;
@@ -111,9 +114,9 @@ export async function resolveShareObfuscator(options: {
 	session?: SecretObfuscator;
 }): Promise<SecretObfuscator | undefined> {
 	if (!options.redact) return undefined;
-	if (options.session?.hasSecrets()) return options.session;
-	const built = await buildSecretObfuscator(options.cwd, getAgentDir());
-	if (!built?.hasSecrets()) {
+	const built = await buildSecretObfuscator(options.cwd, getAgentDir(), undefined, { strict: true });
+	if (options.session?.obfuscates()) return options.session;
+	if (!built?.obfuscates()) {
 		throw new Error(
 			"share.redactSecrets is on but no secret redactor could be built; refusing to upload an unredacted session",
 		);

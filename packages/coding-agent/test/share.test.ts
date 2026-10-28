@@ -614,10 +614,32 @@ describe("resolveShareObfuscator", () => {
 		expect(text).toContain("GONE");
 	});
 
-	test("reuses a live session obfuscator that has secrets", async () => {
+	test("reuses a live session obfuscator only while it actively redacts", async () => {
 		using tempDir = TempDir.createSync("@omp-share-resolve-");
+		await projectWithLiteral(tempDir.path());
 		const session = new SecretObfuscator([{ type: "plain", content: LITERAL }]);
 		expect(await resolveShareObfuscator({ redact: true, cwd: tempDir.path(), session })).toBe(session);
+
+		// secrets.enabled switched off mid-session: the session instance keeps its
+		// secrets but passes text through, so the share must use its own redactor.
+		session.setObfuscating(false);
+		const resolved = await resolveShareObfuscator({ redact: true, cwd: tempDir.path(), session });
+		expect(resolved).not.toBe(session);
+		const text = snapshotText(resolved);
+		expect(text).not.toContain(LITERAL);
+		expect(text).toContain("GONE");
+	});
+
+	test("refuses to share when a secrets.yml cannot be parsed", async () => {
+		using tempDir = TempDir.createSync("@omp-share-resolve-");
+		await Bun.write(path.join(tempDir.path(), ".omp", "secrets.yml"), "- type: plain\n  content: [unclosed\n");
+		await expect(resolveShareObfuscator({ redact: true, cwd: tempDir.path() })).rejects.toThrow("secrets.yml");
+	});
+
+	test("refuses to share when a secrets.yml entry is invalid", async () => {
+		using tempDir = TempDir.createSync("@omp-share-resolve-");
+		await Bun.write(path.join(tempDir.path(), ".omp", "secrets.yml"), "- type: bogus\n  content: x\n");
+		await expect(resolveShareObfuscator({ redact: true, cwd: tempDir.path() })).rejects.toThrow("secrets.yml");
 	});
 
 	test("returns nothing when share.redactSecrets is off", async () => {

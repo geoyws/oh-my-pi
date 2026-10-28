@@ -171,6 +171,27 @@ describe("PI_REQ_DEBUG request/response recording", () => {
 		expect(new TextDecoder().decode(log.body)).toBe("[response body omitted: credential exchange]\n");
 	});
 
+	it("never logs the access token minted by Google service-account impersonation", async () => {
+		Bun.env.PI_REQ_DEBUG = "1";
+		const minted = JSON.stringify({ accessToken: "minted-impersonation-value", expireTime: "2026-10-28T12:00:00Z" });
+		const fetchImpl: FetchImpl = async () => new Response(minted, { headers: { "content-type": "application/json" } });
+		const response = await transportFetch(debugModel(), fetchImpl)(
+			"https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/sa@proj.iam.gserviceaccount.com:generateAccessToken",
+			{
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ scope: ["https://www.googleapis.com/auth/cloud-platform"], lifetime: "3600s" }),
+			},
+		);
+		expect(await response.text()).toBe(minted);
+
+		const { requestPath, responsePath } = await findDebugFiles();
+		const dump = (await fs.readFile(requestPath, "utf8")) + (await fs.readFile(responsePath, "utf8"));
+		expect(dump).not.toContain("minted-impersonation-value");
+		const log = splitResponseLog(await fs.readFile(responsePath));
+		expect(new TextDecoder().decode(log.body)).toBe("[response body omitted: credential exchange]\n");
+	});
+
 	it("redacts credential fields in JSON bodies at any depth but keeps ordinary tool arguments", async () => {
 		Bun.env.PI_REQ_DEBUG = "1";
 		const fetchImpl: FetchImpl = async () => new Response("ok");
