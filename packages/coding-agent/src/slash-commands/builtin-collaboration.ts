@@ -14,7 +14,7 @@ import { sanitizeDisplayLine } from "@oh-my-pi/pi-tui/overlays/extensions/displa
 import { extractLastCodeBlock, extractLastCommand, extractLastLink } from "@oh-my-pi/pi-tui/overlays/copy-targets";
 import { restartBrowserForModeChange } from "../tools/browser";
 import { shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-utils";
-import { openPath } from "../utils/open";
+import { openLink } from "../utils/open";
 import { copyToClipboard } from "../utils/clipboard";
 import { refreshStatusLine } from "./builtin-modes";
 import { CollabQrCodeComponent, collabBrowserLink } from "@oh-my-pi/pi-tui/chrome/collab-qrcode";
@@ -643,7 +643,7 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 				clearSubmittedText(runtime);
 				return;
 			}
-			openPath(link.href);
+			openLink(link.href);
 			runtime.ctx.showStatus(`Opening ${link.href}`);
 			clearSubmittedText(runtime);
 		},
