@@ -6,6 +6,10 @@ import { Process } from "@oh-my-pi/pi-natives";
 import { readLiveDaemonBrokerPid } from "../../src/launch/presence";
 import { findFreeCdpPort } from "../../src/tools/browser/attach";
 import { probeRelayServer } from "../../src/tools/browser/relay/daemon";
+import { useTestRelayToken } from "../helpers/relay-token";
+
+// Isolated brokers inherit process.env, so their relays and clients share this token too.
+useTestRelayToken();
 
 async function waitUntil(condition: () => boolean | Promise<boolean>, timeoutMs: number): Promise<boolean> {
 	const deadline = Date.now() + timeoutMs;
@@ -666,6 +670,7 @@ import { declareWorkerHostEntry } from ${utils("worker-host.ts")};
 import { closeDaemonClients, daemonClientForGlobal } from ${source("launch/client.ts")};
 import { acquireBrowser, releaseBrowser } from ${source("tools/browser/registry.ts")};
 import { DISCARDED_TABS_PROTOCOL_VERSION } from ${source("tools/browser/relay/protocol.ts")};
+import { relayDiscoveryUrl } from ${source("tools/browser/relay/auth.ts")};
 import { startRelayServer } from ${source("tools/browser/relay/server.ts")};
 
 if (process.argv[2] === "browser-relay") {
@@ -714,7 +719,7 @@ if (process.argv[2] === "browser-relay") {
 		declareWorkerHostEntry();
 		const extension = connectExtension();
 		const handle = await acquireBrowser({ kind: "relay", cdpUrl }, { cwd: process.cwd() });
-		const body: unknown = await (await fetch(\`\${cdpUrl}/json/version\`)).json();
+		const body: unknown = await (await fetch(relayDiscoveryUrl(cdpUrl, "/json/version"))).json();
 		const current = (await client.request({ op: "describe", name })).daemon;
 		process.stdout.write(
 			JSON.stringify({

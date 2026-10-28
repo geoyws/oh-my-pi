@@ -8,6 +8,7 @@ import type { Browser, Page, Target } from "puppeteer-core";
 import { throwIfAborted } from "../tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { isPuppeteerTimeout } from "./launch";
+import { relayDiscoveryUrl } from "./relay/auth";
 
 const ATTACH_TARGET_SKIP_PATTERN =
 	/request[\s_-]?handler|devtools|background[\s_-]?(?:page|host)|service[\s_-]?worker/i;
@@ -528,7 +529,7 @@ async function fetchRelayEntries(
 	timeoutMs = RELAY_JSON_TIMEOUT_MS,
 ): Promise<RelayJsonEntry[] | null> {
 	try {
-		const res = await probeCdpResponse(`${relayJson.replace(/\/$/, "")}/json`, {
+		const res = await probeCdpResponse(relayDiscoveryUrl(relayJson, "/json"), {
 			timeoutMs,
 			signal,
 		});

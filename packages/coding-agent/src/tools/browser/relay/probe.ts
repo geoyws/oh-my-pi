@@ -16,6 +16,7 @@
 import { VERSION } from "@oh-my-pi/pi-utils/dirs";
 import { throwIfAborted } from "../../tool-errors";
 import { probeCdpResponse } from "../attach";
+import { relayDiscoveryUrl } from "./auth";
 import type { RelayUnavailableInfo } from "./server";
 import { DISCARDED_TABS_PROTOCOL_VERSION } from "./protocol";
 
@@ -42,7 +43,9 @@ export type RelayWaitOutcome =
 	/** A compatible relay from an older OMP is ready and reports no CDP client connected to it. */
 	| "idle-older-relay"
 	/** The relay extension is older than the running server. */
-	| "outdated-extension";
+	| "outdated-extension"
+	/** A relay serves the endpoint but refuses this user's capability token (another user's relay, or a mismatched token). */
+	| "unauthorized";
 
 /** The OMP version a parsed `/json/version` body (ready or waiting) reports; empty when it reports none. */
 export function relayVersionOf(parsed: object): string {
@@ -128,7 +131,7 @@ function readyOutcome(body: string): RelayWaitOutcome {
  * ever seeing one.
  */
 export async function waitForRelayExtension(cdpUrl: string, signal?: AbortSignal): Promise<RelayWaitOutcome> {
-	const probeUrl = `${cdpUrl}/json/version`;
+	const probeUrl = relayDiscoveryUrl(cdpUrl, "/json/version");
 	let deadline = Date.now() + EXTENSION_DIAL_WINDOW_MS;
 	let staleRelay = false;
 	for (;;) {
@@ -137,6 +140,7 @@ export async function waitForRelayExtension(cdpUrl: string, signal?: AbortSignal
 		throwIfAborted(signal);
 		if (response === null) return "unreachable";
 		if (response.status >= 200 && response.status < 300) return readyOutcome(response.body);
+		if (response.status === 401) return "unauthorized";
 		if (response.status !== 503) return "unreachable";
 		const info = parseUnavailableInfo(response.body);
 		// Past the dial window a relay from another version reads as outdated even
