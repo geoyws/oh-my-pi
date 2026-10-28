@@ -5,6 +5,7 @@
 ### Added
 
 - Added `Process.startTime`, a platform start-time token that, with `pid`, identifies one process across pid reuse (compare for equality only)
+- Added `ShellOptions.replaceHostEnv`: when true, `sessionEnv` is the shell session's whole environment instead of an overlay on the host process environment, so a caller that filters credentials out of the child env is not undone by the host copy
 
 ### Fixed
 
