@@ -297,3 +297,47 @@ it("publishes a consumed parent injection during a peer wake without publishing 
 		child.close();
 	}
 }, 15_000);
+
+it("publishes a parent injection that cancels a peer wake request before it streams", async () => {
+	const peerStarted = Promise.withResolvers<void>();
+	const releasePeer = Promise.withResolvers<void>();
+	let request = 0;
+	const child = await spawnKeptAliveChild({
+		structured: false,
+		enableIrc: true,
+		handler: async () => {
+			request++;
+			if (request === 1) return { content: ["INITIAL_FINAL"] };
+			if (request === 2) {
+				peerStarted.resolve();
+				// Never released while the turn runs: only the steer can end this request.
+				await releasePeer.promise;
+				return { content: ["PEER_INTERMEDIATE"] };
+			}
+			return { content: ["INJECTED_FINAL"] };
+		},
+	});
+	try {
+		const bus = IrcBus.global();
+		const peer = await bus.send({ from: "Peer", to: AGENT_ID, body: "Can you check?" });
+		expect(peer.outcome).toBe("woken");
+		await peerStarted.promise;
+		const parent = await bus.send({ from: PARENT_ID, to: AGENT_ID, body: "Publish the follow-up" });
+		expect(parent.outcome).toBe("injected");
+		// Default "immediate" mode: the steer cancels the silent peer request and is consumed.
+		await child.session.waitForIdle();
+		await child.session.waitForIrcReplies();
+		await manager.waitForOwnerJobs(PARENT_ID);
+		await manager.drainDeliveries({ filter: { ownerId: PARENT_ID } });
+		const lastContext = JSON.stringify(child.mock.calls.at(-1)?.context.messages);
+		expect(lastContext).toContain("Publish the follow-up");
+		expect(lastContext).not.toContain("PEER_INTERMEDIATE");
+		expect(await Bun.file(child.artifact).text()).toContain("INJECTED_FINAL");
+		expect(child.deliveries).toHaveLength(1);
+		expect(child.deliveries[0]).toContain("INJECTED_FINAL");
+		expect(manager.getAllJobs({ ownerId: PARENT_ID })).toHaveLength(1);
+	} finally {
+		releasePeer.resolve();
+		child.close();
+	}
+}, 15_000);
