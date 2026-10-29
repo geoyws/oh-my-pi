@@ -54,7 +54,12 @@ export async function runShellCommand(cmd: ShellCommandArgs): Promise<void> {
 	const { shell, env: shellEnv } = settings.getShellConfig();
 	const snapshotPath = cmd.noSnapshot || !shell.includes("bash") ? null : await getOrCreateSnapshot(shell, shellEnv);
 	const minimizer = buildMinimizerOptions(cfgShellMinimizer.get(settings));
-	const shellSession = new Shell({ sessionEnv: shellEnv, snapshotPath: snapshotPath ?? undefined, minimizer });
+	const shellSession = new Shell({
+		sessionEnv: shellEnv,
+		replaceHostEnv: true,
+		snapshotPath: snapshotPath ?? undefined,
+		minimizer,
+	});
 
 	let active = false;
 	let lastChar: string | null = null;

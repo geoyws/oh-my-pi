@@ -746,6 +746,9 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	const sessionEnv = options?.gitGuard ? { ...shellEnv, PI_GIT_GUARD: "1" } : shellEnv;
 	const shellOptions = {
 		sessionEnv,
+		// `shellEnv` is the allowlisted child env; without this the native shell
+		// copies OMP's whole environment underneath it (kb omp t-2b5e0f2c).
+		replaceHostEnv: true,
 		snapshotPath: snapshotPath ?? undefined,
 		minimizer,
 	};

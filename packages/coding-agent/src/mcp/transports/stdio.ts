@@ -8,6 +8,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getProjectDir, readJsonl } from "@oh-my-pi/pi-utils";
+import { filterChildEnv } from "@oh-my-pi/pi-utils/child-env";
 import type { Subprocess } from "bun";
 import { hostHasInheritableConsole } from "../../eval/py/spawn-options";
 import type {
@@ -578,8 +579,10 @@ export class StdioTransport implements MCPTransport {
 	async connect(): Promise<void> {
 		if (this.#connected) return;
 
+		// The server inherits only allowlisted names; credentials it needs come
+		// from its config `env` block (kb omp t-2b5e0f2c).
 		const env = {
-			...Bun.env,
+			...filterChildEnv(Bun.env),
 			...this.config.env,
 		};
 		const cwd = this.config.cwd ?? getProjectDir();
