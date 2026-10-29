@@ -360,6 +360,40 @@ export async function ensureSignInChromiumExecutable(): Promise<string | undefin
 	}
 }
 
+/**
+ * Command lines of every running process, or undefined when they cannot be
+ * listed. Windows returns undefined: without a listing, pruning keeps every build.
+ */
+async function runningCommandLines(): Promise<string | undefined> {
+	if (process.platform === "win32") return undefined;
+	try {
+		const proc = Bun.spawn(["ps", "-axww", "-o", "command="], { stdout: "pipe", stderr: "ignore" });
+		const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+		return exitCode === 0 ? stdout : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Remove Chrome for Testing builds left in the managed cache by an older
+ * puppeteer pin, keeping any build a running browser still executes from.
+ */
+async function pruneStaleManagedChromium(
+	browsers: typeof BrowsersNs,
+	cacheDir: string,
+	buildId: string,
+): Promise<void> {
+	const commands = await runningCommandLines();
+	if (commands === undefined) return;
+	const removed = await browsers.pruneStaleBuilds({
+		cacheDir,
+		keepBuildId: buildId,
+		isInUse: installPath => commands.includes(`${installPath}${path.sep}`),
+	});
+	if (removed.length > 0) logger.debug("Removed stale managed Chromium builds", { removed });
+}
+
 let managedChromiumPromise: Promise<string | undefined> | undefined;
 /** Chrome for Testing under ~/.omp/puppeteer, downloaded on first use; undefined when platform detection fails. */
 function ensureManagedChromium(): Promise<string | undefined> {
@@ -378,7 +412,15 @@ function ensureManagedChromium(): Promise<string | undefined> {
 			cacheDir,
 			platform,
 		});
-		if (fs.existsSync(executablePath)) return executablePath;
+		const pruneStale = () => {
+			void pruneStaleManagedChromium(browsers, cacheDir, buildId).catch(err => {
+				logger.warn("Could not prune stale managed Chromium builds", { cacheDir, error: toError(err).message });
+			});
+		};
+		if (fs.existsSync(executablePath)) {
+			pruneStale();
+			return executablePath;
+		}
 
 		logger.warn("Downloading Chromium for puppeteer (first browser use)", {
 			buildId,
@@ -404,6 +446,7 @@ function ensureManagedChromium(): Promise<string | undefined> {
 				},
 			}),
 		);
+		pruneStale();
 		return executablePath;
 	})().catch(err => {
 		managedChromiumPromise = undefined;

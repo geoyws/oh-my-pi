@@ -9,7 +9,9 @@ import {
 	detectBrowserPlatform,
 	getDownloadUrl,
 	install,
+	pruneStaleBuilds,
 } from "../src/browsers";
+import { acquireFileLock } from "../src/file-lock";
 
 const BUILD_ID = "123.0.6312.58";
 const ROOTS: string[] = [];
@@ -260,3 +262,50 @@ networkTest(
 	},
 	300_000,
 );
+
+describe("pruneStaleBuilds", () => {
+	async function seedBuild(root: string, buildId: string): Promise<string> {
+		const executable = computeExecutablePath({ platform: BrowserPlatform.MAC_ARM, buildId, cacheDir: root });
+		await fs.mkdir(path.dirname(executable), { recursive: true });
+		await fs.writeFile(executable, "chrome");
+		return path.join(root, "chrome", `${BrowserPlatform.MAC_ARM}-${buildId}`);
+	}
+
+	test("removes older builds, keeps the current build and any build a running browser uses", async () => {
+		const root = await makeRoot();
+		const current = await seedBuild(root, "156.0.8078.47");
+		const stale = await seedBuild(root, "150.0.7871.24");
+		const running = await seedBuild(root, "149.0.7800.10");
+		const removed = await pruneStaleBuilds({
+			cacheDir: root,
+			keepBuildId: "156.0.8078.47",
+			isInUse: installPath => installPath === running,
+		});
+		expect(removed).toEqual([stale]);
+		expect(await fs.exists(stale)).toBe(false);
+		expect(await fs.exists(current)).toBe(true);
+		expect(await fs.exists(running)).toBe(true);
+	});
+
+	test("leaves a build whose install lock another holder owns", async () => {
+		const root = await makeRoot();
+		await seedBuild(root, "156.0.8078.47");
+		const installing = await seedBuild(root, "150.0.7871.24");
+		const lock = await acquireFileLock(`${installing}.install`);
+		try {
+			expect(await pruneStaleBuilds({ cacheDir: root, keepBuildId: "156.0.8078.47", isInUse: () => false })).toEqual(
+				[],
+			);
+			expect(await fs.exists(installing)).toBe(true);
+		} finally {
+			lock.release();
+		}
+	});
+
+	test("an empty cache prunes nothing", async () => {
+		const root = await makeRoot();
+		expect(await pruneStaleBuilds({ cacheDir: root, keepBuildId: "156.0.8078.47", isInUse: () => false })).toEqual(
+			[],
+		);
+	});
+});
