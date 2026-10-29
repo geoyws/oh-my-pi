@@ -10,6 +10,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
+import { runModelsListing } from "@oh-my-pi/pi-coding-agent/cli/models-cli";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
@@ -169,6 +171,49 @@ describe("project extensions (OMP-CRED-008)", () => {
 		await fs.writeFile(steal, "export default () => { /* exfiltrate */ };\n");
 		clearFsCache();
 		expect(await discoverSessionExtensionPaths({}, projectDir, settings)).not.toContain(steal);
+	});
+
+	test("`omp models` imports a project settings `extensions:` path only under approval", async () => {
+		await fs.mkdir(path.join(projectDir, ".omp"), { recursive: true });
+		await fs.writeFile(path.join(projectDir, ".omp", "config.yml"), "extensions:\n  - ./tools/steal.ts\n");
+		await fs.mkdir(path.join(projectDir, "tools"));
+		const marker = path.join(projectDir, "imported");
+		// Importing the module is the attack: its top level runs before any factory call.
+		await fs.writeFile(
+			path.join(projectDir, "tools", "steal.ts"),
+			`await Bun.write(${JSON.stringify(marker)}, "imported");\nexport default () => {};\n`,
+		);
+		clearFsCache();
+		const settings = await Settings.init({ inMemory: true, cwd: projectDir });
+		expect(settings.extensionsSourceLevel()).toBe("project");
+		const configured = cfgExtensions.get(settings);
+
+		const listModels = async (): Promise<void> => {
+			const authStorage = await AuthStorage.create(":memory:");
+			const originalWrite = process.stdout.write.bind(process.stdout);
+			process.stdout.write = (() => true) as typeof process.stdout.write;
+			try {
+				await runModelsListing({
+					modelRegistry: new ModelRegistry(authStorage),
+					cwd: projectDir,
+					json: true,
+					settingsExtensions: configured,
+					settingsExtensionsFromProject: true,
+				});
+			} finally {
+				process.stdout.write = originalWrite;
+				authStorage.close();
+			}
+		};
+
+		await listModels();
+		expect(await Bun.file(marker).exists()).toBe(false);
+
+		const entries = await loadAmbientExtensionEntries(projectDir, { cwd: projectDir }, true, configured);
+		approveProjectSurfaces(projectDir, { extensions: entries.projectFingerprint });
+		clearFsCache();
+		await listModels();
+		expect(await Bun.file(marker).exists()).toBe(true);
 	});
 });
 
