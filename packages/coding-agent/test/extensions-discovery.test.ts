@@ -734,14 +734,18 @@ describe("extensions discovery", () => {
 			cwd: tempDir.path(),
 			overrides: { disabledExtensions: ["extension-module:guard"] },
 		});
-		initializeWithSettings(settings);
+		const release = initializeWithSettings(settings);
+		try {
+			const result = await discoverForTest([], true);
+			const loadedHook = result.extensions.find(extension => extension.path === hookPath);
 
-		const result = await discoverForTest([], true);
-		const loadedHook = result.extensions.find(extension => extension.path === hookPath);
-
-		expect(result.errors).toHaveLength(0);
-		expect(result.extensions.find(extension => extension.path === extensionPath)).toBeUndefined();
-		expect(loadedHook?.handlers.has("tool_call")).toBe(true);
+			expect(result.errors).toHaveLength(0);
+			expect(result.extensions.find(extension => extension.path === extensionPath)).toBeUndefined();
+			expect(loadedHook?.handlers.has("tool_call")).toBe(true);
+		} finally {
+			// The binding is process-global; a leaked disabled list skews later discovery tests.
+			release();
+		}
 	});
 
 	it("loadExtensions only loads explicit paths without discovery", async () => {
