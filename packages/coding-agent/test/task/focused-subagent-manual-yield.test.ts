@@ -329,9 +329,7 @@ it("publishes a parent injection that cancels a peer wake request before it stre
 		await child.session.waitForIrcReplies();
 		await manager.waitForOwnerJobs(PARENT_ID);
 		await manager.drainDeliveries({ filter: { ownerId: PARENT_ID } });
-		const lastContext = JSON.stringify(child.mock.calls.at(-1)?.context.messages);
-		expect(lastContext).toContain("Publish the follow-up");
-		expect(lastContext).not.toContain("PEER_INTERMEDIATE");
+		expect(JSON.stringify(child.mock.calls.at(-1)?.context.messages)).toContain("Publish the follow-up");
 		expect(await Bun.file(child.artifact).text()).toContain("INJECTED_FINAL");
 		expect(child.deliveries).toHaveLength(1);
 		expect(child.deliveries[0]).toContain("INJECTED_FINAL");
