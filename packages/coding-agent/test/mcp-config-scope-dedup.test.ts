@@ -19,6 +19,7 @@ import { loadAllMCPConfigs } from "@oh-my-pi/pi-coding-agent/mcp/config";
 import { getConfigRootDir, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import { approveProjectSurfaces } from "@oh-my-pi/pi-utils/project-trust";
 import "@oh-my-pi/pi-coding-agent/discovery";
+import { approveProjectForTest } from "./helpers/project-trust";
 
 const originalAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
 const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
@@ -98,6 +99,8 @@ describe("MCP scope filtering precedes connection-equivalence deduplication", ()
 		// starved by the disabled owner and still survives.
 		await writeMcpJson(path.join(projectDir, ".omp"), { shared: { ...CONNECTION, enabled: false } });
 		await writeMcpJson(userAgentDir, { shared: CONNECTION, usercontext: CONNECTION });
+		// A new project server name is new content: approve it, as the user would.
+		await approveProjectForTest(projectDir);
 		const result = await loadAllMCPConfigs(projectDir, { enableProjectConfig: true, filterExa: false });
 		expect(Object.keys(result.configs)).toEqual(["usercontext"]);
 		expect(result.sources.usercontext?.level).toBe("user");

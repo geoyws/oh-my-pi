@@ -155,10 +155,22 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 		return false;
 	};
 
+	// A repository's MCP servers are commands it chose, launched with the
+	// user's environment and file access. They run only after `omp trust`
+	// approved exactly this set (name, source file, full config). The filter
+	// records every project server before the `enabled` switch or the disabled
+	// list suppresses it, and the fingerprint leaves the switch out, so turning
+	// a server on or off (`/mcp`, `disabledServers`) keeps the approval.
+	const surfaceServers: Array<MCPServer & { _source: SourceMeta }> = [];
+	const includeAndRecord = (server: MCPServer & { _source: SourceMeta }): boolean => {
+		if (!includeServer(server)) return false;
+		if (server._source.level === "project") surfaceServers.push(server);
+		return true;
+	};
 	let result = await loadCapability<MCPServer>(mcpCapability.id, {
 		cwd,
 		extensionRoots: options?.extensionRoots,
-		filter: includeServer,
+		filter: includeAndRecord,
 		suppress: suppressServer,
 	});
 
@@ -167,18 +179,7 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 	// CapabilityResult.
 	for (const warning of result.warnings) logger.warn(warning);
 
-	// A repository's MCP servers are commands it chose, launched with the
-	// user's environment and file access. They run only after `omp trust`
-	// approved exactly this set (name, source file, full config). The set
-	// includes disabled entries and leaves out the `enabled` switch, so turning
-	// a server on or off (`/mcp`, the disabled list) keeps the approval.
-	const surface = await loadCapability<MCPServer>(mcpCapability.id, {
-		cwd,
-		extensionRoots: options?.extensionRoots,
-		filter: server => server._source.level === "project" && includeServer(server),
-		disabledExtensions: [],
-	});
-	const projectServers = surface.items.map(server => {
+	const projectServers = surfaceServers.map(server => {
 		const { enabled: _enabled, ...config } = convertToLegacyConfig(server);
 		return { name: server.name, source: server._source.path, config };
 	});
