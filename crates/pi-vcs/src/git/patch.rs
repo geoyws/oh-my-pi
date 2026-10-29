@@ -2811,10 +2811,11 @@ mod tests {
 		// Regression: worktree application found no source for a submodule
 		// directory ("does not exist") and materialized added gitlinks as blobs.
 		// Before git 2.50 (git 1d9a66493), `git apply --reverse` of a deletion
-		// dropped the mode, so reversing a gitlink deletion tried to write
-		// `module` as a 100644 file and failed on a checked-out submodule. With
-		// such a git the oracle is wrong for that case; check ours against what
-		// fixed git does instead: apply succeeds and changes nothing.
+		// dropped the mode, so reversing a gitlink deletion wrote `module` as a
+		// 100644 file: it failed on a checked-out submodule and replaced an empty
+		// one with a file. With such a git the oracle is wrong for that case;
+		// check ours against what fixed git does instead: apply succeeds and
+		// changes nothing.
 		let oracle_reverses_gitlink_deletes = oracle_git_version() >= (2, 50);
 		for initialized in [true, false] {
 			for (kind, reverse) in [("update", false), ("delete", false), ("delete", true)] {
@@ -2836,7 +2837,7 @@ mod tests {
 				]);
 				let case = format!("{kind} reverse={reverse} initialized={initialized}");
 				let options = ApplyOptions { reverse, ..ApplyOptions::default() };
-				if kind == "delete" && reverse && initialized && !oracle_reverses_gitlink_deletes {
+				if kind == "delete" && reverse && !oracle_reverses_gitlink_deletes {
 					let repository = repo(ours.path());
 					assert!(
 						repository
