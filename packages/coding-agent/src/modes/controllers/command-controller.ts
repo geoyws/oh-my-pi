@@ -27,7 +27,7 @@ import { shouldEnableAppendOnlyContext } from "../../config/append-only-context-
 import { type BashResult, isPersistentShellCdCommand } from "../../exec/bash-executor";
 import { type LoadedCustomShare, loadCustomShare } from "../../export/custom-share";
 import { parseExportArgs } from "../../export/html/args";
-import { shareSession } from "../../export/share";
+import { resolveShareObfuscator, shareSession } from "../../export/share";
 import type { CompactOptions } from "../../extensibility/extensions/types";
 import {
 	diffMentalModelContent,
@@ -535,7 +535,11 @@ export class CommandController {
 				serverUrl: cfgShareServerUrl.get(this.ctx.settings),
 				store: cfgShareStore.get(this.ctx.settings),
 				state: this.ctx.session.state,
-				obfuscator: cfgShareRedactSecrets.get(this.ctx.settings) ? this.ctx.session.obfuscator : undefined,
+				obfuscator: await resolveShareObfuscator({
+					redact: cfgShareRedactSecrets.get(this.ctx.settings),
+					cwd: this.ctx.session.sessionManager.getCwd(),
+					session: this.ctx.session.obfuscator,
+				}),
 			});
 			if (loader.signal.aborted) return;
 			restoreEditor();

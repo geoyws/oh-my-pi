@@ -21,9 +21,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentMessage, AgentState } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ImageContent, TextContent } from "@oh-my-pi/pi-ai";
-import { $which, logger } from "@oh-my-pi/pi-utils";
+import { $which, getAgentDir, logger } from "@oh-my-pi/pi-utils";
 import { DEFAULT_SHARE_URL } from "@oh-my-pi/pi-wire";
 import { $ } from "bun";
+import { buildSecretObfuscator } from "../secrets";
 import { obfuscateToolArguments } from "../secrets/message-transform";
 import type { SecretObfuscator } from "../secrets/obfuscator";
 import { SecretValueSet } from "../secrets/placeholder";
@@ -95,6 +96,32 @@ export interface ShareSessionResult {
 export function buildShareSnapshot(sm: SessionManager, options?: ShareSessionOptions): SessionData {
 	const data = buildSessionData(sm, options?.state);
 	return options?.obfuscator?.hasSecrets() ? redactSessionDataForShare(options.obfuscator, data) : data;
+}
+
+/**
+ * The obfuscator a share must be sealed with. `share.redactSecrets` alone decides: `secrets.enabled`
+ * only governs provider requests, never whether a session leaves the machine unredacted. The
+ * secrets files of `cwd`'s project and the agent dir are always loaded strictly, so an unreadable
+ * or malformed secrets.yml refuses the upload instead of silently dropping its entries. A live
+ * session's obfuscator is reused only while it actively redacts (it keeps placeholders consistent
+ * with what the provider saw); one switched off by `secrets.enabled: false` or without secrets is
+ * replaced by the freshly built one (files, environment, built-in credential patterns). Fails
+ * closed: with redaction on and no actively redacting obfuscator it throws.
+ */
+export async function resolveShareObfuscator(options: {
+	redact: boolean;
+	cwd: string;
+	session?: SecretObfuscator;
+}): Promise<SecretObfuscator | undefined> {
+	if (!options.redact) return undefined;
+	const built = await buildSecretObfuscator(options.cwd, getAgentDir(), undefined, { strict: true });
+	if (options.session?.obfuscates()) return options.session;
+	if (!built?.obfuscates()) {
+		throw new Error(
+			"share.redactSecrets is on but no secret redactor could be built; refusing to upload an unredacted session",
+		);
+	}
+	return built;
 }
 
 /**

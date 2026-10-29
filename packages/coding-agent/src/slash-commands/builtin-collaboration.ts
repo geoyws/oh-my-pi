@@ -7,7 +7,7 @@ import type { CollabHost } from "../collab/host";
 import { type CollabHostSnapshot, listCollabHosts } from "../collab/registry";
 import { settings } from "../config/settings";
 import { parseExportArgs } from "../export/html/args";
-import { shareSession } from "../export/share";
+import { resolveShareObfuscator, shareSession } from "../export/share";
 import { theme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "../modes/types";
 import { sanitizeDisplayLine } from "@oh-my-pi/pi-tui/overlays/extensions/display-text";
@@ -299,7 +299,11 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 					serverUrl: cfgShareServerUrl.get(runtime.settings),
 					store: cfgShareStore.get(runtime.settings),
 					state: runtime.session.state,
-					obfuscator: cfgShareRedactSecrets.get(runtime.settings) ? runtime.session.obfuscator : undefined,
+					obfuscator: await resolveShareObfuscator({
+						redact: cfgShareRedactSecrets.get(runtime.settings),
+						cwd: runtime.sessionManager.getCwd(),
+						session: runtime.session.obfuscator,
+					}),
 				});
 				const lines = [`Share URL: ${result.url}`];
 				if (result.gistUrl) lines.push(`Gist: ${result.gistUrl}`);
