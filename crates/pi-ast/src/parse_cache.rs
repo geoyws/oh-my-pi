@@ -634,7 +634,7 @@ mod tests {
 	/// ids prove two trees share that subtree rather than parsing it twice.
 	/// (The *root* node's id is the address of the `root` field inside the
 	/// `TSTree` struct itself, which a copy necessarily relocates.)
-	fn subtree_id(tree: &Tree, index: usize) -> usize {
+	fn subtree_id(tree: &Tree, index: u32) -> usize {
 		tree.root_node().child(index).expect("top-level decl").id()
 	}
 

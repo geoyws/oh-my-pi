@@ -276,7 +276,7 @@ impl LanguageExt for Html {
 	fn extract_injections<L: LanguageExt>(
 		&self,
 		root: Node<StrDoc<L>>,
-	) -> HashMap<String, Vec<TSRange>> {
+	) -> Vec<(String, Vec<TSRange>)> {
 		let lang = root.lang();
 		let mut map = HashMap::new();
 		let matcher = KindMatcher::new("script_element", lang.clone());
@@ -299,7 +299,11 @@ impl LanguageExt for Html {
 					.push(node_to_range(&content));
 			}
 		}
-		map
+		// One document per language over all its regions, as before ast-grep
+		// 0.45 changed this to a list; sorted so match order is stable.
+		let mut injections: Vec<_> = map.into_iter().collect();
+		injections.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+		injections
 	}
 }
 
@@ -618,10 +622,10 @@ impl LanguageExt for SupportLang {
 	fn extract_injections<L: LanguageExt>(
 		&self,
 		root: Node<StrDoc<L>>,
-	) -> HashMap<String, Vec<TSRange>> {
+	) -> Vec<(String, Vec<TSRange>)> {
 		match self {
 			Self::Html => Html.extract_injections(root),
-			_ => HashMap::new(),
+			_ => Vec::new(),
 		}
 	}
 }
