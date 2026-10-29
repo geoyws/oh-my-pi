@@ -7,16 +7,13 @@
  * `share.redactSecrets`.
  */
 
-import { getAgentDir, isEnoent } from "@oh-my-pi/pi-utils";
+import { isEnoent } from "@oh-my-pi/pi-utils";
 import { Args, Command, Flags } from "@oh-my-pi/pi-utils/cli";
 import { shareHelp as commandHelp } from "../cli/command-help";
 import { Settings } from "../config/settings";
-import { shareSession } from "../export/share";
-import { buildSecretObfuscator } from "../secrets";
+import { resolveShareObfuscator, shareSession } from "../export/share";
 import { resolveResumableSession } from "../session/session-listing";
 import { SessionManager } from "../session/session-manager";
-
-import { cfgSecretsEnabled } from "../secrets/settings";
 import { cfgShareRedactSecrets, cfgShareServerUrl, cfgShareStore } from "./settings";
 
 export default class Share extends Command {
@@ -58,15 +55,14 @@ export default class Share extends Command {
 			return;
 		}
 		// Settings resolve against the session's own project so its
-		// share.redactSecrets/secrets.enabled policy governs, not the invoking cwd's.
+		// share.redactSecrets policy governs, not the invoking cwd's.
 		const settings = await Settings.loadReadOnly({ cwd: sm.getCwd() });
-		// Same leak boundary as /share: a share blob leaves the machine, so honor
-		// share.redactSecrets with the full obfuscator built against the session's
-		// own project directory (its secrets.yml, not the invoking cwd's).
-		const obfuscator =
-			cfgShareRedactSecrets.get(settings) && cfgSecretsEnabled.get(settings)
-				? await buildSecretObfuscator(sm.getCwd(), getAgentDir())
-				: undefined;
+		// Same leak boundary as /share: the obfuscator is built against the
+		// session's own project directory (its secrets.yml, not the invoking cwd's).
+		const obfuscator = await resolveShareObfuscator({
+			redact: cfgShareRedactSecrets.get(settings),
+			cwd: sm.getCwd(),
+		});
 
 		const result = await shareSession(sm, {
 			serverUrl: cfgShareServerUrl.get(settings),

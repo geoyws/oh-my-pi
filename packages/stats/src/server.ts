@@ -1,7 +1,15 @@
+import * as crypto from "node:crypto";
 import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { isEnoent, logger } from "@oh-my-pi/pi-utils";
+import {
+	capabilityTokenMatches,
+	getStatsDashboardTokenPath,
+	isEnoent,
+	isRebindingSafeHost,
+	loadOrCreateCapabilityToken,
+	logger,
+} from "@oh-my-pi/pi-utils";
 import { $, type Server } from "bun";
 import {
 	getCostDashboardStats,
@@ -31,12 +39,19 @@ import {
 import { getGainDashboardStats } from "./gain-aggregator";
 import { statsLive } from "./live";
 import {
+	canonicalStatsHostname,
+	fetchStatsLaunchSecret,
 	prepareStatsPort,
 	recoverStatsPort,
+	STATS_DASHBOARD_CHALLENGE_HEADER,
 	STATS_DASHBOARD_HEADER,
 	STATS_DASHBOARD_HOSTNAME,
 	STATS_DASHBOARD_HOSTNAME_HEADER,
+	STATS_DASHBOARD_PROOF_HEADER,
 	STATS_DASHBOARD_SECURITY_VERSION,
+	STATS_LAUNCH_NONCE_FIELD,
+	statsDashboardProof,
+	statsLaunchMac,
 } from "./port-conflict";
 import { getStatsByModel, getTimeSeries } from "./rollup";
 import {
@@ -367,7 +382,47 @@ export function formatStatsDashboardUrl(hostname: string, port: number): string 
 	return `http://${urlHostname}:${port}`;
 }
 
+/** Short hint for 401 bodies: the token lives in the URL omp printed, nowhere else. */
+const STATS_AUTH_HINT = "Unauthorized: open the dashboard URL printed by `omp stats` or `/trace`.";
+
+/** Extract a `Bearer` capability token from the Authorization header, if present. */
+function bearerToken(req: Request): string | null {
+	const header = req.headers.get("authorization");
+	if (!header) return null;
+	const match = /^Bearer (.+)$/.exec(header.trim());
+	return match ? match[1].trim() : null;
+}
+
+/** Launch secrets of the dashboards this process serves, keyed by `hostname:port`. */
+const localLaunchSecrets = new Map<string, string>();
+
+/**
+ * Dashboard URL that authenticates the browser. `?token=` carries the listener's launch secret,
+ * never the user's reusable capability: it is valid only while that dashboard runs, so a printed
+ * link reopened after another user took the port hands that user a dead credential. The page
+ * swaps it for a session secret at once and strips it from the address bar. `fragment` (e.g.
+ * `#/traces?s=...`) stays after the query. For a dashboard another omp process serves, the
+ * launch secret is obtained with a nonce HMAC that never sends the capability.
+ */
+export async function statsDashboardLaunchUrl(requestedHostname: string, port: number, fragment = ""): Promise<string> {
+	const hostname = canonicalStatsHostname(requestedHostname);
+	const launch = localLaunchSecrets.get(`${hostname}:${port}`) ?? (await fetchStatsLaunchSecret(hostname, port));
+	return `${formatStatsDashboardUrl(hostname, port)}/?token=${launch}${fragment}`;
+}
+
+const LAUNCH_NONCE_TTL_MS = 30_000;
+const MAX_LAUNCH_NONCES = 64;
+
 function createDashboardServer(port: number, hostname: string): Server<undefined> {
+	const token = loadOrCreateCapabilityToken(getStatsDashboardTokenPath());
+	// Printed launch URLs carry this, never the capability; it dies with this listener.
+	const launch = crypto.randomBytes(32).toString("base64url");
+	// Single-use nonces for `/api/launch`, oldest dropped beyond the cap.
+	const launchNonces = new Map<string, number>();
+	// The browser never keeps the launch secret either: it swaps it for this secret,
+	// which also dies with this listener. Origin storage is shared with whoever binds
+	// the same port later, so only a dead credential may sit there.
+	const session = crypto.randomBytes(32).toString("base64url");
 	const server = Bun.serve({
 		port,
 		hostname,
@@ -376,11 +431,77 @@ function createDashboardServer(port: number, hostname: string): Server<undefined
 			const path = url.pathname;
 
 			// The identity header lets another omp session's reuse probe positively
-			// recognize this dashboard without allowing cross-origin API reads.
+			// recognize this dashboard without allowing cross-origin API reads; a
+			// challenge is answered with a proof bound to this port, never the token.
+			// The page URL may carry the token, so no response ever sends a Referer.
 			const dashboardHeaders: Record<string, string> = {
 				[STATS_DASHBOARD_HEADER]: STATS_DASHBOARD_SECURITY_VERSION,
 				[STATS_DASHBOARD_HOSTNAME_HEADER]: hostname,
+				"Referrer-Policy": "no-referrer",
 			};
+			const challenge = req.headers.get(STATS_DASHBOARD_CHALLENGE_HEADER);
+			const proof = challenge === null ? null : statsDashboardProof(token, hostname, server.port ?? port, challenge);
+			if (proof !== null) dashboardHeaders[STATS_DASHBOARD_PROOF_HEADER] = proof;
+			const deny = (status: number, message: string): Response =>
+				new Response(message, {
+					status,
+					headers: { ...dashboardHeaders, "Content-Type": "text/plain; charset=utf-8" },
+				});
+
+			// Gate everything first (including OPTIONS and /api/events): a DNS-
+			// rebinding page can only reach us through a domain hostname, and a
+			// same-user client always sends a loopback Host.
+			const hostHeader = req.headers.get("host");
+			if (!isRebindingSafeHost(hostHeader)) return deny(403, "Forbidden: unexpected Host.");
+			const origin = req.headers.get("origin");
+			if (origin !== null && origin !== `http://${hostHeader}`) return deny(403, "Forbidden: unexpected Origin.");
+
+			// A credential-less `/api/launch` gets a single-use nonce; the HMAC over it under
+			// the capability, bound to this listener's host and port, earns the launch secret.
+			if (path === "/api/launch") {
+				if (req.method !== "GET") return deny(405, "Method not allowed.");
+				const nonce = url.searchParams.get("nonce");
+				const expires = nonce === null ? undefined : launchNonces.get(nonce);
+				if (nonce !== null) launchNonces.delete(nonce);
+				const mac = url.searchParams.get("mac");
+				if (
+					nonce !== null &&
+					expires !== undefined &&
+					expires >= Date.now() &&
+					capabilityTokenMatches(statsLaunchMac(token, hostname, server.port ?? port, nonce), mac)
+				) {
+					return Response.json({ launch }, { headers: { ...dashboardHeaders, "Cache-Control": "no-store" } });
+				}
+				const issued = crypto.randomBytes(24).toString("base64url");
+				launchNonces.set(issued, Date.now() + LAUNCH_NONCE_TTL_MS);
+				for (const oldest of launchNonces.keys()) {
+					if (launchNonces.size <= MAX_LAUNCH_NONCES) break;
+					launchNonces.delete(oldest);
+				}
+				return Response.json(
+					{ [STATS_LAUNCH_NONCE_FIELD]: issued },
+					{ status: 401, headers: { ...dashboardHeaders, "Cache-Control": "no-store" } },
+				);
+			}
+
+			// Every data path needs a credential as a bearer header: the capability (native
+			// clients), this listener's launch secret (the page's one-time exchange), or its
+			// session secret (the page). EventSource cannot set headers, so the event
+			// stream alone takes the session secret as `?session=`. Static assets hold no data.
+			if (path.startsWith("/api/")) {
+				const bearer = bearerToken(req);
+				const viaCapability = capabilityTokenMatches(token, bearer) || capabilityTokenMatches(launch, bearer);
+				const viaSession =
+					capabilityTokenMatches(session, bearer) ||
+					(path === "/api/events" &&
+						req.method === "GET" &&
+						capabilityTokenMatches(session, url.searchParams.get("session")));
+				if (!viaCapability && !viaSession) return deny(401, STATS_AUTH_HINT);
+				if (path === "/api/session") {
+					if (req.method !== "POST" || !viaCapability) return deny(401, STATS_AUTH_HINT);
+					return Response.json({ session }, { headers: { ...dashboardHeaders, "Cache-Control": "no-store" } });
+				}
+			}
 
 			if (req.method === "OPTIONS") {
 				return new Response(null, { headers: dashboardHeaders });
@@ -420,6 +541,7 @@ function createDashboardServer(port: number, hostname: string): Server<undefined
 			}
 		},
 	});
+	localLaunchSecrets.set(`${hostname}:${server.port ?? port}`, launch);
 	return server;
 }
 
@@ -498,10 +620,12 @@ export interface StartServerOptions {
 
 export async function startServer(
 	port = 3847,
-	hostname = STATS_DASHBOARD_HOSTNAME,
+	requestedHostname = STATS_DASHBOARD_HOSTNAME,
 	options: StartServerOptions = {},
 ): Promise<StatsServerHandle> {
 	if (options.judge) setStatsJudgeProvider(options.judge);
+	// Bind, key, sign and print one numeric address, never an alias that can resolve elsewhere.
+	const hostname = canonicalStatsHostname(requestedHostname);
 	const activeKey = `${hostname}:${port}`;
 	if (port !== 0) {
 		const active = activeServers.get(activeKey);
@@ -520,6 +644,7 @@ export async function startServer(
 			port: server.port ?? port,
 			stop: () => {
 				activeServers.delete(activeKey);
+				localLaunchSecrets.delete(`${hostname}:${server.port ?? port}`);
 				server.stop(true);
 				if (stopped) return;
 				stopped = true;

@@ -12,7 +12,10 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
+import { useTestRelayToken } from "../helpers/relay-token";
 import { chromiumAvailable } from "./chromium-probe";
+
+useTestRelayToken();
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
 const TAB_ID = 1;

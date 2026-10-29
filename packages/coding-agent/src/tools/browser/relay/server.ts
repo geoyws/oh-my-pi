@@ -10,10 +10,15 @@
  * - `WS /cdp` → downstream CDP clients (puppeteer).
  * - `WS /ext` → the Chrome extension (token-gated when configured).
  *
- * Binds loopback only: anything that can reach this port can drive the
- * user's logged-in browser.
+ * Binds loopback only, but anything that reaches this port can drive the
+ * user's logged-in browser, and every local OS user can reach loopback. So
+ * discovery and `/cdp` demand this user's capability token (`?token=`, or a
+ * `Bearer` header on discovery; see `./auth`), and every request naming a
+ * domain in its Host header is refused, which defeats DNS rebinding.
  */
+import { isRebindingSafeHost } from "@oh-my-pi/pi-utils";
 import { VERSION } from "@oh-my-pi/pi-utils/dirs";
+import { RELAY_LISTEN_HOST, RELAY_NONCE_FIELD, RelayCdpAuth, relayCdpToken } from "./auth";
 import { RelayBridge } from "./bridge";
 
 /** Options for {@link startRelayServer}. */
@@ -21,6 +26,8 @@ export interface RelayServerOptions {
 	port: number;
 	/** Shared secret the extension must present as `?token=`; unset disables the check. */
 	token?: string;
+	/** Capability CDP clients must present on discovery and `/cdp`; defaults to this user's {@link relayCdpToken}. */
+	cdpToken?: string;
 	/** Group tabs the agent actively drives under one per-window Chrome tab group (default on); `false` disables. */
 	group?: boolean | { title: string; color: string };
 	log?: (message: string, data?: Record<string, unknown>) => void;
@@ -77,15 +84,22 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 	const group =
 		opts.group === false ? null : opts.group === true || opts.group === undefined ? DEFAULT_GROUP : opts.group;
 	const bridge = new RelayBridge({ log, group });
+	const auth = new RelayCdpAuth(
+		opts.cdpToken ?? relayCdpToken(),
+		() => `${RELAY_LISTEN_HOST}:${server.port ?? opts.port}`,
+	);
 	const sockets = new Set<RelayWebSocket>();
 	const startedAt = Date.now();
 
 	const server = Bun.serve({
-		hostname: "127.0.0.1",
+		hostname: RELAY_LISTEN_HOST,
 		port: opts.port,
 		fetch(req, srv): Response | undefined {
 			const fallback = `127.0.0.1:${opts.port}`;
 			const rawHost = req.headers.get("host")?.trim();
+			// Browsers always send the Host they resolved; a domain there means a
+			// page rebound its name to loopback. Hostless native clients still pass.
+			if (rawHost && !isRebindingSafeHost(rawHost)) return new Response("Forbidden", { status: 403 });
 			const host = rawHost && isWsAuthority(rawHost) ? rawHost : fallback;
 			const requestUrl =
 				rawHost && rawHost !== host && req.url.startsWith(`http://${rawHost}`)
@@ -93,10 +107,12 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 					: req.url;
 			const url = new URL(requestUrl, `http://${fallback}`);
 			const path = url.pathname.replace(/\/+$/, "") || "/";
+			const bearer = req.headers.get("authorization")?.match(/^Bearer\s+(\S+)$/i)?.[1];
 			if (path === "/cdp") {
 				// Browsers set Origin on websocket upgrades; native CDP clients
 				// don't. Reject any Origin so a web page can't drive the relay.
 				if (req.headers.get("origin")) return new Response("Forbidden", { status: 403 });
+				if (!auth.authorizesCdp(url.searchParams, bearer)) return new Response("Unauthorized", { status: 401 });
 				const data: SocketData = { role: "cdp" };
 				if (srv.upgrade(req, { data })) return undefined;
 				return new Response("websocket upgrade required", { status: 426 });
@@ -114,6 +130,21 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 				return new Response("websocket upgrade required", { status: 426 });
 			}
 			if (req.method !== "GET") return new Response("Method not allowed", { status: 405 });
+			if (path === "/json/version" || path === "/json" || path === "/json/list") {
+				if (req.headers.get("origin")) return new Response("Forbidden", { status: 403 });
+				if (!auth.authorizesDiscovery(path, url.searchParams, bearer)) {
+					// The single-use nonce lets an omp client prove the token with an HMAC
+					// instead of sending it to a listener it cannot yet trust.
+					return Response.json(
+						{
+							ompRelayVersion: VERSION,
+							error: "relay capability token required",
+							[RELAY_NONCE_FIELD]: auth.issueNonce(),
+						},
+						{ status: 401 },
+					);
+				}
+			}
 			if (path === "/json/version") {
 				if (!bridge.ready) {
 					const disconnectedMs = bridge.extensionGoneForMs;
@@ -127,7 +158,8 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 					};
 					return Response.json(info, { status: 503 });
 				}
-				return Response.json(bridge.versionInfo(`ws://${host}/cdp`));
+				// A single-use ticket, never the token: whoever reads this URL gets one connection at most.
+				return Response.json(bridge.versionInfo(`ws://${host}/cdp?ticket=${auth.issueTicket()}`));
 			}
 			if (path === "/json" || path === "/json/list") {
 				return Response.json(bridge.listTargets());

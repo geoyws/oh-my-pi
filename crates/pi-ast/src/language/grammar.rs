@@ -105,14 +105,15 @@ static LOAD_LOCK: Mutex<()> = Mutex::new(());
 
 /// Source bytes a thread's wasm store may parse before [`parse`] replaces it.
 ///
-/// tree-sitter 0.25 looks up the wasm function on every scanner call
-/// (`ts_wasm_store__call` → `wasmtime_table_get`), and wasmtime 29 registers
-/// each looked-up function in the store until the store is dropped: about 32
-/// bytes per byte of lexed source. Reusing one store per thread forever let a
-/// worker that repeatedly parsed a 2.5 MB C# file grow that registry until a
-/// 40 GiB reallocation aborted the process (issue #16067). Past this budget
-/// the store is dropped and a fresh one is built, bounding each thread's store
-/// to roughly 128 MiB plus the source of a single parse.
+/// tree-sitter looks up the wasm function on every scanner call
+/// (`ts_wasm_store__call` → `wasmtime_table_get`), and wasmtime 29 (the
+/// tree-sitter 0.25 era) registered each looked-up function in the store until
+/// the store was dropped: about 32 bytes per byte of lexed source. Reusing one
+/// store per thread forever let a worker that repeatedly parsed a 2.5 MB C#
+/// file grow that registry until a 40 GiB reallocation aborted the process
+/// (issue #16067). Past this budget the store is dropped and a fresh one is
+/// built, bounding each thread's store to roughly 128 MiB plus the source of a
+/// single parse. Kept on later wasmtime releases as a hard bound.
 const WASM_STORE_BYTE_BUDGET: usize = 4 << 20;
 
 /// A wasm-capable parser and the source bytes its store has parsed so far.
