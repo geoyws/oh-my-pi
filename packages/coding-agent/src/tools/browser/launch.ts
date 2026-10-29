@@ -302,6 +302,8 @@ async function loadBrowsers(): Promise<typeof BrowsersNs> {
  * missing Chrome's system libraries.
  */
 let chromiumExecutablePromise: Promise<string | undefined> | undefined;
+/** The path `chromiumExecutablePromise` settled to, once it has. */
+let chromiumExecutableResolved: string | undefined;
 export async function ensureChromiumExecutable(): Promise<string | undefined> {
 	const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
 	if (envPath) return envPath;
@@ -313,6 +315,13 @@ export async function ensureChromiumExecutable(): Promise<string | undefined> {
 		if (sysChrome) return sysChrome;
 	}
 
+	// A cached managed build can vanish under a long-lived process (another omp
+	// on a newer pin pruned it); resolve again instead of launching a missing file.
+	if (chromiumExecutableResolved && !fs.existsSync(chromiumExecutableResolved)) {
+		chromiumExecutablePromise = undefined;
+		chromiumExecutableResolved = undefined;
+		managedChromiumPromise = undefined;
+	}
 	chromiumExecutablePromise ??= ensureManagedChromium().catch(async err => {
 		// Cache a successful fallback too: the open preflight and the actual
 		// launch both resolve the executable. Otherwise an unavailable download
@@ -336,7 +345,9 @@ export async function ensureChromiumExecutable(): Promise<string | undefined> {
 		);
 	});
 
-	return await chromiumExecutablePromise;
+	const executablePath = await chromiumExecutablePromise;
+	chromiumExecutableResolved = executablePath;
+	return executablePath;
 }
 
 /**
@@ -376,8 +387,16 @@ async function runningCommandLines(): Promise<string | undefined> {
 }
 
 /**
+ * How long older managed builds outlive the current one. An omp process still
+ * on an older puppeteer pin caches its build's path for its whole life (see
+ * {@link ensureChromiumExecutable}); a week lets those processes restart first.
+ */
+const STALE_BUILD_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
  * Remove Chrome for Testing builds left in the managed cache by an older
- * puppeteer pin, keeping any build a running browser still executes from.
+ * puppeteer pin, once the current build is a week old, keeping any build a
+ * running browser still executes from.
  */
 async function pruneStaleManagedChromium(
 	browsers: typeof BrowsersNs,
@@ -389,6 +408,7 @@ async function pruneStaleManagedChromium(
 	const removed = await browsers.pruneStaleBuilds({
 		cacheDir,
 		keepBuildId: buildId,
+		graceMs: STALE_BUILD_GRACE_MS,
 		isInUse: installPath => commands.includes(`${installPath}${path.sep}`),
 	});
 	if (removed.length > 0) logger.debug("Removed stale managed Chromium builds", { removed });

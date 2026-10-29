@@ -9,7 +9,7 @@
 
 ### Added
 
-- `pruneStaleBuilds` in `@oh-my-pi/pi-utils/browsers` removes managed Chrome builds other than the current one, skipping builds a running process uses and builds whose install lock is held.
+- `pruneStaleBuilds` in `@oh-my-pi/pi-utils/browsers` removes managed Chrome builds older than the current one once the current build has been installed for a grace period, skipping builds a running process uses and builds whose install lock is held; `compareBuildIds` orders dotted Chrome build ids numerically.
 ## [18.12.2] - 2026-10-18
 
 ### Added
