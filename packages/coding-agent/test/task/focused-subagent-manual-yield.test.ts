@@ -97,7 +97,12 @@ function resultForLatestPrompt(messages: ReadonlyArray<{ role: string; content: 
 }
 
 /** Starts an idle child with an accepted result and records subsequent parent deliveries. */
-async function spawnKeptAliveChild(options?: { handler?: MockHandler; structured?: boolean; enableIrc?: boolean }) {
+async function spawnKeptAliveChild(options?: {
+	handler?: MockHandler;
+	structured?: boolean;
+	enableIrc?: boolean;
+	interruptMode?: "immediate" | "wait";
+}) {
 	// Under the isolated HOME: project discovery walks up from cwd and stops at os.homedir(). On Windows
 	// os.tmpdir() lives under the real home, so a cwd outside the fake HOME would walk into the real
 	// ~/.omp and load the developer's installed plugins as project plugins.
@@ -155,6 +160,7 @@ async function spawnKeptAliveChild(options?: { handler?: MockHandler; structured
 				"todo.reminders": false,
 				"advisor.enabled": false,
 				modelRoles: { default: "mock/mock-model" },
+				...(options?.interruptMode ? { interruptMode: options.interruptMode } : {}),
 			}),
 			enableLsp: false,
 			enableMCP: false,
@@ -232,6 +238,10 @@ it("publishes a consumed parent injection during a peer wake without publishing 
 	const child = await spawnKeptAliveChild({
 		structured: false,
 		enableIrc: true,
+		// The blocked peer request has streamed nothing, so in "immediate" mode the
+		// parent steer may cancel and consume it at any moment after receipt. "wait"
+		// holds the steer until the peer response ends, so receipt is observable.
+		interruptMode: "wait",
 		handler: async () => {
 			request++;
 			if (request === 1) return { content: ["INITIAL_FINAL"] };
