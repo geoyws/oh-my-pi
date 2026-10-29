@@ -433,10 +433,13 @@ jj-lib = { version = "0.44", default-features = false, features = ["git"] }
 # ──────────────────────────────────────────────────────────────────────────────
 # AST & Tree-Sitter
 # ──────────────────────────────────────────────────────────────────────────────
-ast-grep-core = { version = "0.39", default-features = false, features = [
+# tree-sitter 0.27 pulls wasmtime 48.x (LTS); 0.25 pinned wasmtime 29.0.1,
+# unsupported and hit by the Cranelift sandbox escapes CVE-2026-115889/115893
+# (kb omp t-29255f07). ast-grep-core moves with it: 0.45.3+ requires 0.27.
+ast-grep-core = { version = "0.51", default-features = false, features = [
    "tree-sitter",
 ] }
-tree-sitter = "0.25"
+tree-sitter = "0.27"
 tree-sitter-bash = "0.25"
 tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"

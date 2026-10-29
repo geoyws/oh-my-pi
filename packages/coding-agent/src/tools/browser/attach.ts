@@ -8,6 +8,13 @@ import type { Browser, Page, Target } from "puppeteer-core";
 import { throwIfAborted } from "../tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { isPuppeteerTimeout } from "./launch";
+import {
+	RELAY_LISTEN_HOST,
+	RELAY_NONCE_FIELD,
+	type RelayDiscoveryEndpoint,
+	relayCdpToken,
+	relayRequestMac,
+} from "./relay/auth";
 
 const ATTACH_TARGET_SKIP_PATTERN =
 	/request[\s_-]?handler|devtools|background[\s_-]?(?:page|host)|service[\s_-]?worker/i;
@@ -159,6 +166,46 @@ export function probeCdpResponse(
 	opts: { timeoutMs: number; signal?: AbortSignal },
 ): Promise<CdpProbeResponse | null> {
 	return rawHttpGet(url, { ...opts, readBody: true });
+}
+
+/**
+ * Single-use relay discovery URL for `endpoint` under `cdpUrl` that never carries the capability
+ * token. A token-less `/json/version` makes an omp relay answer 401 with a single-use nonce; the URL
+ * then carries that nonce and an HMAC of it under this user's token, bound to the exact authority
+ * (`host:port`) dialled here. The relay accepts only its own `127.0.0.1:<port>`, so a listener
+ * another OS user holds on any other address or port learns nothing reusable and cannot relay the
+ * exchange to the genuine relay. `localhost` is dialled as `127.0.0.1` so it cannot resolve to a
+ * squatter on `::1`. Anything that does not hand out a nonce (Chrome, a legacy relay) gets the plain
+ * URL. Fetch the returned URL once: the relay spends the nonce.
+ */
+export async function authenticatedRelayDiscoveryUrl(
+	cdpUrl: string,
+	endpoint: RelayDiscoveryEndpoint,
+	opts: { timeoutMs: number; signal?: AbortSignal },
+): Promise<string> {
+	let base = cdpUrl.replace(/\/+$/, "");
+	let authority: string;
+	try {
+		const target = new URL(base);
+		if (target.hostname === "localhost") {
+			target.hostname = RELAY_LISTEN_HOST;
+			base = target.origin;
+		}
+		authority = `${target.hostname}:${target.port || "80"}`;
+	} catch {
+		return `${base}${endpoint}`;
+	}
+	const plain = `${base}${endpoint}`;
+	const response = await probeCdpResponse(`${base}/json/version`, opts);
+	if (response?.status !== 401) return plain;
+	let nonce: unknown;
+	try {
+		const body: unknown = JSON.parse(Buffer.from(response.body, "latin1").toString("utf8"));
+		if (isRecord(body)) nonce = body[RELAY_NONCE_FIELD];
+	} catch {}
+	if (typeof nonce !== "string" || nonce.length === 0) return plain;
+	const mac = relayRequestMac(relayCdpToken(), authority, nonce, endpoint);
+	return `${plain}?nonce=${encodeURIComponent(nonce)}&mac=${encodeURIComponent(mac)}`;
 }
 
 /** Poll `${cdpUrl}/json/version` until it responds with 200, with abort + timeout support. */
@@ -528,10 +575,8 @@ async function fetchRelayEntries(
 	timeoutMs = RELAY_JSON_TIMEOUT_MS,
 ): Promise<RelayJsonEntry[] | null> {
 	try {
-		const res = await probeCdpResponse(`${relayJson.replace(/\/$/, "")}/json`, {
-			timeoutMs,
-			signal,
-		});
+		const url = await authenticatedRelayDiscoveryUrl(relayJson, "/json", { timeoutMs, signal });
+		const res = await probeCdpResponse(url, { timeoutMs, signal });
 		if (!res || res.status < 200 || res.status >= 300) return null;
 		const body: unknown = JSON.parse(Buffer.from(res.body, "latin1").toString("utf8"));
 		return Array.isArray(body) ? (body as RelayJsonEntry[]) : null;

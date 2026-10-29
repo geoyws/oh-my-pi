@@ -155,7 +155,11 @@ async function runSmokeTest(): Promise<void> {
 
 	const statsServer = await startServer(0);
 	try {
-		const response = await fetch(`http://127.0.0.1:${statsServer.port}/`);
+		const { getStatsDashboardTokenPath, loadOrCreateCapabilityToken } = await import("@oh-my-pi/pi-utils");
+		const statsToken = loadOrCreateCapabilityToken(getStatsDashboardTokenPath());
+		const response = await fetch(`http://127.0.0.1:${statsServer.port}/`, {
+			headers: { Authorization: `Bearer ${statsToken}` },
+		});
 		if (!response.ok) throw new Error(`stats dashboard smoke failed: HTTP ${response.status}`);
 		const html = await response.text();
 		if (!html.includes('<div id="root"></div>') || !html.includes("index.js")) {

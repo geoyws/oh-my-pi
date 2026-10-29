@@ -102,7 +102,7 @@ import { sanitizeErrorLine } from "@oh-my-pi/pi-tui/chrome/error-block";
 import { ToolAbortError } from "../../tools/tool-errors";
 import { captureBrowserSession } from "../../utils/browser-session";
 import { copyToClipboard } from "../../utils/clipboard";
-import { openPath } from "../../utils/open";
+import { openLink, openPath } from "../../utils/open";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 import { getAssistantMessageLinkTargets } from "@oh-my-pi/pi-tui/prompt/interactive-context-helpers";
 import { type AdvisorConfigDeps, AdvisorConfigOverlayComponent } from "@oh-my-pi/pi-tui/overlays/advisor-config";
@@ -1631,7 +1631,7 @@ export class SelectorController {
 			},
 			onOpen: (href, label) => {
 				done();
-				openPath(href);
+				openLink(href);
 				this.ctx.showStatus(`Opening ${label}: ${href}`);
 			},
 			onCancel: done,

@@ -18,7 +18,7 @@ import { daemonClientForGlobal } from "../../../launch/client";
 import { describeQuietly, stopQuietly, waitReady } from "../../../launch/ensure";
 import { resolveWorkerSpawnCmd } from "../../../subprocess/worker-client";
 import { throwIfAborted } from "../../tool-errors";
-import { probeCdpResponse, probeCdpStatus } from "../attach";
+import { authenticatedRelayDiscoveryUrl, probeCdpResponse, probeCdpStatus } from "../attach";
 import { DEFAULT_RELAY_URL } from "./kind";
 import { isOlderRelayVersion, relayCdpClientsOf, relayVersionOf } from "./probe";
 
@@ -45,10 +45,14 @@ const PROBE_TIMEOUT_MS = 1_500;
 /** probe→describe→start rounds; bounds cross-process races and wedged-relay replacement. */
 const ENSURE_ATTEMPTS = 3;
 
-/** True when the relay HTTP server answers /json/version at all (200 = extension connected, 503 = waiting for it). */
+/**
+ * True when the relay HTTP server answers /json/version at all (200 = extension connected, 503 = waiting for it,
+ * 401 = serving but refusing a token-less request, which the caller's wait reports rather than fighting the bind).
+ * Sends no token: whatever holds the port may not be this user's relay.
+ */
 export async function probeRelayServer(cdpUrl: string): Promise<boolean> {
-	const status = await probeCdpStatus(`${cdpUrl}/json/version`, { timeoutMs: PROBE_TIMEOUT_MS });
-	return status === 503 || (status !== null && status >= 200 && status < 300);
+	const status = await probeCdpStatus(`${cdpUrl.replace(/\/+$/, "")}/json/version`, { timeoutMs: PROBE_TIMEOUT_MS });
+	return status === 503 || status === 401 || (status !== null && status >= 200 && status < 300);
 }
 
 /** Auto-start is only safe for endpoints this machine can own. */
@@ -189,7 +193,9 @@ async function relayStatusAt(
 	cdpUrl: string,
 	signal: AbortSignal | undefined,
 ): Promise<{ version: string; cdpClients: number | null } | null> {
-	const response = await probeCdpResponse(`${cdpUrl}/json/version`, { timeoutMs: PROBE_TIMEOUT_MS, signal });
+	const url = await authenticatedRelayDiscoveryUrl(cdpUrl, "/json/version", { timeoutMs: PROBE_TIMEOUT_MS, signal });
+	throwIfAborted(signal);
+	const response = await probeCdpResponse(url, { timeoutMs: PROBE_TIMEOUT_MS, signal });
 	throwIfAborted(signal);
 	if (!response) return null;
 	try {
