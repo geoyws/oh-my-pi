@@ -19,6 +19,7 @@ import type {
 import { isBuiltinComposerStyle, type KeyId } from "@oh-my-pi/pi-tui";
 import { hasFsCode, isEacces, isEnoent, logger } from "@oh-my-pi/pi-utils";
 import { fingerprintProjectSurface, isProjectSurfaceTrusted } from "@oh-my-pi/pi-utils/project-trust";
+import { boundSettings } from "../../capability";
 import { type ExtensionModule, extensionModuleCapability } from "../../capability/extension-module";
 import { type Hook, hookCapability } from "../../capability/hook";
 import { isServiceTierFamily, isServiceTierForFamily } from "../../config/service-tier";
@@ -37,6 +38,7 @@ import * as TypeBox from "../legacy-typebox";
 import { resolveExtensionDirectory } from "./directory-resolution";
 import { installLegacyPiSpecifierShim, loadLegacyPiModule } from "../plugins/legacy-pi-compat";
 import { getAllPluginExtensionPaths } from "../plugins/loader";
+import { cfgDisabledExtensions } from "../settings";
 
 import { resolvePath, withHostGuard } from "../utils";
 import type { ComposerShapeDefinition } from "@oh-my-pi/pi-tui/overlays/composer-shape-registry";
@@ -646,11 +648,11 @@ export interface AmbientExtensionEntries {
 	projectTrusted: boolean;
 }
 
-/** Native extension modules, then JS/TS hook factories, discovered for `loadOptions`. */
-async function listAmbientEntries(
-	loadOptions: { cwd: string; disabledExtensions?: string[] },
-	includeHooks: boolean,
-): Promise<AmbientExtensionEntries["entries"]> {
+type AmbientEntry = AmbientExtensionEntries["entries"][number];
+type AmbientLoadOptions = { cwd: string; disabledExtensions?: string[] };
+
+/** Native extension modules for `loadOptions`. */
+async function listNativeExtensionEntries(loadOptions: AmbientLoadOptions): Promise<AmbientEntry[]> {
 	// Native provider only — the extension-module capability also has
 	// claude/codex/gemini/opencode providers whose items were discarded here
 	// anyway (see #4198); the filter skips those walks entirely.
@@ -658,17 +660,15 @@ async function listAmbientEntries(
 		...loadOptions,
 		providers: ["native"],
 	});
-	const entries: AmbientExtensionEntries["entries"] = discovered.items.map(ext => ({
-		path: ext.path,
-		level: ext.level,
-	}));
-	if (includeHooks) {
-		const hooks = await loadCapability<Hook>(hookCapability.id, loadOptions);
-		for (const hook of hooks.items) {
-			if (isExtensionFile(path.basename(hook.path))) entries.push({ path: hook.path, level: hook.level });
-		}
-	}
-	return entries;
+	return discovered.items.map(ext => ({ path: ext.path, level: ext.level }));
+}
+
+/** JS/TS hook factories for `loadOptions`. */
+async function listHookEntries(loadOptions: AmbientLoadOptions): Promise<AmbientEntry[]> {
+	const hooks = await loadCapability<Hook>(hookCapability.id, loadOptions);
+	return hooks.items
+		.filter(hook => isExtensionFile(path.basename(hook.path)))
+		.map(hook => ({ path: hook.path, level: hook.level }));
 }
 
 /**
@@ -681,20 +681,32 @@ async function listAmbientEntries(
  *
  * The fingerprint always covers every project entry, hooks included and none
  * disabled: `omp trust` approves the whole surface, so disabling one extension
- * or skipping hooks for a read-only command must not revoke that approval.
+ * or skipping hooks for a read-only command must not revoke that approval. A
+ * capability is walked a second time only when the disabled list names its
+ * ids or its entries were skipped.
  */
 export async function loadAmbientExtensionEntries(
 	cwd: string,
-	loadOptions: { cwd: string; disabledExtensions?: string[] } = { cwd },
+	loadOptions: AmbientLoadOptions = { cwd },
 	includeHooks = true,
 	projectConfiguredPaths: readonly string[] = [],
 ): Promise<AmbientExtensionEntries> {
-	const entries = await listAmbientEntries(loadOptions, includeHooks);
-	// No disabled list falls back to the settings' list, so only an explicit empty one is unfiltered.
-	const unfiltered = includeHooks && loadOptions.disabledExtensions?.length === 0;
-	const surfaceEntries = unfiltered
-		? entries
-		: await listAmbientEntries({ cwd: loadOptions.cwd, disabledExtensions: [] }, true);
+	// Same fallback as loadCapability: no explicit list means the settings' list.
+	const settings = boundSettings();
+	const disabled =
+		loadOptions.disabledExtensions ?? (settings ? cfgDisabledExtensions.get(settings) : undefined) ?? [];
+	const unfilteredOptions = { cwd: loadOptions.cwd, disabledExtensions: [] };
+	const nativeEntries = await listNativeExtensionEntries(loadOptions);
+	const hookEntries = includeHooks ? await listHookEntries(loadOptions) : [];
+	const entries = [...nativeEntries, ...hookEntries];
+	const surfaceEntries = [
+		...(disabled.some(id => id.startsWith("extension-module:"))
+			? await listNativeExtensionEntries(unfilteredOptions)
+			: nativeEntries),
+		...(includeHooks && !disabled.some(id => id.startsWith("hook:"))
+			? hookEntries
+			: await listHookEntries(unfilteredOptions)),
+	];
 	const projectConfiguredEntries: string[] = [];
 	// A configured directory is hashed whole: its entry files can import anything in it.
 	const hashRoots = surfaceEntries.filter(entry => entry.level === "project").map(entry => entry.path);
