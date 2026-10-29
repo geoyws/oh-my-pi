@@ -1,11 +1,27 @@
 import * as path from "node:path";
-import { getLogsDir, isCompiledBinary, logger, untilAborted, withTimeout, workerHostEntry } from "@oh-my-pi/pi-utils";
+import {
+	getBrowserRelayCdpTokenPath,
+	getLogsDir,
+	isCompiledBinary,
+	logger,
+	untilAborted,
+	withTimeout,
+	workerHostEntry,
+} from "@oh-my-pi/pi-utils";
 import type { Subprocess } from "bun";
 import type { Browser, CDPSession } from "puppeteer-core";
 import type { DaemonBrokerLease } from "../../launch/client";
 import { ToolAbortError } from "../tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
-import { findFreeCdpPort, findReusableCdp, gracefulKillTreeOnce, resolveSpawnArgs, waitForCdp } from "./attach";
+import {
+	findFreeCdpPort,
+	findReusableCdp,
+	gracefulKillTreeOnce,
+	probeCdpResponse,
+	resolveSpawnArgs,
+	authenticatedRelayDiscoveryUrl,
+	waitForCdp,
+} from "./attach";
 import type { CmuxKind } from "./cmux/rpc";
 import { CmuxSocketClient } from "./cmux/socket-client";
 import {
@@ -48,6 +64,8 @@ export type BrowserKindTag = BrowserKind["kind"];
  * forever (issue #5260), so we cap the wait and force-kill on timeout.
  */
 const HEADLESS_CLOSE_TIMEOUT_MS = 5_000;
+/** Bound on the relay `/json/version` read that yields the authenticated CDP WebSocket URL. */
+const RELAY_DISCOVERY_TIMEOUT_MS = 5_000;
 
 interface BrowserHandleCommon {
 	key: string;
@@ -314,9 +332,34 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 				"The OMP Browser Relay extension is out of date. Run `omp browser-relay install` and reload the extension in Chrome.",
 			);
 		}
+		if (outcome === "unauthorized") {
+			throw new ToolError(
+				`The browser relay at ${cdpUrl} refused this omp's capability token. It belongs to another OS user or was started with a different token; this user's token lives in ${getBrowserRelayCdpTokenPath()} (a client on another machine sets PI_BROWSER_RELAY_CDP_TOKEN to its content).`,
+			);
+		}
+		// Discovery proves the capability token with a nonce HMAC and never sends it; the WebSocket
+		// URL it returns carries a relay-issued ticket instead of the token.
+		const discoveryUrl = await authenticatedRelayDiscoveryUrl(cdpUrl, "/json/version", {
+			timeoutMs: RELAY_DISCOVERY_TIMEOUT_MS,
+			signal: opts.signal,
+		});
+		const discovery = await probeCdpResponse(discoveryUrl, {
+			timeoutMs: RELAY_DISCOVERY_TIMEOUT_MS,
+			signal: opts.signal,
+		});
+		let browserWSEndpoint: unknown;
+		try {
+			const parsed: unknown = discovery ? JSON.parse(discovery.body) : null;
+			if (typeof parsed === "object" && parsed !== null && "webSocketDebuggerUrl" in parsed) {
+				browserWSEndpoint = parsed.webSocketDebuggerUrl;
+			}
+		} catch {}
+		if (typeof browserWSEndpoint !== "string") {
+			throw new ToolError(`omp browser relay at ${cdpUrl} did not return a CDP WebSocket URL from /json/version.`);
+		}
 		const puppeteer = await loadPuppeteer();
 		const browser = await connectPuppeteer(puppeteer, {
-			browserURL: cdpUrl,
+			browserWSEndpoint,
 			defaultViewport: null,
 			protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 		});

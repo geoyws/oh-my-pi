@@ -7,14 +7,14 @@ import type { CollabHost } from "../collab/host";
 import { type CollabHostSnapshot, listCollabHosts } from "../collab/registry";
 import { settings } from "../config/settings";
 import { parseExportArgs } from "../export/html/args";
-import { shareSession } from "../export/share";
+import { resolveShareObfuscator, shareSession } from "../export/share";
 import { theme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "../modes/types";
 import { sanitizeDisplayLine } from "@oh-my-pi/pi-tui/overlays/extensions/display-text";
 import { extractLastCodeBlock, extractLastCommand, extractLastLink } from "@oh-my-pi/pi-tui/overlays/copy-targets";
 import { restartBrowserForModeChange } from "../tools/browser";
 import { shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-utils";
-import { openPath } from "../utils/open";
+import { openLink } from "../utils/open";
 import { copyToClipboard } from "../utils/clipboard";
 import { refreshStatusLine } from "./builtin-modes";
 import { CollabQrCodeComponent, collabBrowserLink } from "@oh-my-pi/pi-tui/chrome/collab-qrcode";
@@ -213,9 +213,9 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 			try {
 				// Lazy: the stats dashboard (server + sqlite) loads on demand only,
 				// matching src/cli/stats-cli.ts, to keep CLI startup fast.
-				const { formatStatsDashboardUrl, startServer } = await import("@oh-my-pi/omp-stats");
+				const { startServer, statsDashboardLaunchUrl } = await import("@oh-my-pi/omp-stats");
 				const { hostname, port } = await startServer();
-				const url = `${formatStatsDashboardUrl(hostname, port)}/#/traces?s=${encodeURIComponent(sessionFile)}`;
+				const url = await statsDashboardLaunchUrl(hostname, port, `#/traces?s=${encodeURIComponent(sessionFile)}`);
 				await runtime.output(url);
 				return commandConsumed();
 			} catch (err) {
@@ -299,7 +299,11 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 					serverUrl: cfgShareServerUrl.get(runtime.settings),
 					store: cfgShareStore.get(runtime.settings),
 					state: runtime.session.state,
-					obfuscator: cfgShareRedactSecrets.get(runtime.settings) ? runtime.session.obfuscator : undefined,
+					obfuscator: await resolveShareObfuscator({
+						redact: cfgShareRedactSecrets.get(runtime.settings),
+						cwd: runtime.sessionManager.getCwd(),
+						session: runtime.session.obfuscator,
+					}),
 				});
 				const lines = [`Share URL: ${result.url}`];
 				if (result.gistUrl) lines.push(`Gist: ${result.gistUrl}`);
@@ -643,7 +647,7 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 				clearSubmittedText(runtime);
 				return;
 			}
-			openPath(link.href);
+			openLink(link.href);
 			runtime.ctx.showStatus(`Opening ${link.href}`);
 			clearSubmittedText(runtime);
 		},

@@ -27,7 +27,7 @@ import { shouldEnableAppendOnlyContext } from "../../config/append-only-context-
 import { type BashResult, isPersistentShellCdCommand } from "../../exec/bash-executor";
 import { type LoadedCustomShare, loadCustomShare } from "../../export/custom-share";
 import { parseExportArgs } from "../../export/html/args";
-import { shareSession } from "../../export/share";
+import { resolveShareObfuscator, shareSession } from "../../export/share";
 import type { CompactOptions } from "../../extensibility/extensions/types";
 import {
 	diffMentalModelContent,
@@ -97,7 +97,7 @@ import {
 } from "../../utils/changelog";
 import { copyToClipboard } from "../../utils/clipboard";
 import { formatDumpArchiveReport, type SessionDumpArchive } from "../../session/session-dump-format";
-import { openPath } from "../../utils/open";
+import { openCapabilityUrl, openPath } from "../../utils/open";
 import { resumeCommand } from "../../utils/resume-command";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 import {
@@ -367,10 +367,10 @@ export class CommandController {
 		try {
 			// Lazy: the stats dashboard (server + sqlite) loads on demand only,
 			// matching src/cli/stats-cli.ts, to keep CLI startup fast.
-			const { formatStatsDashboardUrl, startServer } = await import("@oh-my-pi/omp-stats");
+			const { startServer, statsDashboardLaunchUrl } = await import("@oh-my-pi/omp-stats");
 			const { hostname, port } = await startServer();
-			const url = `${formatStatsDashboardUrl(hostname, port)}/#/traces?s=${encodeURIComponent(sessionFile)}`;
-			this.openInBrowser(url);
+			const url = await statsDashboardLaunchUrl(hostname, port, `#/traces?s=${encodeURIComponent(sessionFile)}`);
+			openCapabilityUrl(url);
 			this.ctx.showStatus(`Trace: ${url}`);
 		} catch (error: unknown) {
 			this.ctx.showError(`Failed to open trace: ${error instanceof Error ? error.message : "Unknown error"}`);
@@ -535,7 +535,11 @@ export class CommandController {
 				serverUrl: cfgShareServerUrl.get(this.ctx.settings),
 				store: cfgShareStore.get(this.ctx.settings),
 				state: this.ctx.session.state,
-				obfuscator: cfgShareRedactSecrets.get(this.ctx.settings) ? this.ctx.session.obfuscator : undefined,
+				obfuscator: await resolveShareObfuscator({
+					redact: cfgShareRedactSecrets.get(this.ctx.settings),
+					cwd: this.ctx.session.sessionManager.getCwd(),
+					session: this.ctx.session.obfuscator,
+				}),
 			});
 			if (loader.signal.aborted) return;
 			restoreEditor();

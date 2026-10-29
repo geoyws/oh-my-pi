@@ -932,8 +932,9 @@ describe("pickElectronTarget relay path", () => {
 	it("falls back to target enumeration at once when /json lists no pages", async () => {
 		let served = 0;
 		relay.reload({
-			fetch: () => {
-				served++;
+			fetch: request => {
+				// Discovery first probes /json/version for a relay nonce; count the listings themselves.
+				if (new URL(request.url).pathname === "/json") served++;
 				return Response.json([]);
 			},
 		});
@@ -1137,8 +1138,8 @@ it("uses relay metadata through a proxy without corrupting UTF-8 titles", async 
 	const relay = Bun.serve({
 		hostname: "127.0.0.1",
 		port: 0,
-		fetch: () => {
-			relayHits++;
+		fetch: request => {
+			if (new URL(request.url).pathname === "/json") relayHits++;
 			return Response.json(entries);
 		},
 	});

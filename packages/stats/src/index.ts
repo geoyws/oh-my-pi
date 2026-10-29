@@ -7,7 +7,7 @@ import { formatErrorRate } from "./client/data/formatters";
 import { getDashboardStats, getTotalMessageCount, syncAllSessions } from "./aggregator";
 import { closeDb } from "./db";
 import { refreshRollups } from "./rollup";
-import { formatStatsDashboardUrl, startServer } from "./server";
+import { startServer, statsDashboardLaunchUrl } from "./server";
 
 export {
 	getDashboardStats,
@@ -22,7 +22,7 @@ export { closeDb } from "./db";
 export { refreshRollups } from "./rollup";
 export type { StatsJudge, StatsJudgeProvider } from "./frustration";
 export { getGainDashboardStats } from "./gain-aggregator";
-export { formatStatsDashboardUrl, type StartServerOptions, startServer } from "./server";
+export { formatStatsDashboardUrl, type StartServerOptions, startServer, statsDashboardLaunchUrl } from "./server";
 export type { GainDashboardStats, GainSource, GainSourceTotals, GainTimeSeriesPoint } from "./shared-types";
 export type {
 	AggregatedStats,
@@ -158,7 +158,7 @@ Examples:
 		if (!values.json && !values.sync) {
 			// The dashboard ingests sessions in the background and streams progress to the page.
 			const { port: actualPort } = await startServer(values.port, values.host);
-			console.log(`Dashboard available at: ${formatStatsDashboardUrl(values.host, actualPort)}`);
+			console.log(`Dashboard available at: ${await statsDashboardLaunchUrl(values.host, actualPort)}`);
 			console.log("Press Ctrl+C to stop\n");
 			process.on("SIGINT", () => {
 				console.log("\nShutting down...");

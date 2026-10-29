@@ -241,10 +241,16 @@ export async function connectPuppeteer(puppeteer: typeof Puppeteer, options: Con
 			!(error instanceof Error) && isRecord(error) && typeof error.message === "string"
 				? new Error(error.message, { cause: error })
 				: toError(error);
-		if (endpoint && !failure.message.includes(endpoint)) {
-			throw new Error(`CDP connection to '${endpoint}' failed: ${failure.message}`, { cause: error });
-		}
-		throw failure;
+		const message =
+			endpoint && !failure.message.includes(endpoint)
+				? `CDP connection to '${endpoint}' failed: ${failure.message}`
+				: failure.message;
+		// Relay WebSocket URLs carry a reusable ticket (or, from manual configs, the capability
+		// token); never let either reach an error (or the cause chain, which loggers serialize).
+		const redacted = message.replace(/([?&](?:token|ticket)=)[^&\s'"]+/g, "$1***");
+		if (redacted !== message) throw new Error(redacted);
+		if (redacted === failure.message) throw failure;
+		throw new Error(redacted, { cause: error });
 	}
 }
 
@@ -302,6 +308,8 @@ async function loadBrowsers(): Promise<typeof BrowsersNs> {
  * missing Chrome's system libraries.
  */
 let chromiumExecutablePromise: Promise<string | undefined> | undefined;
+/** The path `chromiumExecutablePromise` settled to, once it has. */
+let chromiumExecutableResolved: string | undefined;
 export async function ensureChromiumExecutable(): Promise<string | undefined> {
 	const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
 	if (envPath) return envPath;
@@ -313,6 +321,13 @@ export async function ensureChromiumExecutable(): Promise<string | undefined> {
 		if (sysChrome) return sysChrome;
 	}
 
+	// A cached managed build can vanish under a long-lived process (another omp
+	// on a newer pin pruned it); resolve again instead of launching a missing file.
+	if (chromiumExecutableResolved && !fs.existsSync(chromiumExecutableResolved)) {
+		chromiumExecutablePromise = undefined;
+		chromiumExecutableResolved = undefined;
+		managedChromiumPromise = undefined;
+	}
 	chromiumExecutablePromise ??= ensureManagedChromium().catch(async err => {
 		// Cache a successful fallback too: the open preflight and the actual
 		// launch both resolve the executable. Otherwise an unavailable download
@@ -336,7 +351,9 @@ export async function ensureChromiumExecutable(): Promise<string | undefined> {
 		);
 	});
 
-	return await chromiumExecutablePromise;
+	const executablePath = await chromiumExecutablePromise;
+	chromiumExecutableResolved = executablePath;
+	return executablePath;
 }
 
 /**
@@ -360,6 +377,49 @@ export async function ensureSignInChromiumExecutable(): Promise<string | undefin
 	}
 }
 
+/**
+ * Command lines of every running process, or undefined when they cannot be
+ * listed. Windows returns undefined: without a listing, pruning keeps every build.
+ */
+async function runningCommandLines(): Promise<string | undefined> {
+	if (process.platform === "win32") return undefined;
+	try {
+		const proc = Bun.spawn(["ps", "-axww", "-o", "command="], { stdout: "pipe", stderr: "ignore" });
+		const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+		return exitCode === 0 ? stdout : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * How long older managed builds outlive the current one. An omp process still
+ * on an older puppeteer pin caches its build's path for its whole life (see
+ * {@link ensureChromiumExecutable}); a week lets those processes restart first.
+ */
+const STALE_BUILD_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Remove Chrome for Testing builds left in the managed cache by an older
+ * puppeteer pin, once the current build is a week old, keeping any build a
+ * running browser still executes from.
+ */
+async function pruneStaleManagedChromium(
+	browsers: typeof BrowsersNs,
+	cacheDir: string,
+	buildId: string,
+): Promise<void> {
+	const commands = await runningCommandLines();
+	if (commands === undefined) return;
+	const removed = await browsers.pruneStaleBuilds({
+		cacheDir,
+		keepBuildId: buildId,
+		graceMs: STALE_BUILD_GRACE_MS,
+		isInUse: installPath => commands.includes(`${installPath}${path.sep}`),
+	});
+	if (removed.length > 0) logger.debug("Removed stale managed Chromium builds", { removed });
+}
+
 let managedChromiumPromise: Promise<string | undefined> | undefined;
 /** Chrome for Testing under ~/.omp/puppeteer, downloaded on first use; undefined when platform detection fails. */
 function ensureManagedChromium(): Promise<string | undefined> {
@@ -378,7 +438,15 @@ function ensureManagedChromium(): Promise<string | undefined> {
 			cacheDir,
 			platform,
 		});
-		if (fs.existsSync(executablePath)) return executablePath;
+		const pruneStale = () => {
+			void pruneStaleManagedChromium(browsers, cacheDir, buildId).catch(err => {
+				logger.warn("Could not prune stale managed Chromium builds", { cacheDir, error: toError(err).message });
+			});
+		};
+		if (fs.existsSync(executablePath)) {
+			pruneStale();
+			return executablePath;
+		}
 
 		logger.warn("Downloading Chromium for puppeteer (first browser use)", {
 			buildId,
@@ -404,6 +472,7 @@ function ensureManagedChromium(): Promise<string | undefined> {
 				},
 			}),
 		);
+		pruneStale();
 		return executablePath;
 	})().catch(err => {
 		managedChromiumPromise = undefined;

@@ -10,7 +10,10 @@ import { type RelayServer, startRelayServer } from "@oh-my-pi/pi-coding-agent/to
 import { releaseTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { isRecord } from "@oh-my-pi/pi-utils";
+import { useTestRelayToken } from "../helpers/relay-token";
 import { type FakeAnswer, type FakeDaemon, startFakeDaemon } from "./tern-fake-daemon";
+
+useTestRelayToken();
 
 const PANE = 3;
 
