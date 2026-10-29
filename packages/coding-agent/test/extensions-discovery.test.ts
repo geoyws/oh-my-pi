@@ -726,6 +726,8 @@ describe("extensions discovery", () => {
 				}
 			`,
 		);
+		// Approve first, then disable one module: disabling must not revoke the rest.
+		await trustProjectExtensions();
 
 		const settings = await Settings.init({
 			inMemory: true,
@@ -733,8 +735,6 @@ describe("extensions discovery", () => {
 			overrides: { disabledExtensions: ["extension-module:guard"] },
 		});
 		initializeWithSettings(settings);
-		// Approval covers the disabled module too; disabling it must not revoke the rest.
-		await trustProjectExtensions();
 
 		const result = await discoverForTest([], true);
 		const loadedHook = result.extensions.find(extension => extension.path === hookPath);

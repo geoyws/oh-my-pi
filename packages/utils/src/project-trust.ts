@@ -86,7 +86,10 @@ function readStore(storePath: string): ProjectTrustStore {
 			!Array.isArray(parsed.projects)
 		) {
 			// Entry contents are re-checked at every read site (optional chaining).
-			const store: ProjectTrustStore = { version: 1, projects: parsed.projects as Record<string, ProjectTrustEntry> };
+			const store: ProjectTrustStore = {
+				version: 1,
+				projects: parsed.projects as Record<string, ProjectTrustEntry>,
+			};
 			return store;
 		}
 	} catch {

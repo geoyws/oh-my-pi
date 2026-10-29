@@ -690,8 +690,11 @@ export async function loadAmbientExtensionEntries(
 	projectConfiguredPaths: readonly string[] = [],
 ): Promise<AmbientExtensionEntries> {
 	const entries = await listAmbientEntries(loadOptions, includeHooks);
-	const unfiltered = includeHooks && !loadOptions.disabledExtensions?.length;
-	const surfaceEntries = unfiltered ? entries : await listAmbientEntries({ cwd: loadOptions.cwd }, true);
+	// No disabled list falls back to the settings' list, so only an explicit empty one is unfiltered.
+	const unfiltered = includeHooks && loadOptions.disabledExtensions?.length === 0;
+	const surfaceEntries = unfiltered
+		? entries
+		: await listAmbientEntries({ cwd: loadOptions.cwd, disabledExtensions: [] }, true);
 	const projectConfiguredEntries: string[] = [];
 	// A configured directory is hashed whole: its entry files can import anything in it.
 	const hashRoots = surfaceEntries.filter(entry => entry.level === "project").map(entry => entry.path);
