@@ -23,6 +23,8 @@ The native provider also reads `.omp/.mcp.json` and `~/.omp/agent/.mcp.json` for
 
 These user paths are defaults: `PI_CONFIG_DIR` changes the home config root, and `PI_CODING_AGENT_DIR` can override the default-profile agent directory. Named profiles derive their own agent directory rather than inheriting that override. Project config remains in `.omp/`.
 
+Project-level servers from any of these sources start only after you approve the project with `omp trust`; see [Project trust](project-trust.md).
+
 OMP also accepts fallback standalone files in the project root:
 
 - `mcp.json`

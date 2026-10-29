@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { parseEnv } from "node:util";
 import { getAgentDir, getConfigRootDir, getProjectDir, refreshDirsFromEnv } from "./dirs";
+import { fingerprintProjectRoutingEnv, isProjectRoutingEnvName, isProjectSurfaceTrusted } from "./project-trust";
 
 export * from "./worker-host";
 
@@ -288,7 +289,22 @@ export function parseEnvFile(filePath: string): Record<string, string> {
 const homeEnv = parseEnvFile(path.join(os.homedir(), ".env"));
 const piEnv = parseEnvFile(path.join(getConfigRootDir(), ".env"));
 const agentEnv = parseEnvFile(path.join(getAgentDir(), ".env"));
-const projectEnv = parseEnvFile(path.join(getProjectDir(), ".env"));
+const projectDir = getProjectDir();
+const projectEnvFile = parseEnvFile(path.join(projectDir, ".env"));
+// A repository's .env must not redirect provider, proxy or OAuth traffic (or
+// move OMP's own config dirs) until the user approves that exact content with
+// `omp trust` (kb omp t-f77ec1f5). The home directory's .env is the user's own.
+const projectEnvTrusted =
+	path.resolve(projectDir) === path.resolve(os.homedir()) ||
+	isProjectSurfaceTrusted(projectDir, "env", fingerprintProjectRoutingEnv(projectEnvFile));
+/** Routing names a project `.env` defines that were NOT applied because the project's env is unapproved. */
+export const untrustedProjectRoutingEnvNames: readonly string[] = projectEnvTrusted
+	? []
+	: Object.keys(projectEnvFile).filter(isProjectRoutingEnvName);
+const projectEnv: Record<string, string> = {};
+for (const key in projectEnvFile) {
+	if (projectEnvTrusted || !isProjectRoutingEnvName(key)) projectEnv[key] = projectEnvFile[key]!;
+}
 
 for (const key of Object.keys(Bun.env)) {
 	const value = Bun.env[key];

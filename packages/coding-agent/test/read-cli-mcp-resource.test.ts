@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import { approveProjectForTest } from "./helpers/project-trust";
 
 const CLI_ENTRY = path.join(import.meta.dir, "..", "src", "cli.ts");
 const FIXTURE_PATH = path.join(import.meta.dir, "fixtures", "resources-no-templates-mcp.ts");
@@ -38,6 +39,8 @@ describe("omp read MCP resources", () => {
 				},
 			}),
 		);
+		// Project MCP servers start only once approved (kb omp t-f77ec1f5).
+		await approveProjectForTest(projectDir, agentDir);
 		probePath = path.join(root, "probe.ts");
 		await Bun.write(
 			probePath,

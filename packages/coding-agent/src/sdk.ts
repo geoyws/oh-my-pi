@@ -1102,13 +1102,16 @@ export async function discoverSessionExtensionPaths(
 	const roots = options.extensionRoots?.();
 	const explicit = roots?.explicit ?? options.additionalExtensionPaths ?? [];
 	const explicitOnly = roots ? roots.mode === "explicit-only" : options.disableExtensionDiscovery;
-	const configuredPaths = explicitOnly
-		? [...explicit]
-		: [...explicit, ...(roots?.configured ?? cfgExtensions.get(settings))];
+	const settingsPaths = explicitOnly ? [] : (roots?.configured ?? cfgExtensions.get(settings));
+	// An `extensions:` list from a project settings file is repository code: it
+	// loads only under project trust (kb omp t-f77ec1f5).
+	const fromProject = (roots?.configuredLevel ?? settings.extensionsSourceLevel()) === "project";
+	const configuredPaths = fromProject ? [...explicit] : [...explicit, ...settingsPaths];
 	const disabledExtensionIds = explicitOnly ? undefined : cfgDisabledExtensions.get(settings);
 	return discoverExtensionPaths(configuredPaths, cwd, disabledExtensionIds, {
 		ambient: !explicitOnly,
 		includeAmbientHooks: options.includeAmbientHooks,
+		projectConfiguredPaths: fromProject ? settingsPaths : [],
 	});
 }
 
