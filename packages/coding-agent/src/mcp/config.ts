@@ -169,10 +169,19 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 
 	// A repository's MCP servers are commands it chose, launched with the
 	// user's environment and file access. They run only after `omp trust`
-	// approved exactly this set (name, source file, full config).
-	const projectServers = result.items
-		.filter(server => server._source.level === "project")
-		.map(server => ({ name: server.name, source: server._source.path, config: convertToLegacyConfig(server) }));
+	// approved exactly this set (name, source file, full config). The set
+	// includes disabled entries and leaves out the `enabled` switch, so turning
+	// a server on or off (`/mcp`, the disabled list) keeps the approval.
+	const surface = await loadCapability<MCPServer>(mcpCapability.id, {
+		cwd,
+		extensionRoots: options?.extensionRoots,
+		filter: server => server._source.level === "project" && includeServer(server),
+		disabledExtensions: [],
+	});
+	const projectServers = surface.items.map(server => {
+		const { enabled: _enabled, ...config } = convertToLegacyConfig(server);
+		return { name: server.name, source: server._source.path, config };
+	});
 	const projectFingerprint = fingerprintProjectSurface(
 		projectServers.map(({ name, source, config }) => [name, stableStringifyJson({ source, config })] as const),
 	);

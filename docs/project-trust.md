@@ -15,6 +15,12 @@ it is bound to a content fingerprint. Any change to a surface's content — a
 new MCP server, a changed command, an edited extension file, a changed routing
 URL — makes that surface unapproved again until you re-approve it.
 
+The fingerprint covers everything the project supplies, including MCP servers
+and extensions you have turned off. Turning one on or off (`/mcp enable`,
+`/mcp disable`, an `enabled` flag, `disabledServers`, `disabledExtensions`)
+keeps the approval, and so do read-only commands such as `omp models` that
+skip project hooks.
+
 ## Approving a project
 
 ```bash

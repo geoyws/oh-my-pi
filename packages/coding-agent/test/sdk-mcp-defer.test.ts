@@ -14,6 +14,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils/dirs";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+import { approveProjectForTest } from "./helpers/project-trust";
 
 // Contract for B1 (interactive MCP deferral): when `hasUI` is true, MCP
 // discovery is deferred off the first-paint path, so an explicitly requested
@@ -181,6 +182,8 @@ describe("createAgentSession MCP catalog handoff", () => {
 				path.join(tempDir, ".mcp.json"),
 				JSON.stringify({ mcpServers: { [SERVER]: { type: "http", url: `${server.url}mcp` } } }),
 			);
+			// Project MCP servers start only once approved (kb omp t-f77ec1f5).
+			await approveProjectForTest(tempDir);
 			const changeToolsDuringLoad: ExtensionFactory = async () => {
 				tools = next;
 				await MCPManager.instance()?.refreshServerTools(SERVER);
