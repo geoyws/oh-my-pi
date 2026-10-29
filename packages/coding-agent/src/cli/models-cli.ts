@@ -335,8 +335,7 @@ export async function runModelsListing(options: RunModelsListingOptions): Promis
 	} = options;
 
 	const eventBus = new EventBus();
-	const projectConfiguredPaths =
-		disableExtensionDiscovery || !settingsExtensionsFromProject ? [] : settingsExtensions;
+	const projectConfiguredPaths = disableExtensionDiscovery || !settingsExtensionsFromProject ? [] : settingsExtensions;
 	const configuredPaths =
 		disableExtensionDiscovery || settingsExtensionsFromProject
 			? additionalExtensionPaths
