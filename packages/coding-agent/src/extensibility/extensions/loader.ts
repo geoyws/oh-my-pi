@@ -646,20 +646,11 @@ export interface AmbientExtensionEntries {
 	projectTrusted: boolean;
 }
 
-/**
- * Ambient extension entry points for `cwd` and the approval state of the
- * repository-supplied ones (kb omp t-f77ec1f5). Shared by startup discovery
- * and `omp trust`, so both fingerprint the same code. `projectConfiguredPaths`
- * is the `extensions:` list when a project settings file supplied it
- * (`Settings.extensionsSourceLevel() === "project"`): repository-controlled
- * code under the same approval as `.omp/extensions`.
- */
-export async function loadAmbientExtensionEntries(
-	cwd: string,
-	loadOptions: { cwd: string; disabledExtensions?: string[] } = { cwd },
-	includeHooks = true,
-	projectConfiguredPaths: readonly string[] = [],
-): Promise<AmbientExtensionEntries> {
+/** Native extension modules, then JS/TS hook factories, discovered for `loadOptions`. */
+async function listAmbientEntries(
+	loadOptions: { cwd: string; disabledExtensions?: string[] },
+	includeHooks: boolean,
+): Promise<AmbientExtensionEntries["entries"]> {
 	// Native provider only — the extension-module capability also has
 	// claude/codex/gemini/opencode providers whose items were discarded here
 	// anyway (see #4198); the filter skips those walks entirely.
@@ -677,9 +668,33 @@ export async function loadAmbientExtensionEntries(
 			if (isExtensionFile(path.basename(hook.path))) entries.push({ path: hook.path, level: hook.level });
 		}
 	}
+	return entries;
+}
+
+/**
+ * Ambient extension entry points for `cwd` and the approval state of the
+ * repository-supplied ones (kb omp t-f77ec1f5). Shared by startup discovery
+ * and `omp trust`, so both fingerprint the same code. `projectConfiguredPaths`
+ * is the `extensions:` list when a project settings file supplied it
+ * (`Settings.extensionsSourceLevel() === "project"`): repository-controlled
+ * code under the same approval as `.omp/extensions`.
+ *
+ * The fingerprint always covers every project entry, hooks included and none
+ * disabled: `omp trust` approves the whole surface, so disabling one extension
+ * or skipping hooks for a read-only command must not revoke that approval.
+ */
+export async function loadAmbientExtensionEntries(
+	cwd: string,
+	loadOptions: { cwd: string; disabledExtensions?: string[] } = { cwd },
+	includeHooks = true,
+	projectConfiguredPaths: readonly string[] = [],
+): Promise<AmbientExtensionEntries> {
+	const entries = await listAmbientEntries(loadOptions, includeHooks);
+	const unfiltered = includeHooks && !loadOptions.disabledExtensions?.length;
+	const surfaceEntries = unfiltered ? entries : await listAmbientEntries({ cwd: loadOptions.cwd }, true);
 	const projectConfiguredEntries: string[] = [];
 	// A configured directory is hashed whole: its entry files can import anything in it.
-	const hashRoots = entries.filter(entry => entry.level === "project").map(entry => entry.path);
+	const hashRoots = surfaceEntries.filter(entry => entry.level === "project").map(entry => entry.path);
 	for (const configuredPath of projectConfiguredPaths) {
 		const { resolved, files } = await expandConfiguredExtensionPath(configuredPath, cwd);
 		projectConfiguredEntries.push(...files);
