@@ -443,6 +443,21 @@ async function runTinyWorker(): Promise<void> {
 /** Resolved top-level command name (never its arguments), for the unsettled-entry report. */
 let runningCommand: string | undefined;
 
+/**
+ * Start per-process memory/fd sampling (see `@oh-my-pi/pi-utils/process-telemetry`)
+ * tagged with `role`. Only the real process entry samples: worker threads share
+ * the pid with their host, and importers of `runCli` are not omp processes.
+ * Telemetry must never fail a launch.
+ */
+async function startProcessTelemetry(role: string): Promise<void> {
+	if (!isProcessEntry) return;
+	try {
+		// Lazy: keeps the logger graph off the worker-selector synchronous prefix.
+		const telemetry = await import("@oh-my-pi/pi-utils/process-telemetry");
+		telemetry.startProcessTelemetry(role);
+	} catch {}
+}
+
 /** Run the CLI with the given argv (no `process.argv` prefix). */
 export async function runCli(argv: string[]): Promise<void> {
 	let resolvedArgv = argv;
@@ -508,7 +523,11 @@ export async function runCli(argv: string[]): Promise<void> {
 	if (isWorkerHostSelector(resolvedArgv[0])) {
 		// Invoke dispatch first so its inbox is installed before asynchronous
 		// process-name setup yields; neither dependency belongs in prepaint.
-		const [dispatched] = await Promise.all([runWorkerEntrypoint(resolvedArgv[0]), setFullProcessName()]);
+		const [dispatched] = await Promise.all([
+			runWorkerEntrypoint(resolvedArgv[0]),
+			setFullProcessName(),
+			startProcessTelemetry(resolvedArgv[0]),
+		]);
 		if (!dispatched) {
 			process.stderr.write(`Error: unknown worker selector: ${resolvedArgv[0]}\n`);
 			process.exitCode = 1;
@@ -567,6 +586,7 @@ export async function runCli(argv: string[]): Promise<void> {
 			return;
 		}
 		runningCommand = resolved.argv[0];
+		await startProcessTelemetry(runningCommand);
 		await run({ bin: APP_NAME, version: VERSION, argv: resolved.argv, commands, metadataHelp: showHelp });
 	} finally {
 		stopStartupComposer?.();

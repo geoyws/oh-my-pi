@@ -10,6 +10,8 @@
 ### Added
 
 - `pruneStaleBuilds` in `@oh-my-pi/pi-utils/browsers` removes managed Chrome builds older than the current one once the current build has been installed for a grace period, skipping builds a running process uses and builds whose install lock is held; `compareBuildIds` orders dotted Chrome build ids numerically.
+- `@oh-my-pi/pi-utils/process-telemetry`: a per-process sampler of RSS, JS heap, external memory and open fd count that writes role-tagged `proc.sample` (debug, once a minute), `proc.high-water` (warn, at 1/2/4/8… GiB RSS and 256/512/1024… fds) and opt-in `proc.rss-limit` (error, then SIGTERM to self) records to the process's own log. Controlled by `OMP_PROC_TELEMETRY`, `OMP_PROC_TELEMETRY_INTERVAL_MS` and `OMP_PROC_RSS_LIMIT_MB`.
+
 ## [18.12.2] - 2026-10-18
 
 ### Added
