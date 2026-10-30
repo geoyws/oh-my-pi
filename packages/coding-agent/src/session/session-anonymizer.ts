@@ -1115,6 +1115,7 @@ const KNOWN_SCHEMES = new Set([
 	"local",
 	"mcp",
 	"memory",
+	"mr",
 	"omp",
 	"pr",
 	"proc",

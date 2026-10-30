@@ -90,7 +90,7 @@ The runner's source transformer rewrites IPython-style magics to plain Python ca
 
 | Magic                             | Effect                                                                                                                                                      |
 | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `%pip <args>`                     | `python -m pip <args>` with live streaming output; the host pauses the cell watchdog while the verified pip child runs. Newly installed packages are evicted from `sys.modules` so the next `import` picks up the fresh install. |
+| `%pip <args>`                     | `python -m pip <args>` with live streaming output; the host pauses the cell watchdog while the verified pip child runs. In an interpreter without pip (a `uv venv` env), first installs pip with `ensurepip`, or with `uv` (when on `PATH`) if that fails; that bootstrap counts against the cell timeout. Newly installed packages are evicted from `sys.modules` so the next `import` picks up the fresh install. |
 | `%cd <path>`                      | `os.chdir(path)` (with `~` expansion); emits status event.                                                                                                  |
 | `%pwd`                            | Returns `os.getcwd()`.                                                                                                                                      |
 | `%ls [path]`                      | Returns `sorted(os.listdir(path))`.                                                                                                                         |
