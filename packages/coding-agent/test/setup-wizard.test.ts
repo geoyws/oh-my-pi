@@ -43,6 +43,7 @@ function testScene(id: string, minVersion: number, shouldRun?: () => boolean): S
 	return {
 		id,
 		title: id,
+		step: id,
 		minVersion,
 		shouldRun,
 		mount: () => ({
@@ -230,6 +231,7 @@ describe("setup wizard persistence", () => {
 		const scene: SetupScene = {
 			id: "providers",
 			title: "providers",
+			step: "providers",
 			minVersion: 1,
 			mount: host => ({
 				title: "providers",
@@ -269,6 +271,7 @@ describe("setup wizard mouse routing", () => {
 		const scene: SetupScene = {
 			id: "scrollable",
 			title: "scrollable",
+			step: "scrollable",
 			minVersion: 1,
 			mount: () => ({
 				title: "scrollable",
@@ -307,6 +310,7 @@ describe("setup wizard mouse routing", () => {
 		const scene: SetupScene = {
 			id: "mouse",
 			title: "mouse",
+			step: "mouse",
 			minVersion: 1,
 			mount: () => ({
 				title: "mouse",

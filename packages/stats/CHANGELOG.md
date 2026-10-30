@@ -5,6 +5,21 @@
 ### Security
 
 - The stats dashboard's API and live event stream now require a credential as an `Authorization: Bearer` header, and refuse non-loopback `Host` headers and cross-origin `Origin` values, so another local user or a DNS-rebinding page can no longer read sessions. The credential is the per-user capability token (native clients) or a session secret the page gets by swapping the printed `?token=` URL's capability (`POST /api/session`); the session secret dies with that dashboard, and it is the only thing the page stores (no cookie, never the capability), because a browser origin is only host and port and a later listener on the same port could read it. The event stream, which `EventSource` cannot give headers, takes the session as `?session=`. `omp-stats` now prints the authenticated URL too. Reuse probes no longer send the token to whatever holds the port: a dashboard proves it holds the token by answering a random challenge with a port-bound HMAC. The identity version is now 5, so older dashboards are reclaimed on next start. Concurrent first users of the token file now converge on one token.
+## [18.14.0] - 2026-10-29
+
+### Changed
+
+- Improved `omp stats` session synchronization performance by approximately 2–5× on large histories. The first sync after upgrading may take up to a minute while the stats database is optimized.
+
+### Fixed
+
+- Fixed `/stats` and `omp stats` failing when another dashboard was syncing sessions or the configured port was already in use; busy dashboards are now reused, and a free port is selected when necessary.
+
+## [18.13.3] - 2026-10-28
+
+### Changed
+
+- Updated Bun engine requirement to ≥1.4.4
 
 ## [18.12.0] - 2026-10-17
 

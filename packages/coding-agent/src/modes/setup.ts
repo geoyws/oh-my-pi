@@ -11,7 +11,6 @@ import {
 } from "@oh-my-pi/pi-tui/setup/wizard";
 import type { Settings } from "../config/settings";
 import { captureBrowserSession } from "../utils/browser-session";
-import { copyToClipboard } from "../utils/clipboard";
 import { createModelBrowserSource } from "./model-browser-source";
 import type { InteractiveModeContext } from "./types";
 
@@ -85,7 +84,6 @@ export function createSetupHost(ctx: InteractiveModeContext): SetupHost {
 			(mode === "dark" ? cfgThemeDark : cfgThemeLight).set(ctx.settings, name);
 		},
 		captureBrowserSession,
-		copyToClipboard,
 		openInBrowser: url => ctx.openInBrowser(url),
 		markComplete: version => markSetupWizardComplete(ctx.settings, version),
 		playWelcomeIntro: () => ctx.playWelcomeIntro(),

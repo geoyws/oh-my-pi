@@ -122,9 +122,9 @@ Unknown magic names raise `NameError: UsageError: ...` inside the cell.
   - If the subprocess dies during execution, the cell is not replayed because completion is uncertain. The next call starts a fresh kernel.
   - After `eval.kernelIdleTimeoutSeconds` (default 600; `0` disables) with no cell or kernel-defined tool request in flight, the kernel is shut down. The next call starts a fresh kernel and prefixes its output with a `[kernel] … shut down after Ns with no cell running` note stating that earlier state is gone.
 - `per-call`
-  - Spawns a fresh subprocess for each call.
-  - Shuts the subprocess down after the call.
-  - No cross-call state persistence.
+   - Spawns a fresh subprocess for each call.
+   - Shuts the subprocess down after the call.
+   - No cross-call state persistence.
 
 ### State across eval calls
 
@@ -211,15 +211,15 @@ From runner frames:
 
 The runner replaces `builtins.print`. When it prints to the cell's stdout, each argument is classified; any other `file` (for example `sys.stderr`, or a redirected `sys.stdout`) gets the stock `print`. The trailing-expression echo applies the same classification to `repr(value)`.
 
-| Value | Text in the output | Extra frame |
-| --- | --- | --- |
-| `{"type": "image", "mimeType", "data": str\|bytes, "detail"?, "url"?, "providerFile"?}` | `<image MIME>` | `image` |
-| matplotlib `Figure` (PNG, `bbox_inches="tight"`), `PIL.Image.Image`, objects with `_repr_png_` / `_repr_jpeg_` | `str` / `repr` | `image` |
-| objects (not classes) with `_repr_markdown_` | the Markdown source | `markdown` view |
-| pandas `DataFrame` / `Series`, polars `DataFrame` / `Series` | `str` / `repr` | `table` view |
-| `dict` / `list` / `tuple` whose text exceeds 80 chars or spans lines | `str` / `repr` | `json` view |
+| Value                                                                                                          | Text in the output  | Extra frame     |
+| -------------------------------------------------------------------------------------------------------------- | ------------------- | --------------- |
+| `{"type": "image", "mimeType", "data": str\|bytes, "detail"?, "url"?, "providerFile"?}`                        | `<image MIME>`      | `image`         |
+| matplotlib `Figure` (PNG, `bbox_inches="tight"`), `PIL.Image.Image`, objects with `_repr_png_` / `_repr_jpeg_` | `str` / `repr`      | `image`         |
+| objects (not classes) with `_repr_markdown_`                                                                   | the Markdown source | `markdown` view |
+| pandas `DataFrame` / `Series`, polars `DataFrame` / `Series`                                                   | `str` / `repr`      | `table` view    |
+| `dict` / `list` / `tuple` whose text exceeds 80 chars or spans lines                                           | `str` / `repr`      | `json` view     |
 
-- Table views follow the library's own truncation (`display.max_rows` / `min_rows` / `max_columns`, including pandas' terminal-width fitting; polars `tbl_rows` / `tbl_cols`), so the view shows the rows and columns the text shows. Elided rows and columns become `…` cells. Index levels are leading columns; MultiIndex column labels are joined with ` / `. Columns are marked `numeric` by dtype (bool is not numeric). pandas and polars are detected through `sys.modules`, never imported.
+- Table views follow the library's own truncation (`display.max_rows` / `min_rows` / `max_columns`, including pandas' terminal-width fitting; polars `tbl_rows` / `tbl_cols`), so the view shows the rows and columns the text shows. Elided rows and columns become `…` cells. Index levels are leading columns; MultiIndex column labels are joined with `/`. Columns are marked `numeric` by dtype (bool is not numeric). pandas and polars are detected through `sys.modules`, never imported.
 - JSON views turn integers beyond ±2^53 into decimal strings and other non-JSON leaves into `str()`. Subclasses that customise their text (namedtuple, `OrderedDict`) get no view.
 - A probe that raises never breaks the print; the value just prints as text.
 
@@ -234,14 +234,14 @@ Output is streamed through `OutputSink` in `packages/tui/src/tools/streaming-out
 ### Renderer behavior
 
 - Tool renderer (`packages/tui/src/tools/eval.ts`):
-  - shows code-cell blocks with per-cell status
-  - collapsed preview defaults to 10 lines
-  - supports expanded mode for all output retained in the tool result
+   - shows code-cell blocks with per-cell status
+   - collapsed preview defaults to 10 lines
+   - supports expanded mode for all output retained in the tool result
 - Interactive renderer (`eval-execution.ts`):
-  - used for user-triggered Python execution in TUI
-  - collapsed preview defaults to 20 lines
-  - clamps very long individual lines to 4000 visible columns for display safety
-  - shows cancellation/error/truncation notices
+   - used for user-triggered Python execution in TUI
+   - collapsed preview defaults to 20 lines
+   - clamps very long individual lines to 4000 visible columns for display safety
+   - shows cancellation/error/truncation notices
 
 ## Operational troubleshooting
 

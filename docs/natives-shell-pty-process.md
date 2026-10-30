@@ -36,7 +36,7 @@ Shell execution modes:
 
 Both stream merged stdout/stderr text through a threadsafe callback and return `{ exitCode?, cancelled, timedOut, minimized?, workingDir? }`.
 
-Persistent `Shell` also exposes `liveBackgroundJobCount()`, which silently reaps completed jobs and returns the number of live jobs tracked by the session. Hosts can retain per-call shells while ordinary background jobs remain alive. `terminateBackgroundJobs()` escalates over the tracked background jobs with an awaited TERM→KILL (150ms grace, then a bounded ~2s exit wait with job-table reaping): returning means the recorded groups are dead. `shutdown()` aborts any in-flight run and then runs the same background-job termination; it never blocks on a wedged run holding the session lock — the run's own cancel bridge owns its foreground tree, so hosts awaiting an in-flight run's settlement must track the run promise itself. Builtin `nohup <command> &` is special: brush detaches and reparents the operand so it survives shell teardown (including `terminateBackgroundJobs` and `shutdown`, which only reach job-tracked processes); this is not the behavior of the system `nohup` binary.
+Persistent `Shell` also exposes `liveBackgroundJobCount()`, which silently reaps completed jobs and returns the number of live jobs tracked by the session. Hosts can retain per-call shells while ordinary background jobs remain alive. Builtin `nohup <command> &` is special: brush detaches and reparents the operand so it survives shell teardown; this is not the behavior of the system `nohup` binary.
 
 `ShellOptions` supports `sessionEnv`, `snapshotPath`, output `minimizer`, and `filesystem`. `ShellExecuteOptions` additionally supports `command`, `cwd`, command-scoped `env`, `timeoutMs`, and `signal`. `ShellRunOptions` supports `command`, `cwd`, command-scoped `env`, `timeoutMs`, `signal`, and a run-only `filesystem` override.
 
@@ -51,7 +51,7 @@ Rust creates `brush_core::Shell` with:
 - in-process utility builtins registered from `pi_builtins::utility_builtins()` (see the next section),
 - an opt-in `git` builtin (`crates/pi-shell/src/git.rs`), registered when either layer below is on; anything a layer does not take runs the git binary with the original arguments:
    - `PI_SMART_GIT` serves supported `git worktree add` invocations through `pi-vcs`: copy-on-write clone, worktree registration, and reconciliation to the target commit, with an in-process checkout fallback when cloning is unavailable;
-   - `PI_GIT_GUARD` (set by the coding agent from `bash.gitGuard`; `crates/pi-shell/src/git/guard.rs`) refuses, with exit status 1, git commands that discard or move work in a shared checkout: `stash` other than `list`/`show`/`create`, `reset --hard`, `reset` to a commit other than HEAD's, `switch` and `checkout` of a branch or commit, and `checkout` of paths and working-tree `restore` unless the repository is mid-merge/rebase/cherry-pick/revert (unmerged index entries or the operation's state files; a finished rebase's leftover `REBASE_HEAD` does not count), and even then not forced or whole-tree forms. It judges the expanded argv in the directory git actually runs in (`cd` and `-C` applied); `--git-dir`/`--work-tree`/`GIT_DIR`-style redirection forfeits the conflict exemption,
+   - `PI_GIT_GUARD` (set by the coding agent from `bash.gitGuard`; `crates/pi-shell/src/git/guard.rs`) judges git commands that discard or move work by the checkout they run in. In a repository's main checkout, which other sessions may share, it refuses with exit status 1: `stash` other than `list`/`show`/`create`, `reset --hard`, `reset` to a commit other than HEAD's, `switch` and `checkout` of a branch or commit, and `checkout` of paths and working-tree `restore` unless the repository is mid-merge/rebase/cherry-pick/revert (unmerged index entries or the operation's state files; a finished rebase's leftover `REBASE_HEAD` does not count), and even then not forced or whole-tree forms. A linked worktree of a non-bare repository, and a submodule inside one, run everything: a command that discards uncommitted tracked changes first records them as a `git stash create` commit on the `refs/omp/discarded` reflog and says so on stderr (refused instead when it recurses into submodules, through `--recurse-submodules` or `submodule.recurse`, since that record does not hold their changes), and `stash pop`/`apply`/`drop`/`branch`/`clear` refuse a stash-list entry whose `WIP on <branch>:`/`On <branch>:` subject names another branch, a detached HEAD, or no branch. It judges the expanded argv in the directory git actually runs in (`cd` and `-C` applied); `--git-dir`/`--work-tree`/`GIT_DIR`-style redirection is refused, since the repository it changes is not the one found from the directory,
 - skip-list for shell-sensitive vars (`PS1`, `PWD`, `SHLVL`, bash function exports, etc.),
 - a non-exported `env="$env"` fallback so PowerShell-style `$env:NAME` survives brush parameter expansion unless the user shadows `env`.
 
@@ -78,9 +78,10 @@ Beyond the bash builtins, session creation registers the in-process command-line
 
 Three search-related builtins are worth calling out:
 
-- `grep` is implemented on the ripgrep libraries (`grep-regex`/`grep-searcher`), with recursive directory walks served by `pi-walker`.
+- `grep` is implemented on the ripgrep libraries (`grep-regex`/`grep-searcher`), with directory walks and ordered parallel search served by `pi-walker` (`rg`/`grep` output stays in path order).
 - `rg` is a sibling builtin with ripgrep defaults (recursive search, ignore/hidden filtering, binary suppression) — a separate module and argument model, not an alias of `grep`.
-- `fd` is backed by `pi-walker`, `globset`, and `regex`.
+- `fd` is backed by `pi-walker`'s ordered `walk::tree` traversal, `globset`, and `regex`.
+- `ast-grep` (also `sg`) runs ast-grep 0.50's `run` command (`-p`/`-r`/`-U`, `--json`, context, `--heading`, `--files-with-matches`, `--stdin`) on the `pi-ast` search engine with ast-grep's piped (uncolored) output; `scan`, `test`, `new`, `lsp`, `outline`, `--config`, `--interactive`, `--kind`, `--debug-query`, and `--inspect` exit 2 as unsupported.
 
 Each builtin runs inside the shell process (no `fork`/`exec`) against the `pi-builtins` `Host` view of the shell (`src/host.rs`): stdio routes through the command's (possibly piped/redirected) file descriptors, path operands resolve against the shell working directory, the shell's exported environment is visible, and abort/timeout cancellation is honored. Because these builtins shadow system binaries, registration is gated in `crates/pi-shell/src/shell.rs`:
 
@@ -287,27 +288,26 @@ Layout behavior:
 
 ### Shell + PTY + Process
 
-| JS API                                       | Rust N-API export                  | Notes                                                                                                   |
-| -------------------------------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `executeShell(options, onChunk?)`            | `executeShell` (`execute_shell`)   | One-shot shell execution                                                                                |
-| `new Shell(options?)`                        | `Shell` class                      | Persistent shell session                                                                                |
-| `shell.run(options, onChunk?)`               | `Shell::run`                       | Reuses session on keepalive control flow                                                                |
-| `shell.abort()`                              | `Shell::abort`                     | Aborts active run for that shell instance                                                               |
-| `shell.terminateBackgroundJobs()`            | `Shell::terminate_background_jobs` | Awaited TERM→KILL over tracked background jobs; return means the groups are dead                        |
-| `shell.shutdown()`                           | `Shell::shutdown`                  | Aborts the in-flight run, then terminates leftover background jobs; skips runs holding the session lock |
-| `new PtySession()`                           | `PtySession` class                 | Stateful PTY session                                                                                    |
-| `pty.start(options, onChunk?, onStart?)`     | `PtySession::start`                | Shell-command PTY run                                                                                   |
-| `pty.startArgv(options, onChunk?, onStart?)` | `PtySession::start_argv`           | Direct executable/argv PTY run                                                                          |
-| `pty.write(data)`                            | `PtySession::write`                | Raw stdin passthrough                                                                                   |
-| `pty.resize(cols, rows)`                     | `PtySession::resize`               | Clamped terminal dimensions                                                                             |
-| `pty.kill()`                                 | `PtySession::kill`                 | Terminates active PTY child/targets                                                                     |
-| `Process.fromPid(pid)`                       | `Process::from_pid`                | Stable process reference lookup                                                                         |
-| `Process.fromPath(path)`                     | `Process::from_path`               | Executable-path process lookup                                                                          |
-| `process.killTree(signal?)`                  | `Process::kill_tree`               | Children-first process tree termination                                                                 |
-| `process.terminate(options?)`                | `Process::terminate`               | Graceful then hard process termination                                                                  |
-| `process.waitForExit(options?)`              | `Process::wait_for_exit`           | Async exit wait                                                                                         |
-| `process.children()`                         | `Process::children`                | Direct children as `Process[]`                                                                          |
-| `process.status()`                           | `Process::status`                  | `running` / `exited`                                                                                    |
+| JS API                                       | Rust N-API export                  | Notes                                            |
+| -------------------------------------------- | ---------------------------------- | ------------------------------------------------ |
+| `executeShell(options, onChunk?)`            | `executeShell` (`execute_shell`)   | One-shot shell execution                         |
+| `new Shell(options?)`                        | `Shell` class                      | Persistent shell session                         |
+| `shell.run(options, onChunk?)`               | `Shell::run`                       | Reuses session on keepalive control flow         |
+| `shell.abort()`                              | `Shell::abort`                     | Aborts active run for that shell instance        |
+| `shell.liveBackgroundJobCount()`             | `Shell::live_background_job_count` | Reaps jobs, then counts live background children |
+| `new PtySession()`                           | `PtySession` class                 | Stateful PTY session                             |
+| `pty.start(options, onChunk?, onStart?)`     | `PtySession::start`                | Shell-command PTY run                            |
+| `pty.startArgv(options, onChunk?, onStart?)` | `PtySession::start_argv`           | Direct executable/argv PTY run                   |
+| `pty.write(data)`                            | `PtySession::write`                | Raw stdin passthrough                            |
+| `pty.resize(cols, rows)`                     | `PtySession::resize`               | Clamped terminal dimensions                      |
+| `pty.kill()`                                 | `PtySession::kill`                 | Terminates active PTY child/targets              |
+| `Process.fromPid(pid)`                       | `Process::from_pid`                | Stable process reference lookup                  |
+| `Process.fromPath(path)`                     | `Process::from_path`               | Executable-path process lookup                   |
+| `process.killTree(signal?)`                  | `Process::kill_tree`               | Children-first process tree termination          |
+| `process.terminate(options?)`                | `Process::terminate`               | Graceful then hard process termination           |
+| `process.waitForExit(options?)`              | `Process::wait_for_exit`           | Async exit wait                                  |
+| `process.children()`                         | `Process::children`                | Direct children as `Process[]`                   |
+| `process.status()`                           | `Process::status`                  | `running` / `exited`                             |
 
 ### Keys
 

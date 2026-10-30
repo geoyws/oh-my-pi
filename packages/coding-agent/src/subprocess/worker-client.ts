@@ -9,7 +9,6 @@ import {
 	isExecutable,
 	isFullyQualifiedPath,
 	logger,
-	openCloexecSync,
 	postmortem,
 	stripWindowsExtendedLengthPathPrefix,
 	WhichCachePolicy,
@@ -404,7 +403,7 @@ interface StderrCapture {
 function createStderrCapture(exitLabel: string): StderrCapture {
 	try {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-worker-stderr-"));
-		const fd = openCloexecSync(
+		const fd = fs.openSync(
 			path.join(dir, "stderr.log"),
 			fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_TRUNC,
 		);
