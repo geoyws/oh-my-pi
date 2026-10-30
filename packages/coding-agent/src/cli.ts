@@ -445,12 +445,13 @@ let runningCommand: string | undefined;
 
 /**
  * Start per-process memory/fd sampling (see `@oh-my-pi/pi-utils/process-telemetry`)
- * tagged with `role`. Only the real process entry samples: worker threads share
- * the pid with their host, and importers of `runCli` are not omp processes.
+ * tagged with `role`. Only the real process entry's main thread samples: worker
+ * threads share the pid with their host (and in a compiled binary `isProcessEntry`
+ * is true in every realm), and importers of `runCli` are not omp processes.
  * Telemetry must never fail a launch.
  */
 async function startProcessTelemetry(role: string): Promise<void> {
-	if (!isProcessEntry) return;
+	if (!isProcessEntry || !Bun.isMainThread) return;
 	try {
 		// Lazy: keeps the logger graph off the worker-selector synchronous prefix.
 		const telemetry = await import("@oh-my-pi/pi-utils/process-telemetry");
