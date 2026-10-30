@@ -2040,9 +2040,6 @@ export function runGitLabDuoWorkflowSocket(
 							`GitLab Duo Workflow closed the session (WebSocket ${event.code})${reasonSuffix}`,
 							{ provider: "gitlab-duo-agent", kind: "runtime" },
 						);
-			if (!settled && !closing) {
-				telemetry?.noteCallError(error);
-			}
 			settle("closed", error);
 			return;
 		}

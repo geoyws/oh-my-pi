@@ -1163,6 +1163,7 @@ export class ExtensionRunner {
 				});
 			}
 		}
+		if (this.#sessionStartEvent) await this.#emitTo(added, this.#sessionStartEvent);
 	}
 
 	getExtensionPaths(): string[] {

@@ -368,7 +368,9 @@ describe("async task child usage", () => {
 
 		// Billed once: nothing is left for a later wait to recover.
 		expect(undeliveredJobs(manager, undefined).map(j => j.id)).not.toContain("WorkerG");
-		await expect(wait.execute("wait-cancel-repeat", {})).rejects.toThrow("Nothing to wait for");
+		const repeat = await wait.execute("wait-cancel-repeat", {});
+		expect(repeat.content[0]).toMatchObject({ text: expect.stringContaining("Nothing to wait for") });
+		expect(repeat.details?.usage).toBeUndefined();
 		expect(buildJobResult(session, manager, "wait", [job], []).details?.usage).toBeUndefined();
 	});
 
