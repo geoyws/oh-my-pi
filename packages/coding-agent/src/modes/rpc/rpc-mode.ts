@@ -34,7 +34,7 @@ import {
 } from "../../extensibility/extensions";
 import {
 	type BuiltSkillPromptMessage,
-	buildSkillPromptMessage,
+	loadSkillPromptBody,
 	parseSkillInvocation,
 	type Skill,
 	type SkillPromptInput,
@@ -49,6 +49,8 @@ import {
 } from "@oh-my-pi/pi-tui/prompt/word-completion";
 import { requestTextPrediction, textPredictionBackend } from "../../predict/client";
 import { type AgentSession, SessionBusyError } from "../../session/agent-session";
+import type { MCPManager } from "../../mcp/manager";
+import { reconnectMcpManagerServer } from "../../mcp/oauth-reauth";
 import type { RestoredQueuedMessage } from "../../session/agent-session-types";
 import { CACHE_WARMING_MODES } from "../../session/cache-warmer";
 import { findMostRecentNonEmptySession } from "../../session/session-listing";
@@ -245,7 +247,10 @@ export type RpcSessionChangeResult =
 
 export type RpcSessionChangeSession = Pick<AgentSession, "newSession" | "switchSession" | "branch" | "fork">;
 
-export type RpcSkillCommandSession = Pick<AgentSession, "promptCustomMessage" | "skills" | "skillsSettings">;
+export type RpcSkillCommandSession = Pick<
+	AgentSession,
+	"buildUserSkillPrompt" | "renderUserSkillPrompt" | "promptCustomMessage" | "skills" | "skillsSettings"
+>;
 export type RpcSkillCommandResult = { agentInvoked: true };
 
 export interface RpcSkillInvocation extends SkillPromptInput {
@@ -282,7 +287,7 @@ export async function runRpcSkillCommand(
 	onPromptAdmitted?: () => void,
 	images?: ImageContent[],
 ): Promise<boolean> {
-	const built = prebuilt ?? (await buildSkillPromptMessage(invocation.skill, invocation, "user"));
+	const built = prebuilt ?? (await session.buildUserSkillPrompt(invocation.skill, invocation));
 	return session.promptCustomMessage(
 		{
 			customType: SKILL_PROMPT_MESSAGE_TYPE,
@@ -320,13 +325,12 @@ export async function dispatchRpcSkillPrompt(input: {
 }): Promise<RpcSkillCommandResult | "cancelled" | null> {
 	const invocation = resolveRpcSkillInvocation(input.session, input.message);
 	if (!invocation) return null;
-	// buildSkillPromptMessage is cheap file I/O and covers the failure the old
-	// synchronous path reported immediately (a removed or unreadable SKILL.md);
-	// keep that error contract by awaiting it before answering. The expensive
-	// promptCustomMessage pipeline (usage preflight, compaction, provider
-	// calls) is what moves behind the acknowledgement.
-	const built = await buildSkillPromptMessage(invocation.skill, invocation, "user");
+	// Read the skill before acknowledging the command so a missing SKILL.md
+	// still fails immediately. Rendering (and authorizing model tags) happens
+	// only after the in-flight submission survives the currentness check.
+	const body = await loadSkillPromptBody(invocation.skill);
 	if (input.isCurrent && !input.isCurrent()) return "cancelled";
+	const built = input.session.renderUserSkillPrompt(invocation.skill, invocation, body);
 	// A failure before admission still resolves this wait (without rejecting this
 	// call) — reportPromptResult already routed it to onError and a failed prompt_result.
 	await watchAndReportPromptResult({
@@ -1334,6 +1338,8 @@ export interface RpcModeOptions {
 	input?: ReadableStream<Uint8Array>;
 	/** Builds `live_start` sessions; defaults to the real {@link LiveSessionController}. */
 	createLiveSession?: RpcLiveSessionFactory;
+	/** The session's MCP manager, so `/mcp` builtins resolve and reconnect live servers. */
+	mcpManager?: MCPManager;
 }
 
 /**
@@ -1401,9 +1407,12 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		() => goalController.continuationPending,
 		() => settleWatcher,
 	);
-	const promptResults = new RpcPromptResults(session, output, goalTurnScheduled);
-	const sessionEvents = new RpcSessionEventForwarder(output);
 	const settleWatcher = new RpcSessionSettleWatcher(session, output, goalTurnScheduled);
+	const promptResults = new RpcPromptResults(session, output, goalTurnScheduled, {
+		costCapRefusal: () => session.costCapRefusal,
+		settledWithoutRun: () => void settleWatcher.check(),
+	});
+	const sessionEvents = new RpcSessionEventForwarder(output);
 
 	const pendingExtensionRequests = new RpcPendingExtensionRequests();
 	const hostToolBridge = new RpcHostToolBridge(output);
@@ -1801,6 +1810,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				});
 				if (skillResult === "cancelled") return "cancelled";
 				if (skillResult) return "admitted";
+				const builtinAbort = new AbortController();
+				builtinCommandAborts.add(builtinAbort);
+				let backgroundedBuiltin = false;
 				const builtinResult = await executeAcpBuiltinSlashCommand(text, {
 					session,
 					sessionManager: session.sessionManager,
@@ -1809,7 +1821,24 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					output: commandOutput => output({ type: "command_output", text: commandOutput }),
 					refreshCommands: emitAvailableCommandsUpdate,
 					reloadPlugins: reloadPluginState,
-					runCommandInBackground: task => shutdownCoordinator.track(task()),
+					mcpManager: options.mcpManager,
+					reconnectMcpServer: options.mcpManager
+						? async (mcpName, selected) => {
+								const manager = options.mcpManager!;
+								const state = await reconnectMcpManagerServer(manager, mcpName, selected);
+								if (state) {
+									// RPC mode wires no tools-changed callback; refresh the
+									// session binding so later prompts see the recovered tools.
+									await session.refreshMCPTools(manager.getTools());
+								}
+								return state;
+							}
+						: undefined,
+					signal: builtinAbort.signal,
+					runCommandInBackground: task => {
+						backgroundedBuiltin = true;
+						shutdownCoordinator.track(task().finally(() => builtinCommandAborts.delete(builtinAbort)));
+					},
 					userMessageSource: "rpc",
 					notifyTitleChanged: async () => {
 						output({ type: "session_info_update", title: session.sessionName, sessionId: session.sessionId });
@@ -1818,6 +1847,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 						output({ type: "config_update", model: session.model, thinkingLevel: session.thinkingLevel });
 					},
 				});
+				if (!backgroundedBuiltin) builtinCommandAborts.delete(builtinAbort);
 				if (!isCurrent()) return "cancelled";
 				if (builtinResult !== false) {
 					if (!("prompt" in builtinResult)) {
@@ -1853,6 +1883,16 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			});
 			return "admitted";
 		});
+	// Abort controllers for builtin commands whose work outlives the prompt
+	// response (e.g. the `/mcp reauth` browser wait, dispatched through
+	// `runCommandInBackground`). Host abort and disconnect must tear those
+	// down, or a tracked task parks the shutdown drain for up to five minutes
+	// and can persist credentials after the client asked to abort.
+	const builtinCommandAborts = new Set<AbortController>();
+	const abortBuiltinCommands = (reason: string): void => {
+		for (const controller of builtinCommandAborts) controller.abort(reason);
+		builtinCommandAborts.clear();
+	};
 
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
@@ -1922,6 +1962,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 
 			case "abort": {
 				goalController.stopForHostAbort();
+				abortBuiltinCommands("RPC command aborted by host");
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
 				return success(id, "abort");
 			}
@@ -1932,12 +1973,14 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				// abort()'s stranded-queue drain can run it.
 				const restored = session.clearQueue({ forInterrupt: true });
 				goalController.stopForHostAbort();
+				abortBuiltinCommands("RPC command aborted by host");
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
 				return fitAbortAndRestoreQueueResponse(id, restored, frameEncoder.maxResponseBytes);
 			}
 
 			case "abort_and_prompt": {
 				goalController.stopForHostAbort();
+				abortBuiltinCommands("RPC command aborted by host");
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
 				const ticket = promptResults.begin(id);
 				void dispatchOrderedUserInput(command, ticket).then(
@@ -2706,6 +2749,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	hostUriBridge.clear("RPC client disconnected before host URI request completed");
 	await liveBridge.stop();
 	await inputDispatcher.drain();
+	// A backgrounded builtin (e.g. a /mcp reauth browser wait) must not park
+	// the drain: tear it down now that the client is gone.
+	abortBuiltinCommands("RPC client disconnected");
 	await shutdownCoordinator.drain();
 	subagentRegistry?.dispose();
 	// Dispose the main session before exiting so the browser reaper and other

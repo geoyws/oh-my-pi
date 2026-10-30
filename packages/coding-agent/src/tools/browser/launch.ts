@@ -237,6 +237,7 @@ export async function connectPuppeteer(puppeteer: typeof Puppeteer, options: Con
 		return await puppeteer.connect(options);
 	} catch (error) {
 		// The WebSocket transports can reject with ErrorEvent rather than Error.
+		// Its message includes the actual debugger endpoint and handshake failure.
 		const failure =
 			!(error instanceof Error) && isRecord(error) && typeof error.message === "string"
 				? new Error(error.message, { cause: error })

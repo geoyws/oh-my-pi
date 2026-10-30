@@ -604,6 +604,7 @@ function buildExecutorOptions(
 		// A task `cwd` names the child's checkout; isolated runs override this
 		// with their worktree below, non-isolated runs start here directly.
 		cwd: childCwd ?? session.cwd,
+		costGate: session.costGate,
 		additionalDirectories: session.additionalDirectories,
 		getApiKey: session.getApiKey,
 		credentialSourceSessionId: session.getCredentialSourceSessionId?.(),
@@ -665,6 +666,7 @@ function buildExecutorOptions(
 		customTools: request.customTools,
 		workPoolYieldItems: request.workPoolYieldItems,
 		contextFiles: session.contextFiles?.filter(file => path.basename(file.path).toLowerCase() !== "agents.md"),
+		noContextFiles: session.noContextFiles,
 		skills,
 		// Autoload runs after session start, outside the seance isolation options.
 		autoloadSkills: preparedSession ? undefined : autoloadSkills,

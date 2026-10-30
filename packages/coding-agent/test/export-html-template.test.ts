@@ -182,7 +182,16 @@ describe("HTML export template", () => {
 		expect(buildExitCode, `${buildStdout}\n${buildStderr}`).toBe(0);
 		expect(await Bun.file(staleAssetPath).exists()).toBe(false);
 
-		const packDir = path.join(tempRoot, "production-package");
+		// `catalog:` versions resolve from the workspace root manifest, so pack inside a workspace that keeps the
+		// repo's catalog but declares only this package (Bun rejects declared workspaces that do not exist).
+		const packWorkspace = path.join(tempRoot, "production-workspace");
+		const repoRoot = path.resolve(packageDir, "../..");
+		const packageRel = path.relative(repoRoot, packageDir).split(path.sep).join("/");
+		const rootManifest = await Bun.file(path.join(repoRoot, "package.json")).json();
+		rootManifest.workspaces = { packages: [packageRel], catalog: rootManifest.workspaces.catalog };
+		await Bun.write(path.join(packWorkspace, "package.json"), JSON.stringify(rootManifest));
+		await Bun.write(path.join(packWorkspace, "bun.lock"), Bun.file(path.join(repoRoot, "bun.lock")));
+		const packDir = path.join(packWorkspace, packageRel);
 		await Bun.write(path.join(packDir, "package.json"), Bun.file(path.join(packageDir, "package.json")));
 		const workspace = await Bun.file(path.resolve(packageDir, "../../package.json")).json();
 		// Packing a copied workspace member still needs its catalog: dependency versions.

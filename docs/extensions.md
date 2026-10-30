@@ -461,6 +461,16 @@ Canonical event unions and payload types are in `types.ts`.
 - `session_before_tree` / `session_tree`
 - `session_shutdown`
 
+In the interactive TUI, an extension whose factory registers no providers,
+shortcuts, composer shapes, or file fallbacks is loaded after the composer
+accepts input, once a previous launch has recorded that about its current
+source. Its `session_start` still runs (it is delivered when the extension
+binds), and the first submitted message and every model turn wait until it is
+loaded, so its tools, commands, and `input`/`before_agent_start` hooks apply from
+the first request. Events emitted before it binds are not replayed. Resumed
+sessions, `--tools`, and launches with flags omp does not recognize load every
+extension before the session starts.
+
 `session.compacting` receives `{ sessionId, messages }` and can return
 `{ context?: string[]; prompt?: string; preserveData?: Record<string, unknown> }`
 to customize summary context, the summarizer prompt, and stored compaction data.
@@ -499,7 +509,7 @@ pi.on("assistant_message", event => ({
 }));
 ```
 
-`before_agent_start` prepares policy for an ordinary prompt and for each steering or follow-up batch containing user work when that batch is actually dequeued. It is not an enqueue notification: a live batch can fire it without another `agent_start`. Queue peeks, provider retries, tool-only iterations, and synthetic-only queued continuations do not fire it. Explicit synthetic prompts retain their ordinary prompt lifecycle.
+`before_agent_start` prepares policy for an ordinary prompt and for each steering or follow-up batch containing user work when that batch is actually dequeued (`reason: "prompt"`). It is not an enqueue notification: a live batch can fire it without another `agent_start`. Queue peeks, provider retries, tool-only iterations, and synthetic-only queued continuations do not fire it. Explicit synthetic prompts retain their ordinary prompt lifecycle. Reviving a parked subagent (for a wake, a message, or just to focus it) fires it once after `session_start` with `reason: "revive"`, an empty `prompt`, and its result discarded, so an extension can register again what it registered at the subagent's first prompt; handlers doing per-prompt work (recall, classification, logging) should return early for `reason: "revive"`, since the revive waits on them. Wake turns are agent-initiated and do not fire it, while a later ordinary prompt runs it as usual.
 
 For queued batches, `prompt` contains the already-transformed text of every selected user message, joined with two newlines between messages; text blocks within a message are concatenated. `images` contains their already-normalized images in delivery order. Hidden agent-attributed companions are excluded from these event inputs but remain in the delivered batch. Input hooks, commands, templates, and original attachment preprocessing are not rerun.
 

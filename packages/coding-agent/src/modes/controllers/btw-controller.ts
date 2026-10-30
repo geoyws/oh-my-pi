@@ -1,4 +1,4 @@
-import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
 import { type OverlayHandle, replaceTabs } from "@oh-my-pi/pi-tui";
 import { logger, toError, withTimeout } from "@oh-my-pi/pi-utils";
 import {
@@ -22,6 +22,7 @@ interface BtwRequest {
 	component: BtwPanelComponent;
 	abortController: AbortController;
 	question: string;
+	images?: ImageContent[];
 	leafId: string | null;
 	sessionId: string;
 	session: InteractiveModeContext["session"];
@@ -64,6 +65,7 @@ function assistantMessageWithReplyText(assistantMessage: AssistantMessage, reply
 export class BtwController {
 	#activeRequest: BtwRequest | undefined;
 	#lastQuestion: string | undefined;
+	#lastImages: ImageContent[] | undefined;
 	#lastReplyText: string | undefined;
 	#lastAssistantMessage: AssistantMessage | undefined;
 	#lastLeafId: string | null | undefined;
@@ -184,6 +186,7 @@ export class BtwController {
 		}
 		const request = this.#activeRequest;
 		const question = this.#lastQuestion;
+		const images = this.#lastImages;
 		const assistantMessage = this.#lastAssistantMessage;
 		const leafId = this.#lastLeafId;
 		const sessionId = this.#lastSessionId;
@@ -192,7 +195,7 @@ export class BtwController {
 		request.component.markBranching();
 		try {
 			await this.flush();
-			await this.ctx.handleBtwBranch(question, assistantMessage, leafId, sessionId);
+			await this.ctx.handleBtwBranch(question, assistantMessage, leafId, sessionId, images);
 			return true;
 		} catch (error) {
 			this.ctx.showError(sanitizeErrorLine(`Cannot branch /btw: ${toError(error).message}`));
@@ -352,16 +355,31 @@ export class BtwController {
 		}
 	}
 
-	async start(question: string): Promise<void> {
-		await this.#start(question);
+	/**
+	 * Ask a side question; resolves `false` when no question started and no history opened.
+	 * `title` heads the topic instead of the question, e.g. `/sitrep` rather than its expanded template.
+	 */
+	start(question: string, images?: ImageContent[], title?: string): Promise<boolean> {
+		return this.#start(question, undefined, undefined, images, title);
 	}
 
-	async startFollowUp(recordId: string, question: string, signal?: AbortSignal): Promise<boolean> {
+	async startFollowUp(
+		recordId: string,
+		question: string,
+		signal?: AbortSignal,
+		images?: ImageContent[],
+	): Promise<boolean> {
 		if (!question.trim()) return false;
-		return this.#start(question, recordId, signal);
+		return this.#start(question, recordId, signal, images);
 	}
 
-	async #start(question: string, recordId?: string, signal?: AbortSignal): Promise<boolean> {
+	async #start(
+		question: string,
+		recordId?: string,
+		signal?: AbortSignal,
+		images?: ImageContent[],
+		title?: string,
+	): Promise<boolean> {
 		if (signal?.aborted) return false;
 		const trimmedQuestion = question.trim();
 		if (this.#starting || this.#branchInFlight || this.#transitionCount > 0) {
@@ -444,16 +462,18 @@ export class BtwController {
 			this.#activeRequest?.component.close();
 			this.#clearCompletedState();
 			const leafId = this.#sessionManager.getLeafId();
-			const { record, history, conversationKey } = beginBtwTurn(trimmedQuestion, leafId, previous);
+			const { record, history, conversationKey } = beginBtwTurn(trimmedQuestion, leafId, previous, images, title);
 			const request: BtwRequest = {
 				component: new BtwPanelComponent({
 					question: trimmedQuestion,
+					title,
 					tui: this.ctx.ui,
 					canBranch: () => this.canBranch(),
 					canFollowUp: () => this.canFollowUp(),
 				}),
 				abortController: new AbortController(),
 				question: trimmedQuestion,
+				images,
 				leafId,
 				sessionId,
 				session: viewSession,
@@ -531,12 +551,14 @@ export class BtwController {
 				this.#transitionCount === 0 &&
 				getBtwLatestTurn(record).status !== "running" &&
 				(!this.#activeRequest || getBtwLatestTurn(this.#activeRequest.record).status !== "running"),
-			onFollowUp: (record, question, signal) => {
+			onFollowUp: (record, question, signal, images) => {
 				if (historySessionId !== this.#sessionManager.getSessionId()) {
 					return Promise.resolve(false);
 				}
-				return this.startFollowUp(record.id, question, signal);
+				return this.startFollowUp(record.id, question, signal, images);
 			},
+			onPasteImage: () => this.ctx.handleImagePaste(),
+			onPasteImagePath: path => this.ctx.handleImagePathPaste(path),
 			spaceHoldKeys: this.ctx.keybindings.getKeys("app.stt.pushToTalk"),
 			spaceHold: input => this.ctx.dictationSpaceHold(input),
 			requestRender: () => this.ctx.ui.requestRender(),
@@ -625,6 +647,7 @@ export class BtwController {
 		try {
 			const { replyText, assistantMessage } = await runBtwTurn(request.session, {
 				question: request.question,
+				images: request.images,
 				history: request.history,
 				conversationKey: request.conversationKey,
 				onTextDelta: delta => {
@@ -650,6 +673,7 @@ export class BtwController {
 				const copyText = request.component.getCopyText();
 				if (copyText !== undefined) {
 					this.#lastQuestion = request.question;
+					this.#lastImages = request.images;
 					this.#lastReplyText = replyText;
 					this.#lastCopyText = copyText;
 					this.#lastAssistantMessage = assistantMessageWithReplyText(assistantMessage, replyText);
@@ -683,6 +707,7 @@ export class BtwController {
 
 	#clearCompletedState(): void {
 		this.#lastQuestion = undefined;
+		this.#lastImages = undefined;
 		this.#lastReplyText = undefined;
 		this.#lastAssistantMessage = undefined;
 		this.#lastCopyText = undefined;

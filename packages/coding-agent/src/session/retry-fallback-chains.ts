@@ -187,7 +187,7 @@ export function getRetryFallbackChains(settings: Settings): RetryFallbackChains 
 export interface RetryFallbackRole {
 	/** Selector the role is assigned (the chain's primary). */
 	primary: string;
-	/** Fallback selectors walked after the primary. */
+	/** Fallback selectors walked after the primary; empty explicitly disables fallbacks. */
 	chain: string[];
 	/** True when the chain is an explicit multi-entry override list. */
 	exhaustive?: boolean;
@@ -228,11 +228,11 @@ export function restoreExhaustiveRetryFallbackRoles(settings: Settings, roles: r
 	for (const role of installed) existing.add(role);
 }
 
-/** Reads the primary and non-empty chain installed for `role`, if any. */
+/** Reads the primary and chain installed for `role`, including an explicitly empty chain. */
 export function getRetryFallbackRole(settings: Settings, role: string): RetryFallbackRole | undefined {
 	const primary = settings.getModelRole(role);
 	const chain = cfgRetryFallbackChains.get(settings)[role];
-	if (!primary || !Array.isArray(chain) || chain.length === 0) return undefined;
+	if (!primary || !Array.isArray(chain)) return undefined;
 	const roleState: RetryFallbackRole = { primary, chain };
 	if (exhaustiveRetryFallbackRoles.get(settings)?.has(role)) roleState.exhaustive = true;
 	return roleState;

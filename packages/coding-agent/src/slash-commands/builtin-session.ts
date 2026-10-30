@@ -19,6 +19,7 @@ import { theme } from "@oh-my-pi/pi-tui/theme";
 import { sanitizeText } from "@oh-my-pi/pi-utils";
 import { handleMcpAcp } from "./helpers/mcp";
 import { markdownFenceFor } from "../utils/markdown-fence";
+import { openLocalFileInEditor } from "../modes/local-file-editor";
 import { commandConsumed, errorMessage, parseSubcommand, usage } from "./helpers/parse";
 import {
 	describeRedeemOutcome,
@@ -452,6 +453,9 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				await runtime.output(result.message);
 			} catch (error) {
 				await runtime.output(`Stats dashboard failed: ${errorMessage(error)}`);
+				// Mark the failure like `usage()` does, for hosts that report a
+				// failed builtin (print mode does not dispatch `/stats`).
+				return commandConsumed({ failed: true });
 			}
 			return commandConsumed();
 		},
@@ -585,6 +589,17 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		handleTui: (command, runtime) => {
 			runtime.ctx.showGitUi(command.args.trim() || undefined);
 			clearSubmittedText(runtime);
+		},
+	},
+	{
+		name: "local",
+		icon: "pencil",
+		description: "Open a session local:// file in $EDITOR (picker when no name given)",
+		inlineHint: "[name]",
+		allowArgs: true,
+		handleTui: async (command, runtime) => {
+			clearSubmittedText(runtime);
+			await openLocalFileInEditor(runtime.ctx, command.args);
 		},
 	},
 	{
