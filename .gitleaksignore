@@ -121,10 +121,10 @@ f868f02301d16ec7177c1bbd69cf408ffc23b4cb:packages/catalog/src/models.json:generi
 fe75d5f3492bab353ca63b60fc109a9693f1df57:packages/catalog/src/models.json:generic-api-key:1
 fec79e4077c0f9646dd229ee520feb3092c53468:packages/catalog/src/models.json:generic-api-key:1
 # 2026-10-30, omp t-7cb62cb5 (upstream v18.14.0 intake): upstream's
-# anthropic-headers.ts lists `thinkingTokenCountBeta` inside the two Claude Code
-# beta arrays; generic-api-key matches the identifier list, and the value is a
-# public dated Anthropic beta-flag name (`thinking-token-count-<date>`), not a
-# credential. File is byte-identical to can1357/oh-my-pi v18.14.0. Checked by
+# anthropic-headers.ts lists Claude Code beta flags in two arrays; generic-api-key
+# matches `oauthAuthBeta,` followed by the next quoted entry, a public dated
+# Anthropic beta-flag name (`<feature>-<date>`), not a credential. File is
+# byte-identical to can1357/oh-my-pi v18.14.0. Checked by
 # @:geoyws/omp/driver/executor from shape and use; working-tree fingerprints only.
 packages/ai/src/providers/anthropic-headers.ts:generic-api-key:63
 packages/ai/src/providers/anthropic-headers.ts:generic-api-key:72
