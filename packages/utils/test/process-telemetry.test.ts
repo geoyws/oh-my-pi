@@ -166,8 +166,7 @@ describe("readProcessTelemetryEnv", () => {
 });
 
 describe("countOpenFds", () => {
-	test("counts directory entries minus the listing's own fd; a missing directory is undefined", () => {
-		expect(countOpenFds(undefined)).toBeUndefined();
+	test("counts this process's open fds; an unreadable directory is undefined", () => {
 		expect(countOpenFds("/nonexistent/omp-fd-dir")).toBeUndefined();
 		if (process.platform === "linux" || process.platform === "darwin") {
 			const n = countOpenFds();
