@@ -24,6 +24,9 @@
 
 ### Fixed
 
+- Fixed extensions silently failing to load from discovered and configured paths after asynchronous path canonicalization.
+- Fixed missing stale browser relay extension notices when relay discovery requires authentication.
+- Fixed interactive skill and background-task submissions losing or restoring the wrong draft text and images.
 - Fixed `omp share`, `/share` and the interactive share uploading a session unredacted when `share.redactSecrets` was on but `secrets.enabled` was off (at start or switched off mid-session) or the live session had no secrets: all three now share one resolver that reuses the session's redactor only while it actively redacts, otherwise builds one from the session's project and agent `secrets.yml`, secret-shaped environment variables and the built-in credential patterns. Sharing loads `secrets.yml` strictly and refuses to upload when a file cannot be read or parsed or holds an invalid entry, or when no redactor can be built.
 - `/park` now refuses active foreground shell or Python execution both before and after persistence. Explicit owner checkpoints retain resumed draft-only transcripts through shutdown, so the advertised resume command still opens the same session after draft cleanup.
 - Browser CDP connection failures retain the discovered debugger websocket URL and the transport failure reason even when Bun reports a bare handshake error.
