@@ -399,7 +399,7 @@ describe("AgentSession prompt admission racing abort", () => {
 				),
 			),
 		).toBe(true);
-		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [], liveSteered: 0 });
 	});
 
 	it("refuses a steer whose owning turn settled while the steer's preprocessing ran", async () => {

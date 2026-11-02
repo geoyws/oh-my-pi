@@ -384,6 +384,7 @@ describe("submitInteractiveInput", () => {
 				throw new UserMessageRefusedError(NOTICE);
 			}),
 			promptCustomMessage: vi.fn(async () => true),
+			resume: vi.fn(async () => {}),
 			buildUserSkillPrompt: buildSkillPromptMessage,
 			isStreaming: false,
 		};

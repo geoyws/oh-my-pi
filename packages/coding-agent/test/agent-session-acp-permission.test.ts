@@ -1413,7 +1413,7 @@ it("parks a steer that lands mid-dispatch until the owning prompt goes live, the
 		content: [{ type: "text", text: "steer answer" }],
 	});
 	await session.waitForIdle();
-	expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+	expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [], liveSteered: 0 });
 });
 
 it("refuses a steer into an agent-initiated turn whose output has no client forwarder", async () => {
