@@ -18,6 +18,8 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import { isBuiltinComposerStyle, type KeyId } from "@oh-my-pi/pi-tui";
 import { hasFsCode, isEacces, isEnoent, logger } from "@oh-my-pi/pi-utils";
+import { fingerprintProjectSurface, isProjectSurfaceTrusted } from "@oh-my-pi/pi-utils/project-trust";
+import { boundSettings } from "../../capability";
 import { type ExtensionModule, extensionModuleCapability } from "../../capability/extension-module";
 import { type Hook, hookCapability } from "../../capability/hook";
 import { isServiceTierFamily, isServiceTierForFamily } from "../../config/service-tier";
@@ -36,6 +38,7 @@ import * as TypeBox from "../legacy-typebox";
 import { resolveExtensionDirectory } from "./directory-resolution";
 import { installLegacyPiSpecifierShim, loadLegacyPiModule } from "../plugins/legacy-pi-compat";
 import { getAllPluginExtensionPaths } from "../plugins/loader";
+import { cfgDisabledExtensions } from "../settings";
 
 import { resolvePath, withHostGuard } from "../utils";
 import type { ComposerShapeDefinition } from "@oh-my-pi/pi-tui/overlays/composer-shape-registry";
@@ -552,6 +555,189 @@ async function discoverHooksInPackageRoot(root: string): Promise<string[]> {
 	return hooks;
 }
 
+const EXTENSION_ROOT_DIR_NAMES: Record<string, true> = { extensions: true, hooks: true, pre: true, post: true };
+
+/**
+ * Every file an extension entry can pull in from its own directory: the entry's
+ * extension root (the folder directly under an `extensions`/`hooks` dir inside
+ * `projectDir`, else the entry itself). Everything under the root counts,
+ * dot-directories and `node_modules` included, because an approved entry can
+ * import any of it; only `.git` metadata is skipped. Each file is recorded by
+ * its SHA-256. A symlinked directory below the root is recorded by its link
+ * target, not walked. Imports reaching outside the root are not covered.
+ */
+async function collectExtensionCodeFiles(projectDir: string, entry: string, into: Map<string, string>): Promise<void> {
+	let root = entry;
+	let candidate = entry;
+	for (let dir = path.dirname(entry); dir.startsWith(projectDir + path.sep); dir = path.dirname(dir)) {
+		if (Object.hasOwn(EXTENSION_ROOT_DIR_NAMES, path.basename(dir))) {
+			root = candidate;
+			break;
+		}
+		candidate = dir;
+	}
+	const walk = async (p: string, isRoot: boolean): Promise<void> => {
+		let stat: fs1.Stats;
+		try {
+			stat = isRoot ? await fs.stat(p) : await fs.lstat(p);
+		} catch (err) {
+			if (isEnoent(err) || isEacces(err)) return;
+			throw err;
+		}
+		if (stat.isSymbolicLink()) {
+			const target = await fs.readlink(p);
+			const targetStat = await fs.stat(p).catch(() => undefined);
+			if (targetStat?.isFile()) into.set(p, await hashFile(p));
+			else into.set(p, `symlink:${target}`);
+			return;
+		}
+		if (stat.isDirectory()) {
+			for (const name of await fs.readdir(p)) {
+				if (name === ".git") continue;
+				await walk(path.join(p, name), false);
+			}
+			return;
+		}
+		if (stat.isFile()) into.set(p, await hashFile(p));
+	};
+	await walk(root, true);
+}
+
+async function hashFile(p: string): Promise<string> {
+	return new Bun.CryptoHasher("sha256").update(await fs.readFile(p)).digest("hex");
+}
+
+/**
+ * What a configured `extensions:` path names: a directory's entry files
+ * (`directory: true`), else the path itself.
+ */
+async function expandConfiguredExtensionPath(
+	configuredPath: string,
+	cwd: string,
+): Promise<{ resolved: string; directory: boolean; files: string[] }> {
+	const resolved = resolvePath(configuredPath, cwd);
+	let stat: fs1.Stats | null = null;
+	try {
+		stat = await fs.stat(resolved);
+	} catch (err) {
+		if (!isEnoent(err)) throw err;
+	}
+	if (stat?.isDirectory()) {
+		return {
+			resolved,
+			directory: true,
+			files: resolveExtensionDirectory(resolved, CONFIGURED_EXTENSION_DIRECTORY_OPTIONS).files,
+		};
+	}
+	return { resolved, directory: false, files: [resolved] };
+}
+
+export interface AmbientExtensionEntries {
+	/** Native extension modules then hook factories, in load order, with their source level. */
+	entries: Array<{ path: string; level: "user" | "project" }>;
+	/**
+	 * Repository-supplied entry points: level-`project` ambient entries, then
+	 * the `projectConfiguredEntries`.
+	 */
+	projectPaths: string[];
+	/** Entry points named by an `extensions:` setting that a project settings file supplied. */
+	projectConfiguredEntries: string[];
+	/** Fingerprint of every file those entries can load from their own roots. */
+	projectFingerprint: string;
+	/** Whether `omp trust` approved exactly that fingerprint for `cwd`. */
+	projectTrusted: boolean;
+}
+
+type AmbientEntry = AmbientExtensionEntries["entries"][number];
+type AmbientLoadOptions = { cwd: string; disabledExtensions?: string[] };
+
+/** Native extension modules for `loadOptions`. */
+async function listNativeExtensionEntries(loadOptions: AmbientLoadOptions): Promise<AmbientEntry[]> {
+	// Native provider only — the extension-module capability also has
+	// claude/codex/gemini/opencode providers whose items were discarded here
+	// anyway (see #4198); the filter skips those walks entirely.
+	const discovered = await loadCapability<ExtensionModule>(extensionModuleCapability.id, {
+		...loadOptions,
+		providers: ["native"],
+	});
+	return discovered.items.map(ext => ({ path: ext.path, level: ext.level }));
+}
+
+/** JS/TS hook factories for `loadOptions`. */
+async function listHookEntries(loadOptions: AmbientLoadOptions): Promise<AmbientEntry[]> {
+	const hooks = await loadCapability<Hook>(hookCapability.id, loadOptions);
+	return hooks.items
+		.filter(hook => isExtensionFile(path.basename(hook.path)))
+		.map(hook => ({ path: hook.path, level: hook.level }));
+}
+
+/**
+ * Ambient extension entry points for `cwd` and the approval state of the
+ * repository-supplied ones (kb omp t-f77ec1f5). Shared by startup discovery
+ * and `omp trust`, so both fingerprint the same code. `projectConfiguredPaths`
+ * is the `extensions:` list when a project settings file supplied it
+ * (`Settings.extensionsSourceLevel() === "project"`): repository-controlled
+ * code under the same approval as `.omp/extensions`.
+ *
+ * The fingerprint always covers every project entry, hooks included and none
+ * disabled: `omp trust` approves the whole surface, so disabling one extension
+ * or skipping hooks for a read-only command must not revoke that approval. A
+ * capability is walked a second time only when the disabled list names its
+ * ids or its entries were skipped.
+ */
+export async function loadAmbientExtensionEntries(
+	cwd: string,
+	loadOptions: AmbientLoadOptions = { cwd },
+	includeHooks = true,
+	projectConfiguredPaths: readonly string[] = [],
+): Promise<AmbientExtensionEntries> {
+	// Same fallback as loadCapability: no explicit list means the settings' list.
+	const settings = boundSettings();
+	const disabled =
+		loadOptions.disabledExtensions ?? (settings ? cfgDisabledExtensions.get(settings) : undefined) ?? [];
+	const unfilteredOptions = { cwd: loadOptions.cwd, disabledExtensions: [] };
+	const nativeEntries = await listNativeExtensionEntries(loadOptions);
+	const hookEntries = includeHooks ? await listHookEntries(loadOptions) : [];
+	const entries = [...nativeEntries, ...hookEntries];
+	const surfaceEntries = [
+		...(disabled.some(id => id.startsWith("extension-module:"))
+			? await listNativeExtensionEntries(unfilteredOptions)
+			: nativeEntries),
+		...(includeHooks && !disabled.some(id => id.startsWith("hook:"))
+			? hookEntries
+			: await listHookEntries(unfilteredOptions)),
+	];
+	const projectConfiguredEntries: string[] = [];
+	// A configured directory is hashed whole: its entry files can import anything in it.
+	const hashRoots = surfaceEntries.filter(entry => entry.level === "project").map(entry => entry.path);
+	for (const configuredPath of projectConfiguredPaths) {
+		const { resolved, files } = await expandConfiguredExtensionPath(configuredPath, cwd);
+		projectConfiguredEntries.push(...files);
+		hashRoots.push(resolved);
+	}
+	const projectPaths = [
+		...entries.filter(entry => entry.level === "project").map(entry => entry.path),
+		...projectConfiguredEntries,
+	];
+	const files = new Map<string, string>();
+	if (hashRoots.length > 0) {
+		// Compare real paths: discovery may report /private/var where cwd says /var.
+		const realProjectDir = await fs.realpath(cwd).catch(() => path.resolve(cwd));
+		for (const entry of hashRoots) {
+			const realEntry = await fs.realpath(entry).catch(() => path.resolve(entry));
+			await collectExtensionCodeFiles(realProjectDir, realEntry, files);
+		}
+	}
+	const projectFingerprint = fingerprintProjectSurface([...files]);
+	return {
+		entries,
+		projectPaths,
+		projectConfiguredEntries,
+		projectFingerprint,
+		projectTrusted: isProjectSurfaceTrusted(cwd, "extensions", projectFingerprint),
+	};
+}
+
 /**
  * Discover absolute paths of extensions to load, without importing or
  * binding factories. Hot path on session startup — the scan walks native
@@ -567,6 +753,12 @@ export interface DiscoverExtensionPathOptions {
 	ambient?: boolean;
 	/** Include ambient hook factories. Disable for read-only catalog commands. */
 	includeAmbientHooks?: boolean;
+	/**
+	 * The `extensions:` setting when a project settings file supplied it. These
+	 * load only when the project is trusted for extensions; keep them out of
+	 * `configuredPaths`, which load unconditionally (kb omp t-f77ec1f5).
+	 */
+	projectConfiguredPaths?: readonly string[];
 }
 
 export async function discoverExtensionPaths(
@@ -598,36 +790,31 @@ export async function discoverExtensionPaths(
 	};
 
 	const ambient = options.ambient !== false;
+	let projectConfiguredEntries: string[] = [];
 	if (ambient) {
-		// 1. Discover extension modules via capability API (native .omp/.pi only).
-		// Scope the load to the native provider — the extension-module capability
-		// also has claude/codex/gemini/opencode providers, and their items were
-		// discarded here anyway (see #4198). The provider filter skips the walk
-		// entirely instead of running four foreign directory scans and dropping
-		// the results.
-		const discovered = await loadCapability<ExtensionModule>(extensionModuleCapability.id, {
-			...loadOptions,
-			providers: ["native"],
-		});
-		for (const ext of discovered.items) {
-			addPath(ext.path);
+		// 1. Native extension modules, then 2. JS/TS hook factories, in that
+		// order. Repository-supplied (project-level) entries load only when the
+		// user approved this exact code with `omp trust` (kb omp t-f77ec1f5).
+		const ambientEntries = await loadAmbientExtensionEntries(
+			cwd,
+			loadOptions,
+			options.includeAmbientHooks !== false,
+			options.projectConfiguredPaths,
+		);
+		if (!ambientEntries.projectTrusted) {
+			logger.warn(
+				`Project extensions not loaded: ${ambientEntries.projectPaths.join(", ")} — this project is not trusted for extensions. Review the code, then run \`omp trust\` in ${cwd}.`,
+			);
 		}
-	}
-
-	// 2. Discover JS/TS hook factories and bind them through the extension
-	// runner, which owns the current runtime event bus. Non-ambient discovery
-	// scans only this invocation's configured package roots; it must not consult
-	// settings, installed packages, or process-global CLI injection state.
-	if (ambient) {
-		if (options.includeAmbientHooks !== false) {
-			const hooks = await loadCapability<Hook>(hookCapability.id, loadOptions);
-			for (const hookPath of hooks.items
-				.map(hook => hook.path)
-				.filter(hookPath => isExtensionFile(path.basename(hookPath)))) {
-				addPath(hookPath);
-			}
+		for (const entry of ambientEntries.entries) {
+			if (entry.level === "project" && !ambientEntries.projectTrusted) continue;
+			addPath(entry.path);
 		}
+		projectConfiguredEntries = ambientEntries.projectTrusted ? ambientEntries.projectConfiguredEntries : [];
 	} else {
+		// Non-ambient discovery scans only this invocation's configured package
+		// roots; it must not consult settings, installed packages, or
+		// process-global CLI injection state.
 		for (const configuredPath of configuredPaths) {
 			addPaths(await discoverHooksInPackageRoot(resolvePath(configuredPath, cwd)));
 		}
@@ -638,24 +825,13 @@ export async function discoverExtensionPaths(
 		addPaths(await getAllPluginExtensionPaths(cwd));
 	}
 
-	// 4. Explicitly configured paths
+	// 4. Explicitly configured paths, then project-supplied ones that passed trust.
 	for (const configuredPath of configuredPaths) {
-		const resolved = resolvePath(configuredPath, cwd);
-
-		let stat: fs1.Stats | null = null;
-		try {
-			stat = await fs.stat(resolved);
-		} catch (err) {
-			if (!isEnoent(err)) throw err;
-		}
-
-		if (stat?.isDirectory()) {
-			addPaths(resolveExtensionDirectory(resolved, CONFIGURED_EXTENSION_DIRECTORY_OPTIONS).files);
-			continue;
-		}
-
-		addPath(resolved);
+		const { directory, files } = await expandConfiguredExtensionPath(configuredPath, cwd);
+		if (directory) addPaths(files);
+		else addPath(files[0]);
 	}
+	addPaths(projectConfiguredEntries);
 
 	return allPaths;
 }

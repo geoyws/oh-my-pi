@@ -257,6 +257,28 @@ describe("SessionManager close() drops empty metadata-only sessions", () => {
 		expect(await fileExists(sessionFile)).toBe(true);
 	});
 
+	it("retains a resumed draft-only transcript when an explicit checkpoint requests close survival", async () => {
+		using tempDir = TempDir.createSync("@pi-session-close-checkpoint-resumed-draft-");
+		const firstRun = SessionManager.create(tempDir.path(), tempDir.path());
+		await firstRun.saveDraft("resume me");
+		const file = firstRun.getSessionFile()!;
+		const id = firstRun.getSessionId();
+		await firstRun.close();
+		const resumed = await SessionManager.open(file);
+		expect(await resumed.consumeDraft()).toBe("resume me");
+		await resumed.saveDraft("");
+		await resumed.ensureOnDisk({ preserveOnClose: true });
+		await resumed.close();
+		expect(await fileExists(file)).toBe(true);
+		const reopened = await SessionManager.open(file);
+		try {
+			expect(reopened.getSessionId()).toBe(id);
+		} finally {
+			await reopened.close();
+		}
+		expect(await fileExists(file)).toBe(true);
+	});
+
 	// Never-materialized sessions (no draft ever saved, no assistant reply)
 	// must not be summoned into existence by close() itself.
 	it("is a no-op when the session file was never materialized", async () => {

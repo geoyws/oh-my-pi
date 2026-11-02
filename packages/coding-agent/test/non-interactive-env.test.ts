@@ -93,7 +93,8 @@ it("filters expanded dotenv values while preserving matching and empty launcher 
 			path.join(tmp, ".env"),
 			[
 				"BASE=loaded-by-omp",
-				"EMPTY_PARENT_VAR=project-secret",
+				// Allowlisted name (OMP_ prefix): non-allowlisted parent names never reach the child (child-env.ts).
+				"OMP_TEST_EMPTY_PARENT_VAR=project-secret",
 				"TEST_ENV_FROM_DOTENV=$BASE-suffix",
 				"NODE_ENV=development",
 				"export EXPORTED_SECRET=exported",
@@ -114,7 +115,7 @@ it("filters expanded dotenv values while preserving matching and empty launcher 
 			"	deployment: env.CONVEX_DEPLOYMENT ?? null,",
 			"	url: env.CONVEX_URL ?? null,",
 			"	inherited: env.OMP_TEST_INHERITED_MARKER ?? null,",
-			"	empty: env.EMPTY_PARENT_VAR ?? null,",
+			"	empty: env.OMP_TEST_EMPTY_PARENT_VAR ?? null,",
 			"	matching: env.NODE_ENV ?? null,",
 			"	exported: env.EXPORTED_SECRET ?? null,",
 			"	commented: env.COMMENTED_SECRET ?? null,",
@@ -126,7 +127,7 @@ it("filters expanded dotenv values while preserving matching and empty launcher 
 				cwd: tmp,
 				env: {
 					HOME: process.env.HOME ?? "",
-					EMPTY_PARENT_VAR: "",
+					OMP_TEST_EMPTY_PARENT_VAR: "",
 					OMP_TEST_INHERITED_MARKER: "keep-me",
 					NODE_ENV: "development",
 					PATH: process.env.PATH ?? "",

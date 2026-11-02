@@ -2794,10 +2794,29 @@ mod tests {
 		assert_eq!(gitlink_snapshot(ours), gitlink_snapshot(oracle), "{case}");
 	}
 
+	/// `(major, minor)` of the `git` the oracle runs.
+	fn oracle_git_version() -> (u32, u32) {
+		let version = git(Path::new("."), &["--version"]);
+		let mut parts = version
+			.split_whitespace()
+			.nth(2)
+			.expect("git --version prints a version")
+			.split('.')
+			.map(|part| part.parse::<u32>().expect("numeric git version part"));
+		(parts.next().expect("git major"), parts.next().expect("git minor"))
+	}
+
 	#[test]
 	fn worktree_apply_of_gitlink_patches_matches_git() {
 		// Regression: worktree application found no source for a submodule
 		// directory ("does not exist") and materialized added gitlinks as blobs.
+		// Before git 2.50 (git 1d9a66493), `git apply --reverse` of a deletion
+		// dropped the mode, so reversing a gitlink deletion wrote `module` as a
+		// 100644 file: it failed on a checked-out submodule and replaced an empty
+		// one with a file. With such a git the oracle is wrong for that case;
+		// check ours against what fixed git does instead: apply succeeds and
+		// changes nothing.
+		let oracle_reverses_gitlink_deletes = oracle_git_version() >= (2, 50);
 		for initialized in [true, false] {
 			for (kind, reverse) in [("update", false), ("delete", false), ("delete", true)] {
 				let (ours, old, new) = gitlink_fixture(initialized);
@@ -2816,13 +2835,21 @@ mod tests {
 					"--cacheinfo",
 					&format!("160000,{old},module"),
 				]);
-				assert_gitlink_apply_matches_git(
-					ours.path(),
-					oracle.path(),
-					&patch,
-					&ApplyOptions { reverse, ..ApplyOptions::default() },
-					&format!("{kind} reverse={reverse} initialized={initialized}"),
-				);
+				let case = format!("{kind} reverse={reverse} initialized={initialized}");
+				let options = ApplyOptions { reverse, ..ApplyOptions::default() };
+				if kind == "delete" && reverse && !oracle_reverses_gitlink_deletes {
+					let repository = repo(ours.path());
+					assert!(
+						repository
+							.can_apply_patch(&patch, &options)
+							.expect("check patch"),
+						"{case}"
+					);
+					repository.apply_patch(&patch, &options).expect(&case);
+					assert_eq!(gitlink_snapshot(ours.path()), gitlink_snapshot(oracle.path()), "{case}");
+					continue;
+				}
+				assert_gitlink_apply_matches_git(ours.path(), oracle.path(), &patch, &options, &case);
 			}
 		}
 	}

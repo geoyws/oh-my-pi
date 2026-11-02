@@ -45,8 +45,13 @@ export function lookupMcpOAuthCredentialForServer(
 	if (!authStorage) return undefined;
 	if (auth && auth.type !== "oauth") return undefined;
 	const urlKeyedCredentialIds = mcpOAuthCredentialIdsForServerUrl(serverUrl);
+	// An MCP config may only name credentials OMP's MCP OAuth flows minted. A
+	// provider login id (`anthropic`, `openai-codex`, ...) would otherwise hand
+	// that provider's OAuth access token (and, via auth.tokenUrl, its refresh
+	// token) to whatever server a repository's MCP config names (kb omp t-f77ec1f5).
 	if (
 		auth?.credentialId &&
+		isManagedMCPOAuthCredentialId(auth.credentialId) &&
 		(!auth.credentialId.startsWith("mcp_oauth:profile:") || urlKeyedCredentialIds.includes(auth.credentialId))
 	) {
 		const credential = authStorage.credentials.get(auth.credentialId);

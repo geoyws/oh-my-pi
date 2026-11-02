@@ -34,7 +34,8 @@ tree-sitter-language = "0.1"
 cc = "1.2"
 
 [dev-dependencies]
-tree-sitter = "0.25.8"
+# Workspace member: must match the workspace tree-sitter (one `links` copy).
+tree-sitter = "0.27"
 
 # Vendored upstream code: keep the workspace's pedantic lint config off it and
 # make that non-inheritance explicit so cargo stops warning for this member.

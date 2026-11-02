@@ -493,12 +493,14 @@ describe("AgentSession synthetic follow-up marking", () => {
 	});
 	it("persists a user-attributed custom prompt with its original submission timestamp", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let providerStartedAt: number | undefined;
 		const mock = createMockModel({
 			// Real provider delay: the session's internal settle timers use the
 			// platform clock, so fake timers would freeze both the submission and
 			// the (buggy) emission stamp identically — a genuine delay is the only
 			// way to separate the two and prove the entry carries the submission.
 			handler: async () => {
+				providerStartedAt ??= Date.now();
 				await Bun.sleep(150);
 				return { content: ["Done"] };
 			},
@@ -533,9 +535,15 @@ describe("AgentSession synthetic follow-up marking", () => {
 			await session.waitForIdle();
 			const entry = sessionManager.getEntries().find(entry => entry.type === "custom_message");
 			expect(entry).toBeDefined();
-			const entryMs = new Date((entry as { timestamp: string }).timestamp).getTime();
-			// The entry carries the submission instant, not the post-run emission.
-			expect(entryMs - submittedAt).toBeLessThan(50);
+			if (!entry) throw new Error("expected a custom_message entry");
+			const entryMs = new Date(entry.timestamp).getTime();
+			// The entry carries the submission instant, not the post-run emission:
+			// it is stamped before the provider request starts, and the emission
+			// would land at least the provider's 150 ms later. Ordering, not a
+			// wall-clock window, so a loaded host cannot fail it.
+			expect(providerStartedAt).toBeDefined();
+			expect(entryMs).toBeGreaterThanOrEqual(submittedAt);
+			expect(entryMs).toBeLessThanOrEqual(providerStartedAt!);
 		} finally {
 			await session.dispose();
 		}

@@ -3444,6 +3444,15 @@ mod tests {
 				"--init",
 				"--recursive",
 			]);
+			// Submodule clones get no local identity; tests that commit in them
+			// must not depend on the runner's global gitconfig.
+			git(&linked, &[
+				"submodule",
+				"foreach",
+				"--quiet",
+				"--recursive",
+				"git config user.name Proof && git config user.email proof.invalid",
+			]);
 		}
 		linked
 	}

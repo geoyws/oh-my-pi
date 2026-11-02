@@ -1,3 +1,4 @@
+import { filterChildEnv } from "@oh-my-pi/pi-utils/child-env";
 import { resolveExecutablePath } from "../../subprocess/worker-client";
 
 /** Exit code and captured output of one Bun package-manager invocation. */
@@ -19,7 +20,8 @@ export interface BunCliResult {
 export async function runBunCli(args: readonly string[], cwd: string): Promise<BunCliResult> {
 	const proc = Bun.spawn([resolveExecutablePath(), ...args], {
 		cwd,
-		env: { ...Bun.env, BUN_BE_BUN: "1" },
+		// Package install scripts run here: allowlisted env only (kb omp t-2b5e0f2c).
+		env: { ...filterChildEnv(Bun.env), BUN_BE_BUN: "1" },
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",

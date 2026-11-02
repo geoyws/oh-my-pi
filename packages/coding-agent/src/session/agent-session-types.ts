@@ -214,6 +214,12 @@ export interface AgentSessionConfig {
 	 * slow-verdict boundary runs in milliseconds; production never sets it.
 	 */
 	unexpectedStopJudgeTimeoutMs?: number;
+	/**
+	 * Surface a refused model-endpoint connection instead of auto-retrying it.
+	 * `createAgentSession` passes its `failFastOnRefusedEndpoint` option; the CLI
+	 * sets it for print mode (`omp -p`). Default: false.
+	 */
+	failFastOnRefusedEndpoint?: boolean;
 	/** Prewalk from the starting model to a fast/cheap target after implementation begins. */
 	prewalk?: Prewalk;
 	/** Keep `prewalk.auto` away from this session until `/new` (`--no-prewalk`). */

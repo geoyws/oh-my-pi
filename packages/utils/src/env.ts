@@ -3,7 +3,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { parseEnv } from "node:util";
 import { getAgentDir, getConfigRootDir, getProjectDir, refreshDirsFromEnv } from "./dirs";
+import { fingerprintProjectRoutingEnv, isProjectRoutingEnvName, isProjectSurfaceTrusted } from "./project-trust";
+import { isBunTestRuntime } from "./test-runtime";
 
+export * from "./test-runtime";
 export * from "./worker-host";
 
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -288,7 +291,22 @@ export function parseEnvFile(filePath: string): Record<string, string> {
 const homeEnv = parseEnvFile(path.join(os.homedir(), ".env"));
 const piEnv = parseEnvFile(path.join(getConfigRootDir(), ".env"));
 const agentEnv = parseEnvFile(path.join(getAgentDir(), ".env"));
-const projectEnv = parseEnvFile(path.join(getProjectDir(), ".env"));
+const projectDir = getProjectDir();
+const projectEnvFile = parseEnvFile(path.join(projectDir, ".env"));
+// A repository's .env must not redirect provider, proxy or OAuth traffic (or
+// move OMP's own config dirs) until the user approves that exact content with
+// `omp trust` (kb omp t-f77ec1f5). The home directory's .env is the user's own.
+const projectEnvTrusted =
+	path.resolve(projectDir) === path.resolve(os.homedir()) ||
+	isProjectSurfaceTrusted(projectDir, "env", fingerprintProjectRoutingEnv(projectEnvFile));
+/** Routing names a project `.env` defines that were NOT applied because the project's env is unapproved. */
+export const untrustedProjectRoutingEnvNames: readonly string[] = projectEnvTrusted
+	? []
+	: Object.keys(projectEnvFile).filter(isProjectRoutingEnvName);
+const projectEnv: Record<string, string> = {};
+for (const key in projectEnvFile) {
+	if (projectEnvTrusted || !isProjectRoutingEnvName(key)) projectEnv[key] = projectEnvFile[key]!;
+}
 
 for (const key of Object.keys(Bun.env)) {
 	const value = Bun.env[key];
@@ -376,15 +394,6 @@ export function $envpos(name: string, defaultValue: number): number {
 	const parsed = Number.parseInt(raw, 10);
 	if (Number.isNaN(parsed) || parsed <= 0) return defaultValue;
 	return parsed;
-}
-
-const BUN_TEST_ENTRY_PATTERN = /[._](?:test|spec)\.[cm]?[jt]sx?$/;
-
-/** True when the process is an explicitly marked test child or Bun is running a test entrypoint. */
-export function isBunTestRuntime(): boolean {
-	if (Bun.env.PI_TEST_RUNTIME === "1") return true;
-	const hasTestEnvironment = Bun.env.BUN_ENV === "test" || Bun.env.NODE_ENV === "test";
-	return hasTestEnvironment && BUN_TEST_ENTRY_PATTERN.test(Bun.main);
 }
 
 let terminalHeadless = isBunTestRuntime();

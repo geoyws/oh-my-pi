@@ -399,6 +399,135 @@ describe("AuthStorage model usage health", () => {
 		await expect(health).rejects.toThrow("usage fetch aborted");
 		pending.resolve(report("key-1", [limit("short", 0.2)]));
 	});
+
+	function windowedLimit(id: string, usedFraction: number, resetsAt: number | undefined): UsageLimit {
+		return {
+			...limit(id, usedFraction),
+			window: { id, label: id, ...(resetsAt === undefined ? {} : { resetsAt }) },
+		};
+	}
+
+	it("wakes an account only once every exhausted window has reset", async () => {
+		const now = Date.now();
+		const storage = await createStorage([oauthRow(1)], {
+			"account-1": report("account-1", [
+				windowedLimit("5-hour", 1, now + 60_000),
+				windowedLimit("7-day", 1, now + 3_600_000),
+				windowedLimit("monthly", 0.3, now + 30 * 86_400_000),
+			]),
+		});
+		const health = await storage.health.model("anthropic", { modelId: "claude", reserveFraction: 0.1 });
+		expect(health.state).toBe("depleted");
+		expect(health.accounts[0]).toMatchObject({
+			state: "depleted",
+			resetsAt: now + 3_600_000,
+			resetIsAuthoritative: true,
+		});
+	});
+
+	it.each([
+		["missing", undefined],
+		["non-finite", Number.POSITIVE_INFINITY],
+	])("never presents a wake as authoritative when an exhausted window's reset is %s", async (_kind, unknownReset) => {
+		const now = Date.now();
+		const storage = await createStorage([oauthRow(1)], {
+			"account-1": report("account-1", [
+				windowedLimit("5-hour", 1, now + 60_000),
+				windowedLimit("weekly", 1, unknownReset),
+			]),
+		});
+		const health = await storage.health.model("anthropic", { modelId: "claude", reserveFraction: 0.1 });
+		expect(health.state).toBe("depleted");
+		// The known reset is only a lower bound: the weekly window may outlast it.
+		expect(health.accounts[0]?.resetsAt).toBe(now + 60_000);
+		expect(health.accounts[0]?.resetIsAuthoritative).toBeUndefined();
+	});
+
+	it("does not report healthy from a report whose exhausted window outlived its reset", async () => {
+		const now = Date.now();
+		const staleReport = report("account-1", [
+			windowedLimit("5-hour", 1, now - 60_000),
+			windowedLimit("7-day", 0.2, now + 60_000),
+		]);
+		staleReport.fetchedAt = now - 120_000;
+		const storage = await createStorage([oauthRow(1)], { "account-1": staleReport });
+		const health = await storage.health.model("anthropic", { modelId: "claude", reserveFraction: 0.1 });
+		expect(health.state).toBe("unknown");
+		expect(health.accounts[0]?.state).toBe("unknown");
+	});
+
+	it("blocks on an exhausted hard-scope window the reserve scope omits", async () => {
+		const now = Date.now();
+		const storage = new AuthStorage(makeStore([oauthRow(1)]), {
+			usageProviderResolver: provider =>
+				provider === "anthropic"
+					? makeUsageProvider({
+							"account-1": report("account-1", [
+								windowedLimit("5-hour", 0.2, now + 60_000),
+								windowedLimit("credits", 1, now + 600_000),
+							]),
+						})
+					: undefined,
+			rankingStrategyResolver: provider =>
+				provider === "anthropic"
+					? {
+							...strategy,
+							scopeLimitsForReserve: usage => usage.limits.filter(entry => entry.id === "5-hour"),
+						}
+					: undefined,
+			configValueResolver: async value => value,
+		});
+		await storage.credentials.reload();
+		storages.push(storage);
+		const health = await storage.health.model("anthropic", { modelId: "claude", reserveFraction: 0.1 });
+		expect(health.state).toBe("depleted");
+		expect(health.accounts[0]).toMatchObject({ resetsAt: now + 600_000, resetIsAuthoritative: true });
+	});
+
+	it("reports only the accounts a restricted session may use", async () => {
+		const storage = await createStorage([oauthRow(1), oauthRow(2)], {
+			"account-1": report("account-1", [limit("short", 1)]),
+			"account-2": report("account-2", [limit("short", 0.2)]),
+		});
+		storage.sessions.restrict("anthropic", "child", ["account:account-1"]);
+		const restricted = await storage.health.model("anthropic", {
+			modelId: "claude",
+			sessionId: "child",
+			reserveFraction: 0.1,
+		});
+		expect(restricted.state).toBe("depleted");
+		expect(restricted.accounts.map(account => account.credentialId)).toEqual([1]);
+
+		const unrestricted = await storage.health.model("anthropic", { modelId: "claude", reserveFraction: 0.1 });
+		expect(unrestricted.state).toBe("healthy");
+	});
+
+	it("trusts a block deadline only when the provider timed it and a complete report agrees", async () => {
+		const storage = await createStorage([oauthRow(1), oauthRow(2)], {
+			"account-1": report("account-1", [limit("short", 1)]),
+			"account-2": report("account-2", [limit("short", 0.2)]),
+		});
+		const timed = await storage.limits.markReached("anthropic", undefined, {
+			credentialId: 1,
+			modelId: "claude",
+			retryAfterMs: 120_000,
+			providerTimed: true,
+		});
+		const heuristic = await storage.limits.markReached("anthropic", undefined, {
+			credentialId: 2,
+			modelId: "claude",
+		});
+		const health = await storage.health.model("anthropic", { modelId: "claude", reserveFraction: 0.1 });
+		const [timedAccount, heuristicAccount] = health.accounts;
+		// The provider-stated 120s outlasts the 60s window, so the block decides the wake.
+		expect(timedAccount).toMatchObject({
+			state: "depleted",
+			resetsAt: timed.blockedUntilMs,
+			resetIsAuthoritative: true,
+		});
+		expect(heuristicAccount).toMatchObject({ state: "depleted", resetsAt: heuristic.blockedUntilMs });
+		expect(heuristicAccount?.resetIsAuthoritative).toBeUndefined();
+	});
 });
 
 function sqliteCorruptError(): Error & { code: string } {

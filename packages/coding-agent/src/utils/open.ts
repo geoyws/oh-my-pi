@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
 import { $which, isWsl, logger } from "@oh-my-pi/pi-utils";
@@ -122,4 +123,59 @@ export function openPath(urlOrPath: string): void {
 			// Ignore — awaiting the subprocess is best-effort telemetry.
 		},
 	);
+}
+
+/** How long the private redirect file outlives the opener; the browser has read it by then. */
+const CAPABILITY_REDIRECT_TTL_MS = 60_000;
+
+function escapeHtmlAttribute(value: string): string {
+	return value.replaceAll("&", "&amp;").replaceAll('"', "&quot;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+
+/**
+ * Open a URL that carries a capability (e.g. `?token=`) without putting it in the opener's argv,
+ * which any local user can read from the process table. The URL goes into a `0600` HTML file in a
+ * fresh `0700` directory that redirects the browser to it; only that file's path reaches the
+ * opener. The directory is deleted after a minute, or at exit if sooner. Best-effort, never throws.
+ */
+export function openCapabilityUrl(capabilityUrl: string): void {
+	let dir: string;
+	let file: string;
+	try {
+		dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-open-"));
+		fs.chmodSync(dir, 0o700);
+		file = path.join(dir, "open.html");
+		const attribute = escapeHtmlAttribute(capabilityUrl);
+		const script = JSON.stringify(capabilityUrl).replaceAll("<", "\\u003c");
+		fs.writeFileSync(
+			file,
+			`<!doctype html><meta charset="utf-8"><meta name="referrer" content="no-referrer"><meta http-equiv="refresh" content="0;url=${attribute}"><script>location.replace(${script})</script><a href="${attribute}">Open</a>\n`,
+			{ mode: 0o600, flag: "wx" },
+		);
+	} catch (error) {
+		logger.warn("Failed to stage capability URL for opening", {
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return;
+	}
+	const remove = () => {
+		process.off("exit", remove);
+		clearTimeout(timer);
+		fs.rmSync(dir, { recursive: true, force: true });
+	};
+	const timer = setTimeout(remove, CAPABILITY_REDIRECT_TTL_MS);
+	timer.unref();
+	process.on("exit", remove);
+	openPath(file);
+}
+
+/** Open `href` like {@link openPath}, unless it is an http(s) URL carrying `?token=`: those go through {@link openCapabilityUrl}. */
+export function openLink(href: string): void {
+	let carriesToken = false;
+	try {
+		const parsed = new URL(href);
+		carriesToken = (parsed.protocol === "http:" || parsed.protocol === "https:") && parsed.searchParams.has("token");
+	} catch {}
+	if (carriesToken) openCapabilityUrl(href);
+	else openPath(href);
 }

@@ -3701,6 +3701,11 @@ export interface ShellFsStatFs {
 export interface ShellOptions {
   /** Environment variables to apply once per session. */
   sessionEnv?: Record<string, string>
+  /**
+   * Use `sessionEnv` as the whole environment instead of an overlay on this
+   * process's environment (default false).
+   */
+  replaceHostEnv?: boolean
   /** Optional snapshot file to source on session creation. */
   snapshotPath?: string
   /** Optional per-command output minimizer configuration. */

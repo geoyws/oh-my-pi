@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import { approveProjectForTest } from "./helpers/project-trust";
 
 const CLI_ENTRY = path.join(import.meta.dir, "..", "src", "cli.ts");
 
@@ -77,6 +78,8 @@ describe("omp read skill resources", () => {
 				},
 			}),
 		);
+		// Project MCP servers start only once approved (kb omp t-f77ec1f5).
+		await approveProjectForTest(projectDir, agentDir);
 
 		const local = await runReadProbe("skill://standalone-skill;skill://standalone-skill/SKILL.md");
 		expect(local.exitCode).toBe(0);

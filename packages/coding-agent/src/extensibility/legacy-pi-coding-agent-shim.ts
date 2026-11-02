@@ -895,10 +895,14 @@ export class DefaultPackageManager {
 	/** Resolve enabled extension paths with their OMP plugin provenance. */
 	async resolve(_onMissing?: (source: string) => Promise<MissingSourceAction>): Promise<ResolvedPaths> {
 		const settings = await this.#settingsManager;
-		const configuredPaths = cfgExtensions.get(settings);
+		const settingsPaths = cfgExtensions.get(settings);
+		// A project settings file's `extensions:` loads only under project trust (kb omp t-f77ec1f5).
+		const fromProject = settings.extensionsSourceLevel() === "project";
 		const disabledExtensionIds = cfgDisabledExtensions.get(settings);
 		const [extensionPaths, plugins] = await Promise.all([
-			discoverExtensionPaths(configuredPaths, this.#cwd, disabledExtensionIds),
+			discoverExtensionPaths(fromProject ? [] : settingsPaths, this.#cwd, disabledExtensionIds, {
+				projectConfiguredPaths: fromProject ? settingsPaths : [],
+			}),
 			getEnabledPlugins(this.#cwd),
 		]);
 		const pluginByExtensionPath = new Map<string, ScopedInstalledPlugin>();

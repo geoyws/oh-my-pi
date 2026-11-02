@@ -111,7 +111,7 @@ describe("/copy slash command", () => {
 
 describe("/open slash command", () => {
 	it("opens the last assistant link with the system opener", async () => {
-		const openSpy = spyOn(opener, "openPath").mockImplementation(() => {});
+		const openSpy = spyOn(opener, "openLink").mockImplementation(() => {});
 		const harness = createRuntimeHarness([
 			assistantText("older https://example.com/old"),
 			assistantText(
@@ -127,7 +127,7 @@ describe("/open slash command", () => {
 	});
 
 	it("reports when there is no link and rejects unknown arguments", async () => {
-		const openSpy = spyOn(opener, "openPath").mockImplementation(() => {});
+		const openSpy = spyOn(opener, "openLink").mockImplementation(() => {});
 		const harness = createRuntimeHarness([assistantText("no links")]);
 
 		expect(await executeBuiltinSlashCommand("/open", harness.runtime)).toBe(true);
@@ -135,5 +135,23 @@ describe("/open slash command", () => {
 
 		expect(await executeBuiltinSlashCommand("/open code", harness.runtime)).toBe(true);
 		expect(openSpy).not.toHaveBeenCalled();
+	});
+
+	it("never hands a link's capability token to the system opener's argv", async () => {
+		const argv: string[][] = [];
+		spyOn(Bun, "spawn").mockImplementation(((cmd: string[]) => {
+			argv.push(cmd);
+			return { pid: 1, exited: Promise.resolve(0), kill: () => true };
+		}) as unknown as typeof Bun.spawn);
+		const capability = "sample-capability";
+		const harness = createRuntimeHarness([
+			assistantText(`Trace: http://127.0.0.1:3847/?${new URLSearchParams({ token: capability })}#/traces`),
+		]);
+
+		expect(await executeBuiltinSlashCommand("/open", harness.runtime)).toBe(true);
+
+		expect(argv).toHaveLength(1);
+		expect(argv[0]!.join(" ")).not.toContain(capability);
+		expect(argv[0]!.at(-1)).toEndWith("open.html");
 	});
 });

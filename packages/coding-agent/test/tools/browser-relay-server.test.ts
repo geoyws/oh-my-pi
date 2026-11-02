@@ -16,6 +16,10 @@ const EXTENSION_HELLO = {
 	attachedTabIds: [],
 } as const;
 
+/** Test capability; never the user's real token file. */
+const CDP_TOKEN = "t".repeat(43);
+const AUTH = `token=${CDP_TOKEN}`;
+
 async function rawGet(port: number, requestBytes: string): Promise<string> {
 	const { promise, resolve, reject } = Promise.withResolvers<string>();
 	let response = "";
@@ -90,7 +94,7 @@ async function connectExtension(port: number): Promise<WebSocket> {
 async function waitForDiscovery(port: number): Promise<void> {
 	const deadline = Date.now() + 1_000;
 	while (Date.now() < deadline) {
-		const response = await fetch(`http://127.0.0.1:${port}/json/version`);
+		const response = await fetch(`http://127.0.0.1:${port}/json/version?${AUTH}`);
 		if (response.status === 200) return;
 	}
 	throw new Error("Relay discovery endpoint did not become ready");
@@ -109,46 +113,117 @@ describe("browser relay discovery endpoint", () => {
 
 	async function startReadyRelay(): Promise<number> {
 		const port = await findFreeCdpPort();
-		relay = startRelayServer({ port });
+		relay = startRelayServer({ port, cdpToken: CDP_TOKEN });
 		extension = await connectExtension(port);
 		await waitForDiscovery(port);
 		return port;
 	}
 
-	it("advertises the requested Host authority so a remote Puppeteer client dials the relay", async () => {
+	/** The advertised WebSocket URL carries a relay ticket, never the capability token. */
+	function expectTicketedCdpUrl(url: string, authority: string): void {
+		expect(url).toStartWith(`ws://${authority}/cdp?ticket=`);
+		expect(url).not.toContain(CDP_TOKEN);
+	}
+
+	it("advertises the requested Host authority, with a ticket, so a remote Puppeteer client dials the relay", async () => {
 		const port = await startReadyRelay();
 		const response = await rawGet(
 			port,
-			"GET /json/version HTTP/1.1\r\nHost: 100.100.92.97:12803\r\nConnection: close\r\n\r\n",
+			`GET /json/version?${AUTH} HTTP/1.1\r\nHost: 100.100.92.97:12803\r\nConnection: close\r\n\r\n`,
 		);
-		expect(parseVersion(response).webSocketDebuggerUrl).toBe("ws://100.100.92.97:12803/cdp");
+		expectTicketedCdpUrl(parseVersion(response).webSocketDebuggerUrl, "100.100.92.97:12803");
 	});
 
 	it("uses the loopback discovery URL when an HTTP/1.0 request has no Host header", async () => {
 		const port = await startReadyRelay();
-		const response = await rawGet(port, "GET /json/version HTTP/1.0\r\n\r\n");
-		expect(parseVersion(response).webSocketDebuggerUrl).toBe(`ws://127.0.0.1:${port}/cdp`);
+		const response = await rawGet(port, `GET /json/version?${AUTH} HTTP/1.0\r\n\r\n`);
+		expectTicketedCdpUrl(parseVersion(response).webSocketDebuggerUrl, `127.0.0.1:${port}`);
 	});
 
 	it("uses the loopback discovery URL when Host is empty", async () => {
 		const port = await startReadyRelay();
-		const response = await rawGet(port, "GET /json/version HTTP/1.1\r\nHost: \r\nConnection: close\r\n\r\n");
-		expect(parseVersion(response).webSocketDebuggerUrl).toBe(`ws://127.0.0.1:${port}/cdp`);
+		const response = await rawGet(port, `GET /json/version?${AUTH} HTTP/1.1\r\nHost: \r\nConnection: close\r\n\r\n`);
+		expectTicketedCdpUrl(parseVersion(response).webSocketDebuggerUrl, `127.0.0.1:${port}`);
 	});
 
-	it("uses the loopback discovery URL when Host would produce an unusable WebSocket authority", async () => {
+	it("refuses a Host that names a domain, even with the capability (DNS rebinding)", async () => {
 		const port = await startReadyRelay();
-		const response = await rawGet(
-			port,
-			"GET /json/version HTTP/1.1\r\nHost: bad/host@evil\r\nConnection: close\r\n\r\n",
-		);
-		expect(parseVersion(response).webSocketDebuggerUrl).toBe(`ws://127.0.0.1:${port}/cdp`);
+		for (const host of ["evil.example:9224", "127.0.0.1.nip.io:9224", "bad/host@evil"]) {
+			const response = await rawGet(
+				port,
+				`GET /json/version?${AUTH} HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`,
+			);
+			expect(response).toStartWith("HTTP/1.1 403");
+		}
+	});
+
+	it("refuses discovery without the capability or with a wrong one, before and after the extension connects", async () => {
+		const port = await findFreeCdpPort();
+		relay = startRelayServer({ port, cdpToken: CDP_TOKEN });
+		const unauthorized = async () => {
+			for (const query of ["", "?token=", `?token=${"x".repeat(43)}`]) {
+				for (const path of ["/json/version", "/json", "/json/list"]) {
+					const response = await fetch(`http://127.0.0.1:${port}${path}${query}`);
+					expect(response.status).toBe(401);
+					const body = await response.text();
+					expect(body).not.toContain(CDP_TOKEN);
+					expect(body).not.toContain("webSocketDebuggerUrl");
+				}
+			}
+		};
+		await unauthorized();
+		extension = await connectExtension(port);
+		await waitForDiscovery(port);
+		await unauthorized();
+	});
+
+	it("accepts the capability as a Bearer header on discovery", async () => {
+		const port = await startReadyRelay();
+		const response = await fetch(`http://127.0.0.1:${port}/json/list`, {
+			headers: { Authorization: `Bearer ${CDP_TOKEN}` },
+		});
+		expect(response.status).toBe(200);
+	});
+
+	it("refuses discovery from a web page (any Origin), even with the capability", async () => {
+		const port = await startReadyRelay();
+		const response = await fetch(`http://127.0.0.1:${port}/json/version?${AUTH}`, {
+			headers: { Origin: "http://127.0.0.1:8080" },
+		});
+		expect(response.status).toBe(403);
+	});
+
+	it("refuses a /cdp WebSocket without the capability or with a forged ticket, and reuses the advertised URL", async () => {
+		const port = await startReadyRelay();
+		const opens = async (url: string) => {
+			const socket = new WebSocket(url);
+			const outcome = Promise.withResolvers<"open" | "refused">();
+			socket.addEventListener("open", () => outcome.resolve("open"), { once: true });
+			socket.addEventListener("error", () => outcome.resolve("refused"), { once: true });
+			const result = await outcome.promise;
+			socket.close();
+			return result;
+		};
+		for (const query of ["", `?token=${"x".repeat(43)}`, "?ticket=forged.forged", "?ticket="]) {
+			expect(await opens(`ws://127.0.0.1:${port}/cdp${query}`)).toBe("refused");
+			expect(relay!.bridge.cdpClientCount).toBe(0);
+		}
+		const advertised = (await (await fetch(`http://127.0.0.1:${port}/json/version?${AUTH}`)).json()) as {
+			webSocketDebuggerUrl: string;
+		};
+		// Puppeteer's tab workers reconnect through the same advertised URL.
+		expect(await opens(advertised.webSocketDebuggerUrl)).toBe("open");
+		expect(await opens(advertised.webSocketDebuggerUrl)).toBe("open");
+		// A ticket whose signature was altered is refused.
+		const ticket = new URL(advertised.webSocketDebuggerUrl).searchParams.get("ticket")!;
+		const [id, signature] = ticket.split(".");
+		expect(await opens(`ws://127.0.0.1:${port}/cdp?ticket=${id}.${signature!.slice(1)}x`)).toBe("refused");
 	});
 
 	it("reports 503 with extensionSeen=false while no extension has ever handshaken", async () => {
 		const port = await findFreeCdpPort();
-		relay = startRelayServer({ port });
-		const response = await fetch(`http://127.0.0.1:${port}/json/version`);
+		relay = startRelayServer({ port, cdpToken: CDP_TOKEN });
+		const response = await fetch(`http://127.0.0.1:${port}/json/version?${AUTH}`);
 		expect(response.status).toBe(503);
 		const info = (await response.json()) as RelayUnavailableInfo;
 		expect(info.extensionSeen).toBeFalse();
@@ -159,9 +234,9 @@ describe("browser relay discovery endpoint", () => {
 		const port = await startReadyRelay();
 		extension!.close();
 		const deadline = Date.now() + 1_000;
-		let response = await fetch(`http://127.0.0.1:${port}/json/version`);
+		let response = await fetch(`http://127.0.0.1:${port}/json/version?${AUTH}`);
 		while (response.status !== 503 && Date.now() < deadline) {
-			response = await fetch(`http://127.0.0.1:${port}/json/version`);
+			response = await fetch(`http://127.0.0.1:${port}/json/version?${AUTH}`);
 		}
 		expect(response.status).toBe(503);
 		const info = (await response.json()) as RelayUnavailableInfo;
@@ -172,9 +247,9 @@ describe("browser relay discovery endpoint", () => {
 
 	it("reports how many CDP clients are connected, both while waiting for the extension and once ready", async () => {
 		const port = await findFreeCdpPort();
-		relay = startRelayServer({ port });
+		relay = startRelayServer({ port, cdpToken: CDP_TOKEN });
 		const discovery = async () => {
-			const response = await fetch(`http://127.0.0.1:${port}/json/version`);
+			const response = await fetch(`http://127.0.0.1:${port}/json/version?${AUTH}`);
 			const body: unknown = await response.json();
 			return {
 				status: response.status,
@@ -182,7 +257,7 @@ describe("browser relay discovery endpoint", () => {
 			};
 		};
 		expect(await discovery()).toEqual({ status: 503, clients: 0 });
-		const client = new WebSocket(`ws://127.0.0.1:${port}/cdp`);
+		const client = new WebSocket(`ws://127.0.0.1:${port}/cdp?${AUTH}`);
 		const opened = Promise.withResolvers<void>();
 		client.addEventListener("open", () => opened.resolve(), { once: true });
 		await opened.promise;

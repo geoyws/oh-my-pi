@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import { logger, Snowflake, workerHostEntry } from "@oh-my-pi/pi-utils";
+import { filterChildEnv } from "@oh-my-pi/pi-utils/child-env";
 import {
 	createWorkerHandle,
 	createWorkerSubprocess,
@@ -1085,7 +1086,8 @@ function spawnBunWorker(): JsEvalWorkerHandle {
 function spawnJsProcess(): JsEvalWorkerHandle {
 	const spawned = createWorkerSubprocess<WorkerOutbound>({
 		spawnCommand: resolveWorkerSpawnCmd(JS_EVAL_PROCESS_ARG),
-		env: workerEnvFromParent(),
+		// Agent-written JS runs in this worker: allowlisted env only (kb omp t-2b5e0f2c).
+		env: filterChildEnv(workerEnvFromParent()),
 		exitLabel: "JS eval worker",
 		detached: shouldDetachKernel(process.platform),
 		reportCleanExit: true,

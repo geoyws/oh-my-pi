@@ -5,11 +5,14 @@ import * as path from "node:path";
 import { encodeArchive } from "../src/ar";
 import {
 	BrowserPlatform,
+	compareBuildIds,
 	computeExecutablePath,
 	detectBrowserPlatform,
 	getDownloadUrl,
 	install,
+	pruneStaleBuilds,
 } from "../src/browsers";
+import { acquireFileLock } from "../src/file-lock";
 
 const BUILD_ID = "123.0.6312.58";
 const ROOTS: string[] = [];
@@ -260,3 +263,85 @@ networkTest(
 	},
 	300_000,
 );
+
+describe("pruneStaleBuilds", () => {
+	const DAY_MS = 24 * 60 * 60 * 1000;
+	const KEEP = "156.0.8078.47";
+
+	async function seedBuild(root: string, buildId: string, installedDaysAgo = 0): Promise<string> {
+		const executable = computeExecutablePath({ platform: BrowserPlatform.MAC_ARM, buildId, cacheDir: root });
+		await fs.mkdir(path.dirname(executable), { recursive: true });
+		await fs.writeFile(executable, "chrome");
+		const installPath = path.join(root, "chrome", `${BrowserPlatform.MAC_ARM}-${buildId}`);
+		const installedAt = new Date(Date.now() - installedDaysAgo * DAY_MS);
+		await fs.utimes(installPath, installedAt, installedAt);
+		return installPath;
+	}
+
+	test("after the grace period removes only older builds no running browser uses", async () => {
+		const root = await makeRoot();
+		const current = await seedBuild(root, KEEP, 8);
+		const stale = await seedBuild(root, "150.0.7871.24");
+		const running = await seedBuild(root, "149.0.7800.10");
+		const newer = await seedBuild(root, "157.0.8100.1");
+		const removed = await pruneStaleBuilds({
+			cacheDir: root,
+			keepBuildId: KEEP,
+			graceMs: 7 * DAY_MS,
+			isInUse: installPath => installPath === running,
+		});
+		expect(removed).toEqual([stale]);
+		expect(await fs.exists(stale)).toBe(false);
+		for (const kept of [current, running, newer]) expect(await fs.exists(kept)).toBe(true);
+	});
+
+	test("keeps older builds until the current build has been installed for the grace period", async () => {
+		const root = await makeRoot();
+		await seedBuild(root, KEEP, 6);
+		const stale = await seedBuild(root, "150.0.7871.24", 30);
+		expect(
+			await pruneStaleBuilds({ cacheDir: root, keepBuildId: KEEP, graceMs: 7 * DAY_MS, isInUse: () => false }),
+		).toEqual([]);
+		expect(await fs.exists(stale)).toBe(true);
+	});
+
+	test("prunes nothing when the current build is not installed", async () => {
+		const root = await makeRoot();
+		const stale = await seedBuild(root, "150.0.7871.24", 30);
+		expect(await pruneStaleBuilds({ cacheDir: root, keepBuildId: KEEP, graceMs: 0, isInUse: () => false })).toEqual(
+			[],
+		);
+		expect(await fs.exists(stale)).toBe(true);
+	});
+
+	test("leaves a build whose install lock another holder owns", async () => {
+		const root = await makeRoot();
+		await seedBuild(root, KEEP);
+		const installing = await seedBuild(root, "150.0.7871.24");
+		const lock = await acquireFileLock(`${installing}.install`);
+		try {
+			expect(
+				await pruneStaleBuilds({ cacheDir: root, keepBuildId: KEEP, graceMs: 0, isInUse: () => false }),
+			).toEqual([]);
+			expect(await fs.exists(installing)).toBe(true);
+		} finally {
+			lock.release();
+		}
+	});
+
+	test("an empty cache prunes nothing", async () => {
+		const root = await makeRoot();
+		expect(await pruneStaleBuilds({ cacheDir: root, keepBuildId: KEEP, graceMs: 0, isInUse: () => false })).toEqual(
+			[],
+		);
+	});
+});
+
+describe("compareBuildIds", () => {
+	test("orders dotted build ids numerically, not lexically", () => {
+		expect(compareBuildIds("150.0.7871.24", "156.0.8078.47")).toBe(-1);
+		expect(compareBuildIds("156.0.10000.1", "156.0.8078.47")).toBe(1);
+		expect(compareBuildIds("156.0.8078.47", "156.0.8078.47")).toBe(0);
+		expect(compareBuildIds("156.0.8078", "156.0.8078.0")).toBe(0);
+	});
+});

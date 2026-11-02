@@ -13,7 +13,7 @@ const clientFiles = {
 	"favicon.ico": await Bun.file(path.resolve(import.meta.dir, "../src/client/favicon.ico")).bytes(),
 };
 
-async function startEmbeddedDashboard(): Promise<{ url: string; tmpDir: string }> {
+async function startEmbeddedDashboard(): Promise<{ url: string; tmpDir: string; token: string }> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-stats-embedded-"));
 	tempDirs.push(root);
 	const tmpDir = path.join(root, "tmp");
@@ -36,8 +36,10 @@ async function startEmbeddedDashboard(): Promise<{ url: string; tmpDir: string }
 	await Bun.write(
 		entrypoint,
 		`import { startServer } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/server.ts"))};
+import { getStatsDashboardTokenPath } from ${JSON.stringify(path.resolve(import.meta.dir, "../../utils/src/dirs.ts"))};
+import { loadOrCreateCapabilityToken } from ${JSON.stringify(path.resolve(import.meta.dir, "../../utils/src/local-capability.ts"))};
 const server = await startServer(0);
-process.stdout.write(JSON.stringify({ url: "http://" + server.hostname + ":" + server.port }));`,
+process.stdout.write(JSON.stringify({ url: "http://" + server.hostname + ":" + server.port, token: loadOrCreateCapabilityToken(getStatsDashboardTokenPath()) }));`,
 	);
 	const child = Bun.spawn([process.execPath, "--preload", preload, entrypoint], {
 		cwd: root,
@@ -67,8 +69,8 @@ process.stdout.write(JSON.stringify({ url: "http://" + server.hostname + ":" + s
 	if (ready.done) {
 		throw new Error(`Dashboard failed to start: ${await new Response(child.stderr).text()}`);
 	}
-	const { url }: { url: string } = JSON.parse(new TextDecoder().decode(ready.value));
-	return { url, tmpDir };
+	const { url, token }: { url: string; token: string } = JSON.parse(new TextDecoder().decode(ready.value));
+	return { url, tmpDir, token };
 }
 
 afterEach(async () => {
@@ -80,10 +82,10 @@ afterEach(async () => {
 });
 
 test("embedded dashboard serves its assets and SPA routes after temporary files are removed", async () => {
-	const { url, tmpDir } = await startEmbeddedDashboard();
-	const initial = await fetch(url);
+	const { url, tmpDir, token } = await startEmbeddedDashboard();
+	const auth = { Authorization: `Bearer ${token}` };
+	const initial = await fetch(url, { headers: auth });
 	expect(initial.status).toBe(200);
-	expect(await initial.text()).toBe(clientFiles["index.html"]);
 
 	// Model OS cleanup while the server remains alive, without touching the real TMPDIR.
 	await fs.rm(tmpDir, { recursive: true, force: true });
@@ -97,7 +99,7 @@ test("embedded dashboard serves its assets and SPA routes after temporary files 
 	] as const;
 	await Promise.all(
 		requests.map(async ({ route, file, mime }) => {
-			const response = await fetch(url + route);
+			const response = await fetch(url + route, { headers: auth });
 			expect(response.status).toBe(200);
 			expect(response.headers.get("content-type")).toStartWith(mime);
 			const expected = clientFiles[file];

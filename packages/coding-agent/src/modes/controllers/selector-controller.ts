@@ -102,7 +102,7 @@ import { sanitizeErrorLine } from "@oh-my-pi/pi-tui/chrome/error-block";
 import { ToolAbortError } from "../../tools/tool-errors";
 import { captureBrowserSession } from "../../utils/browser-session";
 import { copyToClipboard } from "../../utils/clipboard";
-import { openPath } from "../../utils/open";
+import { openLink, openPath } from "../../utils/open";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 import { getAssistantMessageLinkTargets } from "@oh-my-pi/pi-tui/prompt/interactive-context-helpers";
 import { type AdvisorConfigDeps, AdvisorConfigOverlayComponent } from "@oh-my-pi/pi-tui/overlays/advisor-config";
@@ -120,12 +120,9 @@ import { createExtensionDashboardRuntime } from "../components/extensions/dashbo
 import { HistorySearchComponent } from "@oh-my-pi/pi-tui/overlays/history-search";
 import type { LoginDialogComponent as LoginDialogComponentType } from "@oh-my-pi/pi-tui/overlays/login-dialog";
 import type { LogoutAccountSelectorComponent as LogoutAccountSelectorComponentType } from "@oh-my-pi/pi-tui/overlays/logout-account-selector";
-import type {
-	ModelHubComponent as ModelHubComponentType,
-	ModelRoleSelectionScope,
-} from "@oh-my-pi/pi-tui/overlays/model-hub";
+import { ModelHubComponent, type ModelRoleSelectionScope } from "@oh-my-pi/pi-tui/overlays/model-hub";
 import { createModelBrowserSource } from "../model-browser-source";
-import type { ModelPickerComponent as ModelPickerComponentType } from "@oh-my-pi/pi-tui/overlays/model-picker";
+import { ModelPickerComponent } from "@oh-my-pi/pi-tui/overlays/model-picker";
 import type { OAuthSelectorComponent as OAuthSelectorComponentType } from "@oh-my-pi/pi-tui/overlays/oauth-selector";
 import { PluginSelectorComponent } from "@oh-my-pi/pi-tui/overlays/plugin-selector";
 import { type ResetUsageAccount, ResetUsageSelectorComponent } from "@oh-my-pi/pi-tui/overlays/reset-usage-selector";
@@ -158,19 +155,6 @@ import {
 	cfgTreeFilterMode,
 } from "../settings";
 import { cfgTaskAgentModelOverrides } from "../../task/settings";
-
-interface ModelOverlayModules {
-	ModelHubComponent: typeof ModelHubComponentType;
-	ModelPickerComponent: typeof ModelPickerComponentType;
-}
-
-/** Synchronous first-use boundary for model overlays; key callbacks require immediate mounting. */
-function loadModelOverlayComponents(): ModelOverlayModules {
-	return {
-		ModelHubComponent: require("@oh-my-pi/pi-tui/overlays/model-hub.js").ModelHubComponent,
-		ModelPickerComponent: require("@oh-my-pi/pi-tui/overlays/model-picker.js").ModelPickerComponent,
-	};
-}
 
 interface ProviderAuthUiModules {
 	PASTE_CODE_LOGIN_PROVIDERS: typeof PasteCodeLoginProviders;
@@ -843,7 +827,6 @@ export class SelectorController {
 			closeOpenMenu("model-picker-select");
 			if (this.#focusOpenMenu("model-picker")) return;
 		}
-		const { ModelPickerComponent } = loadModelOverlayComponents();
 		const viewed = this.ctx.viewSession;
 		const currentContextTokens = viewed.getContextUsage()?.tokens ?? 0;
 		const current = viewed.model;
@@ -963,7 +946,6 @@ export class SelectorController {
 	 */
 	#showModelHub(hubOptions: { initialProviderId?: string }): void {
 		if (this.#focusOpenMenu("model-hub")) return;
-		const { ModelHubComponent } = loadModelOverlayComponents();
 		let closed = false;
 		const done = () => {
 			// Re-entrant guard: cancel paths (Esc, login forward) may race;
@@ -997,8 +979,8 @@ export class SelectorController {
 					try {
 						this.ctx.settings.assertModelRoleWritable(role);
 						if (role === "default") {
-							// `auto` on the default role configures the active session. Other roles
-							// persist an explicit `:auto` suffix and must not mutate the current model.
+							// Project roles own their effort suffix, including `:auto`. Global
+							// default auto uses defaultThinkingLevel; neither changes other roles.
 							const isAuto = thinkingLevel === AUTO_THINKING;
 							const concreteThinking = isAuto || thinkingLevel === undefined ? undefined : thinkingLevel;
 							const effectiveProvenance = this.ctx.settings.getModelRoleProvenance("default");
@@ -1028,15 +1010,8 @@ export class SelectorController {
 							} else if (shadowedProject) {
 								this.ctx.settings.setProjectModelRole(
 									"default",
-									formatModelSelectorValue(selectorValue, concreteThinking),
+									formatModelSelectorValue(selectorValue, thinkingLevel),
 								);
-								if (isAuto) {
-									if (this.ctx.settings.isGlobalConfigReadOnly()) {
-										cfgDefaultThinkingLevel.override(this.ctx.settings, AUTO_THINKING);
-									} else {
-										cfgDefaultThinkingLevel.set(this.ctx.settings, AUTO_THINKING);
-									}
-								}
 							} else {
 								const session = this.ctx.session;
 								const roleThinking = isAuto ? ThinkingLevel.Inherit : concreteThinking;
@@ -1089,13 +1064,13 @@ export class SelectorController {
 									if (targetScope === "project") {
 										this.ctx.settings.setProjectModelRole(
 											"default",
-											formatModelSelectorValue(selectorValue, concreteThinking),
+											formatModelSelectorValue(selectorValue, thinkingLevel),
 										);
 									}
 									if (liveThinking) {
 										session.setThinkingLevel(
 											liveThinking,
-											isAuto && !this.ctx.settings.isGlobalConfigReadOnly(),
+											isAuto && targetScope === "global" && !this.ctx.settings.isGlobalConfigReadOnly(),
 										);
 									}
 									this.ctx.statusLine.invalidate();
@@ -1110,10 +1085,10 @@ export class SelectorController {
 									} else {
 										this.ctx.settings.setProjectModelRole(
 											"default",
-											formatModelSelectorValue(selectorValue, concreteThinking),
+											formatModelSelectorValue(selectorValue, thinkingLevel),
 										);
 									}
-									if (isAuto && !this.ctx.settings.isGlobalConfigReadOnly()) {
+									if (isAuto && targetScope === "global" && !this.ctx.settings.isGlobalConfigReadOnly()) {
 										cfgDefaultThinkingLevel.set(this.ctx.settings, AUTO_THINKING);
 									}
 									// Already on the model mid-turn: no switch is queued, but the
@@ -1638,7 +1613,7 @@ export class SelectorController {
 			},
 			onOpen: (href, label) => {
 				done();
-				openPath(href);
+				openLink(href);
 				this.ctx.showStatus(`Opening ${label}: ${href}`);
 			},
 			onCancel: done,

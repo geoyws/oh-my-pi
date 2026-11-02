@@ -102,19 +102,27 @@ async fn set_shell_working_dir_if_changed(shell: &mut BrushShell, cwd: &str) -> 
 
 #[derive(Clone)]
 struct ShellConfig {
-	session_env:   Option<HashMap<String, String>>,
-	snapshot_path: Option<String>,
-	minimizer:     Option<minimizer::MinimizerConfig>,
-	filesystem:    Fs,
+	session_env:      Option<HashMap<String, String>>,
+	/// Seed the session from this process's environment before `session_env`.
+	/// `false` makes `session_env` the whole environment.
+	inherit_host_env: bool,
+	snapshot_path:    Option<String>,
+	minimizer:        Option<minimizer::MinimizerConfig>,
+	filesystem:       Fs,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ShellOptions {
-	pub session_env:   Option<HashMap<String, String>>,
-	pub snapshot_path: Option<String>,
-	pub minimizer:     Option<minimizer::MinimizerOptions>,
+	pub session_env:      Option<HashMap<String, String>>,
+	/// Make `session_env` the session's whole environment instead of an
+	/// overlay on this process's environment. Callers that filter credentials
+	/// out of the child environment need this, or the host copy brings them
+	/// back (kb omp t-2b5e0f2c).
+	pub replace_host_env: bool,
+	pub snapshot_path:    Option<String>,
+	pub minimizer:        Option<minimizer::MinimizerOptions>,
 	/// Filesystem backing every run of the session (native by default).
-	pub filesystem:    Fs,
+	pub filesystem:       Fs,
 }
 
 struct ShellRunConfig {
@@ -209,10 +217,11 @@ impl Shell {
 	pub fn new(options: Option<ShellOptions>) -> Self {
 		let config = match options {
 			None => ShellConfig {
-				session_env:   None,
-				snapshot_path: None,
-				minimizer:     None,
-				filesystem:    Fs::native(),
+				session_env:      None,
+				inherit_host_env: true,
+				snapshot_path:    None,
+				minimizer:        None,
+				filesystem:       Fs::native(),
 			},
 			Some(opt) => {
 				let minimizer = opt
@@ -221,6 +230,7 @@ impl Shell {
 					.map(minimizer::MinimizerConfig::from_options);
 				ShellConfig {
 					session_env: opt.session_env,
+					inherit_host_env: !opt.replace_host_env,
 					snapshot_path: opt.snapshot_path,
 					minimizer,
 					filesystem: opt.filesystem,
@@ -342,10 +352,11 @@ pub async fn execute_shell(
 		.as_ref()
 		.map(minimizer::MinimizerConfig::from_options);
 	let config = ShellConfig {
-		session_env:   options.session_env,
-		snapshot_path: options.snapshot_path,
-		minimizer:     minimizer.clone(),
-		filesystem:    options.filesystem,
+		session_env:      options.session_env,
+		inherit_host_env: true,
+		snapshot_path:    options.snapshot_path,
+		minimizer:        minimizer.clone(),
+		filesystem:       options.filesystem,
 	};
 	let run_config = ShellRunConfig {
 		command: options.command,
@@ -381,10 +392,11 @@ pub async fn execute_shell_streams(
 	cancel_token: CancelToken,
 ) -> Result<ShellExecuteResult> {
 	let config = ShellConfig {
-		session_env:   options.session_env,
-		snapshot_path: options.snapshot_path,
-		minimizer:     None,
-		filesystem:    options.filesystem,
+		session_env:      options.session_env,
+		inherit_host_env: true,
+		snapshot_path:    options.snapshot_path,
+		minimizer:        None,
+		filesystem:       options.filesystem,
 	};
 	let run_config = ShellRunConfig {
 		command:    options.command,
@@ -923,7 +935,11 @@ async fn create_session_for_run(
 		shell.register_builtin("git", git);
 	}
 
-	copy_env_into_shell(&mut shell, std::env::vars_os())?;
+	// The builder above does not inherit; a caller that filtered the child
+	// environment (`replace_host_env`) gets exactly `session_env`.
+	if config.inherit_host_env {
+		copy_env_into_shell(&mut shell, std::env::vars_os())?;
+	}
 
 	if let Some(env) = config.session_env.as_ref() {
 		for (key, value) in env {
@@ -2501,10 +2517,11 @@ mod tests {
 			.map(|key| (key.to_string(), short_str.clone()))
 			.collect();
 		let config = ShellConfig {
-			session_env:   Some(env),
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      Some(env),
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 
@@ -2568,10 +2585,11 @@ mod tests {
 	#[cfg(unix)]
 	async fn kill_test_context() -> (ShellSessionCore, ExecutionParameters) {
 		let config = ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let session = create_session(&config).await.expect("create_session");
 		let mut params = session.shell.default_exec_params();
@@ -2630,10 +2648,11 @@ mod tests {
 		terminal_stdin: &fs::File,
 	) -> (ShellSessionCore, ExecutionParameters) {
 		let config = ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 		session.shell.options_mut().enable_job_control = true;
@@ -2701,10 +2720,11 @@ mod tests {
 		std::fs::remove_dir(dir.path()).expect("delete process cwd");
 
 		let config = ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let session = create_session(&config)
 			.await
@@ -2840,10 +2860,11 @@ mod tests {
 		env.insert("GIT_DIR".to_string(), "/primary/.git".to_string());
 		env.insert("OMP_GIT_ENV_PROBE".to_string(), "kept".to_string());
 		let config = ShellConfig {
-			session_env:   Some(env),
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      Some(env),
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 
@@ -2863,6 +2884,51 @@ mod tests {
 			.expect("run_string");
 
 		assert_eq!(fs::read_to_string(&out).expect("probe output"), "unset|kept");
+	}
+
+	/// With `inherit_host_env: false` the session env is the whole environment:
+	/// a variable only this process has (a credential the agent filtered out)
+	/// stays invisible to the shell and its children (kb omp t-2b5e0f2c).
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn replaced_host_env_hides_process_only_variables() {
+		assert!(
+			std::env::var_os("CARGO_MANIFEST_DIR").is_some(),
+			"cargo sets CARGO_MANIFEST_DIR for test binaries; the probe needs a host-only variable"
+		);
+		let dir = tempfile::tempdir().expect("probe directory");
+		let out = dir.path().join("probe");
+		let mut env = HashMap::new();
+		env.insert("OMP_ENV_PROBE".to_string(), "kept".to_string());
+		if let Some(path) = std::env::var_os("PATH").and_then(|p| p.into_string().ok()) {
+			env.insert("PATH".to_string(), path);
+		}
+		let config = ShellConfig {
+			session_env:      Some(env),
+			inherit_host_env: false,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
+		};
+		let mut session = create_session(&config).await.expect("create_session");
+
+		let mut params = session.shell.default_exec_params();
+		params.set_fd(OpenFiles::STDIN_FD, null_file().expect("null stdin"));
+		params.set_fd(OpenFiles::STDOUT_FD, null_file().expect("null stdout"));
+		params.set_fd(OpenFiles::STDERR_FD, null_file().expect("null stderr"));
+
+		let command = format!(
+			"printf '%s|%s|%s' \"${{CARGO_MANIFEST_DIR-unset}}\" \"$OMP_ENV_PROBE\" \"$(sh -c \
+			 'printf %s \"${{CARGO_MANIFEST_DIR-unset}}\"')\" > {}",
+			quote_arg(out.to_str().expect("utf8 probe path"))
+		);
+		session
+			.shell
+			.run_string(command, &SourceInfo::from("pi-natives:test"), &params)
+			.await
+			.expect("run_string");
+
+		assert_eq!(fs::read_to_string(&out).expect("probe output"), "unset|kept|unset");
 	}
 
 	/// Waits until `pid` runs as `expected`. Each poll walks the whole process
@@ -4395,10 +4461,11 @@ mod tests {
 		std::fs::write(root.join("c"), b"different").expect("write c");
 
 		let config = ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 		session
@@ -4437,10 +4504,11 @@ mod tests {
 		let root = std::fs::canonicalize(dir.path()).expect("canonical temp dir");
 
 		let config = ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 		session
@@ -4519,10 +4587,11 @@ mod tests {
 		std::fs::write(tmp.join("in.txt"), &input).expect("write input");
 
 		let config = ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 		session
@@ -4588,10 +4657,11 @@ mod tests {
 		let tmp_str = tmp.to_str().expect("utf8 temp path");
 
 		let config = ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 		session
@@ -4640,10 +4710,11 @@ mod tests {
 		let tmp_str = tmp.to_str().expect("utf8 temp path");
 
 		let config = ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 		session
@@ -4704,10 +4775,11 @@ mod tests {
 		std::fs::create_dir_all(&tmp).expect("temp dir");
 
 		let config = ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 		session
@@ -4852,10 +4924,11 @@ mod tests {
 		std::fs::create_dir_all(&tmp).expect("temp dir");
 
 		let config = ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 		session
@@ -4931,10 +5004,11 @@ mod tests {
 		let mut env = HashMap::new();
 		env.insert("HOME".to_string(), home.to_string_lossy().to_string());
 		let config = ShellConfig {
-			session_env:   Some(env),
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      Some(env),
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 		session
@@ -4979,10 +5053,11 @@ mod tests {
 		let tmp_str = tmp.to_str().expect("utf8 temp path");
 
 		let config = ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 		session
@@ -5031,10 +5106,11 @@ mod tests {
 		let tmp_str = tmp.to_str().expect("utf8 temp path");
 
 		let config = ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 		session
@@ -5091,10 +5167,11 @@ mod tests {
 		let tmp_str = tmp.to_str().expect("utf8 temp path");
 
 		let config = ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 		session
@@ -5142,10 +5219,11 @@ mod tests {
 		let tmp_str = tmp.to_str().expect("utf8");
 
 		let config = ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 		session.shell.set_working_dir(tmp_str).await.expect("cwd");
@@ -5248,10 +5326,11 @@ mod tests {
 		let tmp_str = tmp.to_str().expect("utf8");
 
 		let config = ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 		session.shell.set_working_dir(tmp_str).await.expect("cwd");
@@ -5326,10 +5405,11 @@ mod tests {
 		let tmp_str = tmp.to_str().expect("utf8");
 
 		let config = ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 		session.shell.set_working_dir(tmp_str).await.expect("cwd");
@@ -5439,10 +5519,11 @@ mod tests {
 		let tmp_str = tmp.to_str().expect("utf8");
 
 		let config = ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 		session.shell.set_working_dir(tmp_str).await.expect("cwd");
@@ -5498,10 +5579,11 @@ mod tests {
 		let tmp_str = tmp.to_str().expect("utf8");
 
 		let config = ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 		session.shell.set_working_dir(tmp_str).await.expect("cwd");
@@ -5562,10 +5644,11 @@ mod tests {
 		let tmp_str = tmp.to_str().expect("utf8");
 
 		let config = ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 		session.shell.set_working_dir(tmp_str).await.expect("cwd");
@@ -5611,10 +5694,11 @@ mod tests {
 		let tmp_str = tmp.to_str().expect("utf8");
 
 		let config = ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 		session.shell.set_working_dir(tmp_str).await.expect("cwd");
@@ -5651,10 +5735,11 @@ mod tests {
 		let tmp_str = tmp.to_str().expect("utf8");
 
 		let config = ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 		session.shell.set_working_dir(tmp_str).await.expect("cwd");
@@ -5743,10 +5828,11 @@ mod tests {
 		let tmp_str = tmp.to_str().expect("utf8");
 
 		let config = ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 		session.shell.set_working_dir(tmp_str).await.expect("cwd");
@@ -5917,10 +6003,11 @@ mod tests {
 		let tmp_str = tmp.to_str().expect("utf8");
 
 		let config = ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 		session.shell.set_working_dir(tmp_str).await.expect("cwd");
@@ -5972,10 +6059,11 @@ mod tests {
 		let tmp_str = tmp.to_str().expect("utf8");
 
 		let config = ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 		session.shell.set_working_dir(tmp_str).await.expect("cwd");
@@ -6019,10 +6107,11 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn uutils_head_stdin_read_is_cancellable() {
 		let config = ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 
@@ -6073,18 +6162,20 @@ mod tests {
 				.map(|(k, v)| ((*k).to_string(), (*v).to_string()))
 				.collect();
 			ShellConfig {
-				session_env:   Some(map),
-				snapshot_path: None,
-				minimizer:     None,
-				filesystem:    Fs::native(),
+				session_env:      Some(map),
+				inherit_host_env: true,
+				snapshot_path:    None,
+				minimizer:        None,
+				filesystem:       Fs::native(),
 			}
 		};
 
 		let mut default = create_session(&ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		})
 		.await
 		.expect("create_session");
@@ -6972,10 +7063,11 @@ replace = [{ pattern = "^.+$", replacement = "PWD" }]
 
 		// Build the same kind of session pi-natives uses in production.
 		let config = ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 
@@ -7406,10 +7498,11 @@ replace = [{ pattern = "^.+$", replacement = "PWD" }]
 		assert!(host_sid >= 0, "getsid(0) failed: {}", std::io::Error::last_os_error());
 
 		let config = ShellConfig {
-			session_env:   None,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
+			session_env:      None,
+			inherit_host_env: true,
+			snapshot_path:    None,
+			minimizer:        None,
+			filesystem:       Fs::native(),
 		};
 		let mut session = create_session(&config).await.expect("create_session");
 

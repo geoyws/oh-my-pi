@@ -20,6 +20,69 @@ import type {
 
 const API_BASE = "/api";
 
+/**
+ * The page's credential. `omp stats` opens `/?token=<launch secret>` (valid only
+ * while that dashboard runs, never the user's reusable capability); the page
+ * strips it from the address bar and at once swaps it (`POST /api/session`) for
+ * the listener's session secret, which also dies when that dashboard stops. Only
+ * the session secret is stored (this origin's localStorage): an origin is just
+ * host and port, so a later listener on the same port could read it, and a
+ * dead secret is worth nothing to it.
+ */
+const SESSION_STORAGE_KEY = "omp-stats-session";
+let sessionPromise: Promise<string | null> | undefined;
+
+/** The page's session secret, adopted once; the entry point calls this before rendering. */
+export function dashboardSession(): Promise<string | null> {
+	sessionPromise ??= adoptSession();
+	return sessionPromise;
+}
+
+async function adoptSession(): Promise<string | null> {
+	if (typeof window === "undefined" || !window.location?.href) return null;
+	const url = new URL(window.location.href);
+	const launched = url.searchParams.get("token");
+	if (launched === null) {
+		try {
+			return window.localStorage.getItem(SESSION_STORAGE_KEY);
+		} catch {
+			return null;
+		}
+	}
+	url.searchParams.delete("token");
+	window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
+	const res = await fetch(`${API_BASE}/session`, { method: "POST", headers: { Authorization: `Bearer ${launched}` } });
+	if (!res.ok) return null;
+	const body: unknown = await res.json();
+	const session =
+		typeof body === "object" && body !== null && "session" in body && typeof body.session === "string"
+			? body.session
+			: null;
+	if (session) {
+		try {
+			window.localStorage.setItem(SESSION_STORAGE_KEY, session);
+		} catch {
+			// Storage unavailable: the session lasts for this page only.
+		}
+	}
+	return session;
+}
+
+/** `init` with the session bearer header added. */
+async function withAuth(init?: RequestInit): Promise<RequestInit | undefined> {
+	const session = await dashboardSession();
+	if (!session) return init;
+	const headers = new Headers(init?.headers);
+	headers.set("Authorization", `Bearer ${session}`);
+	return { ...init, headers };
+}
+
+/** URL of the live event stream; EventSource cannot send headers, so the session rides in the query. */
+export async function eventStreamUrl(): Promise<string> {
+	const session = await dashboardSession();
+	return session ? `${API_BASE}/events?session=${encodeURIComponent(session)}` : `${API_BASE}/events`;
+}
+
 export class ApiError extends Error {
 	status: number;
 	endpoint: string;
@@ -64,7 +127,7 @@ async function fetchJson<T>(endpoint: string, options?: RequestInit, previous?: 
 		headers.set("If-None-Match", etag);
 		init = { ...options, headers };
 	}
-	const res = await fetch(endpoint, init);
+	const res = await fetch(endpoint, await withAuth(init));
 	if (res.status === 304 && etag) return previous as T;
 	if (!res.ok) {
 		throw new ApiError(res.status, endpoint, await readErrorMessage(res, endpoint));

@@ -17,6 +17,7 @@ import * as path from "node:path";
 import { expandWindowsLongPath } from "@oh-my-pi/pi-natives/path";
 import { engines, version } from "../package.json" with { type: "json" };
 import { isEnoent, isEnotdir } from "./fs-error";
+import { isBunTestRuntime } from "./test-runtime";
 
 /** App name (e.g. "omp") */
 export const APP_NAME: string = "omp";
@@ -655,9 +656,27 @@ export function getReportsDir(): string {
 	return dirs.rootSubdir("reports", "state");
 }
 
-/** Get the logs directory (~/.omp/logs). */
+/**
+ * Get the logs directory (~/.omp/logs). `bun test` processes get
+ * `<tmpdir>/omp-test-logs-<uid>` instead, so suites never write into the
+ * developer's real logs; the uid suffix (as for the test session-owners dir)
+ * keeps users of a shared `/tmp` from owning each other's directory.
+ */
 export function getLogsDir(): string {
+	if (isBunTestRuntime()) {
+		const uid = typeof process.getuid === "function" ? process.getuid() : os.userInfo().username;
+		return path.join(os.tmpdir(), `omp-test-logs-${uid}`);
+	}
 	return dirs.rootSubdir("logs", "state");
+}
+
+/**
+ * Get the private directory `PI_REQ_DEBUG=1` writes request/response dumps to
+ * (~/.omp/debug-requests). Dumps hold prompts and provider responses, so they
+ * never go to the working tree.
+ */
+export function getRequestDebugDir(): string {
+	return dirs.rootSubdir("debug-requests", "state");
 }
 
 /**
@@ -791,6 +810,23 @@ export function getPuppeteerDir(): string {
 /** Get the browser relay extension install directory (~/.omp/browser-relay). */
 export function getBrowserRelayDir(): string {
 	return dirs.rootSubdir("browser-relay", "data");
+}
+
+/**
+ * Get the browser relay's CDP capability token file. Profile-independent: the
+ * relay port is machine-global, so every profile's client must present the
+ * token the one relay checks.
+ */
+export function getBrowserRelayCdpTokenPath(): string {
+	return dirs.baseRootSubdir(path.join("run", "browser-relay-cdp.token"), "state");
+}
+
+/**
+ * Get the stats dashboard's capability token file. Profile-independent: the
+ * dashboard port is shared, and any profile's omp may reuse a running one.
+ */
+export function getStatsDashboardTokenPath(): string {
+	return dirs.baseRootSubdir(path.join("run", "stats-dashboard.token"), "state");
 }
 
 /** Get the profile root for Chromium browsers the browser tool spawns via `app.path` (~/.omp/browser-profiles). */

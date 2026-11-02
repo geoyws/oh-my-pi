@@ -8,7 +8,7 @@ import { formatKeyHint } from "@oh-my-pi/pi-tui/key-hint-format";
 import { truncateToWidth } from "@oh-my-pi/pi-tui/utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { openStandaloneJudge } from "../judgment/standalone";
-import { openPath } from "../utils/open";
+import { openCapabilityUrl } from "../utils/open";
 
 /**
  * Single-line TTY progress bar. On a non-TTY stream we just stay quiet -
@@ -71,12 +71,12 @@ export async function runStatsCommand(cmd: StatsCommandArgs): Promise<void> {
 	// Lazy import to avoid loading stats module when not needed
 	const {
 		closeDb,
-		formatStatsDashboardUrl,
 		getDashboardStats,
 		getTotalMessageCount,
 		printStatsSummary,
 		refreshRollups,
 		startServer,
+		statsDashboardLaunchUrl,
 		syncAllSessions,
 	} = await import("@oh-my-pi/omp-stats");
 
@@ -104,11 +104,11 @@ export async function runStatsCommand(cmd: StatsCommandArgs): Promise<void> {
 	const { hostname, port } = await startServer(cmd.port, cmd.host, {
 		judge: async () => (await openStandaloneJudge(cwd, "stats_frustration")).judge,
 	});
-	const url = formatStatsDashboardUrl(hostname, port);
+	const url = await statsDashboardLaunchUrl(hostname, port);
 	console.log(chalk.green(`Dashboard available at: ${url}`));
 
-	// Open browser
-	openPath(url);
+	// Open browser (the URL carries the dashboard capability: keep it out of the opener's argv)
+	openCapabilityUrl(url);
 
 	console.log(`Press ${formatKeyHint("ctrl+c")} to stop\n`);
 

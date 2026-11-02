@@ -97,7 +97,12 @@ function resultForLatestPrompt(messages: ReadonlyArray<{ role: string; content: 
 }
 
 /** Starts an idle child with an accepted result and records subsequent parent deliveries. */
-async function spawnKeptAliveChild(options?: { handler?: MockHandler; structured?: boolean; enableIrc?: boolean }) {
+async function spawnKeptAliveChild(options?: {
+	handler?: MockHandler;
+	structured?: boolean;
+	enableIrc?: boolean;
+	interruptMode?: "immediate" | "wait";
+}) {
 	// Under the isolated HOME: project discovery walks up from cwd and stops at os.homedir(). On Windows
 	// os.tmpdir() lives under the real home, so a cwd outside the fake HOME would walk into the real
 	// ~/.omp and load the developer's installed plugins as project plugins.
@@ -155,6 +160,7 @@ async function spawnKeptAliveChild(options?: { handler?: MockHandler; structured
 				"todo.reminders": false,
 				"advisor.enabled": false,
 				modelRoles: { default: "mock/mock-model" },
+				...(options?.interruptMode ? { interruptMode: options.interruptMode } : {}),
 			}),
 			enableLsp: false,
 			enableMCP: false,
@@ -232,6 +238,10 @@ it("publishes a consumed parent injection during a peer wake without publishing 
 	const child = await spawnKeptAliveChild({
 		structured: false,
 		enableIrc: true,
+		// The blocked peer request has streamed nothing, so in "immediate" mode the
+		// parent steer may cancel and consume it at any moment after receipt. "wait"
+		// holds the steer until the peer response ends, so receipt is observable.
+		interruptMode: "wait",
 		handler: async () => {
 			request++;
 			if (request === 1) return { content: ["INITIAL_FINAL"] };
@@ -282,6 +292,48 @@ it("publishes a consumed parent injection during a peer wake without publishing 
 		expect(await Bun.file(child.artifact).text()).toContain("NEGATIVE_FINAL");
 		expect(child.deliveries).toHaveLength(2);
 		expect(manager.getAllJobs({ ownerId: PARENT_ID })).toHaveLength(2);
+	} finally {
+		releasePeer.resolve();
+		child.close();
+	}
+}, 15_000);
+
+it("publishes a parent injection that cancels a peer wake request before it streams", async () => {
+	const peerStarted = Promise.withResolvers<void>();
+	const releasePeer = Promise.withResolvers<void>();
+	let request = 0;
+	const child = await spawnKeptAliveChild({
+		structured: false,
+		enableIrc: true,
+		handler: async () => {
+			request++;
+			if (request === 1) return { content: ["INITIAL_FINAL"] };
+			if (request === 2) {
+				peerStarted.resolve();
+				// Never released while the turn runs: only the steer can end this request.
+				await releasePeer.promise;
+				return { content: ["PEER_INTERMEDIATE"] };
+			}
+			return { content: ["INJECTED_FINAL"] };
+		},
+	});
+	try {
+		const bus = IrcBus.global();
+		const peer = await bus.send({ from: "Peer", to: AGENT_ID, body: "Can you check?" });
+		expect(peer.outcome).toBe("woken");
+		await peerStarted.promise;
+		const parent = await bus.send({ from: PARENT_ID, to: AGENT_ID, body: "Publish the follow-up" });
+		expect(parent.outcome).toBe("injected");
+		// Default "immediate" mode: the steer cancels the silent peer request and is consumed.
+		await child.session.waitForIdle();
+		await child.session.waitForIrcReplies();
+		await manager.waitForOwnerJobs(PARENT_ID);
+		await manager.drainDeliveries({ filter: { ownerId: PARENT_ID } });
+		expect(JSON.stringify(child.mock.calls.at(-1)?.context.messages)).toContain("Publish the follow-up");
+		expect(await Bun.file(child.artifact).text()).toContain("INJECTED_FINAL");
+		expect(child.deliveries).toHaveLength(1);
+		expect(child.deliveries[0]).toContain("INJECTED_FINAL");
+		expect(manager.getAllJobs({ ownerId: PARENT_ID })).toHaveLength(1);
 	} finally {
 		releasePeer.resolve();
 		child.close();

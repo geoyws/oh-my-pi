@@ -15,6 +15,7 @@ import {
 	setProjectDir,
 } from "@oh-my-pi/pi-utils";
 import { createInteractiveModeContext, createMcpManagerStub } from "./helpers/interactive-mode-context";
+import { approveProjectForTest } from "./helpers/project-trust";
 
 const originalProjectDir = getProjectDir();
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -63,6 +64,8 @@ async function writeProjectConfig(projectDir: string, servers: Record<string, MC
 			2,
 		)}\n`,
 	);
+	// Project MCP servers start only once approved; toggling one keeps the approval (kb omp t-f77ec1f5).
+	await approveProjectForTest(projectDir);
 }
 
 describe("/mcp enable and disable", () => {

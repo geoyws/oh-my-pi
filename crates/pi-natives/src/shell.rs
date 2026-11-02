@@ -111,22 +111,26 @@ impl From<MinimizerOptions> for minimizer::MinimizerOptions {
 #[napi(object, object_to_js = false)]
 pub struct ShellOptions {
 	/// Environment variables to apply once per session.
-	pub session_env:   Option<HashMap<String, String>>,
+	pub session_env:      Option<HashMap<String, String>>,
+	/// Use `sessionEnv` as the whole environment instead of an overlay on this
+	/// process's environment (default false).
+	pub replace_host_env: Option<bool>,
 	/// Optional snapshot file to source on session creation.
-	pub snapshot_path: Option<String>,
+	pub snapshot_path:    Option<String>,
 	/// Optional per-command output minimizer configuration.
-	pub minimizer:     Option<MinimizerOptions>,
+	pub minimizer:        Option<MinimizerOptions>,
 	/// Filesystem backing every run of this session (native when absent).
-	pub filesystem:    Option<ShellFilesystem>,
+	pub filesystem:       Option<ShellFilesystem>,
 }
 
 impl From<ShellOptions> for CoreShellOptions {
 	fn from(value: ShellOptions) -> Self {
 		Self {
-			session_env:   value.session_env,
-			snapshot_path: value.snapshot_path,
-			minimizer:     value.minimizer.map(Into::into),
-			filesystem:    value.filesystem.map_or_default(ShellFilesystem::into_fs),
+			session_env:      value.session_env,
+			replace_host_env: value.replace_host_env.unwrap_or(false),
+			snapshot_path:    value.snapshot_path,
+			minimizer:        value.minimizer.map(Into::into),
+			filesystem:       value.filesystem.map_or_default(ShellFilesystem::into_fs),
 		}
 	}
 }

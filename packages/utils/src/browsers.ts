@@ -3,7 +3,7 @@ import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type ArchiveLimits, extractArchive } from "./ar";
-import { withFileLock } from "./file-lock";
+import { tryAcquireFileLock, withFileLock } from "./file-lock";
 
 const CHROME_FOR_TESTING_BASE_URL = "https://storage.googleapis.com/chrome-for-testing-public";
 // Installation is outside browser/Eval operation deadlines, but a stalled CDN
@@ -160,6 +160,80 @@ export async function install(options: InstallOptions): Promise<InstalledBrowser
 		},
 		{ retries: Math.ceil(DOWNLOAD_TIMEOUT_MS / 100) + 1, retryDelayMs: 100 },
 	);
+}
+
+/** Inputs for removing managed Chrome builds older than the current one. */
+export interface PruneStaleBuildsOptions {
+	cacheDir: string;
+	/** Build that stays installed; only builds with a lower version are removed. */
+	keepBuildId: string;
+	/**
+	 * Older builds stay until the kept build has been installed this long. An
+	 * omp process still on the older pin caches its build's path for its whole
+	 * life, so pruning waits for those processes to have restarted.
+	 */
+	graceMs: number;
+	/** True when a running process executes from this install directory; such a build is kept. */
+	isInUse: (installPath: string) => boolean;
+}
+
+/** Numeric dotted-version comparison of two Chrome build ids (e.g. `150.0.7871.24`). */
+export function compareBuildIds(a: string, b: string): number {
+	const left = a.split(".").map(Number);
+	const right = b.split(".").map(Number);
+	for (let i = 0; i < Math.max(left.length, right.length); i++) {
+		const diff = (left[i] ?? 0) - (right[i] ?? 0);
+		if (diff !== 0) return Math.sign(diff);
+	}
+	return 0;
+}
+
+/**
+ * Remove managed Chrome builds under `<cacheDir>/chrome` older than
+ * `keepBuildId`, once the kept build has been installed for `graceMs`. Newer
+ * builds (another omp version sharing the cache) are never touched. A build a
+ * running process still executes from is kept (deleting a live browser's
+ * bundle crashes its next tab or helper), and so is a build whose install lock
+ * another process holds, so pruning never races its installer. Returns the
+ * removed install directories.
+ */
+export async function pruneStaleBuilds(options: PruneStaleBuildsOptions): Promise<string[]> {
+	const chromeDir = path.join(options.cacheDir, "chrome");
+	let entries: string[];
+	try {
+		entries = await fsp.readdir(chromeDir);
+	} catch (error) {
+		if (isMissingPath(error)) return [];
+		throw error;
+	}
+	const builds: { installPath: string; buildId: string }[] = [];
+	let keptInstalledAt: number | undefined;
+	for (const entry of entries) {
+		const dash = entry.indexOf("-");
+		if (entry.startsWith(".") || dash < 1) continue;
+		const installPath = path.join(chromeDir, entry);
+		const stat = await fsp.stat(installPath);
+		if (!stat.isDirectory()) continue;
+		const buildId = entry.slice(dash + 1);
+		if (buildId === options.keepBuildId) keptInstalledAt = Math.max(keptInstalledAt ?? 0, stat.mtimeMs);
+		else builds.push({ installPath, buildId });
+	}
+	if (keptInstalledAt === undefined || Date.now() - keptInstalledAt < options.graceMs) return [];
+	const removed: string[] = [];
+	for (const { installPath, buildId } of builds) {
+		const comparable = /^\d+(\.\d+)*$/.test(buildId);
+		if (!comparable || compareBuildIds(buildId, options.keepBuildId) >= 0 || options.isInUse(installPath)) continue;
+		// A held lock means an installer is publishing this build right now; leave it.
+		const lock = tryAcquireFileLock(`${installPath}.install`);
+		if (!lock) continue;
+		try {
+			await fsp.rm(installPath, { recursive: true, force: true });
+		} finally {
+			lock.release();
+		}
+		removed.push(installPath);
+	}
+	return removed;
 }
 
 function chromeArchivePlatform(platform: BrowserPlatform): string {

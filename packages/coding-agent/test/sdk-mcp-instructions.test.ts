@@ -21,6 +21,7 @@ import {
 	SERVER_INSTRUCTIONS,
 	TOOL_RESULT,
 } from "./fixtures/instructions-mcp";
+import { approveProjectForTest } from "./helpers/project-trust";
 
 // Contract: a deferred interactive (`hasUI`) session runs MCP discovery off the
 // first-paint path. Once the background connection completes, the resulting
@@ -102,18 +103,19 @@ describe("createAgentSession MCP server instructions (deferred UI)", () => {
 		}
 	});
 
-	beforeEach(() => {
+	/** Writes the project `.mcp.json` and approves it: project MCP servers start only once trusted (kb omp t-f77ec1f5). */
+	async function writeProjectMcp(mcpServers: Record<string, unknown>): Promise<void> {
+		await Bun.write(path.join(tempDir, ".mcp.json"), JSON.stringify({ mcpServers }));
+		await approveProjectForTest(tempDir);
+	}
+
+	beforeEach(async () => {
 		tempDir = path.join(os.tmpdir(), `pi-sdk-mcp-instr-${Snowflake.next()}`);
 		fs.mkdirSync(tempDir, { recursive: true });
 		spyOn(os, "homedir").mockReturnValue(isolatedHome);
-		fs.writeFileSync(
-			path.join(tempDir, ".mcp.json"),
-			JSON.stringify({
-				mcpServers: {
-					instr: { type: "stdio", command: process.execPath, args: [FIXTURE_PATH] },
-				},
-			}),
-		);
+		await writeProjectMcp({
+			instr: { type: "stdio", command: process.execPath, args: [FIXTURE_PATH] },
+		});
 	});
 
 	afterEach(() => {
@@ -124,14 +126,9 @@ describe("createAgentSession MCP server instructions (deferred UI)", () => {
 	});
 
 	it("omits an opted-out server's instructions and the empty heading, and keeps its tools", async () => {
-		await Bun.write(
-			path.join(tempDir, ".mcp.json"),
-			JSON.stringify({
-				mcpServers: {
-					instr: { type: "stdio", command: process.execPath, args: [FIXTURE_PATH], instructions: false },
-				},
-			}),
-		);
+		await writeProjectMcp({
+			instr: { type: "stdio", command: process.execPath, args: [FIXTURE_PATH], instructions: false },
+		});
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
@@ -160,15 +157,10 @@ describe("createAgentSession MCP server instructions (deferred UI)", () => {
 	}, 20_000);
 
 	it("keeps other servers' instructions when one server opts out", async () => {
-		await Bun.write(
-			path.join(tempDir, ".mcp.json"),
-			JSON.stringify({
-				mcpServers: {
-					instr: { type: "stdio", command: process.execPath, args: [FIXTURE_PATH], instructions: false },
-					other: { type: "stdio", command: process.execPath, args: [FIXTURE_PATH, "--other"] },
-				},
-			}),
-		);
+		await writeProjectMcp({
+			instr: { type: "stdio", command: process.execPath, args: [FIXTURE_PATH], instructions: false },
+			other: { type: "stdio", command: process.execPath, args: [FIXTURE_PATH, "--other"] },
+		});
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
@@ -273,18 +265,13 @@ describe("createAgentSession MCP server instructions (deferred UI)", () => {
 	}, 20_000);
 
 	it("renders a mounted Context Mode route when initialize omits instructions", async () => {
-		fs.writeFileSync(
-			path.join(tempDir, ".mcp.json"),
-			JSON.stringify({
-				mcpServers: {
-					"context-mode": {
-						type: "stdio",
-						command: process.execPath,
-						args: [FIXTURE_PATH, CONTEXT_MODE_NO_INSTRUCTIONS_MODE],
-					},
-				},
-			}),
-		);
+		await writeProjectMcp({
+			"context-mode": {
+				type: "stdio",
+				command: process.execPath,
+				args: [FIXTURE_PATH, CONTEXT_MODE_NO_INSTRUCTIONS_MODE],
+			},
+		});
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
@@ -325,18 +312,13 @@ describe("createAgentSession MCP server instructions (deferred UI)", () => {
 	}, 20_000);
 
 	it("bounds mounted route guidance deterministically and points to the live xd:// inventory", async () => {
-		fs.writeFileSync(
-			path.join(tempDir, ".mcp.json"),
-			JSON.stringify({
-				mcpServers: {
-					instr: {
-						type: "stdio",
-						command: process.execPath,
-						args: [FIXTURE_PATH, BOUNDED_GUIDANCE_MODE],
-					},
-				},
-			}),
-		);
+		await writeProjectMcp({
+			instr: {
+				type: "stdio",
+				command: process.execPath,
+				args: [FIXTURE_PATH, BOUNDED_GUIDANCE_MODE],
+			},
+		});
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
@@ -415,14 +397,9 @@ describe("createAgentSession MCP server instructions (deferred UI)", () => {
 	}, 20_000);
 
 	it("lists an inline-policy MCP tool whose docs overflow the cap once, on its route line", async () => {
-		await Bun.write(
-			path.join(tempDir, ".mcp.json"),
-			JSON.stringify({
-				mcpServers: {
-					instr: { type: "stdio", command: process.execPath, args: [FIXTURE_PATH, OVERSIZED_SCHEMA_MODE] },
-				},
-			}),
-		);
+		await writeProjectMcp({
+			instr: { type: "stdio", command: process.execPath, args: [FIXTURE_PATH, OVERSIZED_SCHEMA_MODE] },
+		});
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,

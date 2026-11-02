@@ -8,13 +8,16 @@ import { getCapability, initializeWithSettings } from "@oh-my-pi/pi-coding-agent
 import {
 	discoverAndLoadExtensions,
 	discoverExtensionPaths,
+	loadAmbientExtensionEntries,
 	loadExtensions,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { discoverSessionExtensionPaths } from "@oh-my-pi/pi-coding-agent/sdk";
-import { getProjectAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { getConfigRootDir, getProjectAgentDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { approveProjectSurfaces } from "@oh-my-pi/pi-utils/project-trust";
 import { filterUserScoped } from "./utils/filter-user-extensions";
 
 describe("extensions discovery", () => {
+	const originalAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
 	let tempDir: TempDir;
 	let extensionsDir: string;
 
@@ -22,12 +25,26 @@ describe("extensions discovery", () => {
 		tempDir = TempDir.createSync("@pi-ext-test-");
 		extensionsDir = path.join(getProjectAgentDir(tempDir.path()), "extensions");
 		fs.mkdirSync(extensionsDir, { recursive: true });
+		// Project-trust approvals land in the agent dir; keep them out of the real one.
+		setAgentDir(tempDir.join("agent"));
 		resetSettingsForTest();
 	});
 	afterEach(() => {
 		resetSettingsForTest();
+		if (originalAgentDirEnv) {
+			setAgentDir(originalAgentDirEnv);
+		} else {
+			setAgentDir(path.join(getConfigRootDir(), "agent"));
+			delete process.env.PI_CODING_AGENT_DIR;
+		}
 		tempDir.removeSync();
 	});
+
+	/** `omp trust` for the temp project's current extension code (kb omp t-f77ec1f5). */
+	const trustProjectExtensions = async () => {
+		const { projectFingerprint } = await loadAmbientExtensionEntries(tempDir.path());
+		approveProjectSurfaces(tempDir.path(), { extensions: projectFingerprint });
+	};
 
 	const discoverForTest = async (configuredPaths: string[] = [], ambient = false) => {
 		const paths = ambient ? configuredPaths : [extensionsDir, ...configuredPaths];
@@ -216,7 +233,8 @@ describe("extensions discovery", () => {
 					explicit: [],
 					mode: "merge",
 					configured: [inherited],
-					configuredLevel: "project",
+					// A project-level lane is gated by project trust (project-trust-gates.test.ts).
+					configuredLevel: "user",
 				}),
 			},
 			tempDir.path(),
@@ -477,6 +495,7 @@ describe("extensions discovery", () => {
 		fs.mkdirSync(realDir, { recursive: true });
 		fs.writeFileSync(path.join(realDir, "index.ts"), extensionCode);
 		fs.symlinkSync(realDir, path.join(extensionsDir, "weird.ts"), "dir");
+		await trustProjectExtensions();
 
 		const result = await discoverForTest([], true);
 
@@ -659,6 +678,7 @@ describe("extensions discovery", () => {
 				}
 			`,
 		);
+		await trustProjectExtensions();
 
 		const result = await discoverForTest([], true);
 		const loadedHook = result.extensions.find(extension => extension.path === hookPath);
@@ -679,6 +699,8 @@ describe("extensions discovery", () => {
 		);
 		const nativeExtensionPath = path.join(extensionsDir, "provider.ts");
 		fs.writeFileSync(nativeExtensionPath, extensionCode);
+		// Approval covers hooks too; a hook-less read-only discovery must still match it.
+		await trustProjectExtensions();
 
 		const paths = await discoverExtensionPaths([], tempDir.path(), undefined, {
 			ambient: true,
@@ -704,20 +726,26 @@ describe("extensions discovery", () => {
 				}
 			`,
 		);
+		// Approve first, then disable one module: disabling must not revoke the rest.
+		await trustProjectExtensions();
 
 		const settings = await Settings.init({
 			inMemory: true,
 			cwd: tempDir.path(),
 			overrides: { disabledExtensions: ["extension-module:guard"] },
 		});
-		initializeWithSettings(settings);
+		const release = initializeWithSettings(settings);
+		try {
+			const result = await discoverForTest([], true);
+			const loadedHook = result.extensions.find(extension => extension.path === hookPath);
 
-		const result = await discoverForTest([], true);
-		const loadedHook = result.extensions.find(extension => extension.path === hookPath);
-
-		expect(result.errors).toHaveLength(0);
-		expect(result.extensions.find(extension => extension.path === extensionPath)).toBeUndefined();
-		expect(loadedHook?.handlers.has("tool_call")).toBe(true);
+			expect(result.errors).toHaveLength(0);
+			expect(result.extensions.find(extension => extension.path === extensionPath)).toBeUndefined();
+			expect(loadedHook?.handlers.has("tool_call")).toBe(true);
+		} finally {
+			// The binding is process-global; a leaked disabled list skews later discovery tests.
+			release();
+		}
 	});
 
 	it("loadExtensions only loads explicit paths without discovery", async () => {

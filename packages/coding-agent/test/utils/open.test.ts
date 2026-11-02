@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { openPath } from "@oh-my-pi/pi-coding-agent/utils/open";
+import { openCapabilityUrl, openLink, openPath } from "@oh-my-pi/pi-coding-agent/utils/open";
 import * as piUtils from "@oh-my-pi/pi-utils";
 import type { Subprocess } from "bun";
 
@@ -230,5 +230,62 @@ describe("openPath", () => {
 			"External opener exited with non-zero status",
 			expect.objectContaining({ exitCode: 1 }),
 		);
+	});
+});
+
+describe("openCapabilityUrl", () => {
+	const capability = "sample-capability";
+	const capabilityUrl = `http://127.0.0.1:3847/?${new URLSearchParams({ token: capability, x: '"<y>' })}#/traces`;
+
+	it("hands the opener only a private redirect file, never the capability", () => {
+		setPlatform("darwin");
+		const spawnCalls: SpawnCall[] = [];
+		spySpawn(spawnCalls);
+
+		openCapabilityUrl(capabilityUrl);
+
+		expect(spawnCalls).toHaveLength(1);
+		const argv = spawnCalls[0]!.cmd;
+		expect(argv.join(" ")).not.toContain(capability);
+		const file = argv[1]!;
+		expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+		expect(fs.statSync(path.dirname(file)).mode & 0o777).toBe(0o700);
+		const html = fs.readFileSync(file, "utf8");
+		expect(html).toContain(`url=${capabilityUrl.replaceAll("&", "&amp;")}"`);
+		expect(html).toContain(`location.replace(${JSON.stringify(capabilityUrl)})`);
+		fs.rmSync(path.dirname(file), { recursive: true, force: true });
+	});
+
+	it("escapes markup in the URL so it cannot break out of the redirect page", () => {
+		setPlatform("darwin");
+		const spawnCalls: SpawnCall[] = [];
+		spySpawn(spawnCalls);
+
+		openCapabilityUrl(`http://127.0.0.1:3847/#"></script><b>`);
+
+		const file = spawnCalls[0]!.cmd[1]!;
+		const html = fs.readFileSync(file, "utf8");
+		expect(html).not.toContain("<b>");
+		expect(html.match(/<\/script>/g)).toHaveLength(1);
+		fs.rmSync(path.dirname(file), { recursive: true, force: true });
+	});
+
+	it("openLink stages token-carrying web URLs and opens everything else directly", () => {
+		setPlatform("darwin");
+		const spawnCalls: SpawnCall[] = [];
+		spySpawn(spawnCalls);
+
+		openLink(capabilityUrl);
+		openLink("https://example.com/?q=token");
+		openLink("/tmp/report.html");
+
+		const staged = spawnCalls[0]!.cmd[1]!;
+		expect(staged).not.toContain(capability);
+		expect(staged).toEndWith("open.html");
+		expect(spawnCalls.slice(1).map(call => call.cmd)).toEqual([
+			["open", "https://example.com/?q=token"],
+			["open", "/tmp/report.html"],
+		]);
+		fs.rmSync(path.dirname(staged), { recursive: true, force: true });
 	});
 });

@@ -306,8 +306,13 @@ export interface RunModelsListingOptions {
 	kind?: ModelKind | "all";
 	/** CLI-supplied extension paths (e.g. from `-e <path>`). */
 	additionalExtensionPaths?: string[];
-	/** Extension paths configured under `extensions:` in user settings. */
+	/** Extension paths configured under `extensions:` in settings. */
 	settingsExtensions?: string[];
+	/**
+	 * Whether a project settings file supplied `settingsExtensions`. Those are
+	 * repository code: they load only under project trust (kb omp t-f77ec1f5).
+	 */
+	settingsExtensionsFromProject?: boolean;
 	/** Disabled extension ids from settings (`disabledExtensions`). */
 	disabledExtensionIds?: string[];
 	/** When true, exclude ambient factories and resolve only `additionalExtensionPaths`. */
@@ -324,20 +329,23 @@ export async function runModelsListing(options: RunModelsListingOptions): Promis
 		kind = "chat",
 		additionalExtensionPaths = [],
 		settingsExtensions = [],
+		settingsExtensionsFromProject = false,
 		disabledExtensionIds = [],
 		disableExtensionDiscovery = false,
 	} = options;
 
 	const eventBus = new EventBus();
-	const configuredPaths = disableExtensionDiscovery
-		? additionalExtensionPaths
-		: [...additionalExtensionPaths, ...settingsExtensions];
+	const projectConfiguredPaths = disableExtensionDiscovery || !settingsExtensionsFromProject ? [] : settingsExtensions;
+	const configuredPaths =
+		disableExtensionDiscovery || settingsExtensionsFromProject
+			? additionalExtensionPaths
+			: [...additionalExtensionPaths, ...settingsExtensions];
 	const extensionsResult = await discoverAndLoadExtensions(
 		configuredPaths,
 		cwd,
 		eventBus,
 		disableExtensionDiscovery ? undefined : disabledExtensionIds,
-		{ ambient: !disableExtensionDiscovery, includeAmbientHooks: false },
+		{ ambient: !disableExtensionDiscovery, includeAmbientHooks: false, projectConfiguredPaths },
 	);
 	const extensionRunner =
 		extensionsResult.extensions.length > 0
@@ -417,6 +425,7 @@ export async function runModelsCommand(command: ModelsCommandArgs): Promise<void
 			kind,
 			additionalExtensionPaths: cliExtensionPaths,
 			settingsExtensions: cfgExtensions.get(settings),
+			settingsExtensionsFromProject: settings.extensionsSourceLevel() === "project",
 			disabledExtensionIds: cfgDisabledExtensions.get(settings),
 			disableExtensionDiscovery: Boolean(command.flags.noExtensions),
 		});

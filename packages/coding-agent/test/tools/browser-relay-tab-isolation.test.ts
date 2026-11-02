@@ -24,10 +24,13 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { getPuppeteerDir } from "@oh-my-pi/pi-utils";
 import puppeteer, { type Browser, type Target, type WebWorker } from "puppeteer-core";
 import { rejectionOf } from "../helpers/rejection";
+import { useTestRelayToken } from "../helpers/relay-token";
 import { chromiumAvailable } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
 const ASSETS = path.resolve(import.meta.dir, "../../src/tools/browser/relay/extension-assets");
+
+useTestRelayToken();
 
 interface TestWorker {
 	outcome: Promise<Extract<WorkerOutbound, { type: "ready" | "init-failed" }>>;

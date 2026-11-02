@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { VERSION } from "@oh-my-pi/pi-utils/dirs";
 import { findFreeCdpPort } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
+import { RELAY_NONCE_FIELD } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/auth";
 import { waitForRelayExtension } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/probe";
 import { DISCARDED_TABS_PROTOCOL_VERSION } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/protocol";
 import {
@@ -8,6 +9,7 @@ import {
 	type RelayUnavailableInfo,
 	startRelayServer,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/server";
+import { useTestRelayToken } from "../helpers/relay-token";
 
 const EXTENSION_HELLO = {
 	t: "hello",
@@ -25,6 +27,8 @@ const LEGACY_EXTENSION_HELLO = {
 	tabs: [],
 	attachedTabIds: [],
 } as const;
+
+const CDP_TOKEN = useTestRelayToken();
 
 describe("waitForRelayExtension", () => {
 	let relay: RelayServer | undefined;
@@ -74,17 +78,18 @@ describe("waitForRelayExtension", () => {
 			ompRelayVersion: VERSION,
 			disconnectedMs: 120_000,
 		};
-		let probes = 0;
+		let requests = 0;
 		fake = Bun.serve({
 			hostname: "127.0.0.1",
 			port: 0,
 			fetch: () => {
-				probes++;
+				requests++;
 				return Response.json(info, { status: 503 });
 			},
 		});
 		expect(await waitForRelayExtension(`http://127.0.0.1:${fake.port}`)).toBe("extension-gone");
-		expect(probes).toBe(1);
+		// One poll: the token-less nonce request, then the discovery request itself.
+		expect(requests).toBe(2);
 	});
 
 	it("reports a stale relay before blaming an extension that has been gone past the redial window", async () => {
@@ -219,12 +224,42 @@ describe("waitForRelayExtension", () => {
 		expect(await waitForRelayExtension(`http://127.0.0.1:${port}`)).toBe("outdated-extension");
 	});
 
+	it("reports unauthorized, without waiting, when the relay refuses this user's token", async () => {
+		const port = await findFreeCdpPort();
+		relay = startRelayServer({ port, cdpToken: "q".repeat(43) });
+		const started = performance.now();
+		expect(await waitForRelayExtension(`http://127.0.0.1:${port}`)).toBe("unauthorized");
+		expect(performance.now() - started).toBeLessThan(2_000);
+	});
+
+	it("never sends the capability to a port holder, even one that hands out a nonce", async () => {
+		const seen: string[] = [];
+		fake = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: request => {
+				seen.push(request.url, ...[...request.headers].map(([name, value]) => `${name}: ${value}`));
+				return Response.json(
+					{
+						ompRelayVersion: VERSION,
+						error: "relay capability token required",
+						[RELAY_NONCE_FIELD]: "squatter-nonce",
+					},
+					{ status: 401 },
+				);
+			},
+		});
+		expect(await waitForRelayExtension(`http://127.0.0.1:${fake.port}`)).toBe("unauthorized");
+		expect(seen.some(line => line.includes("mac="))).toBeTrue();
+		expect(seen.join("\n")).not.toContain(CDP_TOKEN);
+	});
+
 	it("keeps polling a young relay and reports ready once the extension handshakes", async () => {
 		const port = await findFreeCdpPort();
 		relay = startRelayServer({ port });
 		const wait = waitForRelayExtension(`http://127.0.0.1:${port}`);
 		// The relay is serving 503 (young, no extension yet) before the extension dials in.
-		expect((await fetch(`http://127.0.0.1:${port}/json/version`)).status).toBe(503);
+		expect((await fetch(`http://127.0.0.1:${port}/json/version?token=${CDP_TOKEN}`)).status).toBe(503);
 		extension = new WebSocket(`ws://127.0.0.1:${port}/ext`);
 		extension.addEventListener("open", () => extension?.send(JSON.stringify(EXTENSION_HELLO)), { once: true });
 		expect(await wait).toBe("ready");
@@ -242,7 +277,9 @@ describe("waitForRelayExtension", () => {
 		await closed.promise;
 		// A reaped service worker redials: the wait must hold on and succeed, not fail fast.
 		const wait = waitForRelayExtension(`http://127.0.0.1:${port}`);
-		const gone = (await (await fetch(`http://127.0.0.1:${port}/json/version`)).json()) as RelayUnavailableInfo;
+		const gone = (await (
+			await fetch(`http://127.0.0.1:${port}/json/version?token=${CDP_TOKEN}`)
+		).json()) as RelayUnavailableInfo;
 		expect(gone.extensionSeen).toBeTrue();
 		extension = new WebSocket(`ws://127.0.0.1:${port}/ext`);
 		extension.addEventListener("open", () => extension?.send(JSON.stringify(EXTENSION_HELLO)), { once: true });

@@ -67,6 +67,7 @@ import {
 	adjustHsv,
 	formatDuration,
 	formatNumber,
+	getActiveProfile,
 	getProjectDir,
 	isEnoent,
 	logger,
@@ -419,7 +420,8 @@ import { cfgStreamRedactPatterns } from "../stream/settings";
 import { cfgSttEnabled } from "../stt/settings";
 import { combine, type SettingValueOf } from "../config/registry";
 import { cfgAdvisorEnabled, cfgAdvisorMaxNotesPerUpdate } from "../advisor/settings";
-import { cfgTierAdvisor } from "../session/settings";
+import { cfgSessionIdleCheckpointMs, cfgTierAdvisor } from "../session/settings";
+import { checkpointOwnerSession } from "../session/owner-checkpoint";
 import {
 	cfgCompactionEnabled,
 	cfgCompactionIdleEnabled,
@@ -494,6 +496,8 @@ const STILL_CLOSING_DELAY_MS = 3_000;
 const JUDGMENT_BATCH_PROGRESS_RETAIN_MS = 1_000;
 /** Startup emits several status-bar changes within a second; persist only the settled one. */
 const COMPOSER_STATUS_PERSIST_DELAY_MS = 1_000;
+/** Largest delay `setTimeout` honors; longer delays overflow and fire immediately. */
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 const DEFAULT_WORKING_MESSAGE = "Working…";
 /** Native working-message shimmer under a session accent: the hue itself is the terminal's `accent`. */
 const NATIVE_ACCENT_SHIMMER: ShimmerPalette = { low: "dim", mid: "accent", high: "accent", bold: true };
@@ -1147,11 +1151,12 @@ function renderSubagentToolPreview(session: ObservableSession, width: number): s
 }
 
 /**
- * Build the anchored subagent HUD block: a bold accent "Subagents" header plus
- * a bounded set of running-agent rows in the same `Id ⟨role⟩: description` shape
- * the inline task rows use (muted task preview when no description was given).
- * Layout mirrors the Todos HUD exactly: unindented header, then
- * `renderTreeList` rows (dim connectors) shifted right by one space.
+ * Build the anchored subagent HUD block: a bold accent "Subagents · N running"
+ * header (with the agent-hub key right-aligned when `hubKey` is given) plus
+ * a bounded set of running-agent rows in the same `Id ⟨role⟩: description`
+ * shape the inline task rows use (muted assignment preview when no
+ * description was given). Layout mirrors the Todos HUD exactly: unindented
+ * header, then `renderTreeList` rows (dim connectors) shifted right by one space.
  * Every active subagent is listed — detached background spawns and sync task
  * calls alike — so the pinned block doubles as a click jump list.
  * With `livePreview` (`display.subagentLivePreview`), a row that has called a
@@ -1164,6 +1169,7 @@ export function renderSubagentHudLines(
 	columns: number,
 	expanded = false,
 	livePreview = false,
+	hubKey?: string,
 ): string[] {
 	const running = sessions.filter(isHudSubagent);
 	if (running.length === 0) return [];
@@ -1213,12 +1219,19 @@ export function renderSubagentHudLines(
 						line += `${theme.fg("accent", ":")} ${theme.fg("accent", truncateToWidth(formatted, budget))}`;
 					}
 				} else {
-					// No spawn description: fall back to a muted task preview, same as
-					// the inline task rows when a row has no label.
-					const taskPreview = session.progress?.task?.trim();
-					if (taskPreview && !labelEchoesHandle(session.id, taskPreview)) {
-						const formatted = replaceTabs(taskPreview).replace(/\s*[\r\n]+\s*/g, " ↵ ");
-						const budget = Math.min(TRUNCATE_LENGTHS.SHORT, Math.max(0, rowWidth - visibleWidth(line) - 1));
+					// No spawn description: fall back to a muted preview of the raw
+					// assignment — never the rendered prompt, whose fixed template
+					// preamble would fill the row instead of the work. Every spawn
+					// that renders the template (task tool, structured/eval spawns)
+					// also records `assignment`; `task` alone is a raw message
+					// (IRC-woken or direct sends), so it is safe to preview as is.
+					const preview = (session.progress?.assignment ?? session.progress?.task)?.trim();
+					if (preview && !labelEchoesHandle(session.id, preview)) {
+						const formatted = shortenEmbeddedPaths(replaceTabs(sanitizeText(preview))).replace(
+							/\s*[\r\n]+\s*/g,
+							" ↵ ",
+						);
+						const budget = Math.max(0, rowWidth - visibleWidth(line) - 1);
 						if (budget > 0) line += ` ${theme.fg("muted", truncateToWidth(formatted, budget))}`;
 					}
 				}
@@ -1255,12 +1268,13 @@ export function renderSubagentHudLines(
 		);
 		cursor += count;
 	}
-	return [
-		"",
-		truncateToWidth(theme.bold(theme.fg("accent", "Subagents")), contentColumns),
-		...itemLines,
-		...toggleRow,
-	];
+	const title = theme.bold(theme.fg("accent", "Subagents"));
+	const runningLabel = theme.fg("dim", `${theme.sep.dot}${running.length} running`);
+	const titleText = truncateToWidth(`${title}${runningLabel}`, contentColumns);
+	const hint = hubKey ? theme.fg("dim", hubKey) : "";
+	const gap = contentColumns - visibleWidth(titleText) - visibleWidth(hint);
+	const header = hint && gap >= 2 ? `${titleText}${" ".repeat(gap)}${hint}` : titleText;
+	return ["", header, ...itemLines, ...toggleRow];
 }
 
 const CTRL_L_APPEARANCE_RESPONSE_DEADLINE_MS = 2000;
@@ -1676,6 +1690,9 @@ export class InteractiveMode implements InteractiveModeContext {
 	#vibeSkillInFlight = 0;
 	#vibeScopeSuspendedForSwitch = false;
 	#goalContinuationTimer: NodeJS.Timeout | undefined;
+	/** Bounded-idle owner checkpoint: one timer, re-armed for the remainder after activity. */
+	#idleCheckpointTimer: NodeJS.Timeout | undefined;
+	#lastActivityAt = Date.now();
 	/** Submitted continuation turns awaiting their asynchronously delivered `agent_end`. */
 	#pendingGoalContinuationTurns = 0;
 	#previousGoalContinuationActivity: string | undefined;
@@ -2685,6 +2702,22 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.ui.requestRender();
 			}),
 		);
+		// Bounded-idle owner checkpoint. Any terminal input or session event is
+		// activity; the timer only re-checks the remaining idle window when it
+		// fires, so streaming events never churn timers.
+		this.#lastActivityAt = Date.now();
+		this.#eventBusUnsubscribers.push(
+			this.ui.addInputListener(() => {
+				this.#lastActivityAt = Date.now();
+				return undefined;
+			}),
+			this.session.subscribe(() => {
+				this.#lastActivityAt = Date.now();
+			}),
+			cfgSessionIdleCheckpointMs.listen(this.settings, () => this.#armIdleCheckpoint()),
+			() => this.#cancelIdleCheckpoint(),
+		);
+		this.#armIdleCheckpoint();
 		// Set up theme file watcher
 		this.#eventBusUnsubscribers.push(
 			onThemeChange(event => {
@@ -3146,6 +3179,76 @@ export class InteractiveMode implements InteractiveModeContext {
 			clearTimeout(this.#goalContinuationTimer);
 			this.#goalContinuationTimer = undefined;
 		}
+	}
+
+	#cancelIdleCheckpoint(): void {
+		clearTimeout(this.#idleCheckpointTimer);
+		this.#idleCheckpointTimer = undefined;
+	}
+
+	/** Arm the one idle-checkpoint timer for the rest of the current idle window. */
+	#armIdleCheckpoint(): void {
+		this.#cancelIdleCheckpoint();
+		const boundMs = cfgSessionIdleCheckpointMs.get(this.settings);
+		if (!Number.isFinite(boundMs) || boundMs <= 0 || this.isShuttingDown) return;
+		// setTimeout overflows above 2^31-1 ms (~24.8 days) and fires at once;
+		// an early wake just re-checks the window and re-arms.
+		const remainingMs = Math.min(MAX_TIMER_DELAY_MS, Math.max(0, this.#lastActivityAt + boundMs - Date.now()));
+		this.#idleCheckpointTimer = setTimeout(() => {
+			this.#idleCheckpointTimer = undefined;
+			void this.#maybeIdleCheckpoint(boundMs);
+		}, remainingMs);
+		// Never keeps the process alive on its own.
+		this.#idleCheckpointTimer.unref?.();
+	}
+
+	/**
+	 * Checkpoint and exit this owner once it has been idle for the bound. Only
+	 * this process acts on itself: nothing signals another PID. A pending draft,
+	 * open dialog, selector or prompt (anything off the composer), or running
+	 * work keeps the session live and re-arms for another full window.
+	 */
+	async #maybeIdleCheckpoint(boundMs: number): Promise<void> {
+		if (this.isShuttingDown) return;
+		if (Date.now() - this.#lastActivityAt < boundMs) {
+			this.#armIdleCheckpoint();
+			return;
+		}
+		if (!this.#composerIdleForCheckpoint()) {
+			this.#lastActivityAt = Date.now();
+			this.#armIdleCheckpoint();
+			return;
+		}
+		const idleSince = this.#lastActivityAt;
+		try {
+			await checkpointOwnerSession(
+				this.session,
+				() => {
+					// Synchronous last look before the close latch: input or a dialog
+					// that arrived while the transcript was flushing keeps the owner live.
+					if (this.#lastActivityAt !== idleSince || !this.#composerIdleForCheckpoint()) {
+						throw new Error("Idle checkpoint refused: activity resumed during the checkpoint.");
+					}
+					return this.shutdown({ unattended: true });
+				},
+				() => this.hasPendingSubmission(),
+			);
+		} catch (error) {
+			// Active work, or identity/activity changed mid-checkpoint: stay live.
+			logger.debug("Idle checkpoint deferred", { error: error instanceof Error ? error.message : String(error) });
+			this.#lastActivityAt = Date.now();
+			this.#armIdleCheckpoint();
+		}
+	}
+
+	/** The composer is focused and empty: no draft, attachment, dialog, selector or prompt is open. */
+	#composerIdleForCheckpoint(): boolean {
+		return (
+			!this.ui.hasOverlay() &&
+			this.ui.getFocused() === this.editor &&
+			this.editor.getText().trim().length === 0 &&
+			(this.editor.pendingImages?.length ?? 0) === 0
+		);
 	}
 
 	/** Idle bare Esc: drop a pending continuation tick and hold continuation like an interrupt. */
@@ -4829,7 +4932,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		const running = sessions.filter(isHudSubagent);
 		const expanded = this.#pinnedHudOverride ?? mode === "full";
 		const livePreview = cfgDisplaySubagentLivePreview.get(settings);
-		const lines = renderSubagentHudLines(sessions, this.ui.terminal.columns, expanded, livePreview);
+		const hubKey = appKey(this.keybindings, "app.agents.hub") || undefined;
+		const lines = renderSubagentHudLines(sessions, this.ui.terminal.columns, expanded, livePreview, hubKey);
 		if (lines.length === 0) return undefined;
 		const layout = layoutPinnedHud(running.length, expanded);
 		const tickMs =
@@ -7504,7 +7608,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.isInitialized = false;
 	}
 
-	async shutdown(): Promise<void> {
+	/**
+	 * Tear down, print the resume command and exit. `unattended` (the idle
+	 * checkpoint) leaves owned worktrees in place: no one is present to answer a
+	 * `worktree.onExit` prompt, and the resumed session still needs its worktree.
+	 */
+	async shutdown(options: { unattended?: boolean } = {}): Promise<void> {
 		if (this.#isShuttingDown) return;
 		// The previous graceful teardown failed AT the memoized session.dispose()
 		// (the session is already disposing), so it re-rejects identically forever
@@ -7523,7 +7632,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 		this.#beginClose();
-		const worktreePlan = await this.#planOwnedWorktreeExit();
+		const worktreePlan = options.unattended ? [] : await this.#planOwnedWorktreeExit();
 		try {
 			await this.#teardown();
 		} catch (error) {
@@ -7607,10 +7716,17 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 
 		const sessionFile = this.sessionManager.isSessionOnDisk() ? this.sessionManager.getSessionFile() : undefined;
+		// Pass the profile explicitly: native exec does not inherit Bun's process.env updates.
+		const activeProfile = getActiveProfile();
 		const cmd = [
 			...resolveCliEntryCmd(),
-			...restartArgv(process.argv.slice(2), sessionFile ? path.resolve(sessionFile) : undefined),
+			...restartArgv(
+				process.argv.slice(2),
+				sessionFile ? path.resolve(sessionFile) : undefined,
+				activeProfile ? { "--profile": true } : undefined,
+			),
 		];
+		if (activeProfile) cmd.push("--profile", activeProfile);
 		await postmortem.cleanup();
 		await postmortem.drainStdout();
 		if (process.platform !== "win32") {

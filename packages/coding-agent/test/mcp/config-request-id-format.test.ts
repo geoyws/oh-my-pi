@@ -26,6 +26,7 @@ import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability
 import { loadAllMCPConfigs } from "@oh-my-pi/pi-coding-agent/mcp/config";
 import { getConfigRootDir, logger, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import mcpSchema from "../../src/config/mcp-schema.json" with { type: "json" };
+import { approveProjectForTest } from "../helpers/project-trust";
 
 const originalAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
 const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
@@ -64,7 +65,8 @@ afterEach(async () => {
 
 async function loadFrom(file: string, mcpServers: Record<string, unknown>) {
 	await Bun.write(path.join(tempCwd, file), JSON.stringify({ mcpServers }));
-	clearFsCache();
+	// Project MCP config loads only once approved (kb omp t-f77ec1f5).
+	await approveProjectForTest(tempCwd);
 	const { configs } = await loadAllMCPConfigs(tempCwd);
 	return configs;
 }
@@ -133,6 +135,8 @@ for (const [provider, file] of [
 				},
 			}),
 		);
+		await approveProjectForTest(tempCwd);
+		warn.mockClear();
 		const { configs } = await loadAllMCPConfigs(tempCwd, {
 			extensionRoots: {
 				explicit: provider === "plugin" ? [path.join(tempCwd, "plugin")] : [],

@@ -170,6 +170,10 @@ export const ttsrHelp = {
 	description: "Inspect and test Time-Traveling Stream Rules (TTSR)",
 } satisfies CommandMetadata;
 
+export const trustHelp = {
+	description: "Review and approve a project's MCP servers, extensions and provider-routing .env",
+} satisfies CommandMetadata;
+
 export const updateHelp = { description: "Check for and install updates" } satisfies CommandMetadata;
 
 export const usageHelp = {

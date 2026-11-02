@@ -5,6 +5,7 @@ import { runCommitCommand } from "@oh-my-pi/pi-coding-agent/commit";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { getProjectAgentDir, setAgentDir, setProjectDir, TempDir } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
+import { approveProjectForTest } from "./helpers/project-trust";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
 
 const PROVIDER = "commit-extension-fixture";
@@ -50,6 +51,8 @@ beforeEach(async () => {
 			modelRoles: { commit: SELECTOR },
 		}),
 	);
+	// A project settings `extensions:` list loads only once approved (kb omp t-f77ec1f5).
+	await approveProjectForTest(tmp.path());
 
 	await $`git init --initial-branch=main`.cwd(tmp.path()).quiet();
 	await $`git add -A`.cwd(tmp.path()).quiet();
