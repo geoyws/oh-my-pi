@@ -373,6 +373,7 @@ describe("submitInteractiveInput", () => {
 				throw new UserMessageRefusedError(NOTICE);
 			}),
 			promptCustomMessage: vi.fn(async () => true),
+			buildUserSkillPrompt: buildSkillPromptMessage,
 			isStreaming: false,
 		};
 		const input = createInput({ text: "refused draft" });
