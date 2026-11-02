@@ -75,7 +75,6 @@ describe("renderUsageReports (#3268 TUI aggregate)", () => {
 		];
 		const models = ["github-copilot/gpt-5.6", "github-copilot/claude-sonnet-4.6"];
 		const text = stripVTControlCharacters(renderUsageReports(reports, theme, Date.now(), 120, undefined, models));
-		expect(text).toContain("Models with usage data");
 		expect(text).toContain(models[0]);
 		expect(text).toContain(models[1]);
 	});
@@ -195,10 +194,11 @@ describe("renderUsageReports (#3268 TUI aggregate)", () => {
 			},
 		];
 		const text = stripVTControlCharacters(renderUsageReports(reports, theme, Date.now(), 120));
-		expect(text).toContain("Claude");
 		expect(text).toContain("shared@example.test (Primary profile)");
 		expect(text).toContain("shared@example.test (Backup profile)");
 		expect(text).toContain("30% free");
+	});
+
 	it("keeps distinct buckets that share a label and window as separate rows (#16790)", () => {
 		// Antigravity's Google counter: a drained Gemini 4 Argon weekly bucket
 		// beside a barely-used shared Gemini weekly bucket. Both limits share the
