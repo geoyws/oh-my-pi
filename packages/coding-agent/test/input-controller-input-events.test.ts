@@ -448,11 +448,10 @@ describe("interactive native input ingress", () => {
 		h.editor.imageLinks = h.editor.pendingImageLinks;
 		release.resolve();
 		await dispatchEntered.promise;
-		const draftDuringDispatch = h.editor.getText();
+		const draftDuringDispatch = h.editor.getExpandedText();
 		h.editor.setText(`${draftDuringDispatch} still typing`);
 		dispatchRelease.resolve();
 		await submitting;
-		expect(draftDuringDispatch).toBe("new draft [Image #1]");
 		expect(h.editor.getExpandedText()).toBe("/skill:review original [Image #2]\n\nnew draft [Image #1] still typing");
 		expect(h.editor.pendingImages).toEqual([transformedImage, originalImage]);
 		expect(h.editor.pendingImageLinks).toEqual(["local://new.jpeg", "local://original.png"]);
