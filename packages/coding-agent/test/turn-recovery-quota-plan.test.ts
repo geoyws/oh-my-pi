@@ -121,10 +121,13 @@ describe("TurnRecovery quota recovery planning", () => {
 
 	/** Health changes at provider reset times, independently of cache refresh calls. */
 	function stubHealth(phases: Array<Record<string, ModelUsageHealth>>, changeAtMs: number[] = []): void {
+		const startedAtMs = Date.now();
+		const startedMonotonicMs = performance.now();
 		vi.spyOn(authStorage.health, "model").mockImplementation(async (provider, options) => {
 			const key = `${provider}/${options.modelId}`;
 			calls.push(`health:${key}`);
-			const phaseIndex = changeAtMs.filter(at => Date.now() >= at).length;
+			const nowMs = startedAtMs + performance.now() - startedMonotonicMs;
+			const phaseIndex = changeAtMs.filter(at => nowMs >= at).length;
 			const phase = phases[Math.min(phases.length - 1, phaseIndex)] ?? {};
 			return phase[key] ?? { state: "unknown", accounts: [] };
 		});
