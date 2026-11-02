@@ -26,6 +26,8 @@
 ### Fixed
 
 - Fixed retry fallback switching models prematurely when a failed-turn snapshot masked prior signed thinking.
+- Quota recovery now honors the same-model retry budget before switching away from the Anthropic model that signed replayed thinking, just like the ordinary fallback walk.
+- Refresh usage before the initial quota comparison so a sibling whose cached window has already reset is not overlooked in favor of a later fallback wake.
 - Fixed extensions silently failing to load from discovered and configured paths after asynchronous path canonicalization.
 - Fixed missing stale browser relay extension notices when relay discovery requires authentication.
 - Fixed interactive skill and background-task submissions losing or restoring the wrong draft text and images.

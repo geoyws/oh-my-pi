@@ -641,18 +641,16 @@ test("a sibling of the current model that resets before the fallback wins the wa
 	expect(served.model, diagnostics(run)).toBe(PRIMARY_MODEL_ID);
 	expect(served.at - t0, diagnostics(run)).toBeGreaterThanOrEqual(3_000);
 	expect(served.at - t0, diagnostics(run)).toBeLessThan(7_000);
-	// A loaded child can reach recovery after bravo's reset. It must then
-	// refresh and use bravo now, not arm zulu's later reset and discover bravo
-	// only at that wake. A wake announcement must name the actual deadline,
-	// not merely a resume timestamp within the generic notice tolerance.
-	const siblingLines = recoveryLines(run, PRIMARY, "bravo");
-	const siblingWake = siblingLines.some(
-		line => line.includes("waiting for") && line.includes(new Date(t0 + 3_000).toISOString()),
-	);
-	const siblingAvailableNow =
-		siblingLines.some(line => line.includes("using ") && line.includes(" now.")) &&
-		run.probes.some(probe => probe.account === "bravo" && probe.at >= t0 + 3_000 && probe.at <= served.at);
-	expect(siblingWake || siblingAvailableNow, diagnostics(run)).toBe(true);
+	// Recovery can begin after bravo's reset. In that case its immediate
+	// selection must be backed by a fresh probe; otherwise it owns the wake.
+	if (recoveryLines(run, PRIMARY, "bravo").some(line => line.includes("using ") && line.includes(" now."))) {
+		expect(
+			run.probes.some(probe => probe.account === "bravo" && probe.at >= t0 + 3_000 && probe.at <= served.at),
+			diagnostics(run),
+		).toBe(true);
+	} else {
+		expectWakeAnnounced(run, PRIMARY, "bravo", t0 + 3_000);
+	}
 	expect(
 		recoveryLines(run, FALLBACK, "zulu").filter(line => line.includes("waiting for")),
 		diagnostics(run),
