@@ -536,7 +536,7 @@ describe("proc:// background jobs", () => {
 				throw new Error(`Unexpected broker op ${operation.op}`);
 			},
 		} as unknown as DaemonBrokerClient;
-		const spy = vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(client);
+		const spy = vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(unmanagedDaemonLease(client));
 		const { manager, session } = await wokenAgentSession({ launch: true });
 		const protocol = new ProcProtocolHandler();
 		try {

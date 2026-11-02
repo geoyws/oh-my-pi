@@ -870,7 +870,7 @@ export async function discoverExtensionPaths(
 		}
 		for (const entry of ambientEntries.entries) {
 			if (entry.level === "project" && !ambientEntries.projectTrusted) continue;
-			addPath(entry.path);
+			await addPath(entry.path);
 		}
 		projectConfiguredEntries = ambientEntries.projectTrusted ? ambientEntries.projectConfiguredEntries : [];
 	} else {
@@ -890,10 +890,10 @@ export async function discoverExtensionPaths(
 	// 4. Explicitly configured paths, then project-supplied ones that passed trust.
 	for (const configuredPath of configuredPaths) {
 		const { directory, files } = await expandConfiguredExtensionPath(configuredPath, cwd);
-		if (directory) addPaths(files);
-		else addPath(files[0]);
+		if (directory) await addPaths(files);
+		else await addPath(files[0]);
 	}
-	addPaths(projectConfiguredEntries);
+	await addPaths(projectConfiguredEntries);
 
 	return allPaths;
 }

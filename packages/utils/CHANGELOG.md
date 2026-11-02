@@ -81,6 +81,7 @@
 - Fixed `bun test` runs writing their logs into your real `~/.omp/logs`: test processes now log to a per-user `omp-test-logs-<uid>/` under the OS temp dir ([#16386](https://github.com/can1357/oh-my-pi/pull/16386) by [@will-bogusz](https://github.com/will-bogusz))
 - Fixed `.tar.gz` and `.tar.zst` archives that decompress past 256 MB failing to list or read with a raw `Cannot create a Buffer larger than …` error; a bare `.gz` or `.zst` that large now names the archive size limit ([#16394](https://github.com/can1357/oh-my-pi/pull/16394) by [@will-bogusz](https://github.com/will-bogusz))
 - Fixed frontmatter repair deleting HTML comments from document bodies and plain markdown; it now strips only leading comments ahead of the opening delimiter, so prompt bodies keep their comments ([#16481](https://github.com/can1357/oh-my-pi/pull/16481) by [@adi-IL](https://github.com/adi-IL)).
+- `@oh-my-pi/pi-utils/process-telemetry`: a per-process sampler of RSS, JS heap, external memory and open fd count that writes role-tagged `proc.sample` (debug, once a minute), `proc.high-water` (warn, at 1/2/4/8… GiB RSS and 256/512/1024… fds) and opt-in `proc.rss-limit` (error, then SIGTERM to self) records to the process's own log. Controlled by `OMP_PROC_TELEMETRY`, `OMP_PROC_TELEMETRY_INTERVAL_MS` and `OMP_PROC_RSS_LIMIT_MB`.
 
 ## [18.12.2] - 2026-10-18
 

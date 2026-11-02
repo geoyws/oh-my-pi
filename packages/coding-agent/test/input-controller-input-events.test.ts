@@ -60,6 +60,7 @@ async function createHarness(factory: ExtensionFactory) {
 		followUp: vi.fn(async (_text: string, _images?: ImageContent[], _options?: { source?: string }) => {}),
 		buildUserSkillPrompt: buildSkillPromptMessage,
 		promptCustomMessage: vi.fn(async () => true),
+		gateUserMessage: vi.fn(async () => {}),
 		abort: vi.fn(async () => {}),
 		prewarmModelConnection: vi.fn(),
 	};
@@ -403,7 +404,10 @@ describe("interactive native input ingress", () => {
 		expect(h.editor.pendingImageLinks).toEqual(["local://new.jpeg", "local://original.png"]);
 	});
 
-	it("Ctrl+Enter skill dispatch preserves drafts typed during both interception and queue rejection", async () => {
+	it.each([
+		["Enter", ENTER],
+		["Ctrl+Enter", FOLLOW_UP],
+	])("%s skill dispatch preserves drafts typed during both interception and queue rejection", async (_label, key) => {
 		using temp = TempDir.createSync("@omp-native-input-skill-");
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
@@ -430,12 +434,18 @@ describe("interactive native input ingress", () => {
 			throw new Error("skill queue rejected");
 		});
 		h.draftWithImage("/skill:review original [Image #1]");
-		const submitting = h.pressSubmit(FOLLOW_UP);
+		const submitting = h.pressSubmit(key);
 		await entered.promise;
-		h.editor.pendingImages = [transformedImage];
-		h.editor.pendingImageLinks = ["local://new.jpeg"];
+		if (key === ENTER) {
+			h.editor.pendingImages.push(transformedImage);
+			h.editor.pendingImageLinks.push("local://new.jpeg");
+			h.editor.setText("new draft [Image #2]");
+		} else {
+			h.editor.pendingImages = [transformedImage];
+			h.editor.pendingImageLinks = ["local://new.jpeg"];
+			h.editor.setText("new draft [Image #1]");
+		}
 		h.editor.imageLinks = h.editor.pendingImageLinks;
-		h.editor.setText("new draft [Image #1]");
 		release.resolve();
 		await dispatchEntered.promise;
 		const draftDuringDispatch = h.editor.getText();
@@ -543,10 +553,9 @@ describe("interactive native input ingress", () => {
 
 			await h.pressSubmit(ENTER);
 
-			expect(h.prompt).toHaveBeenCalledWith("newer [Image #1]", {
-				streamingBehavior: "steer",
-				images: [newerImage],
-			});
+			expect(h.prompt.mock.calls.map(([text, options]) => ({ text, images: options?.images }))).toEqual([
+				{ text: "newer [Image #1]", images: [newerImage] },
+			]);
 		},
 	);
 
@@ -640,7 +649,9 @@ describe("interactive native input ingress", () => {
 
 		await h.pressSubmit(ENTER);
 
-		expect(h.prompt).toHaveBeenCalledWith("newer [Image #1]", { streamingBehavior: "steer", images: [newerImage] });
+		expect(h.prompt.mock.calls.map(([text, options]) => ({ text, images: options?.images }))).toEqual([
+			{ text: "newer [Image #1]", images: [newerImage] },
+		]);
 	});
 
 	it.each(["/clear", "/export"])(

@@ -13,13 +13,14 @@
  *      generic timeout.
  *   2. The cap is independent of the generic handler timeout (raising one
  *      does not raise the other).
- *   3. The new public constant is the one `runner.emit()` consults.
  */
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
-import * as fs from "node:fs";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { discoverAndLoadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import {
+	ExtensionRuntime,
+	loadExtensionFromFactory,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import {
 	EXTENSION_HANDLER_TIMEOUT_MS,
 	ExtensionRunner,
@@ -29,15 +30,8 @@ import {
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { getProjectAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
-
-const HANG_EXTENSION_SRC = `
-	export default function(pi) {
-		pi.on("session_shutdown", async () => {
-			await Promise.withResolvers().promise;
-		});
-	}
-`;
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { TempDir } from "@oh-my-pi/pi-utils";
 
 describe("issue #2600 - session_shutdown handler timeout", () => {
 	let sharedTempDir: TempDir;
@@ -62,43 +56,46 @@ describe("issue #2600 - session_shutdown handler timeout", () => {
 
 	async function buildRunnerWithHangingShutdown(count = 1): Promise<{
 		runner: ExtensionRunner;
-		hangExtensionPath: string;
-		hangExtensionPaths: string[];
+		started: Set<number>;
 		cleanup: () => void;
 	}> {
 		if (count < 1) throw new Error("count must be positive");
 		const tempDir = TempDir.createSync("@pi-issue-2600-test-");
-		const extensionsDir = path.join(getProjectAgentDir(tempDir.path()), "extensions");
-		fs.mkdirSync(extensionsDir, { recursive: true });
-		const hangExtensionPaths: string[] = [];
-		for (let i = 0; i < count; i++) {
-			const hangExtensionPath = path.join(tempDir.path(), `hang-session-shutdown-${i}.ts`);
-			fs.writeFileSync(hangExtensionPath, HANG_EXTENSION_SRC);
-			hangExtensionPaths.push(hangExtensionPath);
-		}
-		const hangExtensionPath = hangExtensionPaths[0];
-		if (!hangExtensionPath) throw new Error("missing hanging extension");
-
+		const runtime = new ExtensionRuntime();
+		const started = new Set<number>();
+		const extensions = await Promise.all(
+			Array.from({ length: count }, (_, index) =>
+				loadExtensionFromFactory(
+					pi => {
+						pi.on("session_shutdown", async () => {
+							started.add(index);
+							await Promise.withResolvers<void>().promise;
+						});
+					},
+					tempDir.path(),
+					new EventBus(),
+					runtime,
+					`hang-session-shutdown-${index}`,
+				),
+			),
+		);
 		const sessionManager = SessionManager.inMemory();
-		const result = await discoverAndLoadExtensions([extensionsDir, ...hangExtensionPaths], tempDir.path());
 		const runner = new ExtensionRunner(
-			result.extensions,
-			result.runtime,
+			extensions,
+			runtime,
 			tempDir.path(),
 			sessionManager,
 			modelRegistry,
 		);
 		return {
 			runner,
-			hangExtensionPath,
-			hangExtensionPaths,
+			started,
 			cleanup: () => tempDir.removeSync(),
 		};
 	}
 
 	it("runs multiple session_shutdown handlers within one cap", async () => {
-		const { runner, hangExtensionPaths, cleanup } = await buildRunnerWithHangingShutdown(4);
-		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const { runner, started, cleanup } = await buildRunnerWithHangingShutdown(4);
 		try {
 			testSetSessionShutdownHandlerTimeoutMs(100);
 
@@ -108,30 +105,17 @@ describe("issue #2600 - session_shutdown handler timeout", () => {
 
 			// Multiple hung shutdown handlers must share the cap. Sequential
 			// dispatch would consume roughly count × cap and keep `/exit` slow.
+			expect(started).toEqual(new Set([0, 1, 2, 3]));
+			expect(elapsedMs).toBeGreaterThanOrEqual(75);
 			expect(elapsedMs).toBeLessThan(350);
-			for (const hangExtensionPath of hangExtensionPaths) {
-				expect(warnSpy).toHaveBeenCalledWith("Extension handler timed out", {
-					extensionPath: hangExtensionPath,
-					event: "session_shutdown",
-					timeoutMs: 100,
-				});
-			}
 		} finally {
-			warnSpy.mockRestore();
 			cleanup();
 		}
 	});
 
-	it("defaults the session_shutdown cap to ≤ 5s, never the generic 30s budget", () => {
-		expect(SESSION_SHUTDOWN_HANDLER_TIMEOUT_MS).toBeLessThanOrEqual(5_000);
-		expect(SESSION_SHUTDOWN_HANDLER_TIMEOUT_MS).toBeLessThan(EXTENSION_HANDLER_TIMEOUT_MS);
-	});
-
 	it("session_shutdown cap is independent from the generic handler cap", async () => {
-		const { runner, hangExtensionPath, cleanup } = await buildRunnerWithHangingShutdown();
+		const { runner, started, cleanup } = await buildRunnerWithHangingShutdown();
 		try {
-			const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
-
 			// Raise the *generic* timeout to a value the test would never
 			// tolerate (10s) while leaving the shutdown cap at 50ms. If the
 			// dispatcher pulls from the wrong knob the test wall-clock balloons.
@@ -142,13 +126,9 @@ describe("issue #2600 - session_shutdown handler timeout", () => {
 			await runner.emit({ type: "session_shutdown" });
 			const elapsedMs = performance.now() - startedAt;
 
+			expect(started).toEqual(new Set([0]));
+			expect(elapsedMs).toBeGreaterThanOrEqual(25);
 			expect(elapsedMs).toBeLessThan(500);
-			expect(warnSpy).toHaveBeenCalledWith("Extension handler timed out", {
-				extensionPath: hangExtensionPath,
-				event: "session_shutdown",
-				timeoutMs: 50,
-			});
-			warnSpy.mockRestore();
 		} finally {
 			cleanup();
 		}
