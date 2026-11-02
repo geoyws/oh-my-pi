@@ -11,7 +11,7 @@ import * as path from "node:path";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
+import { buildSkillPromptMessage, type Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
@@ -74,6 +74,7 @@ function createContext(options: {
 		isEvalRunning: false,
 		queuedMessageCount: 0,
 		prompt: vi.fn(options.prompt),
+		buildUserSkillPrompt: buildSkillPromptMessage,
 		promptCustomMessage: vi.fn(options.promptCustomMessage),
 		followUp: vi.fn(async () => {}),
 		abort: vi.fn(async () => {}),
@@ -243,7 +244,7 @@ describe("refused interactive submissions preserve a newer draft", () => {
 		expect(editor.pendingImages).toEqual([newerImage]);
 	});
 
-	for (const name of ["compact", "handoff"]) {
+	for (const name of ["compact", "handoff"] as const) {
 		it(`Enter /${name} refusal keeps each image marker on its own image beside a newer draft`, async () => {
 			const editor = new CustomEditor(getEditorTheme());
 			const { commands } = await createSkillCommands();
@@ -262,15 +263,15 @@ describe("refused interactive submissions preserve a newer draft", () => {
 				extra: { handleCompactCommand: refuse, handleHandoffCommand: refuse },
 			});
 
-			editor.setText(`/${name} keep ${SECRET} [Image #1]`);
-			// Enter resets only the text: the submitted image stays in the editor.
-			editor.pendingImages.push(refusedImage);
-			editor.pendingImageLinks.push(undefined);
+			// /handoff is text-only; /compact retains its submitted attachment.
+			editor.setText(`/${name} keep ${SECRET}${name === "compact" ? " [Image #1]" : ""}`);
+			if (name === "compact") {
+				editor.pendingImages.push(refusedImage);
+				editor.pendingImageLinks.push(undefined);
+			}
 			const submitting = pressEnter();
 			await entered.promise;
-			// Typed into the emptied composer while the gate awaited; its own
-			// attachment is the second live image, so its marker is #2.
-			editor.setText("newer draft [Image #2]");
+			editor.setText(`newer draft [Image #${name === "compact" ? 2 : 1}]`);
 			editor.pendingImages.push(newerImage);
 			editor.pendingImageLinks.push(undefined);
 			release.resolve();
@@ -279,9 +280,9 @@ describe("refused interactive submissions preserve a newer draft", () => {
 			expect(refuse).toHaveBeenCalledTimes(1);
 			expect(showError).toHaveBeenCalledWith(NOTICE);
 			const restored = editor.getExpandedText();
-			expect(restored).toContain(`/${name} keep ${SECRET} [Image #1]`);
-			expect(restored).toContain("newer draft [Image #2]");
-			expect(editor.pendingImages).toEqual([refusedImage, newerImage]);
+			expect(restored).toContain(`/${name} keep ${SECRET}${name === "compact" ? " [Image #1]" : ""}`);
+			expect(restored).toContain(`newer draft [Image #${name === "compact" ? 2 : 1}]`);
+			expect(editor.pendingImages).toEqual(name === "compact" ? [refusedImage, newerImage] : [newerImage]);
 		});
 	}
 

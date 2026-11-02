@@ -1226,6 +1226,7 @@ export class InputController {
 					this.ctx.queueCompactionMessage(text, "steer", images);
 					return;
 				}
+				this.#dropSubmittedPending(submittedImages);
 				if (await this.#invokeSkillCommand(text, "steer", inputImages, inputImageLinks)) {
 					// The dispatch above ran the turn inline without resolving the input
 					// callback, so nothing re-enters `getUserInput` to arm the next
@@ -1868,30 +1869,11 @@ export class InputController {
 		streamingBehavior: "steer" | "followUp",
 		images?: ImageContent[],
 		imageLinks?: (string | undefined)[],
-		preserveDraft = false,
 	): Promise<boolean> {
 		if (!isKnownSkillCommand(this.ctx, text)) return false;
 		const draftImages = images && images.length > 0 ? [...images] : undefined;
 		const draftImageLinks = draftImages && imageLinks && imageLinks.length > 0 ? [...imageLinks] : undefined;
-		const restoreDraft = () => {
-			if (preserveDraft) {
-				restoreDetachedDraft(this.ctx.editor, text, draftImages, draftImageLinks);
-			} else {
-				this.ctx.editor.setText(text);
-				if (draftImages && draftImages.length > 0) {
-					this.ctx.editor.pendingImages = [...draftImages];
-					this.ctx.editor.pendingImageLinks = draftImageLinks
-						? [...draftImageLinks]
-						: draftImages.map(() => undefined);
-					this.ctx.editor.imageLinks = this.ctx.editor.pendingImageLinks;
-				}
-				// Images first: collapsing reads `pendingImages.length` to decide which markers become chips.
-				this.ctx.editor.setCollapsedText(text);
-			}
-		};
-
-		if (preserveDraft) this.ctx.editor.addToHistory(text);
-		else this.ctx.editor.clearDraft(text);
+		this.ctx.editor.addToHistory(text);
 		try {
 			const dispatched = await invokeSkillCommandFromText(this.ctx, text, streamingBehavior, {
 				images: draftImages,
@@ -1900,15 +1882,13 @@ export class InputController {
 				propagateErrors: true,
 				source: "interactive",
 			});
-			if (!dispatched) restoreDraft();
+			if (!dispatched) restoreDetachedDraft(this.ctx.editor, text, draftImages, draftImageLinks);
 			return dispatched;
 		} catch (error) {
-			// A refusal merges back alongside any newer draft typed while
-			// dispatch was pending instead of overwriting it (see
-			// #restoreRefusedSubmission); other errors keep the legacy
-			// snapshot restore.
+			// Refusals show only the safe notice; every failed dispatch merges
+			// its detached submission beside any newer composer draft.
 			if (this.#restoreRefusedSubmission(error, text, draftImages, draftImageLinks)) return true;
-			restoreDraft();
+			restoreDetachedDraft(this.ctx.editor, text, draftImages, draftImageLinks);
 			this.ctx.showError(error instanceof Error ? error.message : String(error));
 			return true;
 		} finally {
@@ -2183,7 +2163,7 @@ export class InputController {
 		// Skill commands invoke through the custom-message path regardless of
 		// which keybinding submitted them. Enter routes them as `steer`;
 		// Ctrl+Enter (this handler) routes them as `followUp`.
-		if (text && (await this.#invokeSkillCommand(text, "followUp", images, imageLinks, true))) {
+		if (text && (await this.#invokeSkillCommand(text, "followUp", images, imageLinks))) {
 			return;
 		}
 
