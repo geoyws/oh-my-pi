@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import { createMockModel, type MockHandler, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -14,65 +14,60 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 const authStorage = await AuthStorage.create(path.join(process.cwd(), "auth.db"));
 authStorage.keys.setRuntime("anthropic", "test-key");
 const modelRegistry = new ModelRegistry(authStorage, path.join(process.cwd(), "models.yml"));
-const started: MockResponse = { content: ["Started"] };
-// Streams until the test aborts the turn; the delay only bounds a leaked process.
-const held: MockResponse = { content: ["Started"], delayMs: 600_000 };
-// QUEUED_RPC_SCRIPT varies only the first model call, which otherwise answers at once:
-// - "hold": streams until aborted.
-// - "until-steer": streams until a steer is queued (e.g. a follow-up promoted mid-turn), then
-//   answers without taking it, so the steer runs as the next turn.
-// - "internal-steer": queues a non-user (agent-attributed) steer as the call starts, then holds.
-// - "live-steer": the provider claims the first user steer into the streaming response,
-//   as a live-steering provider (Codex `response.steer`) does, then holds.
-const firstCall: Record<string, MockHandler> = {
-	hold: held,
-	"until-steer": async (_context, options) => {
-		const live = options?.liveSteering;
-		const signal = options?.signal;
-		if (!live || !signal) throw new Error("queued-message-rpc-agent: the mock call has no live steering channel");
-		await live.wait(signal);
-		return started;
-	},
-	"internal-steer": () => {
-		void session.sendCustomMessage(
-			{ customType: "test-internal-steer", content: "internal steer", display: true, attribution: "agent" },
-			{ deliverAs: "steer" },
-		);
-		return held;
-	},
-	"live-steer": async (_context, options) => {
-		const live = options?.liveSteering;
-		const signal = options?.signal;
-		if (live && signal) {
-			await live.wait(signal);
-			(await live.claim(signal))?.accept();
-		}
-		return held;
-	},
-};
+// Only the first provider response is held; later prompts answer normally.
+// Each held stream emits output before injecting or claiming steering, so an
+// immediate pre-output steer cannot cancel/reissue the response under test.
+const script = Bun.env.QUEUED_RPC_SCRIPT;
 const mock = createMockModel({
-	responses: [firstCall[Bun.env.QUEUED_RPC_SCRIPT ?? ""] ?? started],
+	responses: [{ content: ["Started"] }],
 	handler: { content: ["Handled queued request"] },
 });
-let internalSteerPending = Bun.env.QUEUED_RPC_SCRIPT === "internal-steer";
+let firstCallPending = true;
 const agent = new Agent({
 	getApiKey: () => "test-key",
 	initialState: { model: getBundledModel("anthropic", "claude-sonnet-4-5")!, systemPrompt: ["Test"], tools: [] },
 	streamFn: async (model, context, options): Promise<AssistantMessageEventStream> => {
-		if (!internalSteerPending) return mock.stream(model, context, options);
-		internalSteerPending = false;
+		const first = firstCallPending;
+		firstCallPending = false;
+		if (!first || !script) return mock.stream(model, context, options);
 		const signal = options?.signal;
-		if (!signal) throw new Error("Internal-steer fixture requires an abort signal");
+		if (!signal) throw new Error("Queued-message fixture requires an abort signal");
+		// This mock response is immediate: never await a held result before emitting output.
 		const message = await mock.stream(model, context, options).result();
 		const stream = new AssistantMessageEventStream();
+		const afterOutput = async () => {
+			if (script === "internal-steer") {
+				await session.sendCustomMessage(
+					{ customType: "test-internal-steer", content: "internal steer", display: true, attribution: "agent" },
+					{ deliverAs: "steer" },
+				);
+			} else if (script === "live-steer" || script === "until-steer") {
+				const live = options?.liveSteering;
+				if (!live) throw new Error("Queued-message fixture requires a live steering channel");
+				await live.wait(signal);
+				if (signal.aborted) return;
+				if (script === "live-steer") {
+					(await live.claim(signal))?.accept();
+				} else {
+					signal.removeEventListener("abort", abort);
+					stream.push({ type: "text_end", contentIndex: 0, content: "Started", partial: message });
+					stream.push({ type: "done", reason: "stop", message });
+				}
+			}
+		};
 		const unsubscribe = session.subscribe(event => {
 			if (event.type !== "message_update" || event.assistantMessageEvent.type !== "text_delta") return;
 			unsubscribe();
-			// A queued immediate steer may cancel/reissue a response with no consumed output.
-			void session.sendCustomMessage(
-				{ customType: "test-internal-steer", content: "internal steer", display: true, attribution: "agent" },
-				{ deliverAs: "steer" },
-			);
+			// The run loop has consumed visible provider output before steering changes.
+			void afterOutput().catch(error => {
+				if (signal.aborted) return;
+				signal.removeEventListener("abort", abort);
+				stream.push({
+					type: "error",
+					reason: "error",
+					error: { ...message, stopReason: "error", errorMessage: String(error) },
+				});
+			});
 		});
 		const abort = () => {
 			unsubscribe();
@@ -82,6 +77,7 @@ const agent = new Agent({
 		else {
 			signal.addEventListener("abort", abort, { once: true });
 			stream.push({ type: "start", partial: message });
+			stream.push({ type: "text_start", contentIndex: 0, partial: message });
 			stream.push({ type: "text_delta", contentIndex: 0, delta: "Started", partial: message });
 		}
 		return stream;

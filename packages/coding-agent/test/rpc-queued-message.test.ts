@@ -201,9 +201,10 @@ describe("RPC queued-message editing", () => {
 		client = createClient("until-steer");
 		await client.start();
 
-		const agentStarted = Promise.withResolvers<void>();
+		const outputConsumed = Promise.withResolvers<void>();
 		const unsubscribe = client.onEvent(event => {
-			if (event.type === "agent_start") agentStarted.resolve();
+			if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta")
+				outputConsumed.resolve();
 		});
 		const results: RpcPromptResultFrame[] = [];
 		const bothReported = Promise.withResolvers<void>();
@@ -213,7 +214,7 @@ describe("RPC queued-message editing", () => {
 		});
 		try {
 			const firstId = await client.prompt("start a long turn");
-			await withTimeout(agentStarted.promise, 10_000, "First turn never started streaming");
+			await withTimeout(outputConsumed.promise, 10_000, "First turn never emitted provider output");
 
 			const queuedId = await client.prompt("queued with image", [image], "followUp");
 			expect(await client.promoteQueuedMessage("queued with image")).toEqual({ promoted: true });
@@ -237,13 +238,14 @@ describe("RPC queued-message editing", () => {
 		async function startStreamingTurn(script: "hold" | "internal-steer" | "live-steer" = "hold"): Promise<void> {
 			client = createClient(script);
 			await client.start();
-			const agentStarted = Promise.withResolvers<void>();
+			const outputConsumed = Promise.withResolvers<void>();
 			const unsubscribe = client.onEvent(event => {
-				if (event.type === "agent_start") agentStarted.resolve();
+				if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta")
+					outputConsumed.resolve();
 			});
 			try {
 				await client.prompt("start a long turn");
-				await withTimeout(agentStarted.promise, 10_000, "First turn never started streaming");
+				await withTimeout(outputConsumed.promise, 10_000, "First turn never emitted provider output");
 			} finally {
 				unsubscribe();
 			}
@@ -380,7 +382,13 @@ describe("RPC queued-message editing", () => {
 			try {
 				await next(frame => frame.type === "ready", "Fixture never became ready");
 				await send({ id: "start", type: "prompt", message: "start a long turn" });
-				await next(frame => frame.type === "agent_start", "First turn never started streaming");
+				await next(
+					frame =>
+						frame.type === "message_update" &&
+						isRecord(frame.assistantMessageEvent) &&
+						frame.assistantMessageEvent.type === "text_delta",
+					"First turn never emitted provider output",
+				);
 				// Each steer fits one v1 frame; together they exceed it. Undecodable image bytes skip
 				// resizing, so the queued images keep their size.
 				const image = { type: "image", mimeType: "image/png", data: "A".repeat(700 * 1024) };

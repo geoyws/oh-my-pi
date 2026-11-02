@@ -70,7 +70,7 @@ describe("AgentSession prompt admission racing abort", () => {
 		}
 		const dropped: string[] = [];
 		session.setPromptDropped(prompt => dropped.push(prompt.text));
-		return { session, dropped, modelRegistry: options.modelRegistry ?? fallbackRegistry };
+		return { session, dropped, mock, modelRegistry: options.modelRegistry ?? fallbackRegistry };
 	}
 
 	/** Holds image normalization for image-bearing calls until released. */
@@ -359,15 +359,15 @@ describe("AgentSession prompt admission racing abort", () => {
 		const normalization = holdImageNormalization();
 		const turnStarted = Promise.withResolvers<void>();
 		const releaseTurn = Promise.withResolvers<void>();
-		let calls = 0;
-		const { session } = await createSession([
-			async () => {
-				calls++;
-				turnStarted.resolve();
-				await releaseTurn.promise;
-				return { content: ["first turn"] };
-			},
-		]);
+		const { session, mock } = await createSession([], false, { clientBridge: { capabilities: {} } });
+		mock.fallback = async context => {
+			turnStarted.resolve();
+			await releaseTurn.promise;
+			const hasSteer = context.messages.some(
+				message => message.role === "user" && JSON.stringify(message.content).includes("steer during dispatch"),
+			);
+			return { content: [hasSteer ? "answered dispatch steer" : "first turn"] };
+		};
 
 		// A prompt is admitted but still dispatching (normalization held,
 		// `#beginInFlight` not yet reached): the client claim is already
@@ -386,21 +386,20 @@ describe("AgentSession prompt admission racing abort", () => {
 		releaseTurn.resolve();
 		expect(await steer).toBe(true);
 		await dispatching;
+		// The owning prompt must not settle before its provider has answered the steer.
+		expect(session.agent.state.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			content: [{ type: "text", text: "answered dispatch steer" }],
+		});
 		await session.waitForIdle();
-		expect(calls).toBe(1);
-		// The admission really enqueued onto the live run: the steer text
-		// sits on the steering queue (the turn's single response ended it
-		// before the next boundary could deliver).
-		// The admission really injected into the owning run: the steer text
-		// lands in the run's message history after its first response.
-		const messages = session.agent.state.messages;
-		const firstResponseIndex = messages.findIndex(
-			message => message.role === "assistant" && JSON.stringify(message.content).includes("first turn"),
-		);
-		const steerIndex = messages.findIndex(
-			message => message.role === "user" && JSON.stringify(message.content).includes("steer during dispatch"),
-		);
-		expect(steerIndex).toBeGreaterThan(firstResponseIndex);
+		expect(
+			mock.calls.some(call =>
+				call.context.messages.some(
+					message => message.role === "user" && JSON.stringify(message.content).includes("steer during dispatch"),
+				),
+			),
+		).toBe(true);
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
 	});
 
 	it("refuses a steer whose owning turn settled while the steer's preprocessing ran", async () => {
@@ -578,6 +577,7 @@ describe("AgentSession prompt admission racing abort", () => {
 			false,
 			{
 				extensionRunner: {
+					hasHandlers: () => false,
 					getCommand: (name: string) => (name === "queued-cmd" ? { name: "queued-cmd" } : undefined),
 					emitBeforeAgentStart: async () => undefined,
 				},

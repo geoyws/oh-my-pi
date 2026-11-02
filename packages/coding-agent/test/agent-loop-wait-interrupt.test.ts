@@ -16,6 +16,7 @@ import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-sessi
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
+import { unmanagedDaemonLease } from "./helpers/daemon-lease";
 
 const sources = ["background", "peer", "parent"] as const;
 type Source = (typeof sources)[number];
@@ -144,7 +145,7 @@ describe("agent-loop wait wake delivery", () => {
 				},
 				onCompletion: () => () => {},
 			} as unknown as DaemonBrokerClient;
-			vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(broker);
+			vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(unmanagedDaemonLease(broker));
 		}
 		const schema = type({});
 		const barrier: AgentTool<typeof schema> = {

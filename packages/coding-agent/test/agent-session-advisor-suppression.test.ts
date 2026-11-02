@@ -976,7 +976,7 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		const settling = Promise.withResolvers<void>();
 		const releaseSettle = Promise.withResolvers<void>();
 		const extensionRunner: AdvisorTestExtensionRunner = {
-			hasHandlers: () => true,
+			hasHandlers: eventType => eventType === "agent_end",
 			emitBeforeAgentStart: async () => undefined,
 			emit: async event => {
 				if (event.type !== "agent_end") return;

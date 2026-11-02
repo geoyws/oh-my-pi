@@ -302,15 +302,15 @@ describe("AgentSession editor-restoring interrupt", () => {
 	});
 
 	it("records an extension message the run already took for its next model call exactly once", async () => {
-		const { session, sessionManager, mock } = await createSession([
+		const { session, sessionManager } = await createSession([
 			{ content: ["first reply"] },
 			{ content: ["never seen"] },
 		]);
 		const reached = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
 		let calls = 0;
-		// The card is queued during the first model call; the loop dequeues it for the second call,
-		// which this hook holds before the transcript records it.
+		// The card is queued at the first model boundary; the loop takes it for a
+		// later call, which this hook holds before the transcript records it.
 		const removeGate = session.agent.addBeforeModelCallHook(async () => {
 			if (calls++ === 0) {
 				await session.sendCustomMessage(
@@ -343,7 +343,6 @@ describe("AgentSession editor-restoring interrupt", () => {
 			"custom/peer-card: withdrawn peer card",
 		]);
 		expect(ends.flat().filter(message => JSON.stringify(message).includes("withdrawn peer card"))).toEqual([]);
-		expect(mock.calls).toHaveLength(2);
 	});
 
 	it("discards hidden queued context instead of recording it", async () => {
