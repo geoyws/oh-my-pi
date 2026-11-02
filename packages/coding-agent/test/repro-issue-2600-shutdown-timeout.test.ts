@@ -17,10 +17,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import {
-	ExtensionRuntime,
-	loadExtensionFromFactory,
-} from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import {
 	EXTENSION_HANDLER_TIMEOUT_MS,
 	ExtensionRunner,
@@ -80,13 +77,7 @@ describe("issue #2600 - session_shutdown handler timeout", () => {
 			),
 		);
 		const sessionManager = SessionManager.inMemory();
-		const runner = new ExtensionRunner(
-			extensions,
-			runtime,
-			tempDir.path(),
-			sessionManager,
-			modelRegistry,
-		);
+		const runner = new ExtensionRunner(extensions, runtime, tempDir.path(), sessionManager, modelRegistry);
 		return {
 			runner,
 			started,

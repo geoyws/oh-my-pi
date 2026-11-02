@@ -126,5 +126,4 @@ describe("print-mode dispatched builtins", () => {
 		expect(spies.order.indexOf("waitForIdle")).toBeGreaterThan(spies.order.indexOf("retry"));
 		expect(spies.order.indexOf("waitForIdle")).toBeLessThan(spies.order.indexOf("prompt:next question"));
 	});
-
 });
