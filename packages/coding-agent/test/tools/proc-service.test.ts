@@ -214,7 +214,7 @@ describe("proc:// background jobs", () => {
 					throw new Error(`Unexpected broker op ${operation.op}`);
 				},
 			};
-			const broker = vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(client);
+			const broker = vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(unmanagedDaemonLease(client));
 			const manager = new AsyncJobManager({});
 			const pending = Promise.withResolvers<string>();
 			const id = manager.register(
@@ -858,7 +858,7 @@ describe("bash services via proc://", () => {
 		const runtimeDir = path.join(temp.path(), "runtime");
 		await fs.mkdir(cwd);
 		const client = await createDaemonBrokerClient(cwd, { runtimeDir, idleGraceMs: 5_000 });
-		const spy = vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(client);
+		const spy = vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(unmanagedDaemonLease(client));
 		const oldTitle = process.title;
 		const broker = startBroker(cwd, runtimeDir);
 		try {
