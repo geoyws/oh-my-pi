@@ -164,7 +164,11 @@ export const UPDATE_RELAY_EXTENSION = "Run `omp browser-relay install` and reloa
  * extension's version gets no notice: it cannot tell.
  */
 export async function relayExtensionNotice(cdpUrl: string, signal?: AbortSignal): Promise<string | null> {
-	const response = await probeCdpResponse(`${cdpUrl}/json/version`, { timeoutMs: PROBE_TIMEOUT_MS, signal });
+	const probeUrl = await authenticatedRelayDiscoveryUrl(cdpUrl, "/json/version", {
+		timeoutMs: PROBE_TIMEOUT_MS,
+		signal,
+	});
+	const response = await probeCdpResponse(probeUrl, { timeoutMs: PROBE_TIMEOUT_MS, signal });
 	if (response === null || response.status < 200 || response.status >= 300) return null;
 	let installedBy: unknown;
 	try {
