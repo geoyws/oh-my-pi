@@ -44,6 +44,9 @@ it("reuses a plain TAR index across member reads while its file-backed source re
 		["first.txt", "first"],
 		["second.txt", "second"],
 	]);
+	// Cache reuse requires ctime outside the two-second racy-identity window; utimes cannot backdate it.
+	// Real filesystem ctime needs real elapsed time; fake clocks would mutate process-global time.
+	await Bun.sleep(2100);
 	const reads: [number, number][] = [];
 	const openArchive = ar.openArchive;
 	const open = vi.spyOn(ar, "openArchive").mockImplementation(input => {
@@ -82,10 +85,16 @@ for (const change of ["rewrite", "replace"] as const) {
 		const originalTime = new Date("2020-01-02T00:00:00Z");
 		await fs.utimes(archivePath, originalTime, originalTime);
 		const originalStat = await fs.stat(archivePath);
+		// Let ctime settle too, so this exercises invalidation of a cached index, not fresh-file reopening.
+		// Real filesystem ctime needs real elapsed time; fake clocks would mutate process-global time.
+		await Bun.sleep(2100);
 		const open = vi.spyOn(ar, "openArchive");
 		const tool = new ReadTool(makeSession(temp.path()));
 		const before = await tool.execute("before-change", { path: `${archivePath}:value.txt:raw` });
 		expect(before.content).toEqual([{ type: "text", text: "before" }]);
+		const cached = await tool.execute("cached-before-change", { path: `${archivePath}:value.txt:raw` });
+		expect(cached.content).toEqual([{ type: "text", text: "before" }]);
+		expect(open).toHaveBeenCalledTimes(1);
 		const replacementPath = temp.join("replacement.tar");
 		await ar.writeArchive(replacementPath, "tar", [["value.txt", "after!"]]);
 		if (change === "rewrite") {

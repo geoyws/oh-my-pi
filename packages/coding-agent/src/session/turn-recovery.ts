@@ -2408,7 +2408,8 @@ export class TurnRecovery {
 		const latestAssistant = options?.preserveFailedTurn
 			? failedMessage
 			: this.#host.agent.state.messages.findLast(
-					(message): message is AssistantMessage => message.role === "assistant" && message !== failedMessage,
+					(message): message is AssistantMessage =>
+						message.role === "assistant" && !this.#isSameAssistantMessage(message, failedMessage),
 				);
 		// Permitted redemption targets are catalog policy on the refused model.
 		const creditHandle = failedMessage.fallbackCreditHandle;
@@ -2541,6 +2542,8 @@ export class TurnRecovery {
 			wrapAround?: boolean;
 			/** This hop is a classifier-refusal walk, which visits each model at most once per turn. */
 			refusalWalk?: boolean;
+			/** The retry policy retries the failed model if this hop does not switch. */
+			sameModelRetryAvailable?: boolean;
 		},
 	): Promise<boolean> {
 		const creditHandle = failedMessage.fallbackCreditHandle;
