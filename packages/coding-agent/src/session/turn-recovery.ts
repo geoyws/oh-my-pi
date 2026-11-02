@@ -3316,6 +3316,12 @@ export class TurnRecovery {
 			this.#retryAbortController?.abort();
 			this.#retryAbortController = planAbortController;
 			try {
+				// Failure handling can outlive a cached window's reset. Re-read
+				// quota before comparing, just as at wake: an expired exhausted
+				// report is unknown, not evidence to wait for a later fallback.
+				for (const provider of new Set(candidates.map(candidate => candidate.model.provider))) {
+					await this.#host.modelRegistry.authStorage.usage.invalidate(provider, planAbortController.signal);
+				}
 				quotaPlan = await this.#planQuotaRecovery(candidates, planAbortController.signal);
 				for (const choice of quotaPlan.usableNow) {
 					// Past the budget a same-model account switch would keep retrying
