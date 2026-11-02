@@ -4604,6 +4604,7 @@ class CodexWebSocketConnection {
 		exchange: CodexWebSocketExchange,
 		timeouts: CodexWebSocketRequestTimeouts,
 		signal?: AbortSignal,
+		onSseEvent?: (event: RawSseEvent) => void,
 		telemetry?: ReturnType<typeof getProviderRequestTelemetry>,
 		onOwned?: () => void,
 	): AsyncGenerator<Record<string, unknown>> {
