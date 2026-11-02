@@ -3272,13 +3272,63 @@ export class TurnRecovery {
 			/\bGoUsageLimitError\b/.test(errorMessage) &&
 			(!this.#hasReplayUnsafeOutput(message) || this.#unexecutedToolCallsReplaySafe(message));
 
+		let quotaPlan: QuotaRecoveryPlan | undefined;
+		let quotaWait: QuotaRecoveryWait | undefined;
+
+		// Fail-fast cap: if the provider asks us to wait longer than
+		// retry.maxDelayMs and we have no fallback credential or model to
+		// switch to, surface the error instead of sleeping. Defends against
+		// 3-hour Anthropic rate-limit windows that would otherwise leave a
+		// subagent (or interactive session) silently hung. The original
+		// assistant error message is preserved in agent state so the caller
+		// can act on it.
+		// Opt-out: retry.waitForUsageReset lets a provider-stated usage-limit
+		// reset (Flag.UsageLimit — 5h/weekly quota windows, CN 使用上限, spend
+		// caps, … on any provider) sleep past the cap. Gated on authoritative
+		// provider timing: either a parsed reset hint from the error text, or
+		// a complete usage-report window (every exhausted limit carries a
+		// future reset). Usage-limit errors with neither fall back to the
+		// 30-minute QUOTA_EXHAUSTED heuristic, and sleeping on that for a
+		// permanent error (402 balance, dead spend cap) would hold the session
+		// through repeated heuristic sleeps instead of surfacing it. Bounded
+		// by the stated wait so an unrelated large backoff cannot sneak
+		// through. An armed quota wake is provider-stated timing by construction.
+		const maxDelayMs = retrySettings.maxDelayMs;
+		const exceedsDelayCap = (waitMs: number): boolean => {
+			const waitForUsageReset =
+				retrySettings.waitForUsageReset === true &&
+				(quotaWait !== undefined ||
+					(recordedUsageLimitOutcome !== undefined &&
+						(parsedRetryAfterMs !== undefined || recordedUsageLimitOutcome.reportResetAtMs !== undefined) &&
+						effectiveUsageLimitWaitMs !== undefined &&
+						waitMs <= effectiveUsageLimitWaitMs));
+			return maxDelayMs > 0 && waitMs > maxDelayMs && !waitForUsageReset;
+		};
+
+		// Deferring a chain candidate only pays when the code below makes
+		// another attempt on this model that can succeed. Each term is a
+		// branch below that, with no switch, ends the turn instead (a spent
+		// budget, a refusal or account-policy denial, a hard-error or
+		// Fast-degrade consult the classifier would not retry, a wait past
+		// the fail-fast cap), or, under `retry.rateLimitWalksChain`, a rate
+		// limit on this model, which the next attempt re-hits.
+		const sameModelRetryAvailable =
+			!retryBudgetExhausted &&
+			!sourceRateLimited &&
+			!classifierRefusal &&
+			!accountPolicyDenial &&
+			!((options?.fireworksFastFallback || options?.hardErrorFallback) && !this.isRetryableError(message)) &&
+			!exceedsDelayCap(
+				usageLimitWaitMs === undefined && parsedRetryAfterMs && parsedRetryAfterMs > delayMs
+					? parsedRetryAfterMs
+					: delayMs,
+			);
+
 		// Quota recovery: a usage limit that no rotation or consented saved
 		// reset cleared compares every eligible account of the active model and
 		// of each allowed fallback rung, then routes to one that can serve now or
 		// arms one wake for the earliest provider-stated reset. A short sibling
 		// unblock keeps its own wait. This planning never redeems saved resets.
-		let quotaPlan: QuotaRecoveryPlan | undefined;
-		let quotaWait: QuotaRecoveryWait | undefined;
 		if (
 			AIError.is(id, AIError.Flag.UsageLimit) &&
 			recordedUsageLimitOutcome !== undefined &&
@@ -3302,6 +3352,7 @@ export class TurnRecovery {
 					excludeProvider: longUsageLimitFallback ? currentModel.provider : undefined,
 					preserveFailedTurn,
 					wrapAround: longUsageLimitFallback,
+					sameModelRetryAvailable,
 				})) {
 					const routed = formatModelStringWithRouting(rung.candidate);
 					if (seen.has(routed) || !this.#host.modelRegistry.hasConfiguredAuth(rung.candidate)) continue;
@@ -3376,36 +3427,6 @@ export class TurnRecovery {
 			}
 		}
 
-		// Fail-fast cap: if the provider asks us to wait longer than
-		// retry.maxDelayMs and we have no fallback credential or model to
-		// switch to, surface the error instead of sleeping. Defends against
-		// 3-hour Anthropic rate-limit windows that would otherwise leave a
-		// subagent (or interactive session) silently hung. The original
-		// assistant error message is preserved in agent state so the caller
-		// can act on it.
-		// Opt-out: retry.waitForUsageReset lets a provider-stated usage-limit
-		// reset (Flag.UsageLimit — 5h/weekly quota windows, CN 使用上限, spend
-		// caps, … on any provider) sleep past the cap. Gated on authoritative
-		// provider timing: either a parsed reset hint from the error text, or
-		// a complete usage-report window (every exhausted limit carries a
-		// future reset). Usage-limit errors with neither fall back to the
-		// 30-minute QUOTA_EXHAUSTED heuristic, and sleeping on that for a
-		// permanent error (402 balance, dead spend cap) would hold the session
-		// through repeated heuristic sleeps instead of surfacing it. Bounded
-		// by the stated wait so an unrelated large backoff cannot sneak
-		// through. An armed quota wake is provider-stated timing by construction.
-		const maxDelayMs = retrySettings.maxDelayMs;
-		const exceedsDelayCap = (waitMs: number): boolean => {
-			const waitForUsageReset =
-				retrySettings.waitForUsageReset === true &&
-				(quotaWait !== undefined ||
-					(recordedUsageLimitOutcome !== undefined &&
-						(parsedRetryAfterMs !== undefined || recordedUsageLimitOutcome.reportResetAtMs !== undefined) &&
-						effectiveUsageLimitWaitMs !== undefined &&
-						waitMs <= effectiveUsageLimitWaitMs));
-			return maxDelayMs > 0 && waitMs > maxDelayMs && !waitForUsageReset;
-		};
-
 		if (!staleOpenAIResponsesReplayError && !switchedCredential && currentSelector && !deadlineRetriesExhausted) {
 			// The retry budget bounds same-model retries against a failing provider. A
 			// classifier refusal is not that: retrying the same model reproduces it, and
@@ -3450,27 +3471,7 @@ export class TurnRecovery {
 					refusalWalk: classifierRefusal,
 					preserveFailedTurn,
 					wrapAround: longUsageLimitFallback,
-					// Deferring a chain candidate only pays when the code below makes
-					// another attempt on this model that can succeed. Each term is a
-					// branch below that, with no switch, ends the turn instead (a spent
-					// budget, a refusal or account-policy denial, a hard-error or
-					// Fast-degrade consult the classifier would not retry, a wait past
-					// the fail-fast cap), or, under `retry.rateLimitWalksChain`, a rate
-					// limit on this model, which the next attempt re-hits.
-					sameModelRetryAvailable:
-						!retryBudgetExhausted &&
-						!sourceRateLimited &&
-						!classifierRefusal &&
-						!accountPolicyDenial &&
-						!(
-							(options?.fireworksFastFallback || options?.hardErrorFallback) &&
-							!this.isRetryableError(message)
-						) &&
-						!exceedsDelayCap(
-							usageLimitWaitMs === undefined && parsedRetryAfterMs && parsedRetryAfterMs > delayMs
-								? parsedRetryAfterMs
-								: delayMs,
-						),
+					sameModelRetryAvailable,
 				});
 			}
 			// Auto fallback from a Fireworks Fast variant to its base model. Independent
