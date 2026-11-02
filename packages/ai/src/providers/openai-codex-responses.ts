@@ -1941,7 +1941,8 @@ async function* streamCodexCompactionEvents(
 				if (options.signal?.aborted || !(error instanceof CodexWebSocketTransportError)) {
 					throw error;
 				}
-				if (websocketState && !(error instanceof CodexWebSocketBusyError)) recordCodexWebSocketFailure(websocketState, true);
+				if (websocketState && !(error instanceof CodexWebSocketBusyError))
+					recordCodexWebSocketFailure(websocketState, true);
 				const fallback = await openSseReplay();
 				if (websocketState) websocketState.lastTransport = fallback.transport;
 				yield* drainCodexCompactionEvents(fallback.eventStream, requestContext);

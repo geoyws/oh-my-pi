@@ -1,5 +1,11 @@
 import { SEANCE_SLASH_COMMAND } from "./seance";
-import { admitTuiSlashText, clearSubmittedText, refuseImages, restoreRefusedLine, runWithDetachedDraft } from "./helpers/draft";
+import {
+	admitTuiSlashText,
+	clearSubmittedText,
+	refuseImages,
+	restoreRefusedLine,
+	runWithDetachedDraft,
+} from "./helpers/draft";
 import { UserMessageRefusedError } from "../session/user-message-refused-error";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
