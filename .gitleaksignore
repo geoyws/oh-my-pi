@@ -128,3 +128,10 @@ fec79e4077c0f9646dd229ee520feb3092c53468:packages/catalog/src/models.json:generi
 # @:geoyws/omp/driver/executor from shape and use; working-tree fingerprints only.
 packages/ai/src/providers/anthropic-headers.ts:generic-api-key:63
 packages/ai/src/providers/anthropic-headers.ts:generic-api-key:72
+# 2026-11-02, omp t-7cb62cb5: packed catalog field-name table, not a credential.
+# The generic-api-key match spans accountAccess and its adjacent schema key.
+# Private parse confirmed that exact adjacent pair already exists in published
+# b747bf2d62d6b65748e56a0e06448ed5ce43ba1f and the complete key set is unchanged.
+# Codec round-trip was byte-identical; semantic delta is only 20 thinking leaves
+# across four MiniMax launch rows. Exact historical fingerprint, no path exemption.
+43b3b432aab79986562803e6694f53491ce33c3d:packages/catalog/src/models.json:generic-api-key:1
