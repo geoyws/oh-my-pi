@@ -214,7 +214,9 @@ describe("proc:// background jobs", () => {
 					throw new Error(`Unexpected broker op ${operation.op}`);
 				},
 			};
-			const broker = vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(unmanagedDaemonLease(client));
+			const broker = vi
+				.spyOn(daemonClient, "daemonClientForProject")
+				.mockResolvedValue(unmanagedDaemonLease(client));
 			const manager = new AsyncJobManager({});
 			const pending = Promise.withResolvers<string>();
 			const id = manager.register(
