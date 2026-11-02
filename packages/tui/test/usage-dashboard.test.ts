@@ -481,8 +481,12 @@ describe("UsageDashboardComponent", () => {
 	it("shows Claude alongside every other reporting provider in the overview", () => {
 		const now = Date.now();
 		const reports = [
-			report("anthropic", "primary@example.test", [limit("anthropic", "primary", "7d", "Weekly", 1, "exhausted")]),
-			report("anthropic", "secondary@example.test", [limit("anthropic", "secondary", "7d", "Weekly", 0.4, "ok")]),
+			report("anthropic", "primary@example.test", [
+				{ ...limit("anthropic", "primary", "7d", "Weekly", 1, "exhausted"), id: "anthropic:7d" },
+			]),
+			report("anthropic", "secondary@example.test", [
+				{ ...limit("anthropic", "secondary", "7d", "Weekly", 0.4, "ok"), id: "anthropic:7d" },
+			]),
 			...(["openai-codex", "zai", "kimi-code", "cursor"] as const).map(provider =>
 				report(provider, provider + "@example.test", [limit(provider, provider, "7d", "Weekly", 0.3, "ok")]),
 			),
