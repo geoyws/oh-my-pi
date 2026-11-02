@@ -543,8 +543,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				runtime,
 				async () => {
 					if (!(await admitTuiSlashText(command, runtime, work))) return true;
-					await runtime.ctx.handleTanCommand(work, runtime.input?.images);
-					return true;
+					return runtime.ctx.handleTanCommand(work, runtime.input?.images);
 				},
 				{ restoreText: true },
 			);
