@@ -1595,7 +1595,7 @@ export class UiHelpers {
 									if (sent === false) onFirstDropped();
 								},
 								(error: unknown) => {
-									if (error instanceof UserMessageRefusedError) this.#handBackRefused(firstPrompt, error);
+									if (error instanceof UserMessageRefusedError) this.#handBackRefused(first, error);
 									else onFirstFailed(error);
 								},
 							)
@@ -1612,7 +1612,7 @@ export class UiHelpers {
 					})
 					.catch((error: unknown) => {
 						disposeFirstPrompt();
-						if (error instanceof UserMessageRefusedError) this.#handBackRefused(firstPrompt, error);
+						if (error instanceof UserMessageRefusedError) this.#handBackRefused(first, error);
 						else onFirstFailed(error);
 					});
 			}
