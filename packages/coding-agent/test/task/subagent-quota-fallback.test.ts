@@ -138,17 +138,26 @@ async function runQuotaExhaustedTaskSubagent(
 		handler: yieldOrAnswer("answered by opus"),
 	});
 	const mocks: Model<Api>[] = [muse, glm, grok, opus];
+	const findMock = (provider: string, id: string): Model<Api> | undefined =>
+		mocks.find(
+			model => model.provider.toLowerCase() === provider.toLowerCase() && model.id.toLowerCase() === id.toLowerCase(),
+		);
 	for (const model of mocks) authStorage.keys.setRuntime(model.provider, "FAKE-SECRET-NOT-REAL");
 
 	const modelRegistry = new ModelRegistry(authStorage);
 	const catalogAvailable = modelRegistry.getAvailable.bind(modelRegistry);
-	vi.spyOn(modelRegistry, "getAvailable").mockImplementation(kind => [...mocks, ...catalogAvailable(kind)]);
+	vi.spyOn(modelRegistry, "getAvailable").mockImplementation(kind => [
+		...mocks,
+		...catalogAvailable(kind).filter(model => !findMock(model.provider, model.id)),
+	]);
 	const catalogAll = modelRegistry.getAll.bind(modelRegistry);
-	vi.spyOn(modelRegistry, "getAll").mockImplementation(kind => [...mocks, ...catalogAll(kind)]);
+	vi.spyOn(modelRegistry, "getAll").mockImplementation(kind => [
+		...mocks,
+		...catalogAll(kind).filter(model => !findMock(model.provider, model.id)),
+	]);
 	const catalogFind = modelRegistry.find.bind(modelRegistry);
 	vi.spyOn(modelRegistry, "find").mockImplementation(
-		(provider, id) =>
-			mocks.find(model => model.provider === provider && model.id === id) ?? catalogFind(provider, id),
+		(provider, id) => findMock(provider, id) ?? catalogFind(provider, id),
 	);
 	const cooldownUntil = Date.now() + 24 * 60 * 60 * 1000;
 	for (const selector of suppressed) modelRegistry.suppressSelector(selector, cooldownUntil);
@@ -228,8 +237,15 @@ it("falls through to the subagent's role chain when the task role model dies on 
 }, 20_000);
 
 it("does not walk to the role chain on a non-quota 402 when only usage limits fall back", async () => {
-	const { result, opus } = await runQuotaExhaustedTaskSubagent([GLM, GROK], SUBSCRIPTION_REQUIRED_402, "usage-limit");
+	const { result, muse, glm, grok, opus } = await runQuotaExhaustedTaskSubagent(
+		[GLM, GROK],
+		SUBSCRIPTION_REQUIRED_402,
+		"usage-limit",
+	);
 
+	expect(muse.calls.length).toBeGreaterThan(0);
+	expect(glm.calls).toHaveLength(0);
+	expect(grok.calls).toHaveLength(0);
 	expect(opus.calls).toHaveLength(0);
 	expect(result.exitCode).not.toBe(0);
 }, 20_000);

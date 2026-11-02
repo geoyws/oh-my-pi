@@ -3615,7 +3615,7 @@ describe("AgentSession retry fallback", () => {
 		});
 	});
 
-	it("keeps signed Anthropic thinking on its source model during transient retry", async () => {
+	it("keeps signed Anthropic thinking on its source model when a transient failure is snapshotted", async () => {
 		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const fallbackModel = getBundledModel("anthropic", "claude-opus-4-5");
 		if (!primaryModel || !fallbackModel) {
@@ -3660,6 +3660,14 @@ describe("AgentSession retry fallback", () => {
 			"retry.fallbackChains": {
 				"anthropic/*": [`${fallbackModel.provider}/${fallbackModel.id}`],
 			},
+		});
+		agent.subscribe(event => {
+			if (event.type === "message_end" && event.message.role === "assistant" && event.message.stopReason === "error") {
+				// A rebuilt transcript holds a copy, while recovery receives the original event.
+				agent.replaceMessages(
+					agent.state.messages.map(message => (message === event.message ? structuredClone(event.message) : message)),
+				);
+			}
 		});
 
 		session = new AgentSession({
