@@ -67,7 +67,8 @@ describe.skipIf(process.platform === "win32")("SSH structured directory transpor
 
 	it("cancels an in-flight directory transfer without returning a partial listing", async () => {
 		const controller = new AbortController();
-		vi.spyOn(connectionManager, "buildRemoteCommand").mockResolvedValue(["--fixture", "sleep 30"]);
+		// Model a single SSH transport process, without a shell child that can outlive cancellation.
+		vi.spyOn(connectionManager, "buildRemoteCommand").mockResolvedValue(["--fixture", "exec sleep 30"]);
 		onSpawn = () => controller.abort(new Error("directory transfer cancelled"));
 		await expect(listRemoteDir(target, fixture, { signal: controller.signal })).rejects.toThrow(/cancel|abort/i);
 	});
