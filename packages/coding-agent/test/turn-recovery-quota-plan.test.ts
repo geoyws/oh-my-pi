@@ -90,6 +90,11 @@ describe("TurnRecovery quota recovery planning", () => {
 	});
 
 	beforeEach(() => {
+		const wallTimeMs = Date.now();
+		const monotonicTimeMs = performance.now();
+		// Scheduler waits advance performance.now(); provider reset timestamps
+		// and the recovery planner must observe that same elapsed time.
+		vi.spyOn(Date, "now").mockImplementation(() => wallTimeMs + Math.floor(performance.now() - monotonicTimeMs));
 		vi.spyOn(envApiKey, "getEnvApiKey").mockReturnValue(undefined);
 		authStorage.keys.setRuntime("anthropic", "anthropic-test-key");
 		authStorage.keys.setRuntime("openai", "openai-test-key");
@@ -121,13 +126,10 @@ describe("TurnRecovery quota recovery planning", () => {
 
 	/** Health changes at provider reset times, independently of cache refresh calls. */
 	function stubHealth(phases: Array<Record<string, ModelUsageHealth>>, changeAtMs: number[] = []): void {
-		const startedAtMs = Date.now();
-		const startedMonotonicMs = performance.now();
 		vi.spyOn(authStorage.health, "model").mockImplementation(async (provider, options) => {
 			const key = `${provider}/${options.modelId}`;
 			calls.push(`health:${key}`);
-			const nowMs = startedAtMs + performance.now() - startedMonotonicMs;
-			const phaseIndex = changeAtMs.filter(at => nowMs >= at).length;
+			const phaseIndex = changeAtMs.filter(at => Date.now() >= at).length;
 			const phase = phases[Math.min(phases.length - 1, phaseIndex)] ?? {};
 			return phase[key] ?? { state: "unknown", accounts: [] };
 		});
@@ -295,17 +297,16 @@ describe("TurnRecovery quota recovery planning", () => {
 			],
 			[now + HOUR_MS, now + 2 * HOUR_MS],
 		);
-		const waitSpy = mockSchedulerWaitWithClock();
+		mockSchedulerWaitWithClock();
 		const { recovery, failure } = createRecovery({ "retry.modelFallback": false, "retry.waitForUsageReset": true });
 
 		await recovery.recordUsageLimitOutcome(failure);
 		expect(await recovery.handleRetryableError(failure)).toBe(true);
 
-		const longWaits = waitSpy.mock.calls.map(call => call[0] as number).filter(delay => delay > 60_000);
-		expect(longWaits).toHaveLength(2);
-		expect(longWaits[0]).toBeLessThanOrEqual(HOUR_MS);
-		expect(longWaits[1]).toBeGreaterThan(2 * HOUR_MS - 60_000);
-		expect(longWaits[1]).toBeLessThanOrEqual(2 * HOUR_MS);
+		// The shifted account must not resume at the first account's old reset.
+		// It becomes usable at the second deadline, regardless of timer chunking.
+		expect(Date.now() - now).toBeGreaterThanOrEqual(2 * HOUR_MS);
+		expect(Date.now() - now).toBeLessThan(2 * HOUR_MS + 60_000);
 		expect(notices().some(message => message.includes("moved the earliest reset"))).toBe(true);
 		expect(events.filter(event => event.type === "auto_retry_start")).toHaveLength(1);
 		expect(recovery.attempt).toBe(1);
