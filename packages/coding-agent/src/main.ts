@@ -436,7 +436,7 @@ export async function submitInteractiveInput(
 		| "clearOptimisticSkillMessage"
 		| "optimisticSkillMessagePending"
 	> &
-Partial<Pick<InteractiveMode, "loopPrompt" | "pauseLoop" | "restoreRefusedPrompt">>,
+		Partial<Pick<InteractiveMode, "loopPrompt" | "pauseLoop" | "restoreRefusedPrompt">>,
 	session: Pick<AgentSession, "buildUserSkillPrompt" | "prompt" | "promptCustomMessage" | "resume" | "isStreaming">,
 	input: SubmittedUserInput,
 ): Promise<void> {
@@ -863,7 +863,7 @@ async function runInteractiveMode(
 
 	for (const message of initialMessages) {
 		try {
-await session.prompt(message, { streamingBehavior: "steer", source: "interactive" });
+			await session.prompt(message, { streamingBehavior: "steer", source: "interactive" });
 		} catch (error: unknown) {
 			if (error instanceof UserMessageRefusedError) {
 				mode.restoreRefusedPrompt({ text: message, images: undefined });
@@ -2413,7 +2413,6 @@ export async function runRootCommand(
 			resolveActiveProjectRegistryPath,
 			clearPluginRootsCache: clearPluginRootsAndCaches,
 		};
-
 
 		// OTEL: unless `telemetry.otlpExportEnabled` is off, register global OTLP
 		// exporters when an endpoint is configured via env, then switch on the agent

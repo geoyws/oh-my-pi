@@ -289,7 +289,7 @@ export class EventController {
 	// mid-retry blip or the final settle — only the retry lifecycle events
 	// (never deferred) can tell them apart.
 	#retryPending = false;
-// `waitId` of the wait that mounted the countdown: only that wait's `_end`
+	// `waitId` of the wait that mounted the countdown: only that wait's `_end`
 	// may take it down. The Loader itself lives on `ctx.providerRetryLoader`
 	// (never `ctx.retryLoader`, whose overlay must not be clobbered) so the
 	// collab guest's host-state reconcile and `ensureLoadingAnimation()` can
@@ -1228,7 +1228,7 @@ export class EventController {
 			this.ctx.retryLoader = undefined;
 			this.ctx.statusContainer.disposeChildren();
 		}
-// A new turn can never be inside the previous turn's provider backoff. A
+		// A new turn can never be inside the previous turn's provider backoff. A
 		// `provider_retry_wait_end` dropped en route (a collab reconnect, a
 		// renderer exception) would otherwise pin the countdown — and, because
 		// `ensureLoadingAnimation` yields to it, suppress "Working…" for every

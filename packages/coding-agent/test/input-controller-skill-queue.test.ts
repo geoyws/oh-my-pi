@@ -533,7 +533,7 @@ describe("compaction skill re-invocation", () => {
 		expect(options).toEqual({
 			streamingBehavior: "followUp",
 			queueChipText: "/skill:test-skill arg1 arg2",
-source: "interactive",
+			source: "interactive",
 			onPromptQueued: expect.any(Function),
 			onPromptAdmitted: expect.any(Function),
 		});

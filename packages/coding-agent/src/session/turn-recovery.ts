@@ -3272,7 +3272,7 @@ export class TurnRecovery {
 			/\bGoUsageLimitError\b/.test(errorMessage) &&
 			(!this.#hasReplayUnsafeOutput(message) || this.#unexecutedToolCallsReplaySafe(message));
 
-// Quota recovery: a usage limit that no rotation or consented saved
+		// Quota recovery: a usage limit that no rotation or consented saved
 		// reset cleared compares every eligible account of the active model and
 		// of each allowed fallback rung, then routes to one that can serve now or
 		// arms one wake for the earliest provider-stated reset. A short sibling
@@ -3564,7 +3564,7 @@ export class TurnRecovery {
 			return false;
 		}
 
-// The fail-fast cap (`exceedsDelayCap`, defined above the chain consult).
+		// The fail-fast cap (`exceedsDelayCap`, defined above the chain consult).
 		if (exceedsDelayCap(delayMs) && !switchedCredential && !switchedModel) {
 			const attempt = this.#retryAttempt;
 			this.#resetSagaRetryCounters();

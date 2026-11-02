@@ -175,7 +175,7 @@ describe("HTML export template", () => {
 		await Bun.write(path.join(packWorkspace, "bun.lock"), Bun.file(path.join(repoRoot, "bun.lock")));
 		const packDir = path.join(packWorkspace, packageRel);
 		await Bun.write(path.join(packDir, "package.json"), Bun.file(path.join(packageDir, "package.json")));
-await fs.cp(productionDir, path.join(packDir, "dist"), { recursive: true });
+		await fs.cp(productionDir, path.join(packDir, "dist"), { recursive: true });
 		await fs.cp(path.join(packageDir, "src/export/html"), path.join(packDir, "src/export/html"), { recursive: true });
 		const workspace = await Bun.file(path.resolve(packageDir, "../../package.json")).json();
 		// Packing a copied workspace member still needs its catalog: dependency versions.

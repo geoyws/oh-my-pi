@@ -140,7 +140,8 @@ async function runQuotaExhaustedTaskSubagent(
 	const mocks: Model<Api>[] = [muse, glm, grok, opus];
 	const findMock = (provider: string, id: string): Model<Api> | undefined =>
 		mocks.find(
-			model => model.provider.toLowerCase() === provider.toLowerCase() && model.id.toLowerCase() === id.toLowerCase(),
+			model =>
+				model.provider.toLowerCase() === provider.toLowerCase() && model.id.toLowerCase() === id.toLowerCase(),
 		);
 	for (const model of mocks) authStorage.keys.setRuntime(model.provider, "FAKE-SECRET-NOT-REAL");
 

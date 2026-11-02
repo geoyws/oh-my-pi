@@ -629,7 +629,7 @@ export async function startServer(
 	options: StartServerOptions = {},
 ): Promise<StatsServerHandle> {
 	if (options.judge) setStatsJudgeProvider(options.judge);
-// Bind, key, sign and print one numeric address, never an alias that can resolve elsewhere.
+	// Bind, key, sign and print one numeric address, never an alias that can resolve elsewhere.
 	const hostname = canonicalStatsHostname(requestedHostname);
 	const requestedKey = `${hostname}:${port}`;
 	if (port !== 0) {
@@ -646,7 +646,7 @@ export async function startServer(
 			hostname,
 			port: boundPort,
 			stop: () => {
-for (const key of keys) activeServers.delete(key);
+				for (const key of keys) activeServers.delete(key);
 				localLaunchSecrets.delete(`${hostname}:${server.port ?? port}`);
 				server.stop(true);
 				if (stopped) return;

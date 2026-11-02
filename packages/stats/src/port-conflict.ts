@@ -138,7 +138,7 @@ export type StatsPortClaim = "bind" | "reuse" | "fallback";
  * An unauthenticated legacy dashboard (version 1–3, answering 200 without a token) is replaceable.
  */
 async function probeStatsDashboard(port: number, hostname: string): Promise<StatsDashboardProbe> {
-const urlBase = dashboardDialBase(hostname, port);
+	const urlBase = dashboardDialBase(hostname, port);
 	const signal = AbortSignal.timeout(STATS_PROBE_TIMEOUT_MS);
 	try {
 		const challenge = crypto.randomBytes(24).toString("base64url");

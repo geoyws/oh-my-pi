@@ -1339,7 +1339,7 @@ export class UiHelpers {
 		if (!forwarded && this.ctx.loopPrompt === text) this.ctx.pauseLoop();
 	}
 
-/** Deliver one compaction-queued message; `onQueued` receives what it pushes onto the session queues. */
+	/** Deliver one compaction-queued message; `onQueued` receives what it pushes onto the session queues. */
 	async #deliverQueuedMessage(
 		message: CompactionQueuedMessage,
 		onQueued: (queued: readonly AgentMessage[]) => void,
@@ -1385,7 +1385,7 @@ export class UiHelpers {
 			const forwarded = await this.ctx.session.prompt(builtin, {
 				streamingBehavior: message.mode,
 				images: message.images,
-source: "interactive",
+				source: "interactive",
 				onPromptQueued: onQueued,
 			});
 			this.#parkLoopOnLocalConsume(message.text, forwarded);
@@ -1396,14 +1396,14 @@ source: "interactive",
 				propagateErrors: true,
 				queueOnly: true,
 				images: message.images,
-source: "interactive",
+				source: "interactive",
 				onPromptQueued: onQueued,
 			})
 		) {
 			return;
 		}
 		if (this.ctx.isKnownSlashCommand(message.text)) {
-// No `streamingBehavior`: this prompt never queues (a busy session rejects it).
+			// No `streamingBehavior`: this prompt never queues (a busy session rejects it).
 			const forwarded = await this.ctx.session.prompt(message.text, { source: "interactive" });
 			this.#parkLoopOnLocalConsume(message.text, forwarded);
 			return;
@@ -1412,8 +1412,14 @@ source: "interactive",
 			message.text,
 			() =>
 				message.mode === "followUp"
-? this.ctx.session.followUp(message.text, message.images, { source: "interactive", onPromptQueued: onQueued })
-					: this.ctx.session.steer(message.text, message.images, { source: "interactive", onPromptQueued: onQueued }),
+					? this.ctx.session.followUp(message.text, message.images, {
+							source: "interactive",
+							onPromptQueued: onQueued,
+						})
+					: this.ctx.session.steer(message.text, message.images, {
+							source: "interactive",
+							onPromptQueued: onQueued,
+						}),
 			{ imageCount: message.images?.length ?? 0 },
 		);
 	}
@@ -1578,12 +1584,13 @@ source: "interactive",
 				const built = await buildSkillCommandPrompt(this.ctx, first.text, first.mode, first.images);
 				promptPromise = built
 					? this.ctx.session
-.promptCustomMessage(built.message, {
+							.promptCustomMessage(built.message, {
 								...built.options,
 								source: "interactive",
 								onPromptQueued: onFirstQueued,
 								onPromptAdmitted: onFirstAdmitted,
-							}).then(
+							})
+							.then(
 								sent => {
 									if (sent === false) onFirstDropped();
 								},
@@ -1596,7 +1603,7 @@ source: "interactive",
 			} else {
 				const disposeFirstPrompt = this.ctx.recordLocalSubmission(first.text, first.images?.length ?? 0);
 				promptPromise = this.ctx.session
-.prompt(first.text, {
+					.prompt(first.text, {
 						streamingBehavior: first.mode === "followUp" ? "followUp" : "steer",
 						images: first.images,
 						source: "interactive",

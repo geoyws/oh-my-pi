@@ -3318,7 +3318,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (!this.session.goalRuntime.buildContinuationPrompt()) return;
 		this.#goalContinuationTimer = setTimeout(() => {
 			this.#goalContinuationTimer = undefined;
-try {
+			try {
 				if (!this.onInputCallback) return;
 				if (!this.goalModeEnabled || this.goalModePaused) return;
 				// The 800ms timer can outlive the idle window that scheduled it: a
@@ -8245,7 +8245,7 @@ try {
 		this.isInitialized = false;
 	}
 
-async #quitHostOwned(code: number): Promise<void> {
+	async #quitHostOwned(code: number): Promise<void> {
 		try {
 			await postmortem.quit(code);
 		} catch {

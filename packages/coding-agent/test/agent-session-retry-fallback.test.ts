@@ -3662,10 +3662,16 @@ describe("AgentSession retry fallback", () => {
 			},
 		});
 		agent.subscribe(event => {
-			if (event.type === "message_end" && event.message.role === "assistant" && event.message.stopReason === "error") {
+			if (
+				event.type === "message_end" &&
+				event.message.role === "assistant" &&
+				event.message.stopReason === "error"
+			) {
 				// A rebuilt transcript holds a copy, while recovery receives the original event.
 				agent.replaceMessages(
-					agent.state.messages.map(message => (message === event.message ? structuredClone(event.message) : message)),
+					agent.state.messages.map(message =>
+						message === event.message ? structuredClone(event.message) : message,
+					),
 				);
 			}
 		});

@@ -9608,13 +9608,12 @@ export class AgentSession implements SettingsScope {
 
 		try {
 			const args = parseCommandArgs(argsString);
-// Attribute `pi.exec` children the command starts to this session,
+			// Attribute `pi.exec` children the command starts to this session,
 			// like hook and tool invocations above. Commands that consult
 			// findScopedSettings, including /review, must see this session's
 			// cache kill switch instead of the default enabled cache.
-			const result = await runWithExecOwner(
-				this.sessionManager.getSessionId(),
-				() => withActiveSettings(this.settings, () => loaded.command.execute(args, ctx, argsString)),
+			const result = await runWithExecOwner(this.sessionManager.getSessionId(), () =>
+				withActiveSettings(this.settings, () => loaded.command.execute(args, ctx, argsString)),
 			);
 			// If result is a string, it's a prompt to send to LLM
 			// If void/undefined, command handled everything
@@ -11636,7 +11635,7 @@ export class AgentSession implements SettingsScope {
 	}): Promise<void> {
 		const userInterrupt = options?.reason === USER_INTERRUPT_LABEL;
 		this.#pendingAbortErrorId = userInterrupt ? AIError.create(AIError.Flag.UserInterrupt) : undefined;
-// Latch only when the interrupt stops something; an idle Esc would otherwise fold
+		// Latch only when the interrupt stops something; an idle Esc would otherwise fold
 		// every later background completion for the rest of the session.
 		if (userInterrupt && (this.isStreaming || this.agent.hasQueuedMessages())) {
 			this.#advisors.autoResumeSuppressed = true;
