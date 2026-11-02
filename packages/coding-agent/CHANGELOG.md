@@ -25,6 +25,7 @@
 
 ### Fixed
 
+- Fixed retry fallback switching models prematurely when a failed-turn snapshot masked prior signed thinking.
 - Fixed extensions silently failing to load from discovered and configured paths after asynchronous path canonicalization.
 - Fixed missing stale browser relay extension notices when relay discovery requires authentication.
 - Fixed interactive skill and background-task submissions losing or restoring the wrong draft text and images.
