@@ -63,6 +63,13 @@ async function writeSkillFile(dir: string, skillName: string, body: string): Pro
 	return { name: skillName, description: "", filePath: skillPath, baseDir: dir, source: "test" };
 }
 
+async function submitStubEditor(editor: StubEditor): Promise<void> {
+	const text = editor.getExpandedText().trim();
+	// Editor clears text before onSubmit, but leaves pending attachments for the controller.
+	editor.setText("");
+	await editor.onSubmit?.(text);
+}
+
 function createStubInputControllerContext(opts: {
 	skillCommands: Map<string, Skill>;
 	isStreaming: boolean;
@@ -184,7 +191,7 @@ describe("InputController skill queue chip metadata", () => {
 
 		controller.setupEditorSubmitHandler();
 		editor.setText("/skill:test-skill arg1 arg2");
-		await editor.onSubmit?.("/skill:test-skill arg1 arg2");
+		await submitStubEditor(editor);
 
 		expect(promptCustomMessage).toHaveBeenCalledTimes(1);
 		expect(promptCustomMessage.mock.calls[0]?.[1]).toEqual({
@@ -207,7 +214,7 @@ describe("InputController skill queue chip metadata", () => {
 
 		controller.setupEditorSubmitHandler();
 		editor.setText("/skill:test-skill arg1 arg2");
-		await editor.onSubmit?.("/skill:test-skill arg1 arg2");
+		await submitStubEditor(editor);
 
 		expect(queueCompactionMessage).toHaveBeenCalledWith("/skill:test-skill arg1 arg2", "steer", undefined);
 		expect(promptCustomMessage).not.toHaveBeenCalled();
@@ -223,7 +230,7 @@ describe("InputController skill queue chip metadata", () => {
 
 		controller.setupEditorSubmitHandler();
 		editor.setText("/skill:test-skill arg1 arg2");
-		await editor.onSubmit?.("/skill:test-skill arg1 arg2");
+		await submitStubEditor(editor);
 
 		expect(setLoopPrompt).toHaveBeenCalledWith("/skill:test-skill arg1 arg2");
 		expect(promptCustomMessage).toHaveBeenCalledTimes(1);
@@ -241,7 +248,7 @@ describe("InputController skill queue chip metadata", () => {
 
 		controller.setupEditorSubmitHandler();
 		editor.setText("/skill:test-skill arg1 arg2");
-		await editor.onSubmit?.("/skill:test-skill arg1 arg2");
+		await submitStubEditor(editor);
 
 		expect(setLoopPrompt).toHaveBeenCalledWith("/skill:test-skill arg1 arg2");
 		expect(queueCompactionMessage).toHaveBeenCalledWith("/skill:test-skill arg1 arg2", "steer", undefined);
@@ -307,7 +314,7 @@ describe("InputController skill queue chip metadata", () => {
 
 		controller.setupEditorSubmitHandler();
 		editor.setText("/skill:test-skill arg1 arg2");
-		await editor.onSubmit?.("/skill:test-skill arg1 arg2");
+		await submitStubEditor(editor);
 
 		expect(promptCustomMessage.mock.calls[0]?.[1]).toEqual({
 			streamingBehavior: "steer",
@@ -330,7 +337,7 @@ describe("InputController skill queue chip metadata", () => {
 		editor.pendingImages = [image];
 		editor.pendingImageLinks = ["file:///tmp/skill-image.png"];
 		editor.imageLinks = editor.pendingImageLinks;
-		await editor.onSubmit?.("/skill:test-skill inspect this [Image #1]");
+		await submitStubEditor(editor);
 
 		expect(promptCustomMessage).toHaveBeenCalledTimes(1);
 		const message = promptCustomMessage.mock.calls[0]?.[0];
@@ -378,7 +385,7 @@ describe("InputController optimistic skill row (#8895)", () => {
 		const controller = new InputController(ctx);
 		controller.setupEditorSubmitHandler();
 		editor.setText("/skill:test-skill go");
-		await editor.onSubmit?.("/skill:test-skill go");
+		await submitStubEditor(editor);
 
 		expect(order).toEqual(["render", "dispatch"]);
 		expect(renderOptimisticSkillMessage.mock.calls[0]?.[0]).toMatchObject({
@@ -398,7 +405,7 @@ describe("InputController optimistic skill row (#8895)", () => {
 		const controller = new InputController(ctx);
 		controller.setupEditorSubmitHandler();
 		editor.setText("/skill:test-skill go");
-		await editor.onSubmit?.("/skill:test-skill go");
+		await submitStubEditor(editor);
 
 		expect(renderOptimisticSkillMessage).not.toHaveBeenCalled();
 		expect(promptCustomMessage).toHaveBeenCalledTimes(1);
@@ -414,7 +421,7 @@ describe("InputController optimistic skill row (#8895)", () => {
 		const controller = new InputController(ctx);
 		controller.setupEditorSubmitHandler();
 		editor.setText("/skill:test-skill go");
-		await editor.onSubmit?.("/skill:test-skill go");
+		await submitStubEditor(editor);
 
 		expect(renderOptimisticSkillMessage).toHaveBeenCalledTimes(1);
 		expect(clearOptimisticSkillMessage).toHaveBeenCalledTimes(1);
