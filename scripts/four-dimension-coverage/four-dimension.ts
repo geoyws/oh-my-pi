@@ -187,8 +187,9 @@ async function readJsonDumps(dir: string): Promise<libCoverage.CoverageMapData[]
 	return dumps;
 }
 
-function sortedNumbers(values: Iterable<number>): number[] {
-	return [...values].sort((a, b) => a - b);
+function sortedNumbers(values: number[]): number[] {
+	// A typed array sorts numerically; line numbers are positive 32-bit integers.
+	return Array.from(Uint32Array.from(values).sort());
 }
 
 /** Run every suite twice (Bun native, istanbul) and write the four-dimension report under `outDir`. */
