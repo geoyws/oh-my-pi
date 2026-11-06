@@ -21,8 +21,15 @@ function restoreEnv(name: string, value: string | undefined): void {
 	else process.env[name] = value;
 }
 
-/** Start an in-process broker and resolve once it listens; the returned promise settles when it shuts down. */
-async function startBroker(projectDir: string, runtimeDir: string, idleGraceMs: number): Promise<Promise<void>> {
+/**
+ * Start an in-process broker and resolve once it listens. `finished` settles when it shuts down;
+ * it is wrapped because an async function returning a promise would adopt it and wait for shutdown.
+ */
+async function startBroker(
+	projectDir: string,
+	runtimeDir: string,
+	idleGraceMs: number,
+): Promise<{ finished: Promise<void> }> {
 	const previousProjectDir = process.env[DAEMON_PROJECT_DIR_ENV];
 	const previousRuntimeDir = process.env[DAEMON_RUNTIME_DIR_ENV];
 	const previousGrace = process.env[DAEMON_IDLE_GRACE_ENV];
@@ -36,7 +43,7 @@ async function startBroker(projectDir: string, runtimeDir: string, idleGraceMs: 
 	restoreEnv(DAEMON_IDLE_GRACE_ENV, previousGrace);
 	const first = await Promise.race([listening.promise.then(() => "listening"), finished.then(() => "finished")]);
 	if (first !== "listening") throw new Error("broker finished before it listened");
-	return finished;
+	return { finished };
 }
 
 /** A raw connection that has sent nothing, recording what the broker answers and when it closes. */
@@ -79,7 +86,7 @@ describe("daemon broker idle shutdown", () => {
 		// Create the client (writes broker.token) before starting the broker, which reads that token.
 		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 100 });
 		const presence = await registerDaemonProjectPresence(projectDir, runtimeDir);
-		const broker = await startBroker(projectDir, runtimeDir, 100);
+		const { finished: broker } = await startBroker(projectDir, runtimeDir, 100);
 		try {
 			// A persistent daemon that outlives the first idle-shutdown timer (100ms) and then
 			// self-exits (~300ms). restart:"no" so its exit is terminal.
@@ -121,7 +128,7 @@ describe("daemon broker idle shutdown", () => {
 		const previousTitle = process.title;
 		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 20 });
 		const presence = await registerDaemonProjectPresence(projectDir, runtimeDir);
-		const broker = await startBroker(projectDir, runtimeDir, 20);
+		const { finished: broker } = await startBroker(projectDir, runtimeDir, 20);
 		try {
 			expect((await client.request({ op: "ping" })).op).toBe("ping");
 			await presence.close();
@@ -162,7 +169,7 @@ describe("daemon broker idle shutdown", () => {
 		const previousTitle = process.title;
 		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 20 });
 		const presence = await registerDaemonProjectPresence(projectDir, runtimeDir);
-		const broker = await startBroker(projectDir, runtimeDir, 20);
+		const { finished: broker } = await startBroker(projectDir, runtimeDir, 20);
 		try {
 			expect((await client.request({ op: "ping" })).op).toBe("ping");
 			await presence.close();
