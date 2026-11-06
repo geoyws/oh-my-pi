@@ -21,7 +21,8 @@ twice with `bun test --parallel=1`:
 2. `--preload scripts/four-dimension-coverage/istanbul-preload.ts`: a Bun
    runtime plugin instruments only the tracked files with
    `istanbul-lib-instrument` as they load. Each test process writes its
-   counters on exit.
+   counters from a global `afterAll` hook (Bun's test runner does not emit
+   `process.on("exit")`).
 
 Istanbul counters from all suites are merged per file. Every tracked file is
 seeded with its zero-hit map first, so a file that no test loads is reported
