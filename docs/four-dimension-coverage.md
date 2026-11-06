@@ -6,9 +6,9 @@ and statement coverage cannot be read from it. A file that Bun reports at 100%
 lines may still have untaken branches; treat Bun-only branch and statement
 coverage as unmeasured, not as zero and not as a pass.
 
-`scripts/four-dimension-coverage/four-dimension.ts` measures all four
-dimensions (lines, functions, branches, statements) for an explicit list of
-tracked source files.
+`scripts/four-dimension-coverage/cli.ts` (logic in `four-dimension.ts`)
+measures all four dimensions (lines, functions, branches, statements) for an
+explicit list of tracked source files.
 
 ## How it measures
 
@@ -18,9 +18,9 @@ twice with `bun test --parallel=1`:
 
 1. `--coverage --coverage-reporter=lcov`: Bun's native line and function
    numbers, kept so results stay comparable with earlier Bun-only receipts.
-2. `--preload scripts/four-dimension-coverage/istanbul-preload.ts`: a Bun
-   runtime plugin instruments only the tracked files with
-   `istanbul-lib-instrument` as they load. Each test process writes its
+2. `--preload scripts/four-dimension-coverage/istanbul-preload.ts`: the Bun
+   runtime plugin in `coverage-plugin.ts` instruments only the tracked files
+   with `istanbul-lib-instrument` as they load. Each test process writes its
    counters from a global `afterAll` hook (Bun's test runner does not emit
    `process.on("exit")`).
 
@@ -43,7 +43,7 @@ Suites need the same setup as the normal test run (`bun install`,
 never as a bare local test runner:
 
 ```sh
-bun scripts/four-dimension-coverage/four-dimension.ts \
+bun scripts/four-dimension-coverage/cli.ts \
   --scope scripts/four-dimension-coverage/renderer-scope.json \
   --out /tmp/four-dim [--root <other checkout>] [--require-full]
 ```
@@ -85,3 +85,21 @@ reports the lower coverage, and an ignore hint is refused.
 `packages/coding-agent/src/modes/interactive-mode.ts`, measured with the full
 `packages/tui` suite plus the coding-agent renderer, welcome, report and
 interactive-mode tests.
+
+`self-scope.json` tracks the runner itself (`four-dimension.ts`,
+`coverage-plugin.ts`, `instrument-options.ts`) with its own tests. A loader
+cannot instrument a module it has already imported, so measure a copy:
+
+```sh
+mkdir -p .self-coverage/scripts
+cp -R scripts/four-dimension-coverage .self-coverage/scripts/
+bun scripts/four-dimension-coverage/cli.ts \
+  --scope scripts/four-dimension-coverage/self-scope.json \
+  --root .self-coverage --out /tmp/four-dim-self --require-full
+rm -rf .self-coverage
+```
+
+The copy resolves its dependencies from the checkout's `node_modules`. The two
+one-statement entry modules, `cli.ts` and `istanbul-preload.ts`, only run as
+process entrypoints (every measurement and every negative-control run starts
+them) and are not in this scope.
