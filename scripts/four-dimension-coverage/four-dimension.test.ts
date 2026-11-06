@@ -115,6 +115,21 @@ describe("four-dimension coverage negative control", () => {
 		expect(subject.bun.unionLines!.covered).toBeLessThan(subject.bun.unionLines!.total);
 	});
 
+	test("coverage a test records for an untracked file stays out of the istanbul reports", async () => {
+		const root = await fixture({
+			"test/foreign.test.ts": testFile(`	expect(classify(1)).toBe("positive");
+	const global = (globalThis as { __coverage__?: Record<string, { path: string }> }).__coverage__!;
+	const [own] = Object.values(global);
+	global["/foreign/untracked.ts"] = { ...own, path: "/foreign/untracked.ts" };`),
+		});
+		const out = path.join(root, "out");
+		await measure(manifest, root, out);
+		const final = await Bun.file(path.join(out, "istanbul/coverage-final.json")).json();
+		const realRoot = await fs.realpath(root);
+		expect(Object.keys(final).sort()).toEqual(manifest.tracked.map(file => path.join(realRoot, file)).sort());
+		expect(await Bun.file(path.join(out, "istanbul/lcov.info")).text()).not.toContain("untracked.ts");
+	});
+
 	test("a coverage ignore hint in a tracked file is refused", async () => {
 		const root = await fixture(
 			{ "test/partial.test.ts": testFile(`	expect(classify(1)).toBe("positive");`) },
