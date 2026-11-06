@@ -250,7 +250,10 @@ export async function measure(manifest: ScopeManifest, root: string, outDir: str
 			{ OMP_FOUR_DIM_OUT: istanbulDir, OMP_FOUR_DIM_TRACK: JSON.stringify(tracked) },
 			path.join(suiteOut, "istanbul.log"),
 		);
-		for (const dump of await readJsonDumps(istanbulDir)) coverageMap.merge(dump);
+		// A test may instrument its own fixtures in-process; only tracked files enter the reports.
+		for (const dump of await readJsonDumps(istanbulDir)) {
+			for (const file of Object.keys(dump)) if (trackedSet.has(file)) coverageMap.merge({ [file]: dump[file] });
+		}
 		suites.push({ name: suite.name, cwd: suite.cwd, patterns: suite.tests, files, bun, istanbul });
 	}
 
