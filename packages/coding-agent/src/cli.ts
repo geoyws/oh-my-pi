@@ -607,7 +607,12 @@ export async function handleEntryFailure(error: unknown): Promise<never> {
 		import("@oh-my-pi/pi-utils/postmortem"),
 		import("./session/pressure-admission"),
 	]);
-	if (error instanceof PressureAdmissionError) return fatalMessage(`error: ${error.message}`, error.exitCode, error);
+	if (error instanceof PressureAdmissionError) {
+		// The detail can carry adapter stderr or a multi-line execFile failure
+		// (timeout, signal); a launcher reads exactly one line.
+		const line = error.message.replace(/\s+/g, " ").trim();
+		return fatalMessage(`error: ${line}`, error.exitCode, error);
+	}
 	return fatal(error);
 }
 
