@@ -143,7 +143,9 @@ describe("four-dimension coverage CLI", () => {
 				`	expect(classify(0)).toBe("non-positive");\n	expect(pick(false)).toBe("b");`,
 			),
 			"src/limit.ts": "export const LIMIT = 3;\n",
-			"a/limit.test.ts": `import { expect, test } from "bun:test";\nimport { LIMIT } from "../src/limit";\ntest("limit", () => expect(LIMIT).toBe(3));\n`,
+			"src/helper.ts": "export const double = (n: number): number => n * 2;\n",
+			// The untracked helper puts a non-tracked file in Bun's lcov, which the parser must skip.
+			"a/limit.test.ts": `import { expect, test } from "bun:test";\nimport { double } from "../src/helper";\nimport { LIMIT } from "../src/limit";\ntest("limit", () => expect(double(LIMIT)).toBe(6));\n`,
 		});
 		await $`git init -q && git add -A && git -c user.email=t@example.invalid -c user.name=t commit -qm fixture`
 			.cwd(root)
