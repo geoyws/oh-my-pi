@@ -519,8 +519,14 @@ function formatFatalError(label: string, err: Error): string {
 	return `\n[${label}] ${name}: ${message}${formattedStack}\n`;
 }
 
-async function exitAfterFatal(output: string, logMessage: string, err: Error, reason: Reason): Promise<never> {
-	const forcedExit = setTimeout(() => exitProcess(1), CLEANUP_DEADLINE_MS);
+async function exitAfterFatal(
+	output: string,
+	logMessage: string,
+	err: Error,
+	reason: Reason,
+	code: number = 1,
+): Promise<never> {
+	const forcedExit = setTimeout(() => exitProcess(code), CLEANUP_DEADLINE_MS);
 	try {
 		// Cleanup callbacks are invoked synchronously before runCleanup returns its
 		// completion promise. TUI owners therefore hand the cursor back before the
@@ -536,7 +542,7 @@ async function exitAfterFatal(output: string, logMessage: string, err: Error, re
 		await cleanup;
 	} finally {
 		clearTimeout(forcedExit);
-		exitProcess(1);
+		exitProcess(code);
 	}
 }
 
@@ -558,6 +564,20 @@ export async function fatal(error: unknown): Promise<never> {
 		process.exit(1);
 	}
 	return exitAfterFatal(output, "Fatal error", err, Reason.UNHANDLED_REJECTION);
+}
+
+/**
+ * Reports an expected startup refusal as a single line, after terminal owners
+ * restore their display, then exits with the refusal's own status. Use it for
+ * outcomes a launcher must branch on, not for crashes: those go to {@link fatal}.
+ */
+export async function fatalMessage(message: string, code: number, error: Error): Promise<never> {
+	const output = `${message}\n`;
+	if (!Bun.isMainThread) {
+		process.stderr.write(output);
+		process.exit(code);
+	}
+	return exitAfterFatal(output, "Startup refused", error, Reason.UNHANDLED_REJECTION, code);
 }
 
 if (Bun.isMainThread) {
