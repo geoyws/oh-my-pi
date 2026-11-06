@@ -218,6 +218,8 @@ export async function measure(manifest: ScopeManifest, root: string, outDir: str
 		const cwd = path.join(absRoot, suite.cwd);
 		const files = await resolveTests(cwd, suite.tests);
 		const suiteOut = path.join(absOut, "suites", suite.name);
+		// A previous run's dumps or lcov in the same --out would be merged into this one.
+		await fs.rm(suiteOut, { recursive: true, force: true });
 		await fs.mkdir(suiteOut, { recursive: true });
 		await Bun.write(path.join(suiteOut, "files.txt"), `${files.join("\n")}\n`);
 		const empty = { exitCode: 0, pass: 0, fail: 0, seconds: 0 };

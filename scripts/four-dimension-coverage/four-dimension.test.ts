@@ -91,6 +91,29 @@ describe("four-dimension coverage negative control", () => {
 		expect(result.full).toBe(false);
 	});
 
+	test("a re-run into the same --out reports only the new run's hits", async () => {
+		const root = await fixture({
+			"test/a.test.ts": testFile(
+				`	expect(classify(1)).toBe("positive");\n	expect(classify(0)).toBe("non-positive");\n	expect(pick(true)).toBe("a");\n	expect(pick(false)).toBe("b");`,
+			),
+		});
+		const out = path.join(root, "out");
+		const first = await measure(manifest, root, out);
+		expect(first.files.find(file => file.file === "src/subject.ts")!.branches).toMatchObject({
+			covered: 4,
+			total: 4,
+		});
+
+		await Bun.write(
+			path.join(root, "test/a.test.ts"),
+			testFile(`	expect(classify(1)).toBe("positive");\n	expect(pick(true)).toBe("a");`),
+		);
+		const second = await measure(manifest, root, out);
+		const subject = second.files.find(file => file.file === "src/subject.ts")!;
+		expect(subject.branches).toMatchObject({ covered: 2, total: 4 });
+		expect(subject.bun.unionLines!.covered).toBeLessThan(subject.bun.unionLines!.total);
+	});
+
 	test("a coverage ignore hint in a tracked file is refused", async () => {
 		const root = await fixture(
 			{ "test/partial.test.ts": testFile(`	expect(classify(1)).toBe("positive");`) },

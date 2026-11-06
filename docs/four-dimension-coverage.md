@@ -57,7 +57,8 @@ Exit codes: `0` measured; `1` `--require-full` and some dimension is below
 
 ## Output
 
-Under `--out`:
+Under `--out` (each run deletes and recreates `suites/<name>/` before running
+that suite, so a re-run never merges an earlier run's counters):
 
 | Path | Content |
 | --- | --- |
@@ -73,7 +74,8 @@ Under `--out`:
 `bun run test:scripts`) proves detection: a fixture with an untaken `if` and an
 untaken ternary arm reports 2/4 branches and missing statements, the same
 fixture with both arms taken reports 100% on all four dimensions, an unloaded
-tracked file reports 0%, and an ignore hint is refused.
+tracked file reports 0%, a re-run into the same `--out` after dropping calls
+reports the lower coverage, and an ignore hint is refused.
 
 ## Scopes
 
