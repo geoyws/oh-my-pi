@@ -19,6 +19,7 @@ Run from `packages/coding-agent/` (or add `--cwd=packages/coding-agent`):
 | Types only | `bun run check:types` |
 | Lint only | `bun run lint` |
 | Tests | `bun run test` |
+| Lines/functions/branches/statements for tracked files | see [four-dimension-coverage.md](../../docs/four-dimension-coverage.md) |
 | Autofix: lint + format prompts | `bun run fix` |
 | Build the `dist/omp` binary | `bun run build` |
 
