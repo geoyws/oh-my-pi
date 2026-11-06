@@ -1,4 +1,3 @@
-#!/usr/bin/env bun
 /**
  * Four-dimension coverage runner: lines, functions, branches and statements
  * for an explicit set of tracked source files.
@@ -19,7 +18,7 @@
  * line-count disagreement between them is enumerated rather than guessed.
  *
  * Usage:
- *   bun scripts/four-dimension-coverage/four-dimension.ts --scope scripts/four-dimension-coverage/renderer-scope.json --out <dir> [--require-full]
+ *   bun scripts/four-dimension-coverage/cli.ts --scope scripts/four-dimension-coverage/renderer-scope.json --out <dir> [--root <checkout>] [--require-full]
  *
  * Exit codes: 0 measured; 1 `--require-full` and a dimension is below 100%;
  * 2 a suite run failed (the report is still written); 64 usage error.
@@ -367,7 +366,8 @@ export function renderMarkdown(result: MeasureResult): string {
 	return rows.join("\n");
 }
 
-async function main(argv: string[]): Promise<number> {
+/** CLI behind `cli.ts`; returns the process exit code. */
+export async function main(argv: string[]): Promise<number> {
 	const option = (flag: string) => {
 		const index = argv.indexOf(flag);
 		return index >= 0 ? argv[index + 1] : undefined;
@@ -375,9 +375,7 @@ async function main(argv: string[]): Promise<number> {
 	const scope = option("--scope");
 	const out = option("--out");
 	if (!scope || !out) {
-		process.stderr.write(
-			"usage: four-dimension.ts --scope <manifest.json> --out <dir> [--root <checkout>] [--require-full]\n",
-		);
+		process.stderr.write("usage: cli.ts --scope <manifest.json> --out <dir> [--root <checkout>] [--require-full]\n");
 		return 64;
 	}
 	// --root measures another checkout (e.g. an older commit without this script) with this checkout's tooling.
@@ -388,8 +386,4 @@ async function main(argv: string[]): Promise<number> {
 	if (!result.suitesGreen) return 2;
 	if (argv.includes("--require-full") && !result.full) return 1;
 	return 0;
-}
-
-if (import.meta.main) {
-	process.exitCode = await main(process.argv.slice(2));
 }

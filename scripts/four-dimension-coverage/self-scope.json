@@ -1,0 +1,8 @@
+{
+	"tracked": [
+		"scripts/four-dimension-coverage/four-dimension.ts",
+		"scripts/four-dimension-coverage/coverage-plugin.ts",
+		"scripts/four-dimension-coverage/instrument-options.ts"
+	],
+	"suites": [{ "name": "self", "cwd": "scripts/four-dimension-coverage", "tests": ["*.test.ts"] }]
+}

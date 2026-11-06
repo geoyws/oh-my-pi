@@ -2,7 +2,8 @@ import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { measure, type ScopeManifest } from "./four-dimension";
+import { $ } from "bun";
+import { main, measure, type ScopeManifest } from "./four-dimension";
 
 setDefaultTimeout(120_000);
 
@@ -120,5 +121,82 @@ describe("four-dimension coverage negative control", () => {
 			{ "src/unloaded.ts": `/* istanbul ignore next */\n${UNLOADED}` },
 		);
 		await expect(measure(manifest, root, path.join(root, "out"))).rejects.toThrow("coverage ignore hint");
+	});
+});
+
+describe("four-dimension coverage CLI", () => {
+	async function writeScope(root: string, scope: ScopeManifest): Promise<string> {
+		const file = path.join(root, "scope.json");
+		await Bun.write(file, JSON.stringify(scope));
+		return file;
+	}
+
+	test("missing --scope or --out is a usage error", async () => {
+		expect(await main([])).toBe(64);
+		expect(await main(["--scope", "scope.json"])).toBe(64);
+	});
+
+	test("--require-full exits 1 below 100% and 0 once two suites together cover every dimension", async () => {
+		const root = await fixture({
+			"a/positive.test.ts": testFile(`	expect(classify(1)).toBe("positive");\n	expect(pick(true)).toBe("a");`),
+			"b/negative.test.ts": testFile(
+				`	expect(classify(0)).toBe("non-positive");\n	expect(pick(false)).toBe("b");`,
+			),
+			"src/limit.ts": "export const LIMIT = 3;\n",
+			"a/limit.test.ts": `import { expect, test } from "bun:test";\nimport { LIMIT } from "../src/limit";\ntest("limit", () => expect(LIMIT).toBe(3));\n`,
+		});
+		await $`git init -q && git add -A && git -c user.email=t@example.invalid -c user.name=t commit -qm fixture`
+			.cwd(root)
+			.quiet();
+		const head = (await $`git rev-parse HEAD`.cwd(root).text()).trim();
+		const out = path.join(root, "out");
+		const tracked = ["src/subject.ts", "src/limit.ts"];
+		const onlyA = await writeScope(root, { tracked, suites: [{ name: "a", cwd: "a", tests: ["*.test.ts"] }] });
+		expect(await main(["--scope", onlyA, "--out", out, "--root", root, "--require-full"])).toBe(1);
+		expect(await main(["--scope", onlyA, "--out", out, "--root", root])).toBe(0);
+
+		const both = await writeScope(root, {
+			tracked,
+			suites: [
+				{ name: "a", cwd: "a", tests: ["*.test.ts"] },
+				{ name: "b", cwd: "b", tests: ["*.test.ts"] },
+			],
+		});
+		expect(await main(["--scope", both, "--out", out, "--root", root, "--require-full"])).toBe(0);
+		const summary = await Bun.file(path.join(out, "summary.json")).json();
+		expect(summary.head).toBe(head);
+		const subject = summary.files.find((file: { file: string }) => file.file === "src/subject.ts");
+		expect(subject.branches).toEqual({ covered: 4, total: 4, pct: 100 });
+		expect(subject.bun.perSuite.a.lines.covered).toBeLessThan(subject.bun.perSuite.a.lines.total);
+		expect(subject.bun.unionLines.covered).toBe(subject.bun.unionLines.total);
+		const limit = summary.files.find((file: { file: string }) => file.file === "src/limit.ts");
+		expect(limit.functions).toEqual({ covered: 0, total: 0, pct: 100 });
+		expect(await Bun.file(path.join(out, "summary.md")).text()).toContain(`at ${head}`);
+	});
+
+	test("a suite whose process dies early exits 2 and still reports the tracked files", async () => {
+		const root = await fixture({ "test/dies.test.ts": `process.exit(3);\n` });
+		const scope = await writeScope(root, manifest);
+		const out = path.join(root, "out");
+		expect(await main(["--scope", scope, "--out", out, "--root", root])).toBe(2);
+		const summary = await Bun.file(path.join(out, "summary.json")).json();
+		expect(summary.suites[0].istanbul).toMatchObject({ exitCode: 3, pass: null, fail: null });
+		expect(summary.files.map((file: { statements: { covered: number } }) => file.statements.covered)).toEqual([0, 0]);
+		expect(await Bun.file(path.join(out, "summary.md")).text()).toContain("unknown HEAD");
+	});
+
+	test("without --root it measures the checkout that holds the script; a suite with no files runs nothing", async () => {
+		const repoRoot = path.join(import.meta.dir, "..", "..");
+		const root = await fixture({});
+		const scope = await writeScope(root, {
+			tracked: [path.relative(repoRoot, path.join(import.meta.dir, "instrument-options.ts"))],
+			suites: [{ name: "none", cwd: ".", tests: ["no-such-dir/*.test.ts"] }],
+		});
+		const out = path.join(root, "out");
+		expect(await main(["--scope", scope, "--out", out])).toBe(0);
+		const summary = await Bun.file(path.join(out, "summary.json")).json();
+		expect(summary.root).toBe(await fs.realpath(repoRoot));
+		expect(summary.suites[0]).toMatchObject({ files: [], istanbul: { exitCode: 0, pass: 0 } });
+		expect(summary.files[0].functions).toMatchObject({ covered: 0, total: 1 });
 	});
 });
