@@ -473,44 +473,55 @@ mod tests {
 		unsafe { libc::close(read_fd) };
 	}
 
-	#[test]
-	fn pending_tracks_partial_drain_progress() {
-		let (read_fd, write_fd) = pipe_pair();
-		let mut writer = TtyWriter::new(write_fd).unwrap();
-		// Far larger than any kernel pipe buffer, so the pump writes what fits
-		// and then blocks on the remainder with no reader draining.
-		let total = 1024 * 1024;
-		push(&writer, &vec![b'x'; total]);
-		// Wait until the pump has written at least one chunk, but remains blocked
-		// on the undrained tail. Do not treat one unchanged sample as stability:
-		// under full-suite load the pump thread may not be scheduled before the
-		// first poll.
-		let deadline = Instant::now() + Duration::from_secs(2);
-		loop {
-			std::thread::sleep(Duration::from_millis(20));
-			let pending = writer.pending();
-			if pending > 0 && pending < total as u32 {
+	/// Reads exactly `want` bytes from `fd`, or fewer at EOF/error.
+	fn read_up_to(fd: i32, want: usize) -> usize {
+		let mut buf = vec![0u8; 64 * 1024];
+		let mut got = 0usize;
+		while got < want {
+			let len = buf.len().min(want - got);
+			// SAFETY: buf is a valid out-buffer of at least `len` bytes.
+			let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), len) };
+			if n <= 0 {
 				break;
 			}
+			got += n as usize;
+		}
+		got
+	}
+
+	/// A slow-but-alive terminal: the reader takes one chunk, then stalls.
+	/// `pending()` must shrink below the enqueued total while the pump stays
+	/// blocked on the tail (#10430). The reader paces the pump, so this holds
+	/// for any pipe capacity, including one smaller than a write chunk, where
+	/// a blocking write completes only after the reader consumes it.
+	fn assert_pending_tracks_partial_drain(read_fd: i32, write_fd: i32) {
+		let mut writer = TtyWriter::new(write_fd).unwrap();
+		let total = 1024 * 1024;
+		push(&writer, &vec![b'x'; total]);
+		let (first_read_tx, first_read_rx) = std::sync::mpsc::channel();
+		let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+		let reader = std::thread::spawn(move || {
+			let mut got = read_up_to(read_fd, MAX_TTY_WRITE_CHUNK_BYTES);
+			first_read_tx.send(got).unwrap();
+			resume_rx.recv().unwrap();
+			got += read_up_to(read_fd, total - got);
+			got
+		});
+		assert_eq!(first_read_rx.recv().unwrap(), MAX_TTY_WRITE_CHUNK_BYTES);
+		// The pump accounts the first chunk once its write(2) returns; allow for
+		// scheduling on a loaded runner.
+		let deadline = Instant::now() + Duration::from_secs(5);
+		let mut pending = writer.pending();
+		while pending == total as u32 {
 			assert!(
 				Instant::now() < deadline,
 				"pump made no observable partial progress; pending {pending} of {total}"
 			);
+			std::thread::sleep(Duration::from_millis(5));
+			pending = writer.pending();
 		}
-		// Drain the rest so stop() can join the pump thread.
-		let reader = std::thread::spawn(move || {
-			let mut buf = vec![0u8; 64 * 1024];
-			let mut got = 0usize;
-			while got < total {
-				// SAFETY: buf is a valid out-buffer for read(2).
-				let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
-				if n <= 0 {
-					break;
-				}
-				got += n as usize;
-			}
-			got
-		});
+		assert!(pending > 0, "the stalled reader cannot have drained the whole backlog");
+		resume_tx.send(()).unwrap();
 		assert!(writer.flush_sync(5_000));
 		writer.stop(1_000);
 		// SAFETY: closing the test-owned write fd unblocks the reader at EOF.
@@ -518,6 +529,27 @@ mod tests {
 		assert_eq!(reader.join().unwrap(), total);
 		// SAFETY: closing test-owned fd.
 		unsafe { libc::close(read_fd) };
+	}
+
+	#[test]
+	fn pending_tracks_partial_drain_progress() {
+		let (read_fd, write_fd) = pipe_pair();
+		assert_pending_tracks_partial_drain(read_fd, write_fd);
+	}
+
+	/// Docker without `CAP_SYS_RESOURCE` hands out 8 KiB pipes once the user is
+	/// past `fs.pipe-user-pages-soft`; a 16 KiB blocking write then cannot
+	/// complete until a reader drains it.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn pending_tracks_partial_drain_progress_on_a_pipe_smaller_than_a_chunk() {
+		let (read_fd, write_fd) = pipe_pair();
+		// SAFETY: write_fd is a valid pipe fd owned by this test.
+		assert!(unsafe { libc::fcntl(write_fd, libc::F_SETPIPE_SZ, 8 * 1024) } >= 0);
+		// SAFETY: as above; this only reads the capacity.
+		let capacity = unsafe { libc::fcntl(write_fd, libc::F_GETPIPE_SZ) };
+		assert!(capacity > 0 && (capacity as usize) < MAX_TTY_WRITE_CHUNK_BYTES);
+		assert_pending_tracks_partial_drain(read_fd, write_fd);
 	}
 
 	#[test]
