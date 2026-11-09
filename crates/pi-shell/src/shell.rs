@@ -7230,7 +7230,9 @@ replace = [{ pattern = "^.+$", replacement = "PWD" }]
 				"TERM trap died {after_abort:?} after cancel, inside the {TERM_GRACE:?} grace, \
 				 without finishing its cleanup"
 			);
-			eprintln!("attempt {attempt}: trap starved past the TERM grace ({after_abort:?}); retrying");
+			eprintln!(
+				"attempt {attempt}: trap starved past the TERM grace ({after_abort:?}); retrying"
+			);
 		}
 		panic!("TERM trap never finished inside the {TERM_GRACE:?} grace in {ATTEMPTS} attempts");
 	}
