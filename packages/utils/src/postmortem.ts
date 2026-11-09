@@ -637,8 +637,15 @@ function writeRecoveryHints(providers: readonly FatalRecoveryHintProvider[], hea
 	writeTerminalReport(`${heading}${hints}`);
 }
 
-async function exitAfterFatal(output: string, logMessage: string, err: Error, reason: Reason): Promise<never> {
-	const hintProviders = [...fatalRecoveryHintProviders];
+async function exitAfterFatal(
+	output: string,
+	logMessage: string,
+	err: Error,
+	reason: Reason,
+	code: number = 1,
+	recoveryHints: boolean = true,
+): Promise<never> {
+	const hintProviders = recoveryHints ? [...fatalRecoveryHintProviders] : [];
 	// The forced exit backs up the pass deadline, so it waits while a callback with
 	// its own `deadlineMs` holds the pass open; that pass still ends at its deadline.
 	const forceExit = (): void => {
@@ -647,7 +654,7 @@ async function exitAfterFatal(output: string, logMessage: string, err: Error, re
 			return;
 		}
 		writeRecoveryHints(hintProviders);
-		exitProcess(1);
+		exitProcess(code);
 	};
 	let forcedExit = setTimeout(forceExit, CLEANUP_DEADLINE_MS);
 	try {
@@ -661,7 +668,7 @@ async function exitAfterFatal(output: string, logMessage: string, err: Error, re
 		writeRecoveryHints(hintProviders);
 	} finally {
 		clearTimeout(forcedExit);
-		exitProcess(1);
+		exitProcess(code);
 	}
 }
 
@@ -683,6 +690,21 @@ export async function fatal(error: unknown): Promise<never> {
 		process.exit(1);
 	}
 	return exitAfterFatal(report, "Fatal error", err, Reason.UNHANDLED_REJECTION);
+}
+
+/**
+ * Reports an expected startup refusal as a single line, after terminal owners
+ * restore their display, then exits with the refusal's own status. Use it for
+ * outcomes a launcher must branch on, not for crashes: those go to {@link fatal}.
+ */
+export async function fatalMessage(message: string, code: number, error: Error): Promise<never> {
+	const output = `${message}\n`;
+	if (!Bun.isMainThread) {
+		process.stderr.write(output);
+		process.exit(code);
+	}
+	// A refusal is one line by contract; recovery hints belong to crashes only.
+	return exitAfterFatal(output, "Startup refused", error, Reason.UNHANDLED_REJECTION, code, false);
 }
 
 if (Bun.isMainThread) {

@@ -1,0 +1,26 @@
+{
+	"tracked": [
+		"packages/tui/src/tui.ts",
+		"packages/tui/src/prompt/composer.ts",
+		"packages/tui/src/components/editor.ts",
+		"packages/coding-agent/src/modes/controllers/session-focus-controller.ts",
+		"packages/coding-agent/src/modes/interactive-mode.ts"
+	],
+	"suites": [
+		{ "name": "tui", "cwd": "packages/tui", "tests": ["test/*.test.ts"] },
+		{
+			"name": "coding-agent-renderer",
+			"cwd": "packages/coding-agent",
+			"tests": [
+				"test/welcome-history-resize.test.ts",
+				"test/command-report-text-mode.test.ts",
+				"test/modes/controllers/event-controller-superseded-agent-end.test.ts",
+				"test/session-focus-controller.test.ts",
+				"test/startup-composer.test.ts",
+				"test/issue-9597-cold-launch-double-clear.test.ts",
+				"test/cli-streaming-pty.test.ts",
+				"test/interactive-mode*.test.ts"
+			]
+		}
+	]
+}

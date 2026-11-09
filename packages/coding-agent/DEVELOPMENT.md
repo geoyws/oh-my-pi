@@ -13,14 +13,15 @@ duplicating prose that goes stale.
 
 Run from `packages/coding-agent/` (or add `--cwd=packages/coding-agent`):
 
-| Task                           | Command               |
-| ------------------------------ | --------------------- |
-| Typecheck + lint (the gate)    | `bun run check`       |
-| Types only                     | `bun run check:types` |
-| Lint only                      | `bun run lint`        |
-| Tests                          | `bun run test`        |
-| Autofix: lint + format prompts | `bun run fix`         |
-| Build the `dist/omp` binary    | `bun run build`       |
+| Task                                                  | Command                                                                 |
+| ----------------------------------------------------- | ----------------------------------------------------------------------- |
+| Typecheck + lint (the gate)                           | `bun run check`                                                         |
+| Types only                                            | `bun run check:types`                                                   |
+| Lint only                                             | `bun run lint`                                                          |
+| Tests                                                 | `bun run test`                                                          |
+| Lines/functions/branches/statements for tracked files | see [four-dimension-coverage.md](../../docs/four-dimension-coverage.md) |
+| Autofix: lint + format prompts                        | `bun run fix`                                                           |
+| Build the `dist/omp` binary                           | `bun run build`                                                         |
 
 Never invoke `tsc`/`npx tsc` directly — `bun run check` is the typecheck gate. After
 changing export HTML/CSS/JS, web themes, or the shared tool/trace renderers, run

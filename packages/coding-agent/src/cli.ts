@@ -599,12 +599,33 @@ export async function runCli(argv: string[]): Promise<void> {
 	}
 }
 
+/**
+ * Failure boundary for the process entry. A new-agent admission refusal is an
+ * expected outcome a launcher branches on, so it prints one line and exits with
+ * its own status (75 pressure, 78 admission unavailable). Anything else mirrors
+ * what an unhandled TLA rejection produced: error dump to stderr, exit code 1.
+ */
+export async function handleEntryFailure(error: unknown): Promise<never> {
+	// Lazy on purpose: neither the postmortem reporter nor the admission module
+	// belongs on the successful-startup import graph of this entry.
+	const [{ fatal, fatalMessage }, { PressureAdmissionError }] = await Promise.all([
+		import("@oh-my-pi/pi-utils/postmortem"),
+		import("./session/pressure-admission"),
+	]);
+	if (error instanceof PressureAdmissionError) {
+		// The detail can carry adapter stderr or a multi-line execFile failure
+		// (timeout, signal); a launcher reads exactly one line.
+		const line = error.message.replace(/\s+/g, " ").trim();
+		return fatalMessage(`error: ${line}`, error.exitCode, error);
+	}
+	return fatal(error);
+}
+
 // The entrypoint needs nothing after this floating call.
-// The catch mirrors what an unhandled TLA rejection produced: error dump to
-// stderr, exit code 1. A settled entry leaves the exit code to the command. An
-// entry still pending when the event loop drains (an await that can never
-// settle) exits 1 with a diagnostic: TLA would have hung there, and a bare
-// floating call exits 0 as if the command had succeeded.
+// A settled entry leaves the exit code to the command; a rejected one goes to
+// handleEntryFailure. An entry still pending when the event loop drains (an
+// await that can never settle) exits 1 with a diagnostic: TLA would have hung
+// there, and a bare floating call exits 0 as if the command had succeeded.
 // Guarded so importing `runCli` (profile CLI tests, SDK embedding) does not
 // launch the agent as a side effect. Worker threads re-enter this module as
 // their entry with `import.meta.main === false`, so the worker-host dispatch
@@ -622,9 +643,5 @@ if (isProcessEntry || !Bun.isMainThread) {
 	postmortem?.registerStdioDisconnectHandling();
 	const entry = runCli(process.argv.slice(2));
 	postmortem?.reportUnsettledEntry(entry, () => runningCommand);
-	entry.catch(async error => {
-		// Failure boundary: inspector/postmortem is irrelevant to successful startup.
-		const { fatal } = await import("@oh-my-pi/pi-utils/postmortem");
-		fatal(error);
-	});
+	entry.catch(handleEntryFailure);
 }

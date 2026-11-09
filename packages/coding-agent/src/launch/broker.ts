@@ -443,6 +443,12 @@ class DaemonBroker {
 	 */
 	readonly #startingNames = new Set<string>();
 	readonly #clients = new Set<IpcConnection>();
+	/**
+	 * Connections whose first request has not been read yet. Idle shutdown must
+	 * wait for them: a client that connects just before the grace expires would
+	 * otherwise lose its first request to "connection closed".
+	 */
+	readonly #awaitingFirstRequest = new Set<IpcConnection>();
 	readonly #ownerSockets = new Map<string, { socket: IpcConnection; subscriptionId: string | undefined }>();
 	readonly #completionSubscriptions = new Map<string, string | undefined>();
 	readonly #pendingCompletions = new Map<string, Map<string, DaemonCompletionNotification>>();
@@ -506,16 +512,19 @@ class DaemonBroker {
 		for (const socket of this.#sockets) socket.destroy();
 		this.#sockets.clear();
 		this.#clients.clear();
+		this.#awaitingFirstRequest.clear();
 		await this.#server?.close();
 		this.#finished.resolve();
 	}
 
 	#accept(socket: IpcConnection): void {
 		this.#sockets.add(socket);
+		this.#awaitingFirstRequest.add(socket);
 		let authenticated = false;
 		// Oversized requests (> MAX_REQUEST_BYTES) close the connection natively.
 		socket.start(
 			line => {
+				// #handleLine authenticates synchronously, before its first await.
 				void this.#handleLine(socket, line, () => {
 					if (authenticated) return;
 					authenticated = true;
@@ -523,10 +532,14 @@ class DaemonBroker {
 					clearTimeout(this.#idleTimer);
 					this.#idleTimer = undefined;
 				});
+				this.#settleFirstRequestWait(socket, authenticated);
 			},
 			() => {
 				this.#sockets.delete(socket);
-				if (!authenticated) return;
+				if (!authenticated) {
+					this.#settleFirstRequestWait(socket, false);
+					return;
+				}
 				this.#clients.delete(socket);
 				this.#scheduleIdleShutdown();
 				for (const [owner, registration] of this.#ownerSockets) {
@@ -1547,8 +1560,23 @@ class DaemonBroker {
 		}
 	}
 
+	/**
+	 * A connection stopped waiting on its first request. If it did not become a
+	 * client and the idle timer fired meanwhile, rearm it; a timer still armed
+	 * keeps its deadline, so connect-and-close probes never extend the grace.
+	 */
+	#settleFirstRequestWait(socket: IpcConnection, authenticated: boolean): void {
+		if (!this.#awaitingFirstRequest.delete(socket) || authenticated) return;
+		if (this.#idleTimer === undefined) this.#scheduleIdleShutdown();
+	}
+
+	/** An authenticated client, or a connection whose first request is still unread. */
+	#hasConnections(): boolean {
+		return this.#clients.size > 0 || this.#awaitingFirstRequest.size > 0;
+	}
+
 	#scheduleIdleShutdown(): void {
-		if (this.#shuttingDown || this.#clients.size > 0) return;
+		if (this.#shuttingDown || this.#hasConnections()) return;
 		clearTimeout(this.#idleTimer);
 		this.#idleTimer = setTimeout(() => {
 			this.#idleTimer = undefined;
@@ -1556,12 +1584,12 @@ class DaemonBroker {
 				const livePersistent = [...this.#records.values()].some(
 					record => record.spec.persist && !terminalState(record.snapshot.state),
 				);
-				if (this.#clients.size > 0 || livePersistent) return;
+				if (this.#hasConnections() || livePersistent) return;
 				if (await hasLiveDaemonProjectPresence(this.#runtimeDir)) {
 					this.#scheduleIdleShutdown();
 					return;
 				}
-				if (this.#clients.size === 0) await this.shutdown();
+				if (!this.#hasConnections()) await this.shutdown();
 			})();
 		}, this.#idleGraceMs);
 	}
