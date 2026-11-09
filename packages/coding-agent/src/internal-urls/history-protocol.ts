@@ -142,8 +142,13 @@ function appendRawMessage(lines: string[], message: AgentMessage): void {
 			lines.push("### assistant");
 			for (const block of assistantMessage.content) {
 				if (block.type === "text") lines.push(block.text);
-				else if (block.type === "thinking") lines.push("<thinking>", block.thinking, "</thinking>");
-				else if (block.type === "toolCall") {
+				else if (block.type === "thinking") {
+					// The model reads this transcript back as a tool result. Echoing its
+					// own reasoning there makes Anthropic refuse the rest of the session
+					// as `reasoning_extraction` (omp t-8af683a9), so mark the block's
+					// presence and keep the text out, as `history://<id>` already does.
+					lines.push(`[thinking: ${block.thinking.length} chars omitted]`);
+				} else if (block.type === "toolCall") {
 					lines.push(`#### tool call: ${block.name} (${block.id})`);
 					lines.push(jsonFence(JSON.stringify(block.arguments, null, 2) ?? "null"));
 				} else if (block.type === "redactedThinking") {

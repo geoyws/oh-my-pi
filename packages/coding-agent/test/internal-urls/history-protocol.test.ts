@@ -307,7 +307,10 @@ describe("history:// protocol", () => {
 		] as unknown as SessionEntry[]);
 
 		expect(content).toContain("answer text");
-		expect(content).toContain("visible reasoning");
+		// The model reads this back as a tool result; its own reasoning there
+		// triggers provider `reasoning_extraction` refusals, so only a marker stays.
+		expect(content).toContain("[thinking: 17 chars omitted]");
+		expect(content).not.toContain("visible reasoning");
 		// Redacted reasoning stays opaque: the marker is present, the blob is not.
 		expect(content).toContain("[redacted thinking:");
 		expect(content).not.toContain("ENCRYPTED-BLOB");
