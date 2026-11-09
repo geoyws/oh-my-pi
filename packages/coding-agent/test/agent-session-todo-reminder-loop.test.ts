@@ -415,4 +415,31 @@ describe("AgentSession todo reminder self-continuation suppression", () => {
 		// 1/3 fires, agent does work, 2/3 fires, agent acks → suppressed, no 3/3.
 		expect(reminderAttempts).toEqual([1, 2]);
 	});
+
+	it("stays silent when a new prompt finishes without touching todos left from an earlier request", async () => {
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		await session.prompt("Unrelated question: what is 8545 * 6512?");
+
+		emitToolResult("eval");
+		emitTextOnlyStop("55644040");
+		await session.waitForIdle();
+
+		expect(reminderAttempts).toEqual([]);
+		expect(todoReminderTranscriptEntry()).toBeUndefined();
+		expect(continueSpy).not.toHaveBeenCalled();
+	});
+
+	it("reminds when the agent works the todo list during the new prompt", async () => {
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		await session.prompt("Carry on with the review slices.");
+
+		emitToolResult("todo", { phases: session.getTodoPhases() });
+		emitTextOnlyStop("Started slice 81.");
+		await session.waitForIdle();
+
+		expect(reminderAttempts).toEqual([1]);
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+	});
 });

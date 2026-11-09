@@ -102,6 +102,11 @@ export class TodoTracker {
 	#reminderAwaitingProgress = false;
 	#mutationsSinceLastTouch = 0;
 	#midRunNudgeCount = 0;
+	/**
+	 * Whether the agent has used `todo` since the current user prompt began.
+	 * Starts true so a session that never began a prompt cycle keeps reminding.
+	 */
+	#todoTouchedThisCycle = true;
 
 	constructor(host: TodoTrackerHost) {
 		this.#host = host;
@@ -133,12 +138,14 @@ export class TodoTracker {
 		this.#reminderAwaitingProgress = false;
 		this.#mutationsSinceLastTouch = 0;
 		this.#midRunNudgeCount = 0;
+		this.#todoTouchedThisCycle = false;
 	}
 
 	/** Records a completed tool result before asynchronous event processing begins. */
 	onToolResult(toolName: string, isError: boolean, details?: unknown): void {
 		if (toolName === "todo") {
 			this.#mutationsSinceLastTouch = 0;
+			this.#todoTouchedThisCycle = true;
 		} else if (!isError && isMutatingResult(toolName, details)) {
 			this.#mutationsSinceLastTouch++;
 		}
@@ -236,6 +243,13 @@ export class TodoTracker {
 	async checkCompletion(message: AssistantMessage): Promise<boolean> {
 		if (this.#host.consumeLastServedToolChoiceLabel() === "user-force") return false;
 		if (this.#host.planModeEnabled()) return false;
+		if (!this.#todoTouchedThisCycle) {
+			// Leftover todos from an earlier request are not this prompt's plan.
+			// Reminding here makes the agent's last reply about them instead of
+			// the answer the user just asked for (omp t-616f5846).
+			logger.debug("Todo completion: todos untouched since the user prompt; skipping reminder");
+			return false;
+		}
 		if (this.#reminderAwaitingProgress) {
 			logger.debug("Todo completion: prior reminder still awaiting agent action; staying silent", {
 				attempt: this.#reminderCount,
