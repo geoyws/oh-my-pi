@@ -7214,10 +7214,34 @@ replace = [{ pattern = "^.+$", replacement = "PWD" }]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn cancellation_keeps_output_open_for_a_term_trap_that_writes() {
 		let _guard = shell_test_lock().lock().await;
+		// A trap that dies writing (the readers' old 500 ms cancel, EPIPE) ends
+		// the run before TERM_GRACE. A runner too loaded to finish the trap
+		// inside TERM_GRACE ends it at the KILL wave instead: that attempt says
+		// nothing about the readers, so it is retried, and only consistent
+		// starvation fails.
+		const ATTEMPTS: usize = 3;
+		for attempt in 1..=ATTEMPTS {
+			let (cleaned, after_abort) = run_term_trap_that_writes().await;
+			if cleaned.as_deref() == Some("cleaned") {
+				return;
+			}
+			assert!(
+				after_abort >= TERM_GRACE,
+				"TERM trap died {after_abort:?} after cancel, inside the {TERM_GRACE:?} grace, \
+				 without finishing its cleanup"
+			);
+			eprintln!("attempt {attempt}: trap starved past the TERM grace ({after_abort:?}); retrying");
+		}
+		panic!("TERM trap never finished inside the {TERM_GRACE:?} grace in {ATTEMPTS} attempts");
+	}
+
+	/// Cancels `sh` while a TERM trap that writes output after 550 ms is armed;
+	/// returns the trap's cleanup marker and the time from cancel to run end.
+	#[cfg(unix)]
+	async fn run_term_trap_that_writes() -> (Option<String>, Duration) {
 		let root = tempfile::tempdir().expect("cleanup directory");
 		// The trap writes once the readers' old 500 ms cancel would have closed
-		// them, and finishes well inside the 1 s TERM grace even when a loaded
-		// runner is slow to start `sleep`.
+		// them, then records its cleanup.
 		fs::write(
 			root.path().join("cleanup.sh"),
 			"trap 'sleep 0.55; echo flushing; printf cleaned > cleaned; exit 0' TERM\n: > \
@@ -7248,18 +7272,16 @@ replace = [{ pattern = "^.+$", replacement = "PWD" }]
 		})
 		.await
 		.expect("child ready");
+		let aborted = time::Instant::now();
 		abort.abort(AbortReason::Signal);
 		let result = time::timeout(Duration::from_secs(5), task)
 			.await
 			.expect("cancel finished")
 			.expect("run task")
 			.expect("shell result");
+		let after_abort = aborted.elapsed();
 		assert!(result.cancelled);
-		assert_eq!(
-			fs::read_to_string(root.path().join("cleaned"))
-				.expect("TERM cleanup after writing output"),
-			"cleaned"
-		);
+		(fs::read_to_string(root.path().join("cleaned")).ok(), after_abort)
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
