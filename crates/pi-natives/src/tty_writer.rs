@@ -537,7 +537,7 @@ mod tests {
 		assert_pending_tracks_partial_drain(read_fd, write_fd);
 	}
 
-	/// Docker without CAP_SYS_RESOURCE hands out 8 KiB pipes once the user is
+	/// Docker without `CAP_SYS_RESOURCE` hands out 8 KiB pipes once the user is
 	/// past `fs.pipe-user-pages-soft`; a 16 KiB blocking write then cannot
 	/// complete until a reader drains it.
 	#[cfg(target_os = "linux")]
