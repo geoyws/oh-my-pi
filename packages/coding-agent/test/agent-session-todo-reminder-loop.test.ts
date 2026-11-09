@@ -415,4 +415,46 @@ describe("AgentSession todo reminder self-continuation suppression", () => {
 		// 1/3 fires, agent does work, 2/3 fires, agent acks → suppressed, no 3/3.
 		expect(reminderAttempts).toEqual([1, 2]);
 	});
+
+	it("does not repeat the reminder on a later prompt that leaves the list unchanged", async () => {
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		emitTextOnlyStop();
+		await session.waitForIdle();
+		expect(reminderAttempts).toEqual([1]);
+
+		// An unrelated question in a new prompt cycle: its answer must stay the last word.
+		await session.prompt("Separately: what is 6 * 7?");
+		emitTextOnlyStop("42.");
+		await session.waitForIdle();
+
+		expect(reminderAttempts).toEqual([1]);
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("reminds again on a later prompt once the list changed after the earlier reminder", async () => {
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		emitTextOnlyStop();
+		await session.waitForIdle();
+		expect(reminderAttempts).toEqual([1]);
+
+		await session.prompt("Mark slice 81 done.");
+		emitToolResult("todo", {
+			phases: [
+				{
+					name: "Pending review",
+					tasks: [
+						{ content: "Slice 81", status: "completed" },
+						{ content: "Slice 82", status: "pending" },
+					],
+				},
+			],
+		});
+		emitTextOnlyStop("Done with slice 81.");
+		await session.waitForIdle();
+
+		expect(reminderAttempts).toEqual([1, 1]);
+		expect(continueSpy).toHaveBeenCalledTimes(2);
+	});
 });
