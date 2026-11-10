@@ -2168,7 +2168,10 @@ export class AgentSession implements SettingsScope {
 			if (this.#planReferenceRearmPending) {
 				this.#planReferenceRearmPending = false;
 				if (context?.willContinue && !signal?.aborted) {
-					this.#midRunPlanReference = (await this.#buildPlanReferenceMessage()) ?? undefined;
+					const built = await this.#buildPlanReferenceMessage();
+					// The read can outlive an abort that started during it. Assigning
+					// after that abort leaves a snapshot the next turn's aside injects.
+					if (!signal?.aborted) this.#midRunPlanReference = built ?? undefined;
 				}
 			}
 		});
@@ -10725,6 +10728,9 @@ export class AgentSession implements SettingsScope {
 		// leave any queued steer/follow-up visible for the user rather than
 		// auto-starting a fresh turn during cleanup.
 		this.#abortInProgress = true;
+		// Drop a mid-run plan snapshot before any await. abort() during the
+		// plan-file read must not leave it for the next turn's aside thunk.
+		this.#midRunPlanReference = undefined;
 		const unwind = Promise.withResolvers<void>();
 		this.#abortUnwinds.add(unwind.promise);
 		try {
@@ -12483,6 +12489,7 @@ export class AgentSession implements SettingsScope {
 
 		this.#disconnectFromAgent();
 		await this.abort({ goalReason: "internal" });
+		this.#midRunPlanReference = undefined;
 		await this.#sessionBeforeSwitchReconciler?.();
 
 		await this.#bash.flushPending();
