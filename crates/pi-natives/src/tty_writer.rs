@@ -539,17 +539,42 @@ mod tests {
 
 	/// Docker without `CAP_SYS_RESOURCE` hands out 8 KiB pipes once the user is
 	/// past `fs.pipe-user-pages-soft`; a 16 KiB blocking write then cannot
-	/// complete until a reader drains it.
+	/// complete until a reader drains it. The kernel rounds `F_SETPIPE_SZ` up to
+	/// the page size, so a 16 KiB or 64 KiB page cannot make a pipe under one
+	/// chunk. That case skips; a pipe that really is under 16 KiB still runs.
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn pending_tracks_partial_drain_progress_on_a_pipe_smaller_than_a_chunk() {
 		let (read_fd, write_fd) = pipe_pair();
 		// SAFETY: write_fd is a valid pipe fd owned by this test.
-		assert!(unsafe { libc::fcntl(write_fd, libc::F_SETPIPE_SZ, 8 * 1024) } >= 0);
+		let set = unsafe { libc::fcntl(write_fd, libc::F_SETPIPE_SZ, 8 * 1024) };
 		// SAFETY: as above; this only reads the capacity.
 		let capacity = unsafe { libc::fcntl(write_fd, libc::F_GETPIPE_SZ) };
-		assert!(capacity > 0 && (capacity as usize) < MAX_TTY_WRITE_CHUNK_BYTES);
+		if !small_pipe_case_runs(set, capacity) {
+			// SAFETY: closing test-owned fds on the skip path.
+			unsafe {
+				libc::close(read_fd);
+				libc::close(write_fd);
+			}
+			eprintln!(
+				"skipping: F_SETPIPE_SZ 8192 produced capacity {capacity} (set {set}), not under {MAX_TTY_WRITE_CHUNK_BYTES}"
+			);
+			return;
+		}
 		assert_pending_tracks_partial_drain(read_fd, write_fd);
+	}
+
+	/// True when the kernel actually gave a pipe smaller than one write chunk.
+	fn small_pipe_case_runs(set_rc: i32, capacity: i32) -> bool {
+		set_rc >= 0 && capacity > 0 && (capacity as usize) < MAX_TTY_WRITE_CHUNK_BYTES
+	}
+
+	#[test]
+	fn small_pipe_case_skips_when_the_kernel_cannot_make_one() {
+		assert!(!small_pipe_case_runs(-1, 0));
+		assert!(!small_pipe_case_runs(0, 16 * 1024));
+		assert!(!small_pipe_case_runs(0, 64 * 1024));
+		assert!(small_pipe_case_runs(0, 8 * 1024));
 	}
 
 	#[test]
