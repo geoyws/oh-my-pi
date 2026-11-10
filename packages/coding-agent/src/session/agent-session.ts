@@ -961,6 +961,10 @@ export class AgentSession implements SettingsScope {
 	#advisorCostRestore: Promise<void> = Promise.resolve();
 	#goalTurnCounter = 0;
 	#planReferenceSent = false;
+	/** Set when compaction clears the sent-flag; a continuing run re-injects at the next step. */
+	#planReferenceRearmPending = false;
+	/** Plan reference built at a mid-run turn end, delivered by the next step-boundary aside drain. */
+	#midRunPlanReference: CustomMessage | undefined;
 	#planReferencePath = "local://PLAN.md";
 	#clientBridge: ClientBridge | undefined;
 	#allowAcpAgentInitiatedTurns = false;
@@ -2157,6 +2161,16 @@ export class AgentSession implements SettingsScope {
 			if (context?.willContinue) this.#steerAnthropicWrapUp();
 			await this.#advisors.onPrimaryTurnEnd(messages, context?.willContinue, signal);
 			await this.#maintenance.maintainContextMidRun(messages, signal, context);
+			// A mid-run compaction (an in-turn `new_context` or threshold boundary)
+			// dropped the history carrying the approved plan; the prompt-time
+			// re-injection only runs on the next user prompt, so the continuing
+			// tool loop would act without it until then.
+			if (this.#planReferenceRearmPending) {
+				this.#planReferenceRearmPending = false;
+				if (context?.willContinue && !signal?.aborted) {
+					this.#midRunPlanReference = (await this.#buildPlanReferenceMessage()) ?? undefined;
+				}
+			}
 		});
 		this.yieldQueue = new YieldQueue({
 			isStreaming: () => this.isStreaming,
@@ -2233,6 +2247,15 @@ export class AgentSession implements SettingsScope {
 				// Mid-run todo reconciliation — evaluated at injection time so a turn
 				// that flips a todo just before this poll suppresses the nudge.
 				thunks.push(() => this.#todo.takeMidRunNudge());
+				const midRunPlanReference = this.#midRunPlanReference;
+				if (midRunPlanReference) {
+					this.#midRunPlanReference = undefined;
+					thunks.push(() => {
+						if (this.#planReferenceSent) return null;
+						this.#planReferenceSent = true;
+						return midRunPlanReference;
+					});
+				}
 				const contextNotesReminder = this.#experimentalContextNotesReminder;
 				if (contextNotesReminder) {
 					this.#experimentalContextNotesReminder = undefined;
@@ -2630,6 +2653,7 @@ export class AgentSession implements SettingsScope {
 			resetCodexProviderAfterCompaction: compaction => this.#resetCodexProviderAfterCompaction(compaction),
 			resetPlanReference: () => {
 				this.#planReferenceSent = false;
+				this.#planReferenceRearmPending = true;
 			},
 			syncTodoPhasesFromBranch: () => {
 				this.#todo.syncFromBranch();
@@ -8910,6 +8934,7 @@ export class AgentSession implements SettingsScope {
 			// (issue #1246) still clear it for re-injection on the next turn.
 			if (planReferenceMessage) {
 				this.#planReferenceSent = true;
+				this.#planReferenceRearmPending = false;
 			}
 			try {
 				await this.#recovery.promptAgentWithIdleRetry(messages, agentPromptOptions);
@@ -10883,6 +10908,8 @@ export class AgentSession implements SettingsScope {
 
 			this.#todo.resetCycle();
 			this.#planReferenceSent = false;
+			this.#planReferenceRearmPending = false;
+			this.#midRunPlanReference = undefined;
 			this.#planReferencePath = "local://PLAN.md";
 			this.#advisors.resetSessionState();
 			advisorRecordersDetached = false;
