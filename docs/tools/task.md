@@ -83,7 +83,7 @@ Extensions that replace `task` inherit this guidance (the native tool's `delegat
 
 Background response (`async.enabled=true`):
 
-- `content`: ``Spawned agent `<id>` (job `<jobId>`).`` A batch call instead returns `Spawned N background agents using <agent types>. ...` (the deduped per-item agent types, comma-joined) with a per-agent `- `<id>`(job`<jobId>`)` listing.
+- `content`: `` Spawned agent `<id>` (job `<jobId>`). `` A batch call instead returns `` Spawned N background agents using <agent types>. ... `` (the deduped per-item agent types, comma-joined) with a per-agent `` - `<id>` (job `<jobId>`) `` listing.
 - `details`: `{ projectAgentsDir, results, totalDurationMs, progress: [<AgentProgress per spawn>], async: { state, jobId, type: "task" } }`. The call keeps one shared `progress[]` snapshot; `async.jobId` is the first started job and `async.state` aggregates over the async spawns ("running" until every job settles, "failed" if any spawn failed) — jobs that settled before the call returned are already reflected. A mixed call's `results` carries the blocking spawns' inline `SingleResult`s (pure background calls return `results: []`).
 - Live progress streams into the same tool block via `onUpdate(...)`; final results arrive as async-result injections. Non-isolated completions get an idle/follow-up hint when messaging is enabled. Aborted agents that can be resumed get a resume hint; isolated runs point at the transcript.
 

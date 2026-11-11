@@ -449,6 +449,10 @@ const settings = Settings.isolated({
 });
 
 const { session } = await createAgentSession({
+	authStorage,
+	modelRegistry,
+	settings,
+	sessionManager: SessionManager.inMemory(),
 	toolNames: ["read", "search", "edit", "write"],
 	restrictToolNames: true,
 	enableMCP: false,

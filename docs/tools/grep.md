@@ -84,26 +84,20 @@ The tool returns a single text block in `content[0].text` plus structured `detai
    - `mode: content`;
    - the combined abort `signal` and `timeoutMs: SEARCH_GREP_TIMEOUT_MS` (`30_000`);
    - `filesystem`: the URL filesystem's `shellFilesystem()`. URL paths resolve through it natively: file-backed schemes (`local://`, `skill://`, `artifact://`) redirect to their host files, virtual schemes (`omp://`, `history://`) serve rendered read-only files and enumerated directories. Host paths never leave native code.
-10.   Native execution happens in `crates/pi-natives/src/grep.rs`:
-
-- `build_matcher()` sanitizes non-quantifier braces and first tries the Rust regex engine;
-- patterns unsupported by Rust regex (including lookaround/backreferences) retry with PCRE2;
-- group-balance errors retry with literal parentheses; if both engines still reject the pattern, the original pattern is searched literally.
-
+10. Native execution happens in `crates/pi-natives/src/grep.rs`:
+   - `build_matcher()` sanitizes non-quantifier braces and first tries the Rust regex engine;
+   - patterns unsupported by Rust regex (including lookaround/backreferences) retry with PCRE2;
+   - group-balance errors retry with literal parentheses; if both engines still reject the pattern, the original pattern is searched literally.
 11. Grep dispatch differs by resolved path set:
-
-- exact explicit files or fanned-out multi-targets: JS loops over targets, merges `grep()` results itself, and deduplicates overlapping targets by absolute path + line number;
-- single file/directory base: one `grep()` call handles native scanning.
-
+   - exact explicit files or fanned-out multi-targets: JS loops over targets, merges `grep()` results itself, and deduplicates overlapping targets by absolute path + line number;
+   - single file/directory base: one `grep()` call handles native scanning.
 12. Native result paths are root-relative with raw entry names; below a URL root `resolveSearchResultPath()` joins them back into full URLs with percent-encoded segments (`local://notes/a%20b.md`). Archive scratch paths are remapped back to user-facing selectors before rendering.
 13. JS output shaping then:
-
-- caps multi-file output to 20 files per page (`DEFAULT_FILE_LIMIT`), using `skip` as the next file offset;
-- caps matches per file to 20 for multi-file scopes and 200 for single-file scopes, and names the rendered files the cap trimmed in a closing line placed past the byte cap (`More than 20 matches in a.ts; grep keeps the first 20 per file when searching several. Search one file alone for up to 200.`; a single file gets `More than 200 matches; …` with a line-range hint). The page label's total reads `N+` only when native grep stopped at `INTERNAL_TOTAL_CAP`, not when a per-file cap bit;
-- round-robins selected per-file matches so one file does not monopolize the page;
-- formats lines through `formatMatchLine()` for the model and `formatCodeFrameLine()` for TUI;
-- in hashline mode, calls `getEditStore(session).recordSnapshotFile()` for each eligible rendered file to mint the `#TAG` anchor, then records emitted lines with `recordSeenLinesFromBody()`. Archive entries, immutable external materializations, and immutable URL schemes are skipped; a mutable file-backed URL (`local://`) is snapshotted against its backing host file (`resultSnapshotPath()`). Files too large or unreadable for snapshots fall back to plain line output.
-
+   - caps multi-file output to 20 files per page (`DEFAULT_FILE_LIMIT`), using `skip` as the next file offset;
+   - caps matches per file to 20 for multi-file scopes and 200 for single-file scopes, and names the rendered files the cap trimmed in a closing line placed past the byte cap (`More than 20 matches in a.ts; grep keeps the first 20 per file when searching several. Search one file alone for up to 200.`; a single file gets `More than 200 matches; …` with a line-range hint). The page label's total reads `N+` only when native grep stopped at `INTERNAL_TOTAL_CAP`, not when a per-file cap bit;
+   - round-robins selected per-file matches so one file does not monopolize the page;
+   - formats lines through `formatMatchLine()` for the model and `formatCodeFrameLine()` for TUI;
+   - in hashline mode, calls `getEditStore(session).recordSnapshotFile()` for each eligible rendered file to mint the `#TAG` anchor, then records emitted lines with `recordSeenLinesFromBody()`. Archive entries, immutable external materializations, and immutable URL schemes are skipped; a mutable file-backed URL (`local://`) is snapshotted against its backing host file (`resultSnapshotPath()`). Files too large or unreadable for snapshots fall back to plain line output.
 14. Final text is passed through `truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER })`, so the effective cap is the default byte cap from `packages/tui/src/tools/streaming-output.ts`, not the default line cap.
 15. `toolResult()` attaches text plus limit/truncation metadata.
 
