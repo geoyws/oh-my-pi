@@ -239,7 +239,9 @@ export function getRetryFallbackRole(settings: Settings, role: string): RetryFal
 	const primary = settings.getModelRole(role);
 	const chain = cfgRetryFallbackChains.get(settings)[role];
 	const exhaustive = exhaustiveRetryFallbackRoles.get(settings)?.has(role);
-	if (!primary || !Array.isArray(chain) || (chain.length === 0 && !exhaustive)) return undefined;
+	// An explicitly configured or installed empty chain is a real terminal chain
+	// ("no fallbacks"), not an absent one; it must stay visible to role resolution.
+	if (!primary || !Array.isArray(chain)) return undefined;
 	const roleState: RetryFallbackRole = { primary, chain };
 	if (exhaustive) roleState.exhaustive = true;
 	return roleState;

@@ -337,10 +337,11 @@ function installSubagentRetryFallbackChain(args: {
 	// An explicit multi-entry override list is its own complete retry chain: mark
 	// it exhaustive so the runtime never leaves it for a model-keyed chain.
 	// A single configured model may reuse its role's (or the default) configured chain, but never an implicit parent fallback.
+	const explicitEmptyChain = !exhaustive && Array.isArray(inheritedFallbackChain) && inheritedFallbackChain.length === 0;
 	const fallbackChain = exhaustive ? fallbackSelectors : inheritedFallbackChain;
 	if (
 		!Array.isArray(fallbackChain) ||
-		(!exhaustive && fallbackChain.length === 0) ||
+		(!exhaustive && !explicitEmptyChain && fallbackChain.length === 0) ||
 		!fallbackChain.every(entry => typeof entry === "string")
 	) {
 		return undefined;
@@ -350,7 +351,8 @@ function installSubagentRetryFallbackChain(args: {
 	installRetryFallbackRole(settings, role, {
 		primary: candidates[selectedIndex].selector,
 		chain: fallbackChain,
-		...(exhaustive ? { exhaustive: true as const } : {}),
+		// An explicitly emptied inherited chain is terminal, like an explicit list.
+		...(exhaustive || explicitEmptyChain ? { exhaustive: true as const } : {}),
 	});
 	return role;
 }

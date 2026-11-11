@@ -3320,14 +3320,22 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							fallbackSelectors.push(selector);
 						}
 					}
-					if (fallbackSelectors.length > 0 || options.modelPatternFallbackExhaustive) {
+					const explicitEmptyDefaultChain =
+						fallbackSelectors.length === 0 &&
+						options.modelPatternFallbackExhaustive !== true &&
+						Array.isArray(options.modelPatternDefaultFallbackChain) &&
+						options.modelPatternDefaultFallbackChain.length === 0;
+					if (fallbackSelectors.length > 0 || options.modelPatternFallbackExhaustive || explicitEmptyDefaultChain) {
 						installRetryFallbackRole(settings, options.modelPatternFallbackRole, {
 							primary: primarySelector,
 							chain: fallbackSelectors,
 							// An explicit multi-entry list owns its session end to end,
 							// matching the executor's immediate install. A singleton
-							// inheriting the default chain stays non-exhaustive.
-							...(options.modelPatternFallbackExhaustive === true ? { exhaustive: true as const } : {}),
+							// inheriting the default chain stays non-exhaustive, except an
+							// explicitly empty inherited chain is terminal like an explicit list.
+							...(options.modelPatternFallbackExhaustive === true || explicitEmptyDefaultChain
+								? { exhaustive: true as const }
+								: {}),
 						});
 						modelPatternRetryFallbackRole = options.modelPatternFallbackRole;
 					}
