@@ -1,3 +1,4 @@
+import { stripVTControlCharacters } from "node:util";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, UsageLimit, UsageReport } from "@oh-my-pi/pi-ai";
@@ -3117,6 +3118,12 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		const right = rightParts;
 		const leftWidths = left.map(part => visibleWidth(part));
 		const rightWidths = right.map(part => visibleWidth(part));
+		// Overflow handling below drops segments it cannot fit; the narrow-pane
+		// floor at the end needs the pre-drop configured content to clip from.
+		const originalLeftParts = left.slice();
+		const originalLeftSegIds = leftSegIds.slice();
+		const originalRightParts = right.slice();
+		const originalRightSegIds = rightSegIds.slice();
 
 		const leftSepWidth = separators.leftSepWidth;
 		const rightSepWidth = separators.rightSepWidth;
@@ -3238,6 +3245,44 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 				leftWidths.splice(dropIdx, 1);
 				leftSegIds.splice(dropIdx, 1);
 				leftWidth = left.length > 0 ? leftWidth - removedWidth - leftSepWidth - 2 : 0;
+			}
+			// Narrow-pane floor: the loops above can drop every segment once even
+			// the last one cannot fit (live grp-socket panes at ≤51 cols), which
+			// rendered an empty bar. Clip one segment instead — the status segment
+			// first (it carries the live hook status text), then the configured
+			// left-to-right order — so the bar always paints something.
+			if (left.length === 0 && right.length === 0 && topFillWidth >= 4) {
+				const statusLeftIdx = originalLeftSegIds.indexOf("status");
+				const statusRightIdx = originalRightSegIds.indexOf("status");
+				let survivor: string | undefined;
+				let survivorId: StatusLineSegmentId | undefined;
+				if (statusLeftIdx >= 0) {
+					survivor = originalLeftParts[statusLeftIdx];
+					survivorId = "status";
+				} else if (statusRightIdx >= 0) {
+					survivor = originalRightParts[statusRightIdx];
+					survivorId = "status";
+				} else if (originalLeftParts.length > 0) {
+					survivor = originalLeftParts[0];
+					survivorId = originalLeftSegIds[0];
+				} else if (originalRightParts.length > 0) {
+					survivor = originalRightParts[0];
+					survivorId = originalRightSegIds[0];
+				}
+				if (survivor && survivorId) {
+					const chrome = 2 + leftCapWidth + bandCapWidth;
+					const budget = Math.max(1, topFillWidth - chrome);
+					// Styled spans are flattened before clipping, as the footer's
+					// own overflow path does, so the cell budget counts text only.
+					const clipped = truncateToWidth(stripVTControlCharacters(survivor), budget);
+					if (clipped) {
+						left.push(clipped);
+						leftSegIds.push(survivorId);
+						const clippedWidth = visibleWidth(clipped);
+						leftWidths.push(clippedWidth);
+						leftWidth = groupWidth([clippedWidth], leftCapWidth + bandCapWidth, leftSepWidth);
+					}
+				}
 			}
 		}
 
