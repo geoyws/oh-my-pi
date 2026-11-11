@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Effort, type Api, type Model } from "@oh-my-pi/pi-ai";
+import { MissingApiKeyError } from "@oh-my-pi/pi-ai/error";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { kNoAuth } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import {
@@ -77,6 +78,46 @@ function createMockRegistry(options: MockRegistryOptions): ModelLookupRegistry &
 }
 
 describe("issue #985: subagent dispatch auth fallback", () => {
+	test.each(["next-authenticated", "exhausted-pools", "unrelated-error"])(
+		"handles explicit-list pooled auth: %s",
+		async scenario => {
+			const chosen = { ...sharedModel, reasoning: true };
+			const unavailable = new MissingApiKeyError("opencode-zen", "Test OAuth account pool unavailable");
+			const unexpected = new Error("Test auth broker transport error");
+			const probes: string[] = [];
+			const registry = {
+				getAvailable: () => [unauthedTaskModel, chosen, parentModel],
+				getApiKey: async (model: Model<Api>) => {
+					probes.push(model.id);
+					if (scenario === "unrelated-error") throw unexpected;
+					if (model === unauthedTaskModel || scenario === "exhausted-pools") throw unavailable;
+					return "test-key";
+				},
+			};
+			const result = resolveModelOverrideWithAuthFallback(
+				["opencode-zen/qwen3.6-plus-free:medium", "deepseek/shared-id:low"],
+				"deepseek/deepseek-v4-pro:high",
+				registry,
+			);
+			if (scenario === "unrelated-error") {
+				await expect(result).rejects.toBe(unexpected);
+				expect(probes).toEqual(["qwen3.6-plus-free"]);
+			} else {
+				if (scenario === "exhausted-pools") {
+					await expect(result).rejects.toThrow("No authenticated model available in explicit model override list");
+				} else {
+					expect(await result).toMatchObject({
+						model: chosen,
+						thinkingLevel: Effort.Low,
+						explicitThinkingLevel: true,
+						authFallbackUsed: false,
+					});
+				}
+				expect(probes).toEqual(["qwen3.6-plus-free", "shared-id"]);
+			}
+		},
+	);
+
 	test.each([undefined, "deepseek/deepseek-v4-pro:high"])(
 		"keeps multi-entry authentication inside the list with parent %s",
 		async parent => {

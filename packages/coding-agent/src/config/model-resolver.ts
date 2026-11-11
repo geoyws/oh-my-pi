@@ -25,6 +25,7 @@ import {
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ModelRoleLookup } from "@oh-my-pi/pi-tui/overlays/model-browser";
 import type { Api, Effort, KnownProvider, Model, ModelSpec } from "@oh-my-pi/pi-ai";
+import { MissingApiKeyError } from "@oh-my-pi/pi-ai/error";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { roleDefaultModels } from "@oh-my-pi/pi-catalog/compat/behavior";
 import { resolveBareVariantSelector, resolveVariantSelector } from "@oh-my-pi/pi-catalog/compat/collapse";
@@ -1749,9 +1750,13 @@ export async function resolveModelOverrideWithAuthFallback(
 			const candidate = resolveModelOverride([pattern], lookupRegistry, settings);
 			if (!candidate.model) continue;
 			matched = true;
-			const key = await modelRegistry.getApiKey(candidate.model, sessionId);
-			if (key === kNoAuth || isAuthenticated(key)) {
-				return { ...candidate, authFallbackUsed: false };
+			try {
+				const key = await modelRegistry.getApiKey(candidate.model, sessionId);
+				if (key === kNoAuth || isAuthenticated(key)) {
+					return { ...candidate, authFallbackUsed: false };
+				}
+			} catch (error) {
+				if (!(error instanceof MissingApiKeyError)) throw error;
 			}
 		}
 		// With no catalog match, let runtime discovery resolve the bounded list.

@@ -25,6 +25,7 @@ import type {
 	SimpleStreamOptions,
 } from "@oh-my-pi/pi-ai";
 import { resolveApiKeyOnce } from "@oh-my-pi/pi-ai/auth-retry";
+import { MissingApiKeyError } from "@oh-my-pi/pi-ai/error";
 import type { DiscoverAuthStorageOptions } from "@oh-my-pi/pi-ai/auth-broker/discover";
 import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
 import { prewarmOpenAICodexResponses } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
@@ -3101,8 +3102,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				const primary = parseModelPattern(pattern, resolutionModels, matchPreferences);
 				if (!primary.model || (retryFallback && !hasModelAuth(primary.model))) continue;
 				if (options.modelPatternFallbackExhaustive) {
-					const key = await modelRegistry.getApiKey(primary.model);
-					if (key !== kNoAuth && !isAuthenticated(key)) continue;
+					try {
+						const key = await modelRegistry.getApiKey(primary.model);
+						if (key !== kNoAuth && !isAuthenticated(key)) continue;
+					} catch (error) {
+						if (!(error instanceof MissingApiKeyError)) throw error;
+						continue;
+					}
 				}
 				let hasUsageFallbackCandidate = false;
 				for (
