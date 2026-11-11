@@ -3325,7 +3325,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						options.modelPatternFallbackExhaustive !== true &&
 						Array.isArray(options.modelPatternDefaultFallbackChain) &&
 						options.modelPatternDefaultFallbackChain.length === 0;
-					if (fallbackSelectors.length > 0 || options.modelPatternFallbackExhaustive || explicitEmptyDefaultChain) {
+					if (
+						fallbackSelectors.length > 0 ||
+						options.modelPatternFallbackExhaustive ||
+						explicitEmptyDefaultChain
+					) {
 						installRetryFallbackRole(settings, options.modelPatternFallbackRole, {
 							primary: primarySelector,
 							chain: fallbackSelectors,
