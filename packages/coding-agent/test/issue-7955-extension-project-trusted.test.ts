@@ -16,11 +16,11 @@ describe("ExtensionRunner project-trust context (issue #7955)", () => {
 		// Regression: this method was missing, so pi-cliproxyapi-provider's
 		// session_start handler crashed with "ctx.isProjectTrusted is not a function".
 		expect(typeof ctx.isProjectTrusted).toBe("function");
-		expect(ctx.isProjectTrusted()).toBe(true);
+		expect(typeof ctx.isProjectTrusted()).toBe("boolean");
 	});
 
 	it("command context inherits isProjectTrusted()", () => {
 		const ctx = createRunner().createCommandContext();
-		expect(ctx.isProjectTrusted()).toBe(true);
+		expect(typeof ctx.isProjectTrusted()).toBe("boolean");
 	});
 });

@@ -427,17 +427,31 @@ export function resolvePluginExtensionPaths(plugin: InstalledPlugin): string[] {
 // =============================================================================
 
 /**
+ * A plugin-supplied module path with the scope it was installed at. Project
+ * scope is repository content and loads only under project trust
+ * (kb omp t-81f67b33).
+ */
+export interface PluginEntryPath {
+	path: string;
+	scope: ScopedInstalledPlugin["scope"];
+	/** The plugin's package directory: everything the entry can import from its own package. */
+	pluginRoot: string;
+}
+
+/**
  * Get all tool paths from all enabled plugins.
  */
-export async function getAllPluginToolPaths(cwd: string): Promise<string[]> {
+export async function getAllPluginToolPaths(cwd: string): Promise<PluginEntryPath[]> {
 	const plugins = await getEnabledPlugins(cwd);
-	const paths: string[] = [];
+	const entries: PluginEntryPath[] = [];
 
 	for (const plugin of plugins) {
-		paths.push(...resolvePluginToolPaths(plugin));
+		for (const entryPath of resolvePluginToolPaths(plugin)) {
+			entries.push({ path: entryPath, scope: plugin.scope, pluginRoot: plugin.path });
+		}
 	}
 
-	return paths;
+	return entries;
 }
 
 /**
@@ -471,15 +485,17 @@ export async function getAllPluginCommandPaths(cwd: string): Promise<string[]> {
 /**
  * Get all extension module paths from all enabled plugins.
  */
-export async function getAllPluginExtensionPaths(cwd: string): Promise<string[]> {
+export async function getAllPluginExtensionPaths(cwd: string): Promise<PluginEntryPath[]> {
 	const plugins = await getEnabledPlugins(cwd);
-	const paths: string[] = [];
+	const entries: PluginEntryPath[] = [];
 
 	for (const plugin of plugins) {
-		paths.push(...resolvePluginExtensionPaths(plugin));
+		for (const entryPath of resolvePluginExtensionPaths(plugin)) {
+			entries.push({ path: entryPath, scope: plugin.scope, pluginRoot: plugin.path });
+		}
 	}
 
-	return paths;
+	return entries;
 }
 
 /**

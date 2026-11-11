@@ -1,13 +1,15 @@
 # Project trust
 
 A repository can ship files that OMP would otherwise act on as soon as it
-starts in that checkout. OMP keeps three such surfaces inert until you approve
+starts in that checkout. OMP keeps five such surfaces inert until you approve
 them for that project:
 
 | Surface | What a repository supplies | What could happen without approval |
 |---|---|---|
 | `mcp` | project MCP servers (`.omp/mcp.json`, `.mcp.json`, `.claude/`, `.cursor/`, `.vscode/`, ...) | OMP launches the repository's command with your environment and file access, or connects to its URL |
-| `extensions` | project extensions and hooks (`.omp/extensions/`, project hook dirs, project `settings.json` `extensions`) | OMP imports the repository's code into the agent process |
+| `extensions` | project extensions and hooks (`.omp/extensions/`, project hook dirs, project `settings.json` `extensions`), and extensions of plugins installed at project scope (`.omp/plugins/`) | OMP imports the repository's code into the agent process |
+| `tools` | project custom tools (`.omp/tools/`, `.claude/tools/`, ...), and tools of plugins installed at project scope | OMP imports the repository's code into the agent process |
+| `commands` | project TypeScript slash commands (`.omp/commands/<name>/index.ts`, ...) | OMP imports the repository's code into the agent process |
 | `env` | provider, proxy, OAuth and OMP-config names in the project `.env` | `ANTHROPIC_BASE_URL`, `HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS` and similar send your stored API keys and OAuth tokens to a host the repository chose |
 
 Approval is per project directory (resolved real path) and per surface, and
@@ -35,11 +37,11 @@ omp trust --dir PATH      # act on another directory
 project code. Read the listing before you approve — approving lets that code
 run as you. Restart omp in the project afterwards.
 
-Without approval, startup logs which project MCP servers, extensions and
-`.env` names it skipped. Everything else keeps working: user-level MCP
-servers and extensions, and non-routing project `.env` names (for example
-`LOG_LEVEL`), load as before. An unapproved project server never shadows a
-same-named user server.
+Without approval, startup logs which project MCP servers, extensions, tools,
+commands and `.env` names it skipped. Everything else keeps working:
+user-level MCP servers, extensions, tools, commands and plugins, and
+non-routing project `.env` names (for example `LOG_LEVEL`), load as before.
+An unapproved project server never shadows a same-named user server.
 
 ## What counts as an `env` routing name
 
@@ -63,11 +65,15 @@ credential.
 
 ## Limits
 
-- The extension fingerprint covers every file under each project extension's
-  own folder, dot-directories and `node_modules` included (only `.git` is
-  skipped). For an `extensions:` list that a project settings file supplies,
-  it covers each listed file, or the whole listed directory. Code imported
-  from outside those is not covered.
+- The extension, tool and command fingerprints cover every file under each
+  project entry's own folder (the folder directly under `extensions/`,
+  `hooks/`, `tools/` or `commands/`), dot-directories and `node_modules`
+  included (only `.git` is skipped). For an `extensions:` list that a project
+  settings file supplies, they cover each listed file, or the whole listed
+  directory; for a project-scope plugin, its whole package directory. Code
+  imported from outside those is not covered.
+- Extensions read the approval through `ctx.isProjectTrusted()`: `true` once
+  any surface of the project is approved, else `false`.
 - The store is `<agent dir>/trusted-projects.json` (mode `0600`). Deleting it
   revokes every approval.
 - Running omp from source with `bun` (not the built binary) lets Bun itself

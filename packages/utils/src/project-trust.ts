@@ -3,8 +3,9 @@
  *
  * A repository can ship content that OMP would otherwise act on the moment it
  * starts in that checkout: project MCP servers (launched as subprocesses with
- * the user's environment), project extensions and hooks (imported into the
- * agent process), and project `.env` names that redirect provider traffic
+ * the user's environment), project extensions, hooks, custom tools, TypeScript
+ * commands and project-scope plugins (imported into the agent process), and
+ * project `.env` names that redirect provider traffic
  * (base URLs, proxies, CA bundles) to a host the repository chooses. None of
  * these may run or apply until the user approves them for that exact project
  * directory AND that exact content. An approval records one fingerprint per
@@ -21,9 +22,9 @@ import * as path from "node:path";
 import { getAgentDir } from "./dirs";
 
 /** The independently approved kinds of project-controlled behaviour. */
-export type ProjectTrustSurface = "mcp" | "extensions" | "env";
+export type ProjectTrustSurface = "mcp" | "extensions" | "tools" | "commands" | "env";
 
-export const PROJECT_TRUST_SURFACES: readonly ProjectTrustSurface[] = ["mcp", "extensions", "env"];
+export const PROJECT_TRUST_SURFACES: readonly ProjectTrustSurface[] = ["mcp", "extensions", "tools", "commands", "env"];
 
 interface ProjectTrustEntry {
 	/** Approved fingerprint per surface. A missing surface is untrusted. */
@@ -156,6 +157,17 @@ export function getProjectTrust(
 	storePath: string = getProjectTrustStorePath(),
 ): Partial<Record<ProjectTrustSurface, { fingerprint: string; approvedAt: string }>> {
 	return readStore(storePath).projects[projectTrustKey(projectDir)]?.surfaces ?? {};
+}
+
+/**
+ * Whether the user approved any surface of `projectDir` with `omp trust`:
+ * the store's answer to "is this directory trusted" for extensions authored
+ * against upstream Pi's `isProjectTrusted()`. Each surface's code still loads
+ * only while its own approved fingerprint matches.
+ */
+export function isProjectApproved(projectDir: string, storePath: string = getProjectTrustStorePath()): boolean {
+	const surfaces = getProjectTrust(projectDir, storePath);
+	return PROJECT_TRUST_SURFACES.some(surface => typeof surfaces?.[surface]?.fingerprint === "string");
 }
 
 const ROUTING_ENV_EXACT: Record<string, true> = {

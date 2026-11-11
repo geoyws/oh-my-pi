@@ -56,7 +56,7 @@ Hook-capability loading already applies its own hook-specific disabled ids, so t
 
 ### 3) Installed plugin extension entries
 
-After hook discovery, `discoverAndLoadExtensions()` appends extension entry points from enabled installed plugins via `getAllPluginExtensionPaths(cwd)`.
+After hook discovery, `discoverAndLoadExtensions()` appends extension entry points from enabled installed plugins via `getAllPluginExtensionPaths(cwd)`: user-scope plugins first, then project-scope plugins (`<project>/.omp/plugins`), which load only after you approve the project with `omp trust` ([Project trust](project-trust.md)).
 
 Plugin extension entries come from package `omp.extensions` / `pi.extensions` manifests, including enabled feature entries.
 

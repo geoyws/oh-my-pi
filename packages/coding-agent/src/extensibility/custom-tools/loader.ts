@@ -11,6 +11,7 @@ import { type } from "@oh-my-pi/omptype";
 import * as zod from "@oh-my-pi/omptype/zod";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { logger } from "@oh-my-pi/pi-utils";
+import { isProjectSurfaceTrusted } from "@oh-my-pi/pi-utils/project-trust";
 import { toolCapability } from "../../capability/tool";
 import { type CustomTool, loadCapability } from "../../discovery";
 import type { ExecOptions } from "../../exec/exec";
@@ -18,6 +19,7 @@ import { execCommand } from "../../exec/exec";
 import type { HookUIContext } from "../../extensibility/hooks/types";
 import { getAllPluginToolPaths } from "../../extensibility/plugins/loader";
 import { loadLegacyPiModule } from "../plugins/legacy-pi-compat";
+import { type CodeRootDirNames, fingerprintProjectCode } from "../project-code";
 // Runtime self-reference: dereference this namespace only inside loader functions to keep the index.ts cycle safe.
 import * as PiCodingAgent from "../../index";
 import * as typebox from "../legacy-typebox";
@@ -245,17 +247,79 @@ export async function loadCustomTools(
 	};
 }
 
+/** Directory names whose direct children are self-contained tool roots. */
+const TOOL_ROOT_DIR_NAMES: CodeRootDirNames = { tools: true };
+
+export interface CustomToolSurface {
+	/** Every discovered tool module (project ones included), in load order. */
+	paths: ToolPathWithSource[];
+	/** Repository-supplied tool modules: project-level ones, then project-scope plugin tools. */
+	projectPaths: string[];
+	/** Fingerprint of every file those modules can load from their own roots. */
+	projectFingerprint: string;
+	/** Whether `omp trust` approved exactly that fingerprint for `cwd`. */
+	projectTrusted: boolean;
+}
+
+/**
+ * Every ambient tool module for `cwd` and the approval state of the
+ * repository-supplied ones (kb omp t-81f67b33). Shared by startup discovery
+ * and `omp trust`, so both fingerprint the same code.
+ */
+export async function loadCustomToolSurface(cwd: string, agentDir?: string): Promise<CustomToolSurface> {
+	const paths: ToolPathWithSource[] = [];
+	const projectPaths: string[] = [];
+	const hashRoots: string[] = [];
+
+	// Capability providers also expose metadata and scripts. Filter before deduplication
+	// so those entries cannot shadow executable modules with the same name.
+	const discoveredTools = await loadCapability<CustomTool>(toolCapability.id, {
+		cwd,
+		agentDir,
+		filter: tool => /\.(ts|js|mjs|cjs)$/.test(tool.path) && !tool.path.endsWith(".d.ts"),
+	});
+	for (const tool of discoveredTools.items) {
+		paths.push({
+			path: tool.path,
+			source: { provider: tool._source.provider, providerName: tool._source.providerName, level: tool.level },
+		});
+		if (tool.level === "project") {
+			projectPaths.push(tool.path);
+			hashRoots.push(tool.path);
+		}
+	}
+
+	// Plugin tools: ~/.omp/plugins/node_modules/*/ and <project>/.omp/plugins/node_modules/*/
+	for (const entry of await getAllPluginToolPaths(cwd)) {
+		paths.push({ path: entry.path, source: { provider: "plugin", providerName: "Plugin", level: entry.scope } });
+		if (entry.scope === "project") {
+			projectPaths.push(entry.path);
+			if (!hashRoots.includes(entry.pluginRoot)) hashRoots.push(entry.pluginRoot);
+		}
+	}
+
+	const projectFingerprint = await fingerprintProjectCode(cwd, hashRoots, TOOL_ROOT_DIR_NAMES);
+	return {
+		paths,
+		projectPaths,
+		projectFingerprint,
+		projectTrusted: isProjectSurfaceTrusted(cwd, "tools", projectFingerprint),
+	};
+}
+
 /**
  * Collect the absolute tool-source paths to load, without importing or
  * binding factories. Hot path on session startup — the scan walks
  * `.omp/tools/`, `.claude/tools/`, the plugin tree, and any configured paths.
+ * Repository-supplied tools load only when the user approved this exact code
+ * with `omp trust` (kb omp t-81f67b33).
  *
  * Subagents reuse the parent's collected paths via the SDK's
  * `preloadedCustomToolPaths` option, then call `loadCustomTools` themselves
  * so each session re-binds factories with its own session-scoped
  * `CustomToolAPI` (cwd, exec, pushPendingAction, UI).
  *
- * @param configuredPaths - Explicit paths from settings.json and CLI --tool flags
+ * @param configuredPaths - Explicit paths from CLI --tool flags
  * @param cwd - Current working directory
  * @param agentDir - Native user config dir. Default: getAgentDir()
  */
@@ -268,7 +332,7 @@ export async function discoverCustomToolPaths(
 	const seen = new Set<string>();
 
 	// Helper to add paths without duplicates
-	const addPath = (p: string, source?: { provider: string; providerName: string; level: "user" | "project" }) => {
+	const addPath = (p: string, source?: ToolPathWithSource["source"]) => {
 		const resolved = path.resolve(p);
 		if (!seen.has(resolved)) {
 			seen.add(resolved);
@@ -276,24 +340,16 @@ export async function discoverCustomToolPaths(
 		}
 	};
 
-	// Capability providers also expose metadata and scripts. Filter before deduplication
-	// so those entries cannot shadow executable modules with the same name.
-	const discoveredTools = await loadCapability<CustomTool>(toolCapability.id, {
-		cwd,
-		agentDir,
-		filter: tool => /\.(ts|js|mjs|cjs)$/.test(tool.path) && !tool.path.endsWith(".d.ts"),
-	});
-	for (const tool of discoveredTools.items) {
-		addPath(tool.path, {
-			provider: tool._source.provider,
-			providerName: tool._source.providerName,
-			level: tool.level,
-		});
+	// 1. User and project tools, then 2. plugin tools.
+	const surface = await loadCustomToolSurface(cwd, agentDir);
+	if (!surface.projectTrusted) {
+		logger.warn(
+			`Project tools not loaded: ${surface.projectPaths.join(", ")} — this project is not trusted for tools. Review the code, then run \`omp trust\` in ${cwd}.`,
+		);
 	}
-
-	// 2. Plugin tools: ~/.omp/plugins/node_modules/*/
-	for (const pluginPath of await getAllPluginToolPaths(cwd)) {
-		addPath(pluginPath, { provider: "plugin", providerName: "Plugin", level: "user" });
+	for (const entry of surface.paths) {
+		if (entry.source?.level === "project" && !surface.projectTrusted) continue;
+		addPath(entry.path, entry.source);
 	}
 
 	// 3. Explicitly configured paths (can override/add)

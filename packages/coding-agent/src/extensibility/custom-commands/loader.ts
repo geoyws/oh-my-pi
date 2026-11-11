@@ -9,12 +9,14 @@ import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import * as zod from "@oh-my-pi/omptype/zod";
 import { getAgentDir, getProjectDir, isEnoent, logger } from "@oh-my-pi/pi-utils";
+import { isProjectSurfaceTrusted } from "@oh-my-pi/pi-utils/project-trust";
 import { getConfigDirs } from "../../config";
 
 import { execCommand } from "../../exec/exec";
 // Runtime self-reference: dereference this namespace only inside loader functions to keep the index.ts cycle safe.
 import * as PiCodingAgent from "../../index";
 import * as typebox from "../legacy-typebox";
+import { type CodeRootDirNames, fingerprintProjectCode } from "../project-code";
 import { GreenCommand } from "./bundled/ci-green";
 import { AnnotateCommand } from "./bundled/annotate";
 import { ReviewCommand } from "./bundled/review";
@@ -75,13 +77,24 @@ export interface DiscoverCustomCommandsOptions {
 	agentDir?: string;
 }
 
+/** Directory names whose direct children are self-contained command roots. */
+const COMMAND_ROOT_DIR_NAMES: CodeRootDirNames = { commands: true };
+
 export interface DiscoverCustomCommandsResult {
-	/** Paths to command modules */
+	/** Paths to command modules, project ones included */
 	paths: Array<{ path: string; source: CustomCommandSource }>;
+	/** Repository-supplied (project-source) command modules. */
+	projectPaths: string[];
+	/** Fingerprint of every file those modules can load from their own roots. */
+	projectFingerprint: string;
+	/** Whether `omp trust` approved exactly that fingerprint for `cwd` (kb omp t-81f67b33). */
+	projectTrusted: boolean;
 }
 
 /**
- * Discover custom command modules (TypeScript slash commands).
+ * Discover custom command modules (TypeScript slash commands) and the approval
+ * state of the repository-supplied ones. Shared by startup loading and
+ * `omp trust`, so both fingerprint the same code.
  * Markdown slash commands are handled by core/slash-commands.ts.
  */
 export async function discoverCustomCommands(
@@ -139,7 +152,14 @@ export async function discoverCustomCommands(
 		}
 	}
 
-	return { paths };
+	const projectPaths = paths.filter(entry => entry.source === "project").map(entry => entry.path);
+	const projectFingerprint = await fingerprintProjectCode(cwd, projectPaths, COMMAND_ROOT_DIR_NAMES);
+	return {
+		paths,
+		projectPaths,
+		projectFingerprint,
+		projectTrusted: isProjectSurfaceTrusted(cwd, "commands", projectFingerprint),
+	};
 }
 
 export interface LoadCustomCommandsOptions {
@@ -185,7 +205,17 @@ export async function loadCustomCommands(options: LoadCustomCommandsOptions = {}
 	const cwd = options.cwd ?? getProjectDir();
 	const agentDir = options.agentDir ?? getAgentDir();
 
-	const { paths } = await discoverCustomCommands({ cwd, agentDir });
+	// Repository-supplied commands load only when the user approved this exact
+	// code with `omp trust` (kb omp t-81f67b33).
+	const discovered = await discoverCustomCommands({ cwd, agentDir });
+	if (!discovered.projectTrusted) {
+		logger.warn(
+			`Project commands not loaded: ${discovered.projectPaths.join(", ")} — this project is not trusted for commands. Review the code, then run \`omp trust\` in ${cwd}.`,
+		);
+	}
+	const paths = discovered.projectTrusted
+		? discovered.paths
+		: discovered.paths.filter(entry => entry.source !== "project");
 
 	const commands: LoadedCustomCommand[] = [];
 	const errors: Array<{ path: string; error: string }> = [];

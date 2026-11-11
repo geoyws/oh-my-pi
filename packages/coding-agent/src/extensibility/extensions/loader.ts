@@ -18,7 +18,7 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import { isBuiltinComposerStyle, type KeyId } from "@oh-my-pi/pi-tui";
 import { hasFsCode, isEacces, isEnoent, logger } from "@oh-my-pi/pi-utils";
-import { fingerprintProjectSurface, isProjectSurfaceTrusted } from "@oh-my-pi/pi-utils/project-trust";
+import { isProjectSurfaceTrusted } from "@oh-my-pi/pi-utils/project-trust";
 import { boundSettings } from "../../capability";
 import { type ExtensionModule, extensionModuleCapability } from "../../capability/extension-module";
 import { type Hook, hookCapability } from "../../capability/hook";
@@ -37,7 +37,8 @@ import { EventBus } from "../../utils/event-bus";
 import * as TypeBox from "../legacy-typebox";
 import { resolveExtensionDirectory } from "./directory-resolution";
 import { installLegacyPiSpecifierShim, loadLegacyPiModule } from "../plugins/legacy-pi-compat";
-import { getAllPluginExtensionPaths } from "../plugins/loader";
+import { getAllPluginExtensionPaths, type PluginEntryPath } from "../plugins/loader";
+import { type CodeRootDirNames, fingerprintProjectCode } from "../project-code";
 import { cfgDisabledExtensions } from "../settings";
 
 import { resolvePath, withHostGuard } from "../utils";
@@ -555,57 +556,7 @@ async function discoverHooksInPackageRoot(root: string): Promise<string[]> {
 	return hooks;
 }
 
-const EXTENSION_ROOT_DIR_NAMES: Record<string, true> = { extensions: true, hooks: true, pre: true, post: true };
-
-/**
- * Every file an extension entry can pull in from its own directory: the entry's
- * extension root (the folder directly under an `extensions`/`hooks` dir inside
- * `projectDir`, else the entry itself). Everything under the root counts,
- * dot-directories and `node_modules` included, because an approved entry can
- * import any of it; only `.git` metadata is skipped. Each file is recorded by
- * its SHA-256. A symlinked directory below the root is recorded by its link
- * target, not walked. Imports reaching outside the root are not covered.
- */
-async function collectExtensionCodeFiles(projectDir: string, entry: string, into: Map<string, string>): Promise<void> {
-	let root = entry;
-	let candidate = entry;
-	for (let dir = path.dirname(entry); dir.startsWith(projectDir + path.sep); dir = path.dirname(dir)) {
-		if (Object.hasOwn(EXTENSION_ROOT_DIR_NAMES, path.basename(dir))) {
-			root = candidate;
-			break;
-		}
-		candidate = dir;
-	}
-	const walk = async (p: string, isRoot: boolean): Promise<void> => {
-		let stat: fs1.Stats;
-		try {
-			stat = isRoot ? await fs.stat(p) : await fs.lstat(p);
-		} catch (err) {
-			if (isEnoent(err) || isEacces(err)) return;
-			throw err;
-		}
-		if (stat.isSymbolicLink()) {
-			const target = await fs.readlink(p);
-			const targetStat = await fs.stat(p).catch(() => undefined);
-			if (targetStat?.isFile()) into.set(p, await hashFile(p));
-			else into.set(p, `symlink:${target}`);
-			return;
-		}
-		if (stat.isDirectory()) {
-			for (const name of await fs.readdir(p)) {
-				if (name === ".git") continue;
-				await walk(path.join(p, name), false);
-			}
-			return;
-		}
-		if (stat.isFile()) into.set(p, await hashFile(p));
-	};
-	await walk(root, true);
-}
-
-async function hashFile(p: string): Promise<string> {
-	return new Bun.CryptoHasher("sha256").update(await fs.readFile(p)).digest("hex");
-}
+const EXTENSION_ROOT_DIR_NAMES: CodeRootDirNames = { extensions: true, hooks: true, pre: true, post: true };
 
 /**
  * What a configured `extensions:` path names: a directory's entry files
@@ -636,12 +587,14 @@ export interface AmbientExtensionEntries {
 	/** Native extension modules then hook factories, in load order, with their source level. */
 	entries: Array<{ path: string; level: "user" | "project" }>;
 	/**
-	 * Repository-supplied entry points: level-`project` ambient entries, then
-	 * the `projectConfiguredEntries`.
+	 * Repository-supplied entry points: level-`project` ambient entries, the
+	 * `projectConfiguredEntries`, then project-scope plugin extension entries.
 	 */
 	projectPaths: string[];
 	/** Entry points named by an `extensions:` setting that a project settings file supplied. */
 	projectConfiguredEntries: string[];
+	/** Extension entry points of every enabled plugin, user and project scope. */
+	pluginEntries: PluginEntryPath[];
 	/** Fingerprint of every file those entries can load from their own roots. */
 	projectFingerprint: string;
 	/** Whether `omp trust` approved exactly that fingerprint for `cwd`. */
@@ -673,11 +626,12 @@ async function listHookEntries(loadOptions: AmbientLoadOptions): Promise<Ambient
 
 /**
  * Ambient extension entry points for `cwd` and the approval state of the
- * repository-supplied ones (kb omp t-f77ec1f5). Shared by startup discovery
- * and `omp trust`, so both fingerprint the same code. `projectConfiguredPaths`
- * is the `extensions:` list when a project settings file supplied it
- * (`Settings.extensionsSourceLevel() === "project"`): repository-controlled
- * code under the same approval as `.omp/extensions`.
+ * repository-supplied ones (kb omp t-f77ec1f5, t-81f67b33). Shared by startup
+ * discovery and `omp trust`, so both fingerprint the same code.
+ * `projectConfiguredPaths` is the `extensions:` list when a project settings
+ * file supplied it (`Settings.extensionsSourceLevel() === "project"`):
+ * repository-controlled code under the same approval as `.omp/extensions`, as
+ * are the extension entries of plugins installed at project scope.
  *
  * The fingerprint always covers every project entry, hooks included and none
  * disabled: `omp trust` approves the whole surface, so disabling one extension
@@ -715,24 +669,21 @@ export async function loadAmbientExtensionEntries(
 		projectConfiguredEntries.push(...files);
 		hashRoots.push(resolved);
 	}
+	// A project-scope plugin is repository content: hash its whole package (kb omp t-81f67b33).
+	const pluginEntries = await getAllPluginExtensionPaths(cwd);
+	const projectPluginEntries = pluginEntries.filter(entry => entry.scope === "project");
+	hashRoots.push(...new Set(projectPluginEntries.map(entry => entry.pluginRoot)));
 	const projectPaths = [
 		...entries.filter(entry => entry.level === "project").map(entry => entry.path),
 		...projectConfiguredEntries,
+		...projectPluginEntries.map(entry => entry.path),
 	];
-	const files = new Map<string, string>();
-	if (hashRoots.length > 0) {
-		// Compare real paths: discovery may report /private/var where cwd says /var.
-		const realProjectDir = await fs.realpath(cwd).catch(() => path.resolve(cwd));
-		for (const entry of hashRoots) {
-			const realEntry = await fs.realpath(entry).catch(() => path.resolve(entry));
-			await collectExtensionCodeFiles(realProjectDir, realEntry, files);
-		}
-	}
-	const projectFingerprint = fingerprintProjectSurface([...files]);
+	const projectFingerprint = await fingerprintProjectCode(cwd, hashRoots, EXTENSION_ROOT_DIR_NAMES);
 	return {
 		entries,
 		projectPaths,
 		projectConfiguredEntries,
+		pluginEntries,
 		projectFingerprint,
 		projectTrusted: isProjectSurfaceTrusted(cwd, "extensions", projectFingerprint),
 	};
@@ -791,6 +742,8 @@ export async function discoverExtensionPaths(
 
 	const ambient = options.ambient !== false;
 	let projectConfiguredEntries: string[] = [];
+	let pluginEntries: PluginEntryPath[] = [];
+	let projectPluginPaths: string[] = [];
 	if (ambient) {
 		// 1. Native extension modules, then 2. JS/TS hook factories, in that
 		// order. Repository-supplied (project-level) entries load only when the
@@ -811,6 +764,10 @@ export async function discoverExtensionPaths(
 			addPath(entry.path);
 		}
 		projectConfiguredEntries = ambientEntries.projectTrusted ? ambientEntries.projectConfiguredEntries : [];
+		pluginEntries = ambientEntries.pluginEntries;
+		if (ambientEntries.projectTrusted) {
+			projectPluginPaths = pluginEntries.filter(entry => entry.scope === "project").map(entry => entry.path);
+		}
 	} else {
 		// Non-ambient discovery scans only this invocation's configured package
 		// roots; it must not consult settings, installed packages, or
@@ -820,10 +777,9 @@ export async function discoverExtensionPaths(
 		}
 	}
 
-	// 3. Discover extension entry points from installed plugins.
-	if (ambient) {
-		addPaths(await getAllPluginExtensionPaths(cwd));
-	}
+	// 3. Extension entry points from installed plugins; project-scope plugins passed trust above.
+	addPaths(pluginEntries.filter(entry => entry.scope === "user").map(entry => entry.path));
+	addPaths(projectPluginPaths);
 
 	// 4. Explicitly configured paths, then project-supplied ones that passed trust.
 	for (const configuredPath of configuredPaths) {

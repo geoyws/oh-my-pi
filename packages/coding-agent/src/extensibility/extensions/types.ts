@@ -733,11 +733,9 @@ export interface ExtensionContext {
 	/** Identity of the agent this session runs: the top-level session or a subagent. */
 	agent: ExtensionAgentIdentity;
 	/**
-	 * Whether the current project/workspace is trusted. OMP performs no
-	 * project-trust gating — project-level settings and extensions load
-	 * unconditionally — so this always returns `true`. Exposed for
-	 * compatibility with extensions authored against upstream Pi, whose
-	 * `SettingsManager` accepts a `projectTrusted` flag.
+	 * Whether the user approved this project with `omp trust` (any surface recorded in the
+	 * project-trust store). Exposed for compatibility with extensions authored against
+	 * upstream Pi, whose `SettingsManager` accepts a `projectTrusted` flag.
 	 */
 	isProjectTrusted(): boolean;
 	/** Get the current effective system prompt. */
@@ -802,11 +800,9 @@ export interface ExtensionContext {
 	 * here; extensions written against that API (e.g. Plannotator) feature-detect this method to
 	 * decide whether project-local config is safe to load, and warn when it is absent.
 	 *
-	 * OMP has no equivalent per-directory trust gate: `.omp/extensions`, `.omp/config.yml`, and
-	 * other project-local inputs are already discovered and loaded unconditionally (see
-	 * `docs/extension-loading.md`). This method exists for compatibility with that upstream surface
-	 * and always returns `true`, truthfully reflecting that OMP already trusts project-local inputs
-	 * by default -- it does not narrow or widen OMP's own security model.
+	 * OMP's equivalent decision is `omp trust`: this returns `true` once the user has approved
+	 * any surface of this directory in the project-trust store, else `false`. Each surface's
+	 * repository code still loads only while its own approved fingerprint matches.
 	 */
 	isProjectTrusted(): boolean;
 }

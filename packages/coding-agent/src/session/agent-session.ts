@@ -110,6 +110,7 @@ import {
 	withFileLock,
 } from "@oh-my-pi/pi-utils";
 import { writeArchive } from "@oh-my-pi/pi-utils/ar";
+import { isProjectApproved } from "@oh-my-pi/pi-utils/project-trust";
 import { frameDataBytesBudget, readerIncludesThinking } from "@oh-my-pi/snapcompact";
 import type { AdvisorConfig } from "@oh-my-pi/pi-tui/overlays/advisor-config";
 import { formatUsageResetWindow } from "@oh-my-pi/pi-tui/overlays/usage-display";
@@ -9006,7 +9007,7 @@ export class AgentSession implements SettingsScope {
 			cwd: this.sessionManager.getCwd(),
 			sessionManager: this.sessionManager,
 			modelRegistry: this.#modelRegistry,
-			isProjectTrusted: () => true,
+			isProjectTrusted: () => isProjectApproved(this.sessionManager.getCwd()),
 			// Used only when the session has no extension runner. `createAgentSession` always builds
 			// one (carrying the real identity), so only hand-constructed sessions land here.
 			agent: TOP_LEVEL_AGENT,

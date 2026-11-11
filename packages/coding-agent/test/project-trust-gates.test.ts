@@ -15,6 +15,14 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
+	discoverCustomCommands,
+	loadCustomCommands,
+} from "@oh-my-pi/pi-coding-agent/extensibility/custom-commands/loader";
+import {
+	discoverCustomToolPaths,
+	loadCustomToolSurface,
+} from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools/loader";
+import {
 	discoverExtensionPaths,
 	loadAmbientExtensionEntries,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
@@ -214,6 +222,104 @@ describe("project extensions (OMP-CRED-008)", () => {
 		clearFsCache();
 		await listModels();
 		expect(await Bun.file(marker).exists()).toBe(true);
+	});
+});
+
+describe("project tools, commands and plugins (kb omp t-81f67b33)", () => {
+	/** A module whose import, not any factory call, is the attack: it writes `marker` at top level. */
+	const markerModule = (marker: string, body: string) =>
+		`await Bun.write(${JSON.stringify(marker)}, "imported");\n${body}\n`;
+
+	test("an untrusted project's custom tool is not discovered; approval admits it until any file changes", async () => {
+		const dir = path.join(projectDir, ".omp", "tools", "evil");
+		await fs.mkdir(dir, { recursive: true });
+		await fs.writeFile(path.join(dir, "index.ts"), 'import "./lib";\nexport default () => [];\n');
+		await fs.writeFile(path.join(dir, "lib.ts"), "export const x = 1;\n");
+		clearFsCache();
+		const isProjectTool = (p: string) => p.startsWith(dir);
+
+		expect((await discoverCustomToolPaths([], projectDir)).some(t => isProjectTool(t.path))).toBe(false);
+
+		const surface = await loadCustomToolSurface(projectDir);
+		expect(surface.projectTrusted).toBe(false);
+		expect(surface.projectPaths.some(isProjectTool)).toBe(true);
+		approveProjectSurfaces(projectDir, { tools: surface.projectFingerprint });
+		clearFsCache();
+		expect((await discoverCustomToolPaths([], projectDir)).some(t => isProjectTool(t.path))).toBe(true);
+
+		// A change to a sibling module the entry imports revokes the approval.
+		await fs.writeFile(path.join(dir, "lib.ts"), "export const x = 2; // exfiltrate\n");
+		clearFsCache();
+		expect((await discoverCustomToolPaths([], projectDir)).some(t => isProjectTool(t.path))).toBe(false);
+	});
+
+	test("an untrusted project's TypeScript command is never imported; approval loads exactly that code", async () => {
+		const dir = path.join(projectDir, ".omp", "commands", "evil");
+		await fs.mkdir(dir, { recursive: true });
+		const marker = path.join(projectDir, "imported");
+		const entry = path.join(dir, "index.ts");
+		await fs.writeFile(entry, markerModule(marker, "export default () => [];"));
+		clearFsCache();
+
+		await loadCustomCommands({ cwd: projectDir, agentDir });
+		expect(await Bun.file(marker).exists()).toBe(false);
+
+		const discovered = await discoverCustomCommands({ cwd: projectDir, agentDir });
+		expect(discovered.projectTrusted).toBe(false);
+		expect(discovered.projectPaths).toEqual([entry]);
+		approveProjectSurfaces(projectDir, { commands: discovered.projectFingerprint });
+		await loadCustomCommands({ cwd: projectDir, agentDir });
+		expect(await Bun.file(marker).exists()).toBe(true);
+
+		// Changed code is no longer approved (re-import would hit Bun's module cache, so check discovery).
+		await fs.writeFile(entry, markerModule(marker, "export default () => []; // exfiltrate"));
+		expect((await discoverCustomCommands({ cwd: projectDir, agentDir })).projectTrusted).toBe(false);
+	});
+
+	test("a project-scope plugin's extension and tool load only under approval of its whole package", async () => {
+		const pluginsRoot = path.join(projectDir, ".omp", "plugins");
+		const pluginDir = path.join(pluginsRoot, "node_modules", "evilplug");
+		await fs.mkdir(path.join(pluginDir, "src"), { recursive: true });
+		await fs.writeFile(
+			path.join(pluginsRoot, "package.json"),
+			JSON.stringify({ dependencies: { evilplug: "1.0.0" } }),
+		);
+		await fs.writeFile(
+			path.join(pluginDir, "package.json"),
+			JSON.stringify({
+				name: "evilplug",
+				version: "1.0.0",
+				omp: { extensions: ["src/ext.ts"], tools: ["src/tool.ts"] },
+			}),
+		);
+		const ext = path.join(pluginDir, "src", "ext.ts");
+		const tool = path.join(pluginDir, "src", "tool.ts");
+		await fs.writeFile(ext, 'import "../lib";\nexport default () => {};\n');
+		await fs.writeFile(tool, 'import "../lib";\nexport default () => [];\n');
+		await fs.writeFile(path.join(pluginDir, "lib.ts"), "export const x = 1;\n");
+		clearFsCache();
+		const discover = async () => ({
+			ext: (await discoverExtensionPaths([], projectDir)).includes(ext),
+			tool: (await discoverCustomToolPaths([], projectDir)).some(t => t.path === tool),
+		});
+
+		expect(await discover()).toEqual({ ext: false, tool: false });
+
+		const extensions = await loadAmbientExtensionEntries(projectDir);
+		const tools = await loadCustomToolSurface(projectDir);
+		expect(extensions.projectPaths).toContain(ext);
+		expect(tools.projectPaths).toContain(tool);
+		approveProjectSurfaces(projectDir, {
+			extensions: extensions.projectFingerprint,
+			tools: tools.projectFingerprint,
+		});
+		clearFsCache();
+		expect(await discover()).toEqual({ ext: true, tool: true });
+
+		// A package file outside both entry directories still revokes both approvals.
+		await fs.writeFile(path.join(pluginDir, "lib.ts"), "export const x = 2; // exfiltrate\n");
+		clearFsCache();
+		expect(await discover()).toEqual({ ext: false, tool: false });
 	});
 });
 

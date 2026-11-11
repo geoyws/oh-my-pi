@@ -7,8 +7,13 @@ import { type CustomTool, toolCapability } from "@oh-my-pi/pi-coding-agent/capab
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { initializeWithSettings, loadCapability } from "@oh-my-pi/pi-coding-agent/discovery";
 import { clearClaudePluginRootsCache } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
-import { discoverCustomToolPaths, loadCustomTools } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools/loader";
+import {
+	discoverCustomToolPaths,
+	loadCustomTools,
+	loadCustomToolSurface,
+} from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools/loader";
 import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
+import { approveProjectSurfaces } from "@oh-my-pi/pi-utils/project-trust";
 import { restoreEnvValue } from "../helpers/settings-test-state";
 
 function toolSource(name: string): string {
@@ -83,6 +88,9 @@ describe("native executable custom tool discovery", () => {
 			fs.writeFile(path.join(projectTools, "helper.py"), "print('helper')\n"),
 		]);
 
+		// Project tools load only under `omp trust` (kb omp t-81f67b33); approve this exact code.
+		approveProjectSurfaces(project, { tools: (await loadCustomToolSurface(project)).projectFingerprint });
+		clearFsCache();
 		const discoveredPaths = await discoverCustomToolPaths([], project);
 		const loaded = await loadCustomTools(discoveredPaths, project, []);
 		expect(loaded.errors).toEqual([]);

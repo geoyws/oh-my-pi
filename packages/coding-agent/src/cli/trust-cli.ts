@@ -2,9 +2,11 @@
  * `omp trust`: review and approve the repository-controlled behaviour of one
  * project directory (kb omp t-f77ec1f5).
  *
- * Three surfaces are gated until approved, each by a content fingerprint:
+ * Five surfaces are gated until approved, each by a content fingerprint:
  *   mcp         project MCP servers (commands OMP would launch, URLs it would call)
- *   extensions  project extension and hook code OMP would import
+ *   extensions  project extension and hook code, and project-scope plugin extensions
+ *   tools       project custom tool code, and project-scope plugin tools
+ *   commands    project TypeScript slash-command code
  *   env         project `.env` names that route provider/proxy/OAuth traffic
  * Approval records the CURRENT fingerprint of every non-empty surface; any later
  * content change needs a new approval.
@@ -27,6 +29,8 @@ import {
 } from "@oh-my-pi/pi-utils/project-trust";
 import { Settings } from "../config/settings";
 import { initializeWithSettings } from "../discovery";
+import { discoverCustomCommands } from "../extensibility/custom-commands/loader";
+import { loadCustomToolSurface } from "../extensibility/custom-tools/loader";
 import { loadAmbientExtensionEntries } from "../extensibility/extensions/loader";
 import { cfgExtensions } from "../extensibility/settings";
 import { loadAllMCPConfigs } from "../mcp/config";
@@ -68,6 +72,8 @@ async function measureSurfaces(dir: string): Promise<SurfaceReport[]> {
 		true,
 		settings.extensionsSourceLevel() === "project" ? cfgExtensions.get(settings) : [],
 	);
+	const tools = await loadCustomToolSurface(dir);
+	const commands = await discoverCustomCommands({ cwd: dir });
 
 	const projectEnv = parseEnvFile(path.join(dir, ".env"));
 	const envFingerprint = fingerprintProjectRoutingEnv(projectEnv);
@@ -80,6 +86,8 @@ async function measureSurfaces(dir: string): Promise<SurfaceReport[]> {
 	const measured: Array<Omit<SurfaceReport, "trusted">> = [
 		{ surface: "mcp", fingerprint: mcpFingerprint, items: mcpItems },
 		{ surface: "extensions", fingerprint: extensions.projectFingerprint, items: extensions.projectPaths },
+		{ surface: "tools", fingerprint: tools.projectFingerprint, items: tools.projectPaths },
+		{ surface: "commands", fingerprint: commands.projectFingerprint, items: commands.projectPaths },
 		{ surface: "env", fingerprint: envFingerprint, items: envItems },
 	];
 	return measured.map(report => ({
