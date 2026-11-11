@@ -6,7 +6,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import type { ExtensionFactory, InputEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
-import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
+import { buildSkillPromptMessage, type Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import { CommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/command-controller";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
@@ -58,7 +58,9 @@ async function createHarness(factory: ExtensionFactory) {
 		queuedMessageCount: 0,
 		prompt,
 		followUp: vi.fn(async (_text: string, _images?: ImageContent[], _options?: { source?: string }) => {}),
+		buildUserSkillPrompt: buildSkillPromptMessage,
 		promptCustomMessage: vi.fn(async () => true),
+		gateUserMessage: vi.fn(async () => {}),
 		abort: vi.fn(async () => {}),
 		prewarmModelConnection: vi.fn(),
 	};
@@ -67,6 +69,7 @@ async function createHarness(factory: ExtensionFactory) {
 		session,
 		viewSession: session,
 		sessionManager,
+		eventController: { isAwaitingAsyncWork: () => false },
 		settings: Settings.isolated({}),
 		keybindings: KeybindingsManager.inMemory(),
 		dictationSpaceHold: vi.fn(),
@@ -91,6 +94,7 @@ async function createHarness(factory: ExtensionFactory) {
 		dismissCommandReport: () => false,
 		updateEditorBorderColor: vi.fn(),
 		updatePendingMessagesDisplay: vi.fn(),
+		syncIdleMaintenanceView: vi.fn(),
 		flushPendingBashComponents: vi.fn(),
 		showStatus: vi.fn(),
 		showError: vi.fn(),
@@ -400,7 +404,10 @@ describe("interactive native input ingress", () => {
 		expect(h.editor.pendingImageLinks).toEqual(["local://new.jpeg", "local://original.png"]);
 	});
 
-	it("Ctrl+Enter skill dispatch preserves drafts typed during both interception and queue rejection", async () => {
+	it.each([
+		["Enter", ENTER],
+		["Ctrl+Enter", FOLLOW_UP],
+	])("%s skill dispatch preserves drafts typed during both interception and queue rejection", async (_label, key) => {
 		using temp = TempDir.createSync("@omp-native-input-skill-");
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
@@ -427,19 +434,24 @@ describe("interactive native input ingress", () => {
 			throw new Error("skill queue rejected");
 		});
 		h.draftWithImage("/skill:review original [Image #1]");
-		const submitting = h.pressSubmit(FOLLOW_UP);
+		const submitting = h.pressSubmit(key);
 		await entered.promise;
-		h.editor.pendingImages = [transformedImage];
-		h.editor.pendingImageLinks = ["local://new.jpeg"];
+		if (key === ENTER) {
+			h.editor.pendingImages.push(transformedImage);
+			h.editor.pendingImageLinks.push("local://new.jpeg");
+			h.editor.setText("new draft [Image #2]");
+		} else {
+			h.editor.pendingImages = [transformedImage];
+			h.editor.pendingImageLinks = ["local://new.jpeg"];
+			h.editor.setText("new draft [Image #1]");
+		}
 		h.editor.imageLinks = h.editor.pendingImageLinks;
-		h.editor.setText("new draft [Image #1]");
 		release.resolve();
 		await dispatchEntered.promise;
-		const draftDuringDispatch = h.editor.getText();
+		const draftDuringDispatch = h.editor.getExpandedText();
 		h.editor.setText(`${draftDuringDispatch} still typing`);
 		dispatchRelease.resolve();
 		await submitting;
-		expect(draftDuringDispatch).toBe("new draft [Image #1]");
 		expect(h.editor.getExpandedText()).toBe("/skill:review original [Image #2]\n\nnew draft [Image #1] still typing");
 		expect(h.editor.pendingImages).toEqual([transformedImage, originalImage]);
 		expect(h.editor.pendingImageLinks).toEqual(["local://new.jpeg", "local://original.png"]);
@@ -506,6 +518,139 @@ describe("interactive native input ingress", () => {
 		expect(h.editor.pendingImageLinks).toEqual(["local://newer.jpg", "local://original.png"]);
 		expect(h.editor.imageLinks).toEqual(["local://newer.jpg", "local://original.png"]);
 		expect(h.prompt).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		["tan", "handleTanCommand"],
+		["btw", "handleBtwCommand"],
+	] as const)(
+		"Enter /%s takes its images out of the composer, so the next draft cannot send them",
+		async (command, handler) => {
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const h = await createHarness(() => {});
+			Object.assign(h.session, { customCommands: [], promptTemplates: [] });
+			const handle = vi.fn(async (_text: string, _images?: ImageContent[]) => {
+				entered.resolve();
+				await release.promise;
+				return true;
+			});
+			h.ctx[handler] = handle;
+			h.draftWithImage(`/${command} fix this block [Image #1]`);
+			const submitting = h.pressSubmit(ENTER);
+			await entered.promise;
+			// Pasted while the command dispatches: the composer holds only this image, so it is #1.
+			h.editor.pendingImages.push(newerImage);
+			h.editor.pendingImageLinks.push("local://newer.jpg");
+			h.editor.setText("newer [Image #1]");
+			release.resolve();
+			await submitting;
+
+			expect(handle).toHaveBeenCalledWith("fix this block [Image #1]", [originalImage]);
+			expect(h.editor.pendingImages).toEqual([newerImage]);
+			expect(h.editor.pendingImageLinks).toEqual(["local://newer.jpg"]);
+
+			await h.pressSubmit(ENTER);
+
+			expect(h.prompt.mock.calls.map(([text, options]) => ({ text, images: options?.images }))).toEqual([
+				{ text: "newer [Image #1]", images: [newerImage] },
+			]);
+		},
+	);
+
+	it.each([
+		["tan", "handleTanCommand"],
+		["btw", "handleBtwCommand"],
+	] as const)(
+		"Enter /%s that does not start gives its draft back, with or without an image",
+		async (command, handler) => {
+			const h = await createHarness(() => {});
+			Object.assign(h.session, { customCommands: [], promptTemplates: [] });
+			h.ctx[handler] = vi.fn(async () => false);
+			h.draftWithImage(`/${command} fix this block [Image #1]`);
+
+			await h.pressSubmit(ENTER);
+
+			expect(h.editor.getExpandedText()).toBe(`/${command} fix this block [Image #1]`);
+			expect(h.editor.pendingImages).toEqual([originalImage]);
+			expect(h.editor.pendingImageLinks).toEqual(["local://original.png"]);
+
+			h.editor.clearDraft();
+			h.editor.setText(`/${command} just text`);
+			await h.pressSubmit(ENTER);
+
+			expect(h.editor.getExpandedText()).toBe(`/${command} just text`);
+		},
+	);
+
+	it.each([
+		["omfg", "handleOmfgCommand"],
+		["handoff", "handleHandoffCommand"],
+		["cleanse", "handleCleanseCommand"],
+	] as const)("Enter /%s with an image keeps the draft and does not run", async (command, handler) => {
+		const h = await createHarness(() => {});
+		const showWarning = vi.fn();
+		Object.assign(h.session, { customCommands: [], promptTemplates: [] });
+		Object.assign(h.ctx, { showWarning });
+		const run = vi.fn(async () => {});
+		h.ctx[handler] = run;
+		h.draftWithImage(`/${command} look at this [Image #1]`);
+
+		await h.pressSubmit(ENTER);
+
+		expect(run).not.toHaveBeenCalled();
+		expect(showWarning).toHaveBeenCalledWith(`/${command} takes text only; remove the images to run it`);
+		expect(h.editor.getExpandedText()).toBe(`/${command} look at this [Image #1]`);
+		expect(h.editor.pendingImages).toEqual([originalImage]);
+		expect(h.editor.pendingImageLinks).toEqual(["local://original.png"]);
+	});
+
+	it("Enter /tan as a collab guest gives the draft and its image back", async () => {
+		const h = await createHarness(() => {});
+		Object.assign(h.session, { customCommands: [], promptTemplates: [] });
+		Object.assign(h.ctx, { collabGuest: {} });
+		const run = vi.fn(async () => true);
+		h.ctx.handleTanCommand = run;
+		h.draftWithImage("/tan fix this block [Image #1]");
+
+		await h.pressSubmit(ENTER);
+
+		expect(run).not.toHaveBeenCalled();
+		expect(h.ctx.showStatus).toHaveBeenCalledWith("/tan is host-only during a collab session");
+		expect(h.editor.getExpandedText()).toBe("/tan fix this block [Image #1]");
+		expect(h.editor.pendingImages).toEqual([originalImage]);
+		expect(h.editor.pendingImageLinks).toEqual(["local://original.png"]);
+	});
+
+	it("Enter /tan renumbers an image pasted while its input hook runs", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const h = await createHarness(pi => {
+			pi.on("input", async () => {
+				entered.resolve();
+				await release.promise;
+			});
+		});
+		Object.assign(h.session, { customCommands: [], promptTemplates: [] });
+		h.ctx.handleTanCommand = vi.fn(async () => true);
+		h.draftWithImage("/tan fix this block [Image #1]");
+		const submitting = h.pressSubmit(ENTER);
+		await entered.promise;
+		// The submitted image is still pending while the hook runs, so this paste is #2.
+		h.editor.pendingImages.push(newerImage);
+		h.editor.pendingImageLinks.push("local://newer.jpg");
+		h.editor.setText("newer [Image #2]");
+		release.resolve();
+		await submitting;
+
+		expect(h.editor.getExpandedText()).toBe("newer [Image #1]");
+		expect(h.editor.pendingImages).toEqual([newerImage]);
+
+		await h.pressSubmit(ENTER);
+
+		expect(h.prompt.mock.calls.map(([text, options]) => ({ text, images: options?.images }))).toEqual([
+			{ text: "newer [Image #1]", images: [newerImage] },
+		]);
 	});
 
 	it.each(["/clear", "/export"])(
@@ -632,7 +777,7 @@ describe("interactive native input ingress", () => {
 		expect(h.editor.imageLinks).toBeUndefined();
 	});
 
-	it("Enter dispatches input once, while continue shortcuts remain synthetic", async () => {
+	it("Enter dispatches input once, while continue shortcuts bypass input handlers as resumes", async () => {
 		const seen: InputEvent[] = [];
 		const h = await createHarness(pi => {
 			pi.on("input", event => {
@@ -654,7 +799,7 @@ describe("interactive native input ingress", () => {
 			await h.pressSubmit(ENTER);
 		}
 		expect(callback).toHaveBeenCalledTimes(2);
-		expect(callback.mock.calls[0][0]).toMatchObject({ synthetic: true, started: true, userInitiated: true });
+		expect(callback.mock.calls[0][0]).toMatchObject({ resume: true, started: true });
 		expect(seen).toHaveLength(1);
 		expect(h.prompt).toHaveBeenCalledTimes(1);
 	});
