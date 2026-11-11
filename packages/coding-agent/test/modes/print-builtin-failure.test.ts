@@ -31,6 +31,7 @@ function printSession(cwd: string, prompts: string[]): AgentSession {
 		disableStopTimeTodoReminders: () => {},
 		prepareForHeadlessAdvisorDrain: () => {},
 		waitForIdle: async () => {},
+		hasPendingAsyncWork: () => false,
 		setTextOutputCommitted: () => {},
 		waitForAdvisorCatchup: async () => true,
 		prompt: async (text: string) => {
@@ -144,6 +145,7 @@ describe("print mode builtin exit codes", () => {
 			disableStopTimeTodoReminders: () => {},
 			prepareForHeadlessAdvisorDrain: () => {},
 			waitForIdle: async () => {},
+			hasPendingAsyncWork: () => false,
 			setTextOutputCommitted: () => {},
 			waitForAdvisorCatchup: async () => true,
 			prompt: async (text: string) => {
