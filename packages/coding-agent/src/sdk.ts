@@ -25,6 +25,7 @@ import type {
 	SimpleStreamOptions,
 } from "@oh-my-pi/pi-ai";
 import { resolveApiKeyOnce } from "@oh-my-pi/pi-ai/auth-retry";
+import { MissingApiKeyError } from "@oh-my-pi/pi-ai/error";
 import type { DiscoverAuthStorageOptions } from "@oh-my-pi/pi-ai/auth-broker/discover";
 import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
 import { prewarmModelConnection } from "@oh-my-pi/pi-ai/providers/connection-prewarm";
@@ -3106,7 +3107,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							pattern,
 							retryFallback: undefined,
 						}));
-						if (!resolved.configuredRole || !cfgRetryModelFallback.get(settings)) {
+						if (
+							!resolved.configuredRole ||
+							!cfgRetryModelFallback.get(settings) ||
+							options.modelPatternFallbackExhaustive
+						) {
 							return primaryPatterns;
 						}
 						const fallbackContext: RetryFallbackResolutionContext = {
@@ -3174,6 +3179,15 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				const { pattern, retryFallback } = expandedModelPatterns[patternIndex];
 				const primary = parseModelPattern(pattern, resolutionModels, matchPreferences);
 				if (!primary.model || (retryFallback && !hasModelAuth(primary.model))) continue;
+				if (options.modelPatternFallbackExhaustive) {
+					try {
+						const key = await modelRegistry.getApiKey(primary.model);
+						if (key !== kNoAuth && !isAuthenticated(key)) continue;
+					} catch (error) {
+						if (!(error instanceof MissingApiKeyError)) throw error;
+						continue;
+					}
+				}
 				let hasUsageFallbackCandidate = false;
 				for (
 					let candidateIndex = patternIndex + 1;
@@ -3262,7 +3276,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					selectedExplicitThinkingLevel = true;
 				}
 				let authFallbackUsed = false;
-				if (options.modelPatternAuthFallback) {
+				if (options.modelPatternAuthFallback && !options.modelPatternFallbackExhaustive) {
 					const primaryKey = await modelRegistry.getApiKey(primary.model);
 					if (primaryKey !== kNoAuth && !isAuthenticated(primaryKey)) {
 						const fallback = parseModelPattern(
@@ -3299,24 +3313,21 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						seenSelectors.add(fallbackSelector);
 						fallbackSelectors.push(fallbackSelector);
 					}
-					const explicitFallbackCount = fallbackSelectors.length;
-					if (fallbackSelectors.length === 0) {
+					if (fallbackSelectors.length === 0 && !options.modelPatternFallbackExhaustive) {
 						for (const selector of options.modelPatternDefaultFallbackChain ?? []) {
 							if (typeof selector !== "string" || seenSelectors.has(selector)) continue;
 							seenSelectors.add(selector);
 							fallbackSelectors.push(selector);
 						}
 					}
-					if (fallbackSelectors.length > 0 || options.modelPatternDefaultFallbackChain?.length === 0) {
+					if (fallbackSelectors.length > 0 || options.modelPatternFallbackExhaustive) {
 						installRetryFallbackRole(settings, options.modelPatternFallbackRole, {
 							primary: primarySelector,
 							chain: fallbackSelectors,
 							// An explicit multi-entry list owns its session end to end,
 							// matching the executor's immediate install. A singleton
 							// inheriting the default chain stays non-exhaustive.
-							...(explicitFallbackCount > 0 && options.modelPatternFallbackExhaustive === true
-								? { exhaustive: true as const }
-								: {}),
+							...(options.modelPatternFallbackExhaustive === true ? { exhaustive: true as const } : {}),
 						});
 						modelPatternRetryFallbackRole = options.modelPatternFallbackRole;
 					}
@@ -3340,6 +3351,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				break;
 			}
 			if (!model) {
+				if (options.modelPatternFallbackExhaustive) {
+					throw new Error("No authenticated model available in explicit model override list");
+				}
 				const requested =
 					deferredModelPatterns.length === 1
 						? `"${deferredModelPatterns[0]}"`

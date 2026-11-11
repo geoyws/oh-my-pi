@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { Agent, CompactionCancelledError, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, UserMessage } from "@oh-my-pi/pi-ai";
@@ -6,6 +7,7 @@ import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { CONTEXT_NOTES_ENTRY_TYPE, getContextNotes } from "@oh-my-pi/pi-coding-agent/session/context-notes";
@@ -103,7 +105,7 @@ describe("experimental context management", () => {
 		session = undefined;
 	});
 
-	async function createRolloverSession() {
+	async function createRolloverSession(onAgent?: (agent: Agent) => void) {
 		const mock = createMockModel({
 			responses: [
 				{
@@ -140,6 +142,7 @@ describe("experimental context management", () => {
 			getApiKey: () => "test-key",
 			streamFn: mock.stream,
 		});
+		onAgent?.(agent);
 		session = new AgentSession({
 			agent,
 			sessionManager: manager,
@@ -177,6 +180,86 @@ describe("experimental context management", () => {
 		expect(
 			mock.calls[1].context.messages.some(message => message.role === "user" && message.content === "old task"),
 		).toBe(false);
+	});
+
+	it("re-injects the approved plan into the same run after an in-turn new_context rollover", async () => {
+		const { session, manager, mock } = await createRolloverSession();
+		// Plan approved inside an earlier step of this run (ACP xd://propose): the
+		// approval evidence lives only in history the rollover is about to drop.
+		const planUrl = "local://in-turn-plan.md";
+		const resolved = resolveLocalUrlToPath(planUrl, {
+			getArtifactsDir: () => manager.getArtifactsDir(),
+			getSessionId: () => manager.getSessionId(),
+		});
+		fs.mkdirSync(path.dirname(resolved), { recursive: true });
+		fs.writeFileSync(resolved, "plan IN-TURN-PLAN-MARKER\n");
+		session.setPlanReferencePath(planUrl);
+		session.markPlanReferenceSent();
+
+		await session.prompt("Implement nothing: request a fresh context window and reply with the plan line.");
+		await session.waitForIdle();
+
+		expect(mock.calls).toHaveLength(2);
+		expect(manager.getEntries().filter(entry => entry.type === "compaction")).toHaveLength(1);
+		// The mock agent drops custom messages on conversion; render the live
+		// history the way the session does and require the plan before the
+		// post-rollover answer.
+		const rendered = convertToLlm(session.agent.state.messages).map(message => JSON.stringify(message));
+		const planIndex = rendered.findIndex(text => text.includes("IN-TURN-PLAN-MARKER"));
+		expect(planIndex).toBeGreaterThanOrEqual(0);
+		expect(rendered[planIndex]).toContain(`<plan path=\\"${planUrl}\\">`);
+		expect(rendered.slice(planIndex + 1).some(text => text.includes('"role":"assistant"'))).toBe(true);
+	});
+
+	it("does not keep a plan snapshot read during an aborted mid-run rollover", async () => {
+		let aside: (() => Promise<unknown[]> | unknown[]) | undefined;
+		const { session, manager } = await createRolloverSession(agent => {
+			const originalSet = agent.setAsideMessageProvider.bind(agent);
+			agent.setAsideMessageProvider = (fn): void => {
+				if (fn !== undefined && aside === undefined) aside = fn;
+				originalSet(fn);
+			};
+		});
+		const planUrl = "local://in-turn-plan.md";
+		const resolved = resolveLocalUrlToPath(planUrl, {
+			getArtifactsDir: () => manager.getArtifactsDir(),
+			getSessionId: () => manager.getSessionId(),
+		});
+		fs.mkdirSync(path.dirname(resolved), { recursive: true });
+		fs.writeFileSync(resolved, "plan STASH-MARKER\n");
+		session.setPlanReferencePath(planUrl);
+		session.markPlanReferenceSent();
+
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const realFile = Bun.file.bind(Bun);
+		vi.spyOn(Bun, "file").mockImplementation((...args: unknown[]) => {
+			const file = Reflect.apply(realFile, Bun, args) as Bun.BunFile;
+			const [filePath] = args;
+			if (filePath !== resolved) return file;
+			return Object.assign(file, {
+				text: async () => {
+					entered.resolve();
+					await release.promise;
+					return "plan STASH-MARKER\n";
+				},
+			});
+		});
+
+		const running = session.prompt("Implement nothing: request a fresh context window.");
+		await entered.promise;
+		const aborting = session.abort();
+		release.resolve();
+		await aborting;
+		await running.catch(() => undefined);
+		await session.waitForIdle();
+
+		expect(aside).toBeDefined();
+		const batch = await aside!();
+		const rendered = JSON.stringify(
+			await Promise.all(batch.map(item => (typeof item === "function" ? item() : item))),
+		);
+		expect(rendered).not.toContain("STASH-MARKER");
 	});
 
 	it("retains the latest request through successive rollovers and context reconstruction without notes", async () => {

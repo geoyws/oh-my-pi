@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Effort, type FetchImpl } from "@oh-my-pi/pi-ai";
+import { MissingApiKeyError } from "@oh-my-pi/pi-ai/error";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
@@ -1347,6 +1348,113 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		} finally {
 			await session.dispose();
 		}
+	});
+
+	test.each(["next-authenticated", "exhausted-pools", "unrelated-error"])(
+		"handles deferred explicit-list pooled auth: %s",
+		async scenario => {
+			const options = buildSessionOptions([
+				"runtime-provider/runtime-model",
+				"runtime-provider/runtime-fallback-model:low",
+			]);
+			const unavailable = new MissingApiKeyError("runtime-provider", "Test OAuth account pool unavailable");
+			const unexpected = new Error("Test auth broker transport error");
+			const probes: string[] = [];
+			vi.spyOn(options.modelRegistry, "getApiKey").mockImplementation(async model => {
+				probes.push(model.id);
+				if (scenario === "unrelated-error") throw unexpected;
+				if (model.id === "runtime-model" || scenario === "exhausted-pools") throw unavailable;
+				return "test-key";
+			});
+			const result = createAgentSession({
+				...options,
+				settings: Settings.isolated({ "retry.usageAwareFallback": false }),
+				modelPatternAuthFallback: "anthropic/claude-sonnet-4-5:high",
+				modelPatternFallbackRole: "subagent:pooled",
+				modelPatternFallbackExhaustive: true,
+			});
+			if (scenario === "unrelated-error") {
+				await expect(result).rejects.toBe(unexpected);
+				expect(probes).toEqual(["runtime-model"]);
+			} else {
+				if (scenario === "exhausted-pools") {
+					await expect(result).rejects.toThrow("No authenticated model available in explicit model override list");
+				} else {
+					const { session } = await result;
+					try {
+						expect(session.model?.id).toBe("runtime-fallback-model");
+						expect(session.thinkingLevel).toBe(Effort.Low);
+						expect(getRetryFallbackRole(session.settings, "subagent:pooled")).toEqual({
+							primary: "runtime-provider/runtime-fallback-model:low",
+							chain: [],
+							exhaustive: true,
+						});
+					} finally {
+						await session.dispose();
+					}
+				}
+				expect(probes).toEqual(["runtime-model", "runtime-fallback-model"]);
+			}
+		},
+	);
+
+	test.each(["unauthenticated", "missing", "duplicate"])(
+		"keeps a deferred terminal rung exhaustive after %s predecessors",
+		async predecessor => {
+			const terminal = "runtime-provider/runtime-fallback-model";
+			const options = buildSessionOptions([
+				predecessor === "missing"
+					? "missing/absent"
+					: predecessor === "duplicate"
+						? `${terminal}:low`
+						: "runtime-provider/runtime-model",
+				`${terminal}:low`,
+			]);
+			vi.spyOn(options.modelRegistry, "getApiKey").mockImplementation(async model =>
+				model.id === "runtime-model" ? undefined : "test-key",
+			);
+			const { session } = await createAgentSession({
+				...options,
+				settings: Settings.isolated({ "retry.usageAwareFallback": false }),
+				modelPatternAuthFallback: "anthropic/claude-sonnet-4-5:high",
+				modelPatternFallbackRole: "subagent:terminal",
+				modelPatternFallbackExhaustive: true,
+				modelPatternDefaultFallbackChain: ["anthropic/claude-sonnet-4-5:high"],
+			});
+			try {
+				expect(session.model?.id).toBe("runtime-fallback-model");
+				expect(session.thinkingLevel).toBe(Effort.Low);
+				expect(getRetryFallbackRole(session.settings, "subagent:terminal")).toEqual({
+					primary: `${terminal}:low`,
+					chain: [],
+					exhaustive: true,
+				});
+			} finally {
+				await session.dispose();
+			}
+		},
+	);
+
+	test("refuses an exhausted deferred exhaustive list instead of authenticating the parent", async () => {
+		const options = buildSessionOptions([
+			"runtime-provider/runtime-model",
+			"runtime-provider/runtime-fallback-model",
+		]);
+		const probes: string[] = [];
+		vi.spyOn(options.modelRegistry, "getApiKey").mockImplementation(async model => {
+			probes.push(model.provider);
+			return model.provider === "runtime-provider" ? undefined : "test-key";
+		});
+		await expect(
+			createAgentSession({
+				...options,
+				settings: Settings.isolated({ "retry.usageAwareFallback": false }),
+				modelPatternAuthFallback: "anthropic/claude-sonnet-4-5:high",
+				modelPatternFallbackRole: "subagent:exhausted",
+				modelPatternFallbackExhaustive: true,
+			}),
+		).rejects.toThrow("No authenticated model available in explicit model override list");
+		expect(probes).not.toContain("anthropic");
 	});
 
 	test("installs an inherited fallback chain for a deferred singleton modelPattern", async () => {

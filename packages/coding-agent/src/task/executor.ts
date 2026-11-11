@@ -324,8 +324,9 @@ function installSubagentRetryFallbackChain(args: {
 	inheritedFallbackChain: string[] | undefined;
 	model: Model<Api> | undefined;
 	authFallbackUsed: boolean;
+	exhaustive: boolean;
 }): string | undefined {
-	const { settings, id, candidates, inheritedFallbackChain, model, authFallbackUsed } = args;
+	const { settings, id, candidates, inheritedFallbackChain, model, authFallbackUsed, exhaustive } = args;
 	if (!model || authFallbackUsed || candidates.length === 0) return undefined;
 
 	const selectedIndex = candidates.findIndex(
@@ -336,8 +337,12 @@ function installSubagentRetryFallbackChain(args: {
 	// An explicit multi-entry override list is its own complete retry chain: mark
 	// it exhaustive so the runtime never leaves it for a model-keyed chain.
 	// A single configured model may reuse its role's (or the default) configured chain, but never an implicit parent fallback.
-	const fallbackChain = fallbackSelectors.length > 0 ? fallbackSelectors : inheritedFallbackChain;
-	if (!Array.isArray(fallbackChain) || !fallbackChain.every(entry => typeof entry === "string")) {
+	const fallbackChain = exhaustive ? fallbackSelectors : inheritedFallbackChain;
+	if (
+		!Array.isArray(fallbackChain) ||
+		(!exhaustive && fallbackChain.length === 0) ||
+		!fallbackChain.every(entry => typeof entry === "string")
+	) {
 		return undefined;
 	}
 
@@ -345,7 +350,7 @@ function installSubagentRetryFallbackChain(args: {
 	installRetryFallbackRole(settings, role, {
 		primary: candidates[selectedIndex].selector,
 		chain: fallbackChain,
-		...(fallbackSelectors.length > 0 ? { exhaustive: true as const } : {}),
+		...(exhaustive ? { exhaustive: true as const } : {}),
 	});
 	return role;
 }
@@ -4618,10 +4623,15 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const retryFallbackRole = installSubagentRetryFallbackChain({
 				settings: subagentSettings,
 				id,
-				candidates: resolveSubagentRetryFallbackCandidates(modelPatterns, modelRegistry, subagentSettings),
+				candidates: resolveSubagentRetryFallbackCandidates(
+					configuredModelPatterns,
+					modelRegistry,
+					subagentSettings,
+				),
 				inheritedFallbackChain: inheritedRetryFallbackChain,
 				model,
 				authFallbackUsed,
+				exhaustive: configuredModelPatterns.length > 1,
 			});
 			if (retryFallbackRole) {
 				logger.debug("Configured subagent runtime model fallback chain", {
@@ -4756,6 +4766,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 
 			const { normalized: normalizedOutputSchema } = normalizeSchema(outputSchema);
+			const deferModelPatterns = !model && (modelOverride !== undefined || configuredModelPatterns.length > 1);
 			// Rebuilding an equivalent session from the same JSONL file re-invokes
 			// createAgentSession with this spec (same agent id, tools, model, system
 			// prompt, artifacts dir) — only the SessionManager and settings differ.
@@ -4771,19 +4782,16 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					oauthAccountPools: options.oauthAccountPools,
 					inheritedSessionAgents: options.inheritedSessionAgents,
 					model,
-					modelPattern: model || modelOverride === undefined ? undefined : modelPatterns,
-					modelPatternAuthFallback:
-						model || modelOverride === undefined ? undefined : options.parentActiveModelPattern,
-					modelPatternFallbackRole:
-						model || modelOverride === undefined ? undefined : subagentRetryFallbackRole(id),
+					modelPattern: deferModelPatterns ? modelPatterns : undefined,
+					modelPatternAuthFallback: deferModelPatterns ? options.parentActiveModelPattern : undefined,
+					modelPatternFallbackRole: deferModelPatterns ? subagentRetryFallbackRole(id) : undefined,
 					// An explicit multi-entry list is its own complete retry chain:
 					// tell the SDK installer to mark it exhaustive, matching the
-					// immediate install above. Singleton and @role patterns leave
-					// this unset and keep inheriting their (default) chain.
+					// immediate install above. Singleton effective lists keep
+					// inheriting their role's (or default) chain.
 					modelPatternFallbackExhaustive:
-						model || modelOverride === undefined || modelPatterns.length <= 1 ? undefined : true,
-					modelPatternDefaultFallbackChain:
-						model || modelOverride === undefined ? undefined : inheritedRetryFallbackChain,
+						deferModelPatterns && configuredModelPatterns.length > 1 ? true : undefined,
+					modelPatternDefaultFallbackChain: deferModelPatterns ? inheritedRetryFallbackChain : undefined,
 					thinkingLevel: effectiveThinkingLevel,
 					thinkingLevelCeiling: spawnEffortCeiling,
 					// Subagents are short-lived; never schedule background warm requests.

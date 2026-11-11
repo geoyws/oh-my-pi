@@ -949,12 +949,17 @@ export const claudeRankingStrategy: CredentialRankingStrategy = {
 	 */
 	healableBlockScopes(report) {
 		const sharedLimits = report.limits.filter(limit => limit.scope.shared === true);
-		// The endpoint returns a report as soon as one window parses, and a tier
-		// 429 can be caused by a shared wall. A payload missing a shared gate
-		// leaves the block's cause unknown, so vouch for nothing rather than
-		// clear a block that still holds.
-		const everySharedGateReported = CLAUDE_SHARED_GATE_WINDOW_IDS.every(windowId =>
-			sharedLimits.some(limit => limit.scope.windowId === windowId || limit.window?.id === windowId),
+		// Missing or malformed windows leave the block's cause unknown. The
+		// usage endpoint also explicitly returns null for an inactive window;
+		// that is different from an omitted gate, and must not strand a recovered
+		// account until its old reset. Generic limits still take precedence.
+		const rawSharedWindows = isRecord(report.raw)
+			? { "5h": report.raw.five_hour, "7d": report.raw.seven_day }
+			: undefined;
+		const everySharedGateReported = CLAUDE_SHARED_GATE_WINDOW_IDS.every(
+			windowId =>
+				sharedLimits.some(limit => limit.scope.windowId === windowId || limit.window?.id === windowId) ||
+				rawSharedWindows?.[windowId] === null,
 		);
 		if (!everySharedGateReported) return [];
 		const tiers = new Set<string>();

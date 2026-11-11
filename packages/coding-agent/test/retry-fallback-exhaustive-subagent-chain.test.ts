@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import type { Api, Model } from "@oh-my-pi/pi-ai";
+import { Effort, type Api, type Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
@@ -224,6 +224,58 @@ describe("exhaustive subagent fallback chains", () => {
 		expect(role?.chain).toEqual([SECOND, THIRD]);
 		expect(role?.exhaustive).toBe(true);
 	});
+
+	it.each(["unauthenticated", "disabled", "missing", "duplicate", "alias"])(
+		"keeps the terminal rung exhaustive after %s predecessors",
+		async predecessor => {
+			const first = model("scout-a", "first");
+			const second = { ...model("scout-b", "second"), reasoning: true };
+			const outside = model("outside", "other");
+			const settings = Settings.isolated({
+				disabledProviders: predecessor === "disabled" ? ["scout-a"] : [],
+				"retry.fallbackChains": { default: [OUTSIDE], [SECOND]: [OUTSIDE] },
+			});
+			const selectors = [
+				predecessor === "missing" ? "missing/absent" : predecessor === "duplicate" ? `${SECOND}:low` : FIRST,
+				`${SECOND}:low`,
+			];
+			settings.setModelRole("scout", selectors.join(","));
+			let child: Parameters<typeof sdkModule.createAgentSession>[0];
+			vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+				child = options;
+				return { session: createYieldingSession(), extensionsResult: {}, setToolUIContext: () => {} } as never;
+			});
+			await runSubprocess({
+				cwd: "/tmp",
+				agent: { name: "scout", description: "test", systemPrompt: "test", source: "bundled" },
+				task: "work",
+				index: 0,
+				id: "terminal-spawn",
+				modelOverride: predecessor === "alias" ? "@scout" : selectors,
+				parentActiveModelPattern: OUTSIDE,
+				settings,
+				modelRegistry: {
+					refresh: async () => {},
+					getAvailable: () => [first, second, outside],
+					getApiKey: async (entry: Model<Api>) => (entry.provider === "scout-a" ? undefined : "test-key"),
+				} as never,
+				enableLsp: false,
+			});
+			if (!child?.settings) throw new Error("Expected child settings");
+			expect(child.model?.id).toBe("second");
+			expect(child.thinkingLevel).toBe(Effort.Low);
+			const role = "subagent:terminal-spawn";
+			expect(getRetryFallbackRole(child.settings, role)).toEqual({
+				primary: `${SECOND}:low`,
+				chain: [],
+				exhaustive: true,
+			});
+			const restored = restoreSubagentSettings(captureSubagentSettings(settings, child.settings));
+			const recovery = recoveryFor(restored, [first, second, outside]);
+			expect(recovery.retryFallbackChainKeys(SECOND, second, { pinnedRole: role })).toEqual([role]);
+			expect(recovery.findRetryFallbackCandidates(role, SECOND, second)).toEqual([]);
+		},
+	);
 
 	it("leaves a spawn's single-entry override non-exhaustive", async () => {
 		const first = model("scout-a", "first");

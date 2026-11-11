@@ -415,4 +415,73 @@ describe("AgentSession todo reminder self-continuation suppression", () => {
 		// 1/3 fires, agent does work, 2/3 fires, agent acks → suppressed, no 3/3.
 		expect(reminderAttempts).toEqual([1, 2]);
 	});
+
+	it("stays silent when a new prompt finishes without touching todos left from an earlier request", async () => {
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		await session.prompt("Unrelated question: what is 8545 * 6512?");
+
+		emitToolResult("eval");
+		emitTextOnlyStop("55644040");
+		await session.waitForIdle();
+
+		expect(reminderAttempts).toEqual([]);
+		expect(todoReminderTranscriptEntry()).toBeUndefined();
+		expect(continueSpy).not.toHaveBeenCalled();
+	});
+
+	it("reminds when the agent works the todo list during the new prompt", async () => {
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		await session.prompt("Carry on with the review slices.");
+
+		emitToolResult("todo", { phases: session.getTodoPhases() });
+		emitTextOnlyStop("Started slice 81.");
+		await session.waitForIdle();
+
+		expect(reminderAttempts).toEqual([1]);
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not repeat the reminder on a later prompt that leaves the list unchanged", async () => {
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		emitTextOnlyStop();
+		await session.waitForIdle();
+		expect(reminderAttempts).toEqual([1]);
+
+		// An unrelated question in a new prompt cycle: its answer must stay the last word.
+		await session.prompt("Separately: what is 6 * 7?");
+		emitTextOnlyStop("42.");
+		await session.waitForIdle();
+
+		expect(reminderAttempts).toEqual([1]);
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("reminds again on a later prompt once the list changed after the earlier reminder", async () => {
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		emitTextOnlyStop();
+		await session.waitForIdle();
+		expect(reminderAttempts).toEqual([1]);
+
+		await session.prompt("Mark slice 81 done.");
+		emitToolResult("todo", {
+			phases: [
+				{
+					name: "Pending review",
+					tasks: [
+						{ content: "Slice 81", status: "completed" },
+						{ content: "Slice 82", status: "pending" },
+					],
+				},
+			],
+		});
+		emitTextOnlyStop("Done with slice 81.");
+		await session.waitForIdle();
+
+		expect(reminderAttempts).toEqual([1, 1]);
+		expect(continueSpy).toHaveBeenCalledTimes(2);
+	});
 });

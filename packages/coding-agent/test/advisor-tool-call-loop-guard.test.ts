@@ -341,6 +341,30 @@ describe("advisor tool-call loop guard", () => {
 		const live = session;
 		activateTodoTool(live, tempDir.path());
 		live.setTodoPhases([{ name: "Work", tasks: [{ content: "Finish the migration", status: "in_progress" }] }]);
+		// Completion reminders cover the list the agent works during the prompt, so
+		// the primary's first step views the todo list before it completes.
+		const primaryStream = live.agent.streamFn;
+		let viewedTodos = false;
+		live.agent.streamFn = (model, ...rest) => {
+			if (viewedTodos) return primaryStream(model, ...rest);
+			viewedTodos = true;
+			const message: AssistantMessage = {
+				role: "assistant",
+				content: [{ type: "toolCall", id: "primary-todo-view", name: "todo", arguments: { op: "view" } }],
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				usage: zeroUsage,
+				stopReason: "toolUse",
+				timestamp: Date.now(),
+			};
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				stream.push({ type: "start", partial: message });
+				stream.push({ type: "done", reason: "toolUse", message });
+			});
+			return stream;
+		};
 		const reminderRunEnded = Promise.withResolvers<void>();
 		let reminded = false;
 		live.subscribe(event => {
