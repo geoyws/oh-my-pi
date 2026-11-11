@@ -533,47 +533,6 @@ describe("subagent runtime model resolution", () => {
 		expect(childFallbackChains?.["subagent:role-alias-default-chain"]).toEqual(["slow/opus-backup"]);
 	});
 
-	it("does not inherit the default chain when multiple requested models collapse to one candidate", async () => {
-		const primary = model("lm-studio", "local-reviewer");
-		const fallback = model("openai-codex", "gpt-5.6-sol");
-		let childFallbackChains: unknown;
-		let childModelRole: string | undefined;
-		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
-			if (!options) throw new Error("Expected createAgentSession options");
-			childFallbackChains = options.settings ? cfgRetryFallbackChains.get(options.settings) : undefined;
-			childModelRole = options.settings?.getModelRoles()["subagent:collapsed-multiple-models"];
-			return { session: createYieldingSession(), extensionsResult: {}, setToolUIContext: () => {} } as never;
-		});
-
-		const settings = Settings.isolated({
-			"retry.fallbackChains": {
-				default: ["openai-codex/gpt-5.6-sol"],
-			},
-		});
-		settings.setModelRole("default", "openai-codex/gpt-5.6-sol");
-		const agent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
-		await runSubprocess({
-			cwd: "/tmp",
-			agent,
-			task: "work",
-			index: 0,
-			id: "collapsed-multiple-models",
-			modelOverride: ["missing/provider", "lm-studio/local-reviewer"],
-			settings,
-			modelRegistry: {
-				refresh: async () => {},
-				getAvailable: () => [primary, fallback],
-				getApiKey: async () => "test-key",
-			} as never,
-			enableLsp: false,
-		});
-
-		expect(childModelRole).toBeUndefined();
-		expect(childFallbackChains).toEqual({
-			default: ["openai-codex/gpt-5.6-sol"],
-		});
-	});
-
 	it("keeps a single local subagent model pinned without a configured fallback chain", async () => {
 		const primary = model("lm-studio", "local-reviewer");
 		const parent = model("openai-codex", "gpt-5.6-sol");

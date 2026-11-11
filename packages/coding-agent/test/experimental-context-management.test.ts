@@ -233,8 +233,9 @@ describe("experimental context management", () => {
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
 		const realFile = Bun.file.bind(Bun);
-		vi.spyOn(Bun, "file").mockImplementation((filePath: string) => {
-			const file = realFile(filePath);
+		vi.spyOn(Bun, "file").mockImplementation((...args: unknown[]) => {
+			const file = Reflect.apply(realFile, Bun, args) as Bun.BunFile;
+			const [filePath] = args;
 			if (filePath !== resolved) return file;
 			return Object.assign(file, {
 				text: async () => {
