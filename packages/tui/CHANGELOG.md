@@ -7,7 +7,7 @@
 - `StatusLineComponent.setPendingModelSwitch()` and `SegmentContext.pendingModelSwitch`: while the session streams, the `model` segment renders a queued switch as `A -> B` followed by a dim ` (after this turn)`; `StatusLineComponent.hasSegment()` reports whether the effective layout shows a segment
 
 ### Fixed
-
+- The status line paints at narrow pane widths again: when overflow handling drops every segment because even the last one cannot fit (live grp-socket panes at ≤51 columns), one segment is clipped to the available width instead of rendering an empty bar — the status segment first, then the configured left-to-right order.
 - The usage dashboard now labels Anthropic accounts as Claude.
 - Task progress shows a subagent's provider-internal retry wait (`provider retrying N/M in …`) instead of a stalled running row ([#12785](https://github.com/can1357/oh-my-pi/pull/12785))
 ## [18.14.0] - 2026-10-29
