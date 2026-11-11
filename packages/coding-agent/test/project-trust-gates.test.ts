@@ -353,6 +353,62 @@ describe("project tools, commands and plugins (kb omp t-81f67b33)", () => {
 		clearFsCache();
 		expect(await discovered()).toBe(false);
 	});
+
+	test("a project-scope plugin's conventional hooks/ entry is approved with its whole package", async () => {
+		const pluginsRoot = path.join(projectDir, ".omp", "plugins");
+		const pluginDir = path.join(pluginsRoot, "node_modules", "hookplug");
+		await fs.mkdir(path.join(pluginDir, "hooks", "pre"), { recursive: true });
+		await fs.writeFile(
+			path.join(pluginsRoot, "package.json"),
+			JSON.stringify({ dependencies: { hookplug: "1.0.0" } }),
+		);
+		// No manifest entries: the hook reaches discovery only through the plugin's hooks/ directory.
+		await fs.writeFile(
+			path.join(pluginDir, "package.json"),
+			JSON.stringify({ name: "hookplug", version: "1.0.0", omp: {} }),
+		);
+		const hook = path.join(pluginDir, "hooks", "pre", "x.ts");
+		await fs.writeFile(hook, 'import "../../lib";\nexport default () => {};\n');
+		await fs.writeFile(path.join(pluginDir, "lib.ts"), "export const x = 1;\n");
+		clearFsCache();
+		const discovered = async () => (await discoverExtensionPaths([], projectDir)).includes(hook);
+
+		expect(await discovered()).toBe(false);
+		const surface = await loadAmbientExtensionEntries(projectDir);
+		expect(surface.projectPaths).toContain(hook);
+		approveProjectSurfaces(projectDir, { extensions: surface.projectFingerprint });
+		clearFsCache();
+		expect(await discovered()).toBe(true);
+
+		// Package code the hook imports from outside hooks/ still revokes the approval.
+		await fs.writeFile(path.join(pluginDir, "lib.ts"), "export const x = 2; // exfiltrate\n");
+		clearFsCache();
+		expect(await discovered()).toBe(false);
+	});
+
+	test("a tools/ entry of a project-configured extension package is approved with its whole package", async () => {
+		const pkg = path.join(projectDir, "pkg");
+		await fs.mkdir(path.join(pkg, "tools"), { recursive: true });
+		await fs.mkdir(path.join(projectDir, ".omp"), { recursive: true });
+		await fs.writeFile(path.join(projectDir, ".omp", "config.yml"), "extensions:\n  - ./pkg\n");
+		const tool = path.join(pkg, "tools", "t.ts");
+		await fs.writeFile(tool, 'import "../lib";\nexport default () => [];\n');
+		await fs.writeFile(path.join(pkg, "lib.ts"), "export const x = 1;\n");
+		clearFsCache();
+		const discovered = async () => (await discoverCustomToolPaths([], projectDir)).some(t => t.path === tool);
+
+		expect(await discovered()).toBe(false);
+		const surface = await loadCustomToolSurface(projectDir);
+		expect(surface.projectPaths).toContain(tool);
+		approveProjectSurfaces(projectDir, { tools: surface.projectFingerprint });
+		clearFsCache();
+		expect(await discovered()).toBe(true);
+
+		// Package code the tool imports from outside tools/ still revokes the approval.
+		await fs.writeFile(path.join(pkg, "lib.ts"), "export const x = 2; // exfiltrate\n");
+		clearFsCache();
+		expect(await discovered()).toBe(false);
+	});
 });
 
 describe("MCP credential lookup (OMP-CRED-003)", () => {

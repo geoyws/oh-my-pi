@@ -38,7 +38,12 @@ import * as TypeBox from "../legacy-typebox";
 import { resolveExtensionDirectory } from "./directory-resolution";
 import { installLegacyPiSpecifierShim, loadLegacyPiModule } from "../plugins/legacy-pi-compat";
 import { getAllPluginExtensionPaths, type PluginEntryPath } from "../plugins/loader";
-import { type CodeRootDirNames, fingerprintProjectCode } from "../project-code";
+import {
+	type CodeRootDirNames,
+	containingPackageRoot,
+	fingerprintProjectCode,
+	listProjectPackageRoots,
+} from "../project-code";
 import { cfgDisabledExtensions } from "../settings";
 
 import { resolvePath, withHostGuard } from "../utils";
@@ -664,6 +669,14 @@ export async function loadAmbientExtensionEntries(
 	const projectConfiguredEntries: string[] = [];
 	// A configured directory is hashed whole: its entry files can import anything in it.
 	const hashRoots = surfaceEntries.filter(entry => entry.level === "project").map(entry => entry.path);
+	// So is the package of a conventional `hooks/` or `extensions/` entry that discovery found
+	// inside a project-scope plugin or a project-configured extension package.
+	const packageRoots = await listProjectPackageRoots(cwd);
+	for (const entry of surfaceEntries) {
+		if (entry.level !== "project") continue;
+		const packageRoot = containingPackageRoot(entry.path, packageRoots);
+		if (packageRoot && !hashRoots.includes(packageRoot)) hashRoots.push(packageRoot);
+	}
 	for (const configuredPath of projectConfiguredPaths) {
 		const { resolved, files } = await expandConfiguredExtensionPath(configuredPath, cwd);
 		projectConfiguredEntries.push(...files);

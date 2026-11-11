@@ -4,9 +4,12 @@
  */
 import type * as fs1 from "node:fs";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { isEacces, isEnoent } from "@oh-my-pi/pi-utils";
 import { fingerprintProjectSurface } from "@oh-my-pi/pi-utils/project-trust";
+import { findRepoRoot } from "../capability/fs";
+import { listOmpExtensionRoots } from "../discovery/omp-extension-roots";
 
 /** Directory names whose direct children are self-contained code roots, keyed for O(1) lookup. */
 export type CodeRootDirNames = Readonly<Record<string, true>>;
@@ -85,4 +88,23 @@ export async function fingerprintProjectCode(
 		}
 	}
 	return fingerprintProjectSurface([...files]);
+}
+
+/**
+ * Repository package directories that discovery scans as extension roots:
+ * the directories of a project-settings `extensions:` list and the packages of
+ * plugins installed at project scope. Their conventional `tools/`, `hooks/`,
+ * `extensions/` and other entries can import anything in the package, so each
+ * such entry is approved together with its whole package (kb omp t-81f67b33).
+ * Built from the same context `loadCapability` gives the providers.
+ */
+export async function listProjectPackageRoots(cwd: string): Promise<string[]> {
+	const roots = await listOmpExtensionRoots({ cwd, home: os.homedir(), repoRoot: await findRepoRoot(cwd) });
+	return roots.filter(root => root.level === "project").map(root => root.path);
+}
+
+/** The package root in `packageRoots` that contains `entry`, if any. */
+export function containingPackageRoot(entry: string, packageRoots: readonly string[]): string | undefined {
+	const resolved = path.resolve(entry);
+	return packageRoots.find(root => resolved.startsWith(path.resolve(root) + path.sep));
 }
