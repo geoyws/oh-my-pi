@@ -270,6 +270,12 @@ describe("TurnRecovery quota recovery planning", () => {
 		expect(waiting).toContain("openai/gpt-4o account #31");
 		expect(waiting).toContain(new Date(fallbackResetAt).toISOString());
 
+		// Every compared provider is refreshed before the wake reads health again.
+		const firstInvalidate = calls.indexOf("invalidate:anthropic");
+		expect(firstInvalidate).toBeGreaterThan(-1);
+		expect(calls.indexOf("invalidate:openai")).toBeGreaterThan(-1);
+		const healthAfterWake = calls.findIndex((call, index) => index > firstInvalidate && call.startsWith("health:"));
+		expect(healthAfterWake).toBeGreaterThan(calls.indexOf("invalidate:openai"));
 		expect(calls.filter(call => call.startsWith("model:"))).toEqual(["model:openai/gpt-4o"]);
 		expect(calls).toContain(`pin:openai:${SESSION_ID}:31`);
 		expect(continues).toBe(1);
@@ -350,6 +356,7 @@ describe("TurnRecovery quota recovery planning", () => {
 		await recovery.recordUsageLimitOutcome(failure);
 		const retrying = recovery.handleRetryableError(failure);
 		await waitStarted.promise;
+		const callsWhenArmed = calls.length;
 		recovery.abortRetry();
 
 		expect(await retrying).toBe(false);
@@ -357,6 +364,8 @@ describe("TurnRecovery quota recovery planning", () => {
 			success: false,
 			finalError: "Retry cancelled",
 		});
+		// No usage refresh once the wake was armed: cancelling never re-plans.
+		expect(calls.slice(callsWhenArmed).some(call => call.startsWith("invalidate:"))).toBe(false);
 		expect(continues).toBe(0);
 		expect(recovery.isRetrying).toBe(false);
 	});

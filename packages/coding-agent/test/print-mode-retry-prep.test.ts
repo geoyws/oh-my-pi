@@ -14,17 +14,17 @@
  *   outlive the one-shot run, so the literal text reaches the model like
  *   every undispatched command.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "bun:test";
 import type { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { runPrintMode } from "@oh-my-pi/pi-coding-agent/modes/print-mode";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 
 interface RetryPrepSpies {
-	prompt: ReturnType<typeof vi.fn>;
-	retry: ReturnType<typeof vi.fn>;
-	refreshMCPTools: ReturnType<typeof vi.fn>;
-	waitForIdle: ReturnType<typeof vi.fn>;
+	prompt: Mock<(text: string) => Promise<void>>;
+	retry: Mock<() => Promise<boolean>>;
+	refreshMCPTools: Mock<() => Promise<void>>;
+	waitForIdle: Mock<() => Promise<void>>;
 	order: string[];
 }
 

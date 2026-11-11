@@ -56,7 +56,7 @@ async function startBunHolder(responseExpr: string, options?: { hostname?: strin
 	const port = reservation.port;
 	reservation.stop(true);
 
-	const source = `Bun.serve({ port: ${port}, hostname: "${hostname}", fetch: () => ${responseExpr} }); process.stdout.write("ready"); await Promise.withResolvers().promise;`;
+	const source = `Bun.serve({ port: ${port}, hostname: "${hostname}", fetch: request => ${responseExpr} }); process.stdout.write("ready"); await Promise.withResolvers().promise;`;
 	const args = [process.execPath, "-e", source];
 	if (options?.statsOwned) args.push("omp-stats");
 	const child = Bun.spawn(args, {
@@ -205,11 +205,22 @@ describe("startServer port conflicts", () => {
 		// `/stats` failed with "not identifiable as an omp stats dashboard". The
 		// holder is a separate process probed over real sockets, so its stall has
 		// to be a real delay; fake timers here cannot slow another process down.
-		const headers = `{ "${STATS_DASHBOARD_HEADER}": "${STATS_DASHBOARD_SECURITY_VERSION}", "${STATS_DASHBOARD_HOSTNAME_HEADER}": "${STATS_DASHBOARD_HOSTNAME}" }`;
+		// It proves capability-token identity like a current dashboard, so the probe
+		// must classify it reusable, not replaceable (which would SIGTERM it and bind
+		// the port itself, passing the port check for the wrong reason).
+		const token = loadOrCreateCapabilityToken(getStatsDashboardTokenPath());
+		const proof = `require("node:crypto").createHmac("sha256", ${JSON.stringify(token)}).update("omp-stats-dashboard-proof\\n${STATS_DASHBOARD_HOSTNAME}\\n" + new URL(request.url).port + "\\n" + (request.headers.get("${STATS_DASHBOARD_CHALLENGE_HEADER}") ?? "")).digest("base64url")`;
+		const headers = `{ "${STATS_DASHBOARD_HEADER}": "${STATS_DASHBOARD_SECURITY_VERSION}", "${STATS_DASHBOARD_HOSTNAME_HEADER}": "${STATS_DASHBOARD_HOSTNAME}", "${STATS_DASHBOARD_PROOF_HEADER}": ${proof} }`;
 		const holder = await startBunHolder(`Bun.sleep(1_000).then(() => Response.json([], { headers: ${headers} }))`);
 
 		const server = await startServer(holder.port);
 		expect(server.port).toBe(holder.port);
+
+		// Reuse leaves the holder serving: it still answers its own slow response.
+		const response = await fetch(`http://${STATS_DASHBOARD_HOSTNAME}:${holder.port}/api/stats/models`);
+		expect(response.status).toBe(200);
+		expect(response.headers.get(STATS_DASHBOARD_HEADER)).toBe(STATS_DASHBOARD_SECURITY_VERSION);
+		await response.body?.cancel();
 		expect(holder.child.exitCode).toBeNull();
 	});
 
