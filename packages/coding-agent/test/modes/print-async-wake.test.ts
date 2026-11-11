@@ -116,9 +116,11 @@ afterEach(() => {
 });
 
 describe("print mode async-result wake", () => {
-	test("by default exits after the prompt and disposes with the job still pending", async () => {
+	test("with async.printWake off, exits after the prompt and disposes with the job still pending", async () => {
 		const { lines } = captureStdout();
-		const { session, events } = sessionWithJobs(Settings.isolated(), 1);
+		const settings = Settings.isolated();
+		cfgAsyncPrintWake.override(settings, false);
+		const { session, events } = sessionWithJobs(settings, 1);
 
 		expect(await runPrintMode(session, { mode: "text", messages: ["go"] })).toBe(0);
 
@@ -295,7 +297,7 @@ describe("print mode async-result wake with a real session", () => {
 		authStorages.push(authStorage);
 		authStorage.keys.setRuntime("anthropic", "test-key");
 		const settings = Settings.isolated();
-		if (printWake) cfgAsyncPrintWake.override(settings, true);
+		cfgAsyncPrintWake.override(settings, printWake);
 		const session = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(),
@@ -315,7 +317,7 @@ describe("print mode async-result wake with a real session", () => {
 		return { session, mock, manager };
 	}
 
-	test("by default prints the first answer and cancels the job at dispose", async () => {
+	test("with async.printWake off, prints the first answer and cancels the job at dispose", async () => {
 		const { lines } = captureStdout();
 		const { session, mock, manager } = await realSession(false);
 

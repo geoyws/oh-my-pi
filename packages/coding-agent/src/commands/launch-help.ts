@@ -93,7 +93,7 @@ export const launchHelp = {
 		}),
 		"wait-async": Flags.boolean({
 			description:
-				"Print mode: before exiting, wait for this run's background jobs and wake the session with each result (async.printWake); no time limit unless --max-time is set",
+				"Print mode: before exiting, wait for this run's background jobs and wake the session with each result (async.printWake, on by default); no time limit unless --max-time is set",
 		}),
 		"external-thinking": Flags.boolean({
 			description:

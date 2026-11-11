@@ -980,13 +980,15 @@ export const cfgAsyncMaxJobs = register({
 	default: 100,
 });
 
-// Print mode is single-shot by default: it disposes after the last prompt, cancelling the
-// run's background jobs. Opting in keeps `-p` alive so each job's async-result wakes the same
-// session, as the TUI does, before exiting (issue #10363).
+// Print mode keeps `-p` alive after the last prompt so each background job's async-result
+// wakes the same session, as the TUI does, before exiting (issue #10363). The fork turns it on
+// by default: a bash call that outlives the auto-background threshold is a background job the
+// model never chose, and cancelling it at exit lost headless reviewers' verdicts (kb omp
+// t-ace558ff). Off restores single-shot exit, which cancels the run's background jobs.
 export const cfgAsyncPrintWake = register({
 	id: "async.printWake",
 	type: "boolean",
-	default: false,
+	default: true,
 	ui: {
 		tab: "tools",
 		group: "Execution",

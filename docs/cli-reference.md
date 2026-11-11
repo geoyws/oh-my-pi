@@ -145,7 +145,7 @@ See [providers](./providers.md) and [models](./models.md) for model resolution.
 | `--approval-mode <mode>` | Override `tools.approvalMode` for this session (`always-ask`, `always-ask-cached`, `write`, or `yolo`). See [approval mode](./approval-mode.md). |
 | `--auto-approve`, `--yolo` | Force yolo tier approval; explicit tool/user policies and provider safety checks still apply. |
 | `--advisor` | Enable the advisor runtime (passively reviews each turn and injects notes). See [advisor / watchdog](./advisor-watchdog.md). |
-| `--wait-async` | Print mode: before exiting, wait for this run's background jobs and start another turn in the same session with each result (`async.printWake`). See [Headless / print mode](#headless--print-mode). |
+| `--wait-async` | Print mode: before exiting, wait for this run's background jobs and start another turn in the same session with each result (`async.printWake`, on by default). See [Headless / print mode](#headless--print-mode). |
 | `--max-time <duration>` | Stop the session after this duration (e.g. `600`, `10m`, `1h`). |
 | `--warn-cost <usd>` | Warn once when the session's spend, subagents included, reaches this many USD. Overrides `session.warnCost`. |
 | `--max-cost <usd>` | Stop sending model requests once the session's spend reaches this many USD; a request already in flight can carry spend past it. Overrides `session.maxCost`. |
@@ -214,17 +214,17 @@ Related flags for headless runs:
 - `--mode json` — emit structured events instead of rendered text.
 - `--no-title` — skip title auto-generation (also `PI_NO_TITLE`).
 - `--max-time <duration>` — bound the run.
-- `--wait-async` — keep the run alive for its background jobs (below).
+- `--wait-async` — keep the run alive for its background jobs (the default; below).
 - `--warn-cost <usd>` / `--max-cost <usd>` — warn at, or stop sending model requests from, a spend.
 
-Print mode is single-shot by default: once its prompts are answered it disposes
-the session, which cancels background jobs the run started (`bash` or `task`
-calls the model ran asynchronously). With `--wait-async` (or
-`async.printWake: true`) it instead waits for them; each job's result is
-delivered to the same session as it is in the TUI, starting another turn, and a
-turn may start further jobs. The run exits once no owned job or undelivered
-result remains, and text mode prints the answer of the last turn. Bound
-unattended runs with `--max-time`.
+By default print mode waits for the background jobs the run started (`bash`
+calls that outlived the auto-background threshold, and `bash` or `task` calls
+the model ran asynchronously); each job's result is delivered to the same
+session as it is in the TUI, starting another turn, and a turn may start
+further jobs. The run exits once no owned job or undelivered result remains,
+and text mode prints the answer of the last turn. Bound unattended runs with
+`--max-time`. With `async.printWake: false` print mode is single-shot: once its
+prompts are answered it disposes the session, which cancels those jobs.
 
 ```sh
 # Start a long build in the background, then react to its result in the same session

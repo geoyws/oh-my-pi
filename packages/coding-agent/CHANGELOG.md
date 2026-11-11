@@ -25,7 +25,7 @@
 
 ### Fixed
 
-- `omp -p` (print and `--mode json`) no longer ends a run while a bash or eval call it started is still running in the background. A call that outlived the auto-background threshold now delivers its result to the model as a follow-up turn before the final response is printed; before, the run ended on "waiting for bg_N", the job was cancelled at exit, and headless reviewers lost their verdict. Interactive mode is unchanged.
+- `omp -p` (print and `--mode json`) no longer ends a run while a bash or eval call it started is still running in the background: `async.printWake` (`--wait-async`) now defaults to on, so a call that outlived the auto-background threshold delivers its result to the model as a follow-up turn before the final response is printed. Before, the run ended on "waiting for bg_N", the job was cancelled at exit, and headless reviewers lost their verdict. `--max-time` still bounds the wait; set `async.printWake: false` for the old single-shot exit. Interactive mode is unchanged.
 - Fixed retry fallback switching models prematurely when a failed-turn snapshot masked prior signed thinking.
 - Quota recovery now honors the same-model retry budget before switching away from the Anthropic model that signed replayed thinking, just like the ordinary fallback walk.
 - Refresh usage before the initial quota comparison so a sibling whose cached window has already reset is not overlooked in favor of a later fallback wake.
