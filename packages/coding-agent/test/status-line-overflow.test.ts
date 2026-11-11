@@ -6,6 +6,7 @@ import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config
 import { StatusLineComponent } from "@oh-my-pi/pi-tui/status-line";
 import { statusLineHost } from "@oh-my-pi/pi-coding-agent/modes/status-line-host";
 import type { SegmentContext } from "@oh-my-pi/pi-tui/status-line/segments";
+import type { StatusLineSegmentId } from "@oh-my-pi/pi-tui/status-line/schema";
 import { renderSegment } from "@oh-my-pi/pi-tui/status-line/segments";
 import { initTheme, theme } from "@oh-my-pi/pi-tui/theme";
 import { getSessionAccentAnsi, getSessionAccentHex } from "@oh-my-pi/pi-tui/theme/session-color";
@@ -345,5 +346,75 @@ describe("overflow: path survives before model", () => {
 		const rendered = stripAnsi(component.getTopBorder(width).content);
 		expect(rendered).toContain("xyz");
 		expect(rendered).not.toContain("MODEL_SHOULD_DROP");
+	});
+});
+
+describe("overflow: narrow-pane clip floor", () => {
+	const LONG_MODEL = `MODEL_CLIP_${"x".repeat(49)}`;
+
+	function buildNarrowComponent(segments: { left: StatusLineSegmentId[]; right: StatusLineSegmentId[] }) {
+		const component = statusLines.track(
+			new StatusLineComponent(createStatusLineSession("narrow pane", LONG_MODEL), statusLineHost),
+		);
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: segments.left,
+			rightSegments: segments.right,
+			separator: "none",
+			sessionAccent: false,
+			transparent: true,
+			segmentOptions: { model: { showThinkingLevel: false } },
+		});
+		return component;
+	}
+
+	it("paints a clipped first configured segment at 51 and 40 cols instead of an empty bar", () => {
+		const component = buildNarrowComponent({ left: ["model"], right: [] });
+		for (const width of [51, 40]) {
+			const content = component.getTopBorder(width).content;
+			const stripped = stripAnsi(content).trim();
+			expect(stripped.length, `width ${width}`).toBeGreaterThan(0);
+			expect(stripped.includes("MODEL_CLIP"), `width ${width}`).toBe(true);
+			expect(visibleWidth(content), `width ${width}`).toBeLessThanOrEqual(width + 1);
+		}
+	});
+
+	it("prefers the status segment over earlier configured segments when clipping", () => {
+		const component = buildNarrowComponent({ left: ["model"], right: ["status"] });
+		component.setHookStatus("test", "kb omp WATCH");
+		const content = component.getTopBorder(40).content;
+		const stripped = stripAnsi(content).trim();
+		expect(stripped).toContain("kb omp WATCH");
+		expect(stripped).not.toContain("MODEL_CLIP");
+	});
+
+	// At 5 cols even the subagent badge cannot fit, so every part is dropped and
+	// the floor picks from the original parts, where the badge sits ahead of the
+	// tracked right segment ids.
+	it("clips the right status segment, not a badge or neighbour, when a badge was unshifted ahead of it", () => {
+		const component = buildNarrowComponent({ left: [], right: ["model", "status"] });
+		component.setHookStatus("test", "kb omp WATCH");
+		component.setRunningSubagents(["agent-a"]);
+		const stripped = stripAnsi(component.getTopBorder(5).content).trim();
+		expect(stripped).toContain("kb");
+		expect(stripped).not.toContain("⬢");
+		expect(stripped).not.toContain("👥");
+	});
+
+	it("clips the first configured right segment, not a badge, when no status is configured", () => {
+		const component = buildNarrowComponent({ left: [], right: ["model"] });
+		component.setRunningSubagents(["agent-a"]);
+		const stripped = stripAnsi(component.getTopBorder(5).content).trim();
+		// The 3-cell budget leaves the model segment's icon and an ellipsis.
+		expect(stripped).toContain("⬢");
+		expect(stripped).not.toContain("👥");
+	});
+
+	it("leaves wide panes unchanged: the full long model segment still renders at 80 and 120 cols", () => {
+		const component = buildNarrowComponent({ left: ["pi", "model"], right: [] });
+		for (const width of [80, 120]) {
+			const stripped = stripAnsi(component.getTopBorder(width).content);
+			expect(stripped, `width ${width}`).toContain(LONG_MODEL);
+		}
 	});
 });

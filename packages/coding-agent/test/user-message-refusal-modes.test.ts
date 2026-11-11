@@ -69,6 +69,7 @@ async function createHarness(factory: ExtensionFactory) {
 		dismissCommandReport: () => false,
 		updateEditorBorderColor: vi.fn(),
 		updatePendingMessagesDisplay: vi.fn(),
+		syncIdleMaintenanceView: vi.fn(),
 		flushPendingBashComponents: vi.fn(),
 		showStatus: vi.fn(),
 		showError: vi.fn(),
@@ -221,6 +222,7 @@ describe("print-mode refusal", () => {
 			setTextOutputCommitted: () => {},
 			waitForAdvisorCatchup: async () => true,
 			waitForIdle: async () => {},
+			hasPendingAsyncWork: () => false,
 			dispose: async () => {},
 		} as unknown as AgentSession;
 	}

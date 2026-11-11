@@ -57,6 +57,7 @@ function createFlushHarness(): FlushHarness {
 			advisorDrainPrepared = true;
 		},
 		waitForIdle: async () => {},
+		hasPendingAsyncWork: () => false,
 		waitForAdvisorCatchup: async () => {
 			if (!advisorDrainPrepared) throw new Error("advisor catch-up started before headless delivery was armed");
 		},

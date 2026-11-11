@@ -5,6 +5,23 @@
 ### Added
 
 - Added `provider_retry_wait_start`/`provider_retry_wait_end` agent events to the collab wire and bumped `COLLAB_PROTO` to 4, so guests that cannot dispatch them are refused at hello ([#12785](https://github.com/can1357/oh-my-pi/pull/12785))
+## [18.14.0] - 2026-10-29
+
+### Added
+
+- Added the TSP `json` kind for displaying raw JSON values as interactive, expandable trees in the terminal.
+- Added `TspEditorProps.typeahead` support so programs that cannot yet read input can preserve typed text, display it at the caret, and submit it when input becomes available.
+
+## [18.13.3] - 2026-10-28
+
+### Changed
+
+- Updated Bun engine requirement to ≥1.4.4
+
+### Removed
+
+- Removed `TspPalette` definition and `t` verb from the protocol specification
+
 ## [18.12.3] - 2026-10-19
 
 ### Added

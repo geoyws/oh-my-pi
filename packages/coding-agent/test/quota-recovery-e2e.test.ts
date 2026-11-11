@@ -641,7 +641,20 @@ test("a sibling of the current model that resets before the fallback wins the wa
 	expect(served.model, diagnostics(run)).toBe(PRIMARY_MODEL_ID);
 	expect(served.at - t0, diagnostics(run)).toBeGreaterThanOrEqual(3_000);
 	expect(served.at - t0, diagnostics(run)).toBeLessThan(7_000);
-	expectWakeAnnounced(run, PRIMARY, "bravo", t0 + 3_000);
+	// Recovery can begin after bravo's reset. In that case its immediate
+	// selection must be backed by a fresh probe; otherwise it owns the wake.
+	if (recoveryLines(run, PRIMARY, "bravo").some(line => line.includes("using ") && line.includes(" now."))) {
+		expect(
+			run.probes.some(probe => probe.account === "bravo" && probe.at >= t0 + 3_000 && probe.at <= served.at),
+			diagnostics(run),
+		).toBe(true);
+	} else {
+		expectWakeAnnounced(run, PRIMARY, "bravo", t0 + 3_000);
+	}
+	expect(
+		recoveryLines(run, FALLBACK, "zulu").filter(line => line.includes("waiting for")),
+		diagnostics(run),
+	).toEqual([]);
 }, 90_000);
 
 test("a fallback model that resets before every sibling wins the wake at its configured effort", async () => {

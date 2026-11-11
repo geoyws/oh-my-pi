@@ -68,6 +68,9 @@ export type CommittableAsideMessage = AgentMessage & {
  */
 export type AsideMessage = CommittableAsideMessage | (() => CommittableAsideMessage | null);
 
+/** Where the loop polls asides: after a tool batch (`"work"`) or after a turn without tool calls (`"stop"`). */
+export type AsideBoundary = "work" | "stop";
+
 export interface AgentTurnEndContext {
 	/** Assistant/user message that just completed this turn boundary. */
 	message: AgentMessage;
@@ -203,6 +206,9 @@ export type QueuedSteerOutcome = "interrupt-model-call" | "interrupt-wait" | "af
 export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model;
 
+	/** Reports whether this loop has reached a safe process-pause boundary. */
+	onPauseChange?: (paused: boolean) => void;
+
 	/**
 	 * When a queued steering message may cut the current work short.
 	 * - "immediate" = cut interruptible waits short and raise the cooperative
@@ -313,7 +319,7 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 *
 	 * Polled while a tool batch runs (in "wait" mode, only when the batch holds an
 	 * interruptible tool) to decide whether to abort in-flight and skip
-	 * not-yet-started *interruptible* waits;
+	 * not-yet-started *interruptible* waits, unless they handle queued interrupts;
 	 * every other already-emitted call still executes and the message injects
 	 * at the batch boundary. Watched the same way while a model call is still
 	 * waiting on its first stream event: a request that has produced no output
@@ -430,8 +436,12 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * should reach the model between requests without waiting for the agent to
 	 * fully stop. Returned messages are appended to the context with normal
 	 * message events and keep the loop running so the model can react.
+	 *
+	 * `boundary` is `"work"` after a tool batch and `"stop"` when the model ended
+	 * its turn without tool calls; a provider may hold back messages that should
+	 * not extend a finished turn.
 	 */
-	getAsideMessages?: () => Promise<AsideMessage[]>;
+	getAsideMessages?: (boundary: AsideBoundary) => Promise<AsideMessage[]>;
 	/**
 	 * Hook fired right before the loop would exit.
 	 *
@@ -1247,6 +1257,13 @@ export interface AgentTool<
 	 */
 	interruptible?: boolean | ((args: Partial<Static<TParameters>>) => boolean);
 	/**
+	 * An interruptible tool can execute with an already-aborted
+	 * `TOOL_INTERRUPT_ABORT_REASON` signal to drain caller-owned wake events.
+	 * It must not block when that signal is aborted. External/user cancellation
+	 * still prevents execution. Omitted tools keep the usual pre-start skip.
+	 */
+	handlesToolInterrupt?: boolean;
+	/**
 	 * Controls how the INTENT_FIELD (`i`) is handled for this tool.
 	 * - `"require"` (default): `i` is injected and required in the parameter schema.
 	 * - `"optional"`: `i` is injected as an optional/nullable field.
@@ -1297,6 +1314,12 @@ export interface AgentTool<
 	 * approving the call can record them. Omit it (or return `undefined`) and the call prompts by tier.
 	 */
 	approvalCacheTargets?: (args: unknown) => readonly string[] | undefined;
+
+	/**
+	 * Paths a call reads beyond its working directory, matched against restricted folders when it
+	 * reports no `approvalCacheTargets`. Unlike cache targets they never key a remembered grant.
+	 */
+	approvalRestrictionPaths?: (args: unknown) => readonly string[] | undefined;
 
 	/** The main execution callback for this tool. */
 	execute: AgentToolExecFn<TParameters, TDetails, TTheme>;

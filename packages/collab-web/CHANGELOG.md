@@ -5,6 +5,11 @@
 ### Fixed
 
 - Fixed the browser guest's composer staying empty after the host refused a prompt (its `before_user_message` gate, e.g. a secret): the refused text comes back into the composer, ahead of anything typed since
+## [18.13.3] - 2026-10-28
+
+### Changed
+
+- Updated Bun engine requirement to ≥1.4.4
 
 ## [18.8.0] - 2026-10-07
 
