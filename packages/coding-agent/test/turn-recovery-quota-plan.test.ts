@@ -90,6 +90,11 @@ describe("TurnRecovery quota recovery planning", () => {
 	});
 
 	beforeEach(() => {
+		const wallTimeMs = Date.now();
+		const monotonicTimeMs = performance.now();
+		// Scheduler waits advance performance.now(); provider reset timestamps
+		// and the recovery planner must observe that same elapsed time.
+		vi.spyOn(Date, "now").mockImplementation(() => wallTimeMs + Math.floor(performance.now() - monotonicTimeMs));
 		vi.spyOn(envApiKey, "getEnvApiKey").mockReturnValue(undefined);
 		authStorage.keys.setRuntime("anthropic", "anthropic-test-key");
 		authStorage.keys.setRuntime("openai", "openai-test-key");
@@ -119,13 +124,13 @@ describe("TurnRecovery quota recovery planning", () => {
 		tempDir.removeSync();
 	});
 
-	/** Health by `provider/model`; phase N applies after the Nth wake refreshed usage (the primary is always compared). */
-	function stubHealth(phases: Array<Record<string, ModelUsageHealth>>): void {
+	/** Health changes at provider reset times, independently of cache refresh calls. */
+	function stubHealth(phases: Array<Record<string, ModelUsageHealth>>, changeAtMs: number[] = []): void {
 		vi.spyOn(authStorage.health, "model").mockImplementation(async (provider, options) => {
 			const key = `${provider}/${options.modelId}`;
 			calls.push(`health:${key}`);
-			const wakes = calls.filter(call => call === `invalidate:${primary.provider}`).length;
-			const phase = phases[Math.min(phases.length - 1, wakes)] ?? {};
+			const phaseIndex = changeAtMs.filter(at => Date.now() >= at).length;
+			const phase = phases[Math.min(phases.length - 1, phaseIndex)] ?? {};
 			return phase[key] ?? { state: "unknown", accounts: [] };
 		});
 	}
@@ -231,19 +236,22 @@ describe("TurnRecovery quota recovery planning", () => {
 	it("waits for the earliest authoritative reset across models, then refreshes usage before resuming on it", async () => {
 		const now = Date.now();
 		const fallbackResetAt = now + HOUR_MS;
-		stubHealth([
-			{
-				"anthropic/claude-sonnet-4-5": pool([depleted(1, now + 2 * HOUR_MS, true)]),
-				// Sooner, but a heuristic block: no provider-stated time.
-				"openai/gpt-4o-mini": pool([depleted(21, now + HOUR_MS / 2, false)]),
-				"openai/gpt-4o": pool([depleted(31, fallbackResetAt, true)]),
-			},
-			{
-				"anthropic/claude-sonnet-4-5": pool([depleted(1, now + 2 * HOUR_MS, true)]),
-				"openai/gpt-4o-mini": pool([depleted(21, now + HOUR_MS / 2, false)]),
-				"openai/gpt-4o": pool([healthy(31)]),
-			},
-		]);
+		stubHealth(
+			[
+				{
+					"anthropic/claude-sonnet-4-5": pool([depleted(1, now + 2 * HOUR_MS, true)]),
+					// Sooner, but a heuristic block: no provider-stated time.
+					"openai/gpt-4o-mini": pool([depleted(21, now + HOUR_MS / 2, false)]),
+					"openai/gpt-4o": pool([depleted(31, fallbackResetAt, true)]),
+				},
+				{
+					"anthropic/claude-sonnet-4-5": pool([depleted(1, now + 2 * HOUR_MS, true)]),
+					"openai/gpt-4o-mini": pool([depleted(21, now + HOUR_MS / 2, false)]),
+					"openai/gpt-4o": pool([healthy(31)]),
+				},
+			],
+			[fallbackResetAt],
+		);
 		const waitSpy = mockSchedulerWaitWithClock();
 		const { recovery, failure } = createRecovery({
 			"retry.fallbackChains": chain,
@@ -277,32 +285,34 @@ describe("TurnRecovery quota recovery planning", () => {
 
 	it("re-arms the same wait when refreshed usage moves the reset, without spending retry attempts", async () => {
 		const now = Date.now();
-		stubHealth([
-			{
-				"anthropic/claude-sonnet-4-5": pool([
-					depleted(1, now + HOUR_MS, true),
-					depleted(2, now + 2 * HOUR_MS, true),
-				]),
-			},
-			{
-				"anthropic/claude-sonnet-4-5": pool([
-					depleted(1, now + 3 * HOUR_MS, true),
-					depleted(2, now + 2 * HOUR_MS, true),
-				]),
-			},
-			{ "anthropic/claude-sonnet-4-5": pool([depleted(1, now + 3 * HOUR_MS, true), healthy(2)]) },
-		]);
-		const waitSpy = mockSchedulerWaitWithClock();
+		stubHealth(
+			[
+				{
+					"anthropic/claude-sonnet-4-5": pool([
+						depleted(1, now + HOUR_MS, true),
+						depleted(2, now + 2 * HOUR_MS, true),
+					]),
+				},
+				{
+					"anthropic/claude-sonnet-4-5": pool([
+						depleted(1, now + 3 * HOUR_MS, true),
+						depleted(2, now + 2 * HOUR_MS, true),
+					]),
+				},
+				{ "anthropic/claude-sonnet-4-5": pool([depleted(1, now + 3 * HOUR_MS, true), healthy(2)]) },
+			],
+			[now + HOUR_MS, now + 2 * HOUR_MS],
+		);
+		mockSchedulerWaitWithClock();
 		const { recovery, failure } = createRecovery({ "retry.modelFallback": false, "retry.waitForUsageReset": true });
 
 		await recovery.recordUsageLimitOutcome(failure);
 		expect(await recovery.handleRetryableError(failure)).toBe(true);
 
-		const longWaits = waitSpy.mock.calls.map(call => call[0] as number).filter(delay => delay > 60_000);
-		expect(longWaits).toHaveLength(2);
-		expect(longWaits[0]).toBeLessThanOrEqual(HOUR_MS);
-		expect(longWaits[1]).toBeGreaterThan(2 * HOUR_MS - 60_000);
-		expect(longWaits[1]).toBeLessThanOrEqual(2 * HOUR_MS);
+		// The shifted account must not resume at the first account's old reset.
+		// It becomes usable at the second deadline, regardless of timer chunking.
+		expect(Date.now() - now).toBeGreaterThanOrEqual(2 * HOUR_MS);
+		expect(Date.now() - now).toBeLessThan(2 * HOUR_MS + 60_000);
 		expect(notices().some(message => message.includes("moved the earliest reset"))).toBe(true);
 		expect(events.filter(event => event.type === "auto_retry_start")).toHaveLength(1);
 		expect(recovery.attempt).toBe(1);
@@ -346,6 +356,7 @@ describe("TurnRecovery quota recovery planning", () => {
 		await recovery.recordUsageLimitOutcome(failure);
 		const retrying = recovery.handleRetryableError(failure);
 		await waitStarted.promise;
+		const callsWhenArmed = calls.length;
 		recovery.abortRetry();
 
 		expect(await retrying).toBe(false);
@@ -353,7 +364,8 @@ describe("TurnRecovery quota recovery planning", () => {
 			success: false,
 			finalError: "Retry cancelled",
 		});
-		expect(calls.some(call => call.startsWith("invalidate:"))).toBe(false);
+		// No usage refresh once the wake was armed: cancelling never re-plans.
+		expect(calls.slice(callsWhenArmed).some(call => call.startsWith("invalidate:"))).toBe(false);
 		expect(continues).toBe(0);
 		expect(recovery.isRetrying).toBe(false);
 	});

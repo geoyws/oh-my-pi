@@ -184,8 +184,8 @@ describe("stats dashboard auth", () => {
 			},
 		});
 		try {
-			// Held by this process, so the probe ends in a refusal; what matters is what it sent.
-			await expect(recoverStatsPort(holder.port)).rejects.toThrow();
+			// Held by this process, so the claim falls back; what matters is what the probe sent.
+			expect(await recoverStatsPort(holder.port)).toBe("fallback");
 			expect(seen.length).toBeGreaterThan(0);
 			expect(seen.join("\n")).not.toContain(dashboardToken());
 			expect(seen.some(line => line.startsWith("authorization:"))).toBe(false);
@@ -210,7 +210,8 @@ describe("stats dashboard auth", () => {
 			},
 		});
 		try {
-			await expect(recoverStatsPort(relay.port)).rejects.toThrow();
+			// Not reused (the relayed proof is bound to the genuine port); the holder is left running.
+			expect(await recoverStatsPort(relay.port)).toBe("fallback");
 		} finally {
 			relay.stop(true);
 			genuine.stop();
