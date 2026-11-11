@@ -134,6 +134,7 @@ async function createHarness(): Promise<ShutdownHarness> {
 		disableStopTimeTodoReminders: () => {},
 		prepareForHeadlessAdvisorDrain: () => {},
 		waitForIdle: async () => {},
+		hasPendingAsyncWork: () => false,
 		setTextOutputCommitted: () => {},
 		waitForAdvisorCatchup: async () => true,
 		// Later writes keep failing on the real store path; the manager latches
