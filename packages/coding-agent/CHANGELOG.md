@@ -25,6 +25,7 @@
 
 ### Fixed
 
+- `omp -p` (print and `--mode json`) no longer ends a run while a bash or eval call it started is still running in the background. A call that outlived the auto-background threshold now delivers its result to the model as a follow-up turn before the final response is printed; before, the run ended on "waiting for bg_N", the job was cancelled at exit, and headless reviewers lost their verdict. Interactive mode is unchanged.
 - Explicit multi-model subagent lists now skip unauthenticated entries in order instead of escaping to the parent's model, and refuse dispatch when none can authenticate. The final available entry retains its thinking level and an exhaustive empty retry chain, so it cannot inherit unrelated fallbacks. Singleton overrides keep their existing parent-auth fallback.
 - Unavailable restricted OAuth account pools now count as missing authentication while walking an explicit subagent list. Only `MissingApiKeyError` advances to the next entry; unrelated authentication errors still propagate.
 - The incomplete-todo reminder no longer fires at the end of a prompt that never used `todo`. Before, todo items left over from an earlier request triggered the reminder after the agent had already answered an unrelated question, and its follow-up reply about those items replaced the answer as the turn's last message. Reminders still fire as before once the agent works the list during the prompt.

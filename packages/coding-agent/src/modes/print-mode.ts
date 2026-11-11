@@ -295,6 +295,20 @@ async function runPrintModeCore(
 		}
 	}
 
+	// A bash or eval call that outlived its auto-background threshold keeps
+	// running as an owned job, and its result reaches the model only as an
+	// async-result follow-up turn. Settle that work (follow-up turns may start
+	// new jobs) before reading the final response; otherwise the run ends on
+	// "waiting for bg_N" and dispose cancels the job (kb omp t-ace558ff).
+	if (!strictMCPFailure) {
+		await session.waitForIdle();
+		while (!signalTeardownActive() && session.hasPendingAsyncWork()) {
+			const stopReason = session.getLastAssistantMessage()?.stopReason;
+			if (stopReason === "error" || stopReason === "aborted") break;
+			await session.settleAsyncWork();
+		}
+	}
+
 	// From this point onward a late blocker must be recorded without starting a
 	// primary turn whose response print mode would never emit.
 	session.prepareForHeadlessAdvisorDrain();
