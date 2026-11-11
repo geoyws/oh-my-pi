@@ -39,7 +39,7 @@ import type { ModelRole } from "../config/model-roles";
 import { loadCapability } from "../discovery";
 import { AgentStorage } from "../session/agent-storage";
 import { type CompactionMethod, DEFAULT_COMPACTION_METHOD_ORDER } from "../session/compaction-methods";
-import { replaceFileAtomically } from "../utils/atomic-file";
+import { writeFileAtomically } from "../utils/atomic-file";
 import { isRegisteredSearchEngine } from "../web/search/provider";
 import { reconcileYamlConfig, stringifyYamlConfig } from "@oh-my-pi/pi-utils/yaml-config";
 import {
@@ -1308,6 +1308,15 @@ export class Settings {
 		for (const [dir, names] of targets) {
 			const existing = this.#fileWatchers.get(dir);
 			if (existing) {
+				// A newly followed target can share a directory with the old one.
+				// Events for its name were filtered out while the reload was reading
+				// the files, so reconcile once even though no new watch was opened.
+				for (const name of names) {
+					if (!existing.names.has(name)) {
+						armed = true;
+						break;
+					}
+				}
 				existing.names = names;
 				continue;
 			}
@@ -1332,10 +1341,9 @@ export class Settings {
 			this.#fileWatchers.set(dir, { watcher, names });
 			armed = true;
 		}
-		// The sources were last read before this watch existed, and Bun arms macOS
-		// FSEvents asynchronously, so a write in between raises no event (a write
-		// right after a symlink retarget, or any edit during startup). Re-read once
-		// the watch is live; that reload's own sync arms nothing new, so it settles.
+		// The sources were last read before a watch or name was added. Bun also
+		// arms macOS FSEvents asynchronously, so a write in between may raise no
+		// event. Re-read once; the next sync adds nothing new, so it settles.
 		if (armed) this.#scheduleWatchReload();
 	}
 
@@ -3642,6 +3650,23 @@ export class Settings {
 		}
 		migrateKindRoleSettings();
 
+		// The old web-provider migration persisted this pair of fuzzy defaults.
+		// Qualified selectors are now exact, so replace the pair without changing
+		// independently configured selectors or other role chains.
+		{
+			const retry = isRecord(raw.retry) ? raw.retry : undefined;
+			const chains = retry && isRecord(retry.fallbackChains) ? retry.fallbackChains : undefined;
+			const web = chains?.web;
+			if (chains && Array.isArray(web)) {
+				const index = web.findIndex(
+					(selector, i) => selector === "openai-codex/gpt-5.6" && web[i + 1] === "openai-codex/gpt-5.5",
+				);
+				if (index !== -1) {
+					chains.web = [...web.slice(0, index), "openai-codex/gpt-5.6-sol", ...web.slice(index + 2)];
+				}
+			}
+		}
+
 		// Consolidate the retired Exa suite toggles onto the sole remaining
 		// provider switch. The old runtime required both `enabled` and
 		// `enableSearch`, so preserve that AND semantics when both are present.
@@ -3719,24 +3744,7 @@ export class Settings {
 	// ─────────────────────────────────────────────────────────────────────────
 
 	async #writeYamlAtomically(filePath: string, content: string): Promise<void> {
-		const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
-		let removeTemp = false;
-		try {
-			const handle = await fs.promises.open(tempPath, "wx", 0o600);
-			removeTemp = true;
-			try {
-				await handle.writeFile(content, "utf8");
-				await handle.sync();
-			} finally {
-				await handle.close();
-			}
-			await replaceFileAtomically(tempPath, filePath);
-			removeTemp = false;
-		} finally {
-			if (removeTemp) {
-				await fs.promises.rm(tempPath, { force: true }).catch(() => {});
-			}
-		}
+		await writeFileAtomically(filePath, content);
 	}
 
 	#queueSave(): void {

@@ -12,7 +12,7 @@ import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
+import { buildSkillPromptMessage, type Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
 import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-tui/theme";
@@ -20,7 +20,11 @@ import type { CompactionQueuedMessage, InteractiveModeContext } from "@oh-my-pi/
 import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "@oh-my-pi/pi-coding-agent/session/messages";
+import {
+	SKILL_PROMPT_MESSAGE_TYPE,
+	type SkillPromptDetails,
+	USER_INTERRUPT_LABEL,
+} from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { Container } from "@oh-my-pi/pi-tui";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -53,6 +57,8 @@ type PromptCustomMessage = Mock<
 			queueChipText?: string;
 			queueOnly?: boolean;
 			source?: string;
+			onPromptQueued?: (queued: readonly unknown[]) => void;
+			onPromptAdmitted?: () => void;
 		},
 	) => Promise<void>
 >;
@@ -61,6 +67,13 @@ async function writeSkillFile(dir: string, skillName: string, body: string): Pro
 	const skillPath = path.join(dir, `${skillName}.md`);
 	await Bun.write(skillPath, `---\nname: ${skillName}\n---\n${body}\n`);
 	return { name: skillName, description: "", filePath: skillPath, baseDir: dir, source: "test" };
+}
+
+async function submitStubEditor(editor: StubEditor): Promise<void> {
+	const text = editor.getExpandedText().trim();
+	// Editor clears text before onSubmit, but leaves pending attachments for the controller.
+	editor.setText("");
+	await editor.onSubmit?.(text);
 }
 
 function createStubInputControllerContext(opts: {
@@ -111,6 +124,7 @@ function createStubInputControllerContext(opts: {
 		editor,
 		ui: { requestRender },
 		skillCommands: opts.skillCommands,
+		fileSlashCommands: new Set<string>(),
 		session: {
 			isStreaming: opts.isStreaming,
 			isCompacting: opts.isCompacting ?? false,
@@ -118,6 +132,7 @@ function createStubInputControllerContext(opts: {
 			isEvalRunning: false,
 			extensionRunner: undefined,
 			prompt,
+			buildUserSkillPrompt: buildSkillPromptMessage,
 			promptCustomMessage,
 		},
 		get viewSession() {
@@ -182,7 +197,7 @@ describe("InputController skill queue chip metadata", () => {
 
 		controller.setupEditorSubmitHandler();
 		editor.setText("/skill:test-skill arg1 arg2");
-		await editor.onSubmit?.("/skill:test-skill arg1 arg2");
+		await submitStubEditor(editor);
 
 		expect(promptCustomMessage).toHaveBeenCalledTimes(1);
 		expect(promptCustomMessage.mock.calls[0]?.[1]).toEqual({
@@ -205,7 +220,7 @@ describe("InputController skill queue chip metadata", () => {
 
 		controller.setupEditorSubmitHandler();
 		editor.setText("/skill:test-skill arg1 arg2");
-		await editor.onSubmit?.("/skill:test-skill arg1 arg2");
+		await submitStubEditor(editor);
 
 		expect(queueCompactionMessage).toHaveBeenCalledWith("/skill:test-skill arg1 arg2", "steer", undefined);
 		expect(promptCustomMessage).not.toHaveBeenCalled();
@@ -221,7 +236,7 @@ describe("InputController skill queue chip metadata", () => {
 
 		controller.setupEditorSubmitHandler();
 		editor.setText("/skill:test-skill arg1 arg2");
-		await editor.onSubmit?.("/skill:test-skill arg1 arg2");
+		await submitStubEditor(editor);
 
 		expect(setLoopPrompt).toHaveBeenCalledWith("/skill:test-skill arg1 arg2");
 		expect(promptCustomMessage).toHaveBeenCalledTimes(1);
@@ -239,7 +254,7 @@ describe("InputController skill queue chip metadata", () => {
 
 		controller.setupEditorSubmitHandler();
 		editor.setText("/skill:test-skill arg1 arg2");
-		await editor.onSubmit?.("/skill:test-skill arg1 arg2");
+		await submitStubEditor(editor);
 
 		expect(setLoopPrompt).toHaveBeenCalledWith("/skill:test-skill arg1 arg2");
 		expect(queueCompactionMessage).toHaveBeenCalledWith("/skill:test-skill arg1 arg2", "steer", undefined);
@@ -305,7 +320,7 @@ describe("InputController skill queue chip metadata", () => {
 
 		controller.setupEditorSubmitHandler();
 		editor.setText("/skill:test-skill arg1 arg2");
-		await editor.onSubmit?.("/skill:test-skill arg1 arg2");
+		await submitStubEditor(editor);
 
 		expect(promptCustomMessage.mock.calls[0]?.[1]).toEqual({
 			streamingBehavior: "steer",
@@ -328,7 +343,7 @@ describe("InputController skill queue chip metadata", () => {
 		editor.pendingImages = [image];
 		editor.pendingImageLinks = ["file:///tmp/skill-image.png"];
 		editor.imageLinks = editor.pendingImageLinks;
-		await editor.onSubmit?.("/skill:test-skill inspect this [Image #1]");
+		await submitStubEditor(editor);
 
 		expect(promptCustomMessage).toHaveBeenCalledTimes(1);
 		const message = promptCustomMessage.mock.calls[0]?.[0];
@@ -376,7 +391,7 @@ describe("InputController optimistic skill row (#8895)", () => {
 		const controller = new InputController(ctx);
 		controller.setupEditorSubmitHandler();
 		editor.setText("/skill:test-skill go");
-		await editor.onSubmit?.("/skill:test-skill go");
+		await submitStubEditor(editor);
 
 		expect(order).toEqual(["render", "dispatch"]);
 		expect(renderOptimisticSkillMessage.mock.calls[0]?.[0]).toMatchObject({
@@ -396,7 +411,7 @@ describe("InputController optimistic skill row (#8895)", () => {
 		const controller = new InputController(ctx);
 		controller.setupEditorSubmitHandler();
 		editor.setText("/skill:test-skill go");
-		await editor.onSubmit?.("/skill:test-skill go");
+		await submitStubEditor(editor);
 
 		expect(renderOptimisticSkillMessage).not.toHaveBeenCalled();
 		expect(promptCustomMessage).toHaveBeenCalledTimes(1);
@@ -412,7 +427,7 @@ describe("InputController optimistic skill row (#8895)", () => {
 		const controller = new InputController(ctx);
 		controller.setupEditorSubmitHandler();
 		editor.setText("/skill:test-skill go");
-		await editor.onSubmit?.("/skill:test-skill go");
+		await submitStubEditor(editor);
 
 		expect(renderOptimisticSkillMessage).toHaveBeenCalledTimes(1);
 		expect(clearOptimisticSkillMessage).toHaveBeenCalledTimes(1);
@@ -453,11 +468,12 @@ describe("compaction skill re-invocation", () => {
 			recordLocalSubmission: vi.fn((_text: string, _imageCount: number) => vi.fn()),
 			withLocalSubmission: vi.fn(async (_text: string, fn: () => unknown) => Promise.resolve(fn())),
 			session: {
+				buildUserSkillPrompt: buildSkillPromptMessage,
 				promptCustomMessage,
 				prompt,
 				steer,
 				followUp,
-				clearQueue: vi.fn(),
+				dropQueuedMessages: vi.fn(),
 			},
 		} as unknown as InteractiveModeContext;
 		return { ctx, promptCustomMessage, promptCustomMessageCalled, prompt, steer, followUp, armLoopAutoSubmit };
@@ -513,10 +529,13 @@ describe("compaction skill re-invocation", () => {
 		expect(renderedText.text).toContain("arg1 arg2");
 		expect(message.content[1]).toEqual(image);
 		expect(message.details).toMatchObject({ name: "test-skill", args: "arg1 arg2", lineCount: 1 });
+		// The flush also passes its own admission callbacks; the skill prompt is sent, not queue-only.
 		expect(options).toEqual({
 			streamingBehavior: "followUp",
 			queueChipText: "/skill:test-skill arg1 arg2",
 			source: "interactive",
+			onPromptQueued: expect.any(Function),
+			onPromptAdmitted: expect.any(Function),
 		});
 		expect(prompt).not.toHaveBeenCalled();
 		expect(steer).not.toHaveBeenCalled();
@@ -685,7 +704,7 @@ describe("AgentSession derived queued custom display", () => {
 		expect(session.agent.hasQueuedMessages()).toBe(false);
 	});
 
-	it("never restores a visible agent-authored custom steer; preserves on dequeue, drops on interrupt", async () => {
+	it("never restores a visible agent-authored custom steer; preserves on dequeue, records on interrupt", async () => {
 		fixture = await createRealSession();
 		const { session } = fixture;
 		// An IRC aside / extension/hook notice: visible, but agent-authored — editing it
@@ -709,9 +728,11 @@ describe("AgentSession derived queued custom display", () => {
 		// ...plain dequeue restores nothing but PRESERVES the extension steer (not lost)...
 		expect(session.clearQueue().steering).toEqual([]);
 		expect(session.agent.peekSteeringQueue()).toHaveLength(1);
-		// ...and only Esc+abort drops it (no auto-resume leftover).
+		// ...and Esc+abort records it in the transcript instead (no auto-resume leftover, not lost).
 		expect(session.clearQueue({ forInterrupt: true }).steering).toEqual([]);
+		await session.abort({ reason: USER_INTERRUPT_LABEL });
 		expect(session.agent.hasQueuedMessages()).toBe(false);
+		expect(session.agent.state.messages).toMatchObject([{ role: "custom", content: "peer pinged you" }]);
 	});
 
 	it("counts a queued advisor card as pending work but keeps it out of chips and restore", async () => {

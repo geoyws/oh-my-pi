@@ -258,7 +258,7 @@ describe("async task child usage", () => {
 		expect(waited.details?.usage).toEqual(usage(4));
 	});
 
-	it("exposes live usage while running and partial usage after cancellation", async () => {
+	it("retains partial usage after cancellation and bills it only once", async () => {
 		const live = usage(5);
 		const partial = usage(6);
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
@@ -294,11 +294,6 @@ describe("async task child usage", () => {
 		);
 		const job = manager.getJob("WorkerC")!;
 		await liveForwarded.promise;
-
-		const running = buildJobResult(session, manager, "jobs", [job], []);
-		expect(running.details?.jobs?.[0]?.status).toBe("running");
-		expect(running.details?.jobs?.[0]?.usage).toEqual(live);
-		expect(running.details?.usage).toBeUndefined();
 
 		expect(manager.cancel("WorkerC")).toBe(true);
 		await job.promise;

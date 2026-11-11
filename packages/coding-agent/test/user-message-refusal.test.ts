@@ -735,9 +735,10 @@ describe("before_user_message refusal", () => {
 			expect(editor.getExpandedText()).toBe(line);
 			expect(showError).toHaveBeenCalledWith(NOTICE);
 
-			// Clean text still reaches the command.
+			// Clean text still reaches the command (/tan also forwards its images).
 			await executeBuiltinSlashCommand(`/${name} tidy the docs`, { ctx });
-			expect(started).toHaveBeenCalledWith("tidy the docs");
+			expect(started).toHaveBeenCalledTimes(1);
+			expect(started.mock.calls[0]?.[0]).toBe("tidy the docs");
 		}
 		// /ratchet renders its flow text into a synthetic kickoff the prompt gate
 		// skips: the refusal must land before anything is armed or sent.

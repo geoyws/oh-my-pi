@@ -1,3 +1,4 @@
+import { stripVTControlCharacters } from "node:util";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, UsageLimit, UsageReport } from "@oh-my-pi/pi-ai";
@@ -822,8 +823,6 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 	#codexResetSnapshots = new Map<string, CodexResetUsageSnapshot>();
 	#onCodexResetFireworks: ((event: CodexResetFireworksEvent) => void) | undefined;
 	#onResetExpiryNotice: ((notice: string) => void) | undefined;
-	/** Conversations already warned about expiring saved resets: later refreshes stay quiet. */
-	#resetExpiryNoticedSessions = new Set<string>();
 	// Context-usage memo. The status line redraws on every agent event, so the
 	// hot path must not recompute context tokens unless an input changed.
 	// `getContextUsage()` anchors on the last assistant's real prompt-token
@@ -998,24 +997,26 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		this.#invalidateStatusLineRenderCache();
 	}
 
-	setRunningSubagents(agentIds: readonly string[]): void {
+	setRunningSubagents(agentIds: readonly string[]): boolean {
 		if (
 			agentIds.length === this.#runningSubagentIds.size &&
 			agentIds.every(agentId => this.#runningSubagentIds.has(agentId))
 		) {
-			return;
+			return false;
 		}
 		this.#subagentCount = agentIds.length;
 		this.#runningSubagentIds = new Set(agentIds);
 		this.#invalidateStatusLineRenderCache();
+		return true;
 	}
 
 	/** Host-computed spend of the main session's whole subagent tree (Agent Hub projection). */
-	setSubagentTreeCost(cost: number): void {
+	setSubagentTreeCost(cost: number): boolean {
 		const next = Number.isFinite(cost) && cost > 0 ? cost : 0;
-		if (next === this.#subagentTreeCost) return;
+		if (next === this.#subagentTreeCost) return false;
 		this.#subagentTreeCost = next;
 		this.#invalidateStatusLineRenderCache();
+		return true;
 	}
 
 	/**
@@ -1260,7 +1261,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		this.#onCodexResetFireworks = handler;
 	}
 
-	/** Set the callback that presents the first pool-wide saved-reset expiry warning, or clear it with `undefined`. */
+	/** Set the callback that presents pool-wide saved-reset expiry warnings, or clear it with `undefined`. */
 	setResetExpiryNoticeHandler(handler: ((notice: string) => void) | undefined): void {
 		this.#onResetExpiryNotice = handler;
 	}
@@ -2143,7 +2144,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 	}
 
 	#noticeResetExpiry(session: TSession, reports: unknown): void {
-		// A focused subagent's view is not a conversation the user started; warn in their own.
+		// A focused subagent's view is not a conversation the user started; leave the warning for their own.
 		if (
 			this.#focusedAgentId !== undefined ||
 			!this.#onResetExpiryNotice ||
@@ -2152,8 +2153,6 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		) {
 			return;
 		}
-		const sessionId = session.sessionManager.getSessionId();
-		if (this.#resetExpiryNoticedSessions.has(sessionId)) return;
 		// fetchUsageReports supplies normalized rows; keep only entries shaped like reports.
 		const usageReports = reports.filter(
 			(report): report is UsageReport =>
@@ -2163,10 +2162,8 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 				"limits" in report &&
 				Array.isArray(report.limits),
 		);
-		const notice = this.host.resetExpiryNotice(usageReports, Date.now());
-		if (!notice) return;
-		this.#resetExpiryNoticedSessions.add(sessionId);
-		this.#onResetExpiryNotice(notice);
+		const notice = this.host.resetExpiryNotice(session, usageReports, Date.now());
+		if (notice) this.#onResetExpiryNotice(notice);
 	}
 
 	#observeLateUsageRefresh(session: TSession, reportsPromise: Promise<unknown>, sequence: number): void {
@@ -3117,6 +3114,12 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		const right = rightParts;
 		const leftWidths = left.map(part => visibleWidth(part));
 		const rightWidths = right.map(part => visibleWidth(part));
+		// Overflow handling below drops segments it cannot fit; the narrow-pane
+		// floor at the end needs the pre-drop configured content to clip from.
+		const originalLeftParts = left.slice();
+		const originalLeftSegIds = leftSegIds.slice();
+		const originalRightParts = right.slice();
+		const originalRightSegIds = rightSegIds.slice();
 
 		const leftSepWidth = separators.leftSepWidth;
 		const rightSepWidth = separators.rightSepWidth;
@@ -3238,6 +3241,47 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 				leftWidths.splice(dropIdx, 1);
 				leftSegIds.splice(dropIdx, 1);
 				leftWidth = left.length > 0 ? leftWidth - removedWidth - leftSepWidth - 2 : 0;
+			}
+			// Narrow-pane floor: the loops above can drop every segment once even
+			// the last one cannot fit (live grp-socket panes at ≤51 cols), which
+			// rendered an empty bar. Clip one segment instead — the status segment
+			// first (it carries the live hook status text), then the configured
+			// left-to-right order — so the bar always paints something.
+			if (left.length === 0 && right.length === 0 && topFillWidth >= 4) {
+				// Badge/job parts were unshifted ahead of the tracked right segment
+				// ids, so a right segment id index maps to parts after that offset.
+				const rightBadgeOffset = originalRightParts.length - originalRightSegIds.length;
+				const statusLeftIdx = originalLeftSegIds.indexOf("status");
+				const statusRightIdx = originalRightSegIds.indexOf("status");
+				let survivor: string | undefined;
+				let survivorId: StatusLineSegmentId | undefined;
+				if (statusLeftIdx >= 0) {
+					survivor = originalLeftParts[statusLeftIdx];
+					survivorId = "status";
+				} else if (statusRightIdx >= 0) {
+					survivor = originalRightParts[statusRightIdx + rightBadgeOffset];
+					survivorId = "status";
+				} else if (originalLeftParts.length > 0) {
+					survivor = originalLeftParts[0];
+					survivorId = originalLeftSegIds[0];
+				} else if (originalRightSegIds.length > 0) {
+					survivor = originalRightParts[rightBadgeOffset];
+					survivorId = originalRightSegIds[0];
+				}
+				if (survivor && survivorId) {
+					const chrome = 2 + leftCapWidth + bandCapWidth;
+					const budget = Math.max(1, topFillWidth - chrome);
+					// Styled spans are flattened before clipping, as the footer's
+					// own overflow path does, so the cell budget counts text only.
+					const clipped = truncateToWidth(stripVTControlCharacters(survivor), budget);
+					if (clipped) {
+						left.push(clipped);
+						leftSegIds.push(survivorId);
+						const clippedWidth = visibleWidth(clipped);
+						leftWidths.push(clippedWidth);
+						leftWidth = groupWidth([clippedWidth], leftCapWidth + bandCapWidth, leftSepWidth);
+					}
+				}
 			}
 		}
 
