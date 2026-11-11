@@ -126,4 +126,16 @@ describe("print-mode dispatched builtins", () => {
 		expect(spies.order.indexOf("waitForIdle")).toBeGreaterThan(spies.order.indexOf("retry"));
 		expect(spies.order.indexOf("waitForIdle")).toBeLessThan(spies.order.indexOf("prompt:next question"));
 	});
+
+	it("leaves /stats undispatched so its literal text reaches the model", async () => {
+		const { session, spies } = createMockSession();
+
+		const exitCode = await runPrintMode(session, { mode: "text", messages: ["/stats"] });
+
+		// No dashboard launched in this one-shot process: the historic
+		// undispatched behavior prompts the model with the literal text.
+		expect(exitCode).toBe(0);
+		expect(spies.prompt).toHaveBeenCalledWith("/stats", { source: "print" });
+		expect(spies.retry).not.toHaveBeenCalled();
+	});
 });
