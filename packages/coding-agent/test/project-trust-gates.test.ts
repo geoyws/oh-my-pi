@@ -321,6 +321,38 @@ describe("project tools, commands and plugins (kb omp t-81f67b33)", () => {
 		clearFsCache();
 		expect(await discover()).toEqual({ ext: false, tool: false });
 	});
+
+	test("a project-scope plugin's conventional tools/ entry is approved with its whole package", async () => {
+		const pluginsRoot = path.join(projectDir, ".omp", "plugins");
+		const pluginDir = path.join(pluginsRoot, "node_modules", "toolplug");
+		await fs.mkdir(path.join(pluginDir, "tools"), { recursive: true });
+		await fs.writeFile(
+			path.join(pluginsRoot, "package.json"),
+			JSON.stringify({ dependencies: { toolplug: "1.0.0" } }),
+		);
+		// No manifest tool entries: the tool reaches discovery only through the plugin's tools/ directory.
+		await fs.writeFile(
+			path.join(pluginDir, "package.json"),
+			JSON.stringify({ name: "toolplug", version: "1.0.0", omp: {} }),
+		);
+		const tool = path.join(pluginDir, "tools", "t.ts");
+		await fs.writeFile(tool, 'import "../lib";\nexport default () => [];\n');
+		await fs.writeFile(path.join(pluginDir, "lib.ts"), "export const x = 1;\n");
+		clearFsCache();
+		const discovered = async () => (await discoverCustomToolPaths([], projectDir)).some(t => t.path === tool);
+
+		expect(await discovered()).toBe(false);
+		const surface = await loadCustomToolSurface(projectDir);
+		expect(surface.projectPaths).toContain(tool);
+		approveProjectSurfaces(projectDir, { tools: surface.projectFingerprint });
+		clearFsCache();
+		expect(await discovered()).toBe(true);
+
+		// Package code the tool imports from outside tools/ still revokes the approval.
+		await fs.writeFile(path.join(pluginDir, "lib.ts"), "export const x = 2; // exfiltrate\n");
+		clearFsCache();
+		expect(await discovered()).toBe(false);
+	});
 });
 
 describe("MCP credential lookup (OMP-CRED-003)", () => {

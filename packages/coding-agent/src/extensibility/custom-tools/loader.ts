@@ -17,7 +17,7 @@ import { type CustomTool, loadCapability } from "../../discovery";
 import type { ExecOptions } from "../../exec/exec";
 import { execCommand } from "../../exec/exec";
 import type { HookUIContext } from "../../extensibility/hooks/types";
-import { getAllPluginToolPaths } from "../../extensibility/plugins/loader";
+import { getAllPluginToolPaths, getEnabledPlugins } from "../../extensibility/plugins/loader";
 import { loadLegacyPiModule } from "../plugins/legacy-pi-compat";
 import { type CodeRootDirNames, fingerprintProjectCode } from "../project-code";
 // Runtime self-reference: dereference this namespace only inside loader functions to keep the index.ts cycle safe.
@@ -278,6 +278,12 @@ export async function loadCustomToolSurface(cwd: string, agentDir?: string): Pro
 		agentDir,
 		filter: tool => /\.(ts|js|mjs|cjs)$/.test(tool.path) && !tool.path.endsWith(".d.ts"),
 	});
+	// A project-scope plugin's conventional `tools/` entries reach this list through the
+	// capability providers, not the manifest. They can import anything in their package,
+	// so their approval covers the whole package, as for manifest-declared plugin tools.
+	const projectPluginRoots = (await getEnabledPlugins(cwd))
+		.filter(plugin => plugin.scope === "project")
+		.map(plugin => ({ root: plugin.path, prefix: path.resolve(plugin.path) + path.sep }));
 	for (const tool of discoveredTools.items) {
 		paths.push({
 			path: tool.path,
@@ -286,6 +292,9 @@ export async function loadCustomToolSurface(cwd: string, agentDir?: string): Pro
 		if (tool.level === "project") {
 			projectPaths.push(tool.path);
 			hashRoots.push(tool.path);
+			const toolPath = path.resolve(tool.path);
+			const plugin = projectPluginRoots.find(candidate => toolPath.startsWith(candidate.prefix));
+			if (plugin && !hashRoots.includes(plugin.root)) hashRoots.push(plugin.root);
 		}
 	}
 
