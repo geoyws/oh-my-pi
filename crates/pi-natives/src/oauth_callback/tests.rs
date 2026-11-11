@@ -309,11 +309,12 @@ async fn wait_wakes_on_callback_published_after_it_starts() {
 		tokio::spawn(async move {
 			// Lets the wait fail its first claim and park on the watch.
 			tokio::time::sleep(Duration::from_millis(50)).await;
-			let published = std::time::Instant::now();
 			publication::publish_once(&callback, b"omp-test://callback?code=late").unwrap();
-			published
 		})
 	};
+	// The wait's first poll sleep starts no earlier than this, so a poll cannot
+	// claim the callback before `waiting + POLL_INTERVAL`.
+	let waiting = std::time::Instant::now();
 	let url = wait_for_callback_async(
 		&callback,
 		"omp-test",
@@ -323,12 +324,13 @@ async fn wait_wakes_on_callback_published_after_it_starts() {
 	)
 	.await
 	.unwrap();
-	let latency = publisher.await.unwrap().elapsed();
+	let claimed = waiting.elapsed();
+	publisher.await.unwrap();
 	assert_eq!(url, "omp-test://callback?code=late");
-	// A poll would claim it most of a POLL_INTERVAL later (2 s in tests); only
-	// the directory watch wakes the wait well inside a quarter of that, even
-	// on a loaded runner.
-	assert!(latency < POLL_INTERVAL / 4, "callback claimed {latency:?} after publication");
+	// Claimed before the first poll could fire: only the directory watch can
+	// have woken the wait. A wall-clock margin under that would fail a loaded
+	// runner that merely delays the watch wake.
+	assert!(claimed < POLL_INTERVAL, "callback claimed {claimed:?} after the wait started");
 	fs::remove_dir_all(home).unwrap();
 }
 

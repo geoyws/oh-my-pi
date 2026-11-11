@@ -403,8 +403,11 @@ mod tests {
 		}
 	}
 
-	/// An operand that ignores cancellation, so only SIGKILL escalation (the
-	/// cancel-token fallback plus the bounded reap) can retire it early.
+	/// An operand that ignores cancellation and never finishes on its own, so
+	/// only SIGKILL escalation (the cancel-token fallback plus the bounded
+	/// reap) can retire it. Finishing on its own after a fixed sleep would let
+	/// a loaded runner that delays the `-k` timer past that sleep see a normal
+	/// exit (124) instead.
 	#[derive(Parser)]
 	struct StubbornCommand;
 
@@ -415,8 +418,7 @@ mod tests {
 			&self,
 			_context: ExecutionContext<'_, SE>,
 		) -> Result<ExecutionResult, Self::Error> {
-			tokio::time::sleep(Duration::from_millis(300)).await;
-			Ok(ExecutionResult::new(99))
+			std::future::pending().await
 		}
 	}
 
@@ -600,8 +602,10 @@ mod tests {
 		for fd in [OpenFiles::STDIN_FD, OpenFiles::STDOUT_FD, OpenFiles::STDERR_FD] {
 			params.set_fd(fd, brush_core::openfiles::null().expect("null device"));
 		}
+		// The operand never finishes, so the builtin returns after its 2 s
+		// bounded reap; the safety deadline only catches a hang beyond that.
 		let result = tokio::time::timeout(
-			Duration::from_secs(1),
+			Duration::from_secs(10),
 			shell.run_string(
 				"timeout -k 0.075 0.010 stubborn-test",
 				&SourceInfo::default(),
