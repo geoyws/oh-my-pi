@@ -1694,8 +1694,9 @@ export function sessionModelDiscoveryProviders(
 }
 
 /**
- * Resolve a list of override patterns to the first matching model, with an
- * auth-aware fallback to the parent session's active model.
+ * Resolve override patterns with authentication. Explicit multi-entry lists
+ * are bounded: try their entries in order and never fall back to the parent.
+ * Singleton overrides retain the auth-aware parent fallback.
  *
  * Providers disabled through settings are removed before matching so ordered
  * overrides skip them and an all-disabled list resolves to no model.
@@ -1741,6 +1742,23 @@ export async function resolveModelOverrideWithAuthFallback(
 		const enabledModels = modelRegistry.getAvailable().filter(model => !disabledProviders.has(model.provider));
 		lookupRegistry = { getAvailable: () => enabledModels };
 	}
+	const configuredPatterns = resolveConfiguredModelPatterns(modelPatterns, settings);
+	if (configuredPatterns.length > 1) {
+		let matched = false;
+		for (const pattern of configuredPatterns) {
+			const candidate = resolveModelOverride([pattern], lookupRegistry, settings);
+			if (!candidate.model) continue;
+			matched = true;
+			const key = await modelRegistry.getApiKey(candidate.model, sessionId);
+			if (key === kNoAuth || isAuthenticated(key)) {
+				return { ...candidate, authFallbackUsed: false };
+			}
+		}
+		// With no catalog match, let runtime discovery resolve the bounded list.
+		if (!matched) return { explicitThinkingLevel: false, authFallbackUsed: false };
+		throw new Error("No authenticated model available in explicit model override list");
+	}
+
 	const primary = resolveModelOverride(modelPatterns, lookupRegistry, settings);
 	if (!primary.model || !parentActiveModelPattern) {
 		return { ...primary, authFallbackUsed: false };

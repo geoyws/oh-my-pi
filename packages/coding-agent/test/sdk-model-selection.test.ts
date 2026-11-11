@@ -1327,6 +1327,65 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		}
 	});
 
+	test.each(["unauthenticated", "missing", "duplicate"])(
+		"keeps a deferred terminal rung exhaustive after %s predecessors",
+		async predecessor => {
+			const terminal = "runtime-provider/runtime-fallback-model";
+			const options = buildSessionOptions([
+				predecessor === "missing"
+					? "missing/absent"
+					: predecessor === "duplicate"
+						? `${terminal}:low`
+						: "runtime-provider/runtime-model",
+				`${terminal}:low`,
+			]);
+			vi.spyOn(options.modelRegistry, "getApiKey").mockImplementation(async model =>
+				model.id === "runtime-model" ? undefined : "test-key",
+			);
+			const { session } = await createAgentSession({
+				...options,
+				settings: Settings.isolated({ "retry.usageAwareFallback": false }),
+				modelPatternAuthFallback: "anthropic/claude-sonnet-4-5:high",
+				modelPatternFallbackRole: "subagent:terminal",
+				modelPatternFallbackExhaustive: true,
+				modelPatternDefaultFallbackChain: ["anthropic/claude-sonnet-4-5:high"],
+			});
+			try {
+				expect(session.model?.id).toBe("runtime-fallback-model");
+				expect(session.thinkingLevel).toBe(Effort.Low);
+				expect(getRetryFallbackRole(session.settings, "subagent:terminal")).toEqual({
+					primary: `${terminal}:low`,
+					chain: [],
+					exhaustive: true,
+				});
+			} finally {
+				await session.dispose();
+			}
+		},
+	);
+
+	test("refuses an exhausted deferred exhaustive list instead of authenticating the parent", async () => {
+		const options = buildSessionOptions([
+			"runtime-provider/runtime-model",
+			"runtime-provider/runtime-fallback-model",
+		]);
+		const probes: string[] = [];
+		vi.spyOn(options.modelRegistry, "getApiKey").mockImplementation(async model => {
+			probes.push(model.provider);
+			return model.provider === "runtime-provider" ? undefined : "test-key";
+		});
+		await expect(
+			createAgentSession({
+				...options,
+				settings: Settings.isolated({ "retry.usageAwareFallback": false }),
+				modelPatternAuthFallback: "anthropic/claude-sonnet-4-5:high",
+				modelPatternFallbackRole: "subagent:exhausted",
+				modelPatternFallbackExhaustive: true,
+			}),
+		).rejects.toThrow("No authenticated model available in explicit model override list");
+		expect(probes).not.toContain("anthropic");
+	});
+
 	test("installs an inherited fallback chain for a deferred singleton modelPattern", async () => {
 		const settings = Settings.isolated({
 			"retry.fallbackChains": {

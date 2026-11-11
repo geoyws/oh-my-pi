@@ -218,7 +218,8 @@ export function getExhaustiveRetryFallbackRoles(settings: Settings): ReadonlySet
  * snapshot can never conjure routing.
  */
 export function restoreExhaustiveRetryFallbackRoles(settings: Settings, roles: readonly string[]): void {
-	const installed = roles.filter(role => getRetryFallbackRole(settings, role) !== undefined);
+	const chains = cfgRetryFallbackChains.get(settings);
+	const installed = roles.filter(role => settings.getModelRole(role) && Array.isArray(chains[role]));
 	if (installed.length === 0) return;
 	let existing = exhaustiveRetryFallbackRoles.get(settings);
 	if (!existing) {
@@ -228,13 +229,14 @@ export function restoreExhaustiveRetryFallbackRoles(settings: Settings, roles: r
 	for (const role of installed) existing.add(role);
 }
 
-/** Reads the primary and non-empty chain installed for `role`, if any. */
+/** Reads the primary and chain installed for `role`, including an exhaustive empty chain. */
 export function getRetryFallbackRole(settings: Settings, role: string): RetryFallbackRole | undefined {
 	const primary = settings.getModelRole(role);
 	const chain = cfgRetryFallbackChains.get(settings)[role];
-	if (!primary || !Array.isArray(chain) || chain.length === 0) return undefined;
+	const exhaustive = exhaustiveRetryFallbackRoles.get(settings)?.has(role);
+	if (!primary || !Array.isArray(chain) || (chain.length === 0 && !exhaustive)) return undefined;
 	const roleState: RetryFallbackRole = { primary, chain };
-	if (exhaustiveRetryFallbackRoles.get(settings)?.has(role)) roleState.exhaustive = true;
+	if (exhaustive) roleState.exhaustive = true;
 	return roleState;
 }
 
