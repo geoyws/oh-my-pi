@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Claude accounts with recovered quota no longer remain excluded by an old usage-limit cooldown when the usage endpoint explicitly reports an inactive shared window as `null`. Missing or malformed windows, exhausted generic limits, recent rejections, and auth/account-policy blocks retain their existing protection.
 - Fixed `PI_REQ_DEBUG=1` dumps leaking credentials: dumps now go to a private `0700` directory under the state dir (`PI_REQ_DEBUG_DIR` overrides it and must already be private) instead of the working directory, as `0600` files named `rr-session-<pid>-<n>`; credential fields in JSON bodies (any depth) and OAuth form bodies read `[redacted]`, and the response bodies of token exchanges and Google IAM credential mints (`:generateAccessToken`, used by impersonated ADC) are omitted.
 - `classifyNetworkCause` now recognizes the `Couldn't connect to … (connection refused)` sentence `networkFailureMessage` itself produces as a `refused` failure, so an `AnthropicConnectionError`'s message classifies the same as the raw `ECONNREFUSED` it wraps.
 - Bounded the shared Anthropic keepalive pool (128 sockets per host, twice that process-wide, `PI_ANTHROPIC_MAX_SOCKETS` to change it) and made cancelling a request that is waiting for a socket take effect immediately instead of after the wait ([#12868](https://github.com/can1357/oh-my-pi/pull/12868)).

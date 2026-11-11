@@ -6,7 +6,7 @@ import {
 	type StoredAuthCredential,
 } from "@oh-my-pi/pi-ai/auth-storage";
 import type { UsageLimit, UsageProvider, UsageReport } from "@oh-my-pi/pi-ai/usage";
-import { claudeRankingStrategy } from "@oh-my-pi/pi-ai/usage/claude";
+import { claudeRankingStrategy, parseClaudeUsagePayload } from "@oh-my-pi/pi-ai/usage/claude";
 
 /**
  * A reactive Fable 429 blocks the credential until the reset that error
@@ -82,7 +82,11 @@ interface HealHarness {
 	blocks: Map<string, number>;
 }
 
-function makeHarness(report: UsageReport, blockScope = "tier:fable"): HealHarness {
+function makeHarness(
+	report: UsageReport,
+	blockScope = "tier:fable",
+	siblingReport = nearlySpentSiblingReport(),
+): HealHarness {
 	const rows = [oauthRow(1), oauthRow(2)];
 	const cache = new Map<string, { value: string; expiresAtSec: number }>();
 	const blocks = new Map<string, number>();
@@ -122,7 +126,7 @@ function makeHarness(report: UsageReport, blockScope = "tier:fable"): HealHarnes
 		id: "anthropic",
 		fetchUsage: async params => {
 			const access = params.credential.type === "oauth" ? params.credential.accessToken : undefined;
-			if (access === "access-2") return nearlySpentSiblingReport();
+			if (access === "access-2") return siblingReport;
 			probes += 1;
 			return report;
 		},
@@ -234,6 +238,61 @@ describe("claude usage-block healing", () => {
 		expect(clearedScopes).toEqual([""]);
 		expect(health.accounts[0]?.state).toBe("healthy");
 		expect(await storage.keys.get("anthropic", "global-heal", { modelId: "claude-fable-5-1" })).toBe("access-1");
+	});
+
+	it("selects a recovered account with an explicitly inactive shared window without unblocking an exhausted sibling", async () => {
+		const report = parseClaudeUsagePayload({
+			five_hour: null,
+			seven_day: { utilization: 0, resets_at: new Date(Date.now() + 86_400_000).toISOString() },
+		});
+		const exhausted = parseClaudeUsagePayload({
+			five_hour: null,
+			seven_day: { utilization: 100, resets_at: new Date(Date.now() + 86_400_000).toISOString() },
+		});
+		if (!report || !exhausted) throw new Error("Expected parsed weekly quota reports");
+		const { storage, blocks } = makeHarness(report, "", exhausted);
+		blocks.set("2:", Date.now() + 86_400_000);
+		storages.push(storage);
+		await storage.credentials.reload();
+
+		const health = await storage.health.model("anthropic", { modelId: "claude-opus-5-5" });
+
+		expect(health.accounts.find(account => account.credentialId === 1)?.state).toBe("healthy");
+		expect(health.accounts.find(account => account.credentialId === 2)?.state).toBe("depleted");
+		expect(await storage.keys.get("anthropic", "inactive-window", { modelId: "claude-opus-5-5" })).toBe("access-1");
+		expect(blocks.has("1:")).toBe(false);
+		expect(blocks.has("2:")).toBe(true);
+	});
+
+	for (const fiveHour of [undefined, {}, { utilization: "invalid" }]) {
+		it("retains a broad block when the shared window is missing or malformed rather than explicitly null", async () => {
+			const report = parseClaudeUsagePayload({
+				...(fiveHour === undefined ? {} : { five_hour: fiveHour }),
+				seven_day: { utilization: 0, resets_at: new Date(Date.now() + 86_400_000).toISOString() },
+			});
+			if (!report) throw new Error("Expected parsed weekly quota report");
+			const { storage, blocks } = makeHarness(report, "");
+			storages.push(storage);
+			await storage.credentials.reload();
+
+			expect(await storage.keys.get("anthropic", "unknown-window", { modelId: "claude-opus-5-5" })).toBe("access-2");
+			expect(blocks.has("1:")).toBe(true);
+		});
+	}
+
+	it("retains a broad block when a generic shared window is exhausted despite a null legacy field", async () => {
+		const report = parseClaudeUsagePayload({
+			five_hour: null,
+			seven_day: { utilization: 0, resets_at: new Date(Date.now() + 86_400_000).toISOString() },
+			limits: [{ kind: "session", percent: 100, resets_at: new Date(Date.now() + 3_600_000).toISOString() }],
+		});
+		if (!report) throw new Error("Expected parsed shared quota report");
+		const { storage, blocks } = makeHarness(report, "");
+		storages.push(storage);
+		await storage.credentials.reload();
+
+		expect(await storage.keys.get("anthropic", "spent-generic", { modelId: "claude-opus-5-5" })).toBe("access-2");
+		expect(blocks.has("1:")).toBe(true);
 	});
 
 	for (const scope of ["auth", "account-policy"]) {
