@@ -233,7 +233,10 @@ describe("daemon broker idle shutdown", () => {
 			client.close();
 
 			// Ten idle graces of real time: "nothing happened" has no event to await.
-			const outcome = await Promise.race([broker.then(() => "shut down"), Bun.sleep(200).then(() => "still serving")]);
+			const outcome = await Promise.race([
+				broker.then(() => "shut down"),
+				Bun.sleep(200).then(() => "still serving"),
+			]);
 			expect(outcome).toBe("still serving");
 
 			// Once the project's last omp leaves, the broker stops the daemon and idles out.
