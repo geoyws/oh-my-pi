@@ -212,7 +212,7 @@ describe("experimental context management", () => {
 	});
 
 	it("does not keep a plan snapshot read during an aborted mid-run rollover", async () => {
-		let aside: (() => Promise<unknown[]> | unknown[]) | undefined;
+		let aside: ((boundary: never) => Promise<unknown[]> | unknown[]) | undefined;
 		const { session, manager } = await createRolloverSession(agent => {
 			const originalSet = agent.setAsideMessageProvider.bind(agent);
 			agent.setAsideMessageProvider = (fn): void => {
@@ -255,7 +255,7 @@ describe("experimental context management", () => {
 		await session.waitForIdle();
 
 		expect(aside).toBeDefined();
-		const batch = await aside!();
+		const batch = await aside!(undefined as never);
 		const rendered = JSON.stringify(
 			await Promise.all(batch.map(item => (typeof item === "function" ? item() : item))),
 		);
