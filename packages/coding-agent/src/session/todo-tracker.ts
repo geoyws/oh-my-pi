@@ -5,10 +5,11 @@ import type { Settings } from "../config/settings";
 import eagerTaskPrompt from "../prompts/system/eager-task.md" with { type: "text" };
 import eagerTodoPrompt from "../prompts/system/eager-todo.md" with { type: "text" };
 import midRunTodoNudgePrompt from "../prompts/system/mid-run-todo-nudge.md" with { type: "text" };
-import { getLatestTodoPhasesFromEntries, isTodoPhase } from "../tools/todo";
+import { getLatestTodoPhasesFromEntries, getLatestTodoSnapshotIdentity, isTodoPhase } from "../tools/todo";
 import { type TodoItem, type TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { AgentSessionEvent } from "./agent-session-events";
+import type { SessionEntry } from "./session-entries";
 import type { SessionManager } from "./session-manager";
 
 import { cfgTaskBatch, cfgTaskEager } from "../task/settings";
@@ -33,6 +34,17 @@ function isMutatingResult(toolName: string, details: unknown): boolean {
 const MID_RUN_NUDGE_MESSAGE_TYPE = "mid-run-todo-nudge";
 /** Message type of the hidden first-turn reminder {@link TodoTracker.createEagerTodoPrelude} builds. */
 export const EAGER_TODO_PRELUDE_MESSAGE_TYPE = "eager-todo-prelude";
+/** Opening of every stop-time todo reminder; also how the transcript scan recognises one. */
+const TODO_REMINDER_HEAD = "<system-reminder>\nYou stopped with ";
+
+function isTodoReminderEntry(entry: SessionEntry): boolean {
+	if (entry.type !== "message" || entry.message.role !== "developer") return false;
+	const { content } = entry.message;
+	return (
+		Array.isArray(content) &&
+		content.some(part => part.type === "text" && (part as TextContent).text.startsWith(TODO_REMINDER_HEAD))
+	);
+}
 const MARKDOWN_PROMPT_PREFIX_RE = /^(?:>\s*)?(?:(?:[-*+]|\d+[.)])\s+)*/;
 const PROMPT_LABEL_RE = /^(?:q(?:uestion)?|ask)\s*\d*\s*[:.)-]\s*/i;
 const INLINE_EMPHASIS_RE = /(\*\*|__)(.*?)\1/g;
@@ -102,6 +114,11 @@ export class TodoTracker {
 	#reminderAwaitingProgress = false;
 	#mutationsSinceLastTouch = 0;
 	#midRunNudgeCount = 0;
+	/**
+	 * Whether the agent has used `todo` since the current user prompt began.
+	 * Starts true so a session that never began a prompt cycle keeps reminding.
+	 */
+	#todoTouchedThisCycle = true;
 
 	constructor(host: TodoTrackerHost) {
 		this.#host = host;
@@ -133,12 +150,14 @@ export class TodoTracker {
 		this.#reminderAwaitingProgress = false;
 		this.#mutationsSinceLastTouch = 0;
 		this.#midRunNudgeCount = 0;
+		this.#todoTouchedThisCycle = false;
 	}
 
 	/** Records a completed tool result before asynchronous event processing begins. */
 	onToolResult(toolName: string, isError: boolean, details?: unknown): void {
 		if (toolName === "todo") {
 			this.#mutationsSinceLastTouch = 0;
+			this.#todoTouchedThisCycle = true;
 		} else if (!isError && isMutatingResult(toolName, details)) {
 			this.#mutationsSinceLastTouch++;
 		}
@@ -236,6 +255,13 @@ export class TodoTracker {
 	async checkCompletion(message: AssistantMessage): Promise<boolean> {
 		if (this.#host.consumeLastServedToolChoiceLabel() === "user-force") return false;
 		if (this.#host.planModeEnabled()) return false;
+		if (!this.#todoTouchedThisCycle) {
+			// Leftover todos from an earlier request are not this prompt's plan.
+			// Reminding here makes the agent's last reply about them instead of
+			// the answer the user just asked for (omp t-616f5846).
+			logger.debug("Todo completion: todos untouched since the user prompt; skipping reminder");
+			return false;
+		}
 		if (this.#reminderAwaitingProgress) {
 			logger.debug("Todo completion: prior reminder still awaiting agent action; staying silent", {
 				attempt: this.#reminderCount,
@@ -291,13 +317,21 @@ export class TodoTracker {
 			});
 			return false;
 		}
+		// A later prompt that leaves the list untouched would otherwise get the same reminder again, and
+		// its continuation would replace the answer to that prompt (kb omp t-213ba328).
+		if (this.#reminderCount === 0 && this.#remindedSinceLastTodoChange()) {
+			logger.debug("Todo completion: list unchanged since an earlier reminder; staying silent", {
+				incomplete: incomplete.length,
+			});
+			return false;
+		}
 		this.#reminderCount++;
 		const todoList = incompleteByPhase
 			.map(phase => `- ${phase.name}\n${phase.tasks.map(task => `  - ${task.content}`).join("\n")}`)
 			.join("\n");
 		const reminder =
-			`<system-reminder>\n` +
-			`You stopped with ${incomplete.length} incomplete todo item(s):\n${todoList}\n\n` +
+			TODO_REMINDER_HEAD +
+			`${incomplete.length} incomplete todo item(s):\n${todoList}\n\n` +
 			`Please continue working on these tasks or mark them complete if finished.\n` +
 			`(Reminder ${this.#reminderCount}/${remindersMax})\n` +
 			`</system-reminder>`;
@@ -369,6 +403,21 @@ export class TodoTracker {
 			toolRefs: { task: wireName("task"), todo: wireName("todo") },
 			taskBatch: cfgTaskBatch.get(this.#host.settings),
 		};
+	}
+
+	/**
+	 * Whether this branch already carries a stop-time reminder newer than its latest durable todo snapshot.
+	 * Read from the transcript, so a reopened session or a fresh process sees the same answer.
+	 */
+	#remindedSinceLastTodoChange(): boolean {
+		const entries = this.#host.sessionManager.getBranch();
+		const snapshotEntryId = getLatestTodoSnapshotIdentity(entries)?.sourceEntryId;
+		for (let index = entries.length - 1; index >= 0; index--) {
+			const entry = entries[index];
+			if (entry.id === snapshotEntryId) return false;
+			if (isTodoReminderEntry(entry)) return true;
+		}
+		return false;
 	}
 
 	#clonePhases(phases: TodoPhase[]): TodoPhase[] {
