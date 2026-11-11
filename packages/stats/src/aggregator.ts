@@ -269,10 +269,16 @@ const INGEST_TIERS_MS = [24 * 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000];
  * exception is a from-scratch ingest where a fork was touched more recently
  * than a parent idle for a day: the fork then owns the copied entries, which
  * changes per-session attribution but never totals.
+ *
+ * Files born in the same instant (coarse or tied timestamps) fall back to
+ * byte order of their path, not directory listing order, which ext4 does
+ * not keep by name. Session files are named
+ * `<timestamp>_<id>.jsonl` and a subagent's `<parent>/<agent>.jsonl` sorts
+ * after `<parent>.jsonl` ('.' < '/'), so the parent still goes first.
  */
 async function orderForIngest(files: string[]): Promise<string[]> {
 	const now = Date.now();
-	const ranked: { file: string; tier: number; born: number; index: number }[] = [];
+	const ranked: { file: string; tier: number; born: number }[] = [];
 	for (let start = 0; start < files.length; start += SYNC_METADATA_FILES) {
 		const batch = files.slice(start, start + SYNC_METADATA_FILES);
 		const stats = await Promise.all(batch.map(file => fs.promises.stat(file).catch(() => null)));
@@ -284,11 +290,10 @@ async function orderForIngest(files: string[]): Promise<string[]> {
 				file: batch[i],
 				tier: tier === -1 ? INGEST_TIERS_MS.length : tier,
 				born: stat ? stat.birthtimeMs || stat.ctimeMs : 0,
-				index: start + i,
 			});
 		}
 	}
-	ranked.sort((a, b) => a.tier - b.tier || a.born - b.born || a.index - b.index);
+	ranked.sort((a, b) => a.tier - b.tier || a.born - b.born || (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
 	return ranked.map(entry => entry.file);
 }
 
