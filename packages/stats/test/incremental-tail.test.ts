@@ -133,6 +133,10 @@ describe("incremental stats ingestion", () => {
 		await Bun.write(fileB, assistant("oldB"));
 		await syncAllSessions({ workers: 1 });
 		await fs.writeFile(fileA, assistant("newA"));
+		// This rewrite keeps A's size, so only its mtime reveals it, and mtime moves in
+		// filesystem ticks: a rewrite in the tick the first sync recorded looks unchanged.
+		const { mtime } = await fs.stat(fileA);
+		await fs.utimes(fileA, mtime, new Date(mtime.getTime() + 1000));
 		await expect(
 			syncAllSessions({
 				workers: 1,
