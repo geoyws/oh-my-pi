@@ -388,6 +388,28 @@ describe("overflow: narrow-pane clip floor", () => {
 		expect(stripped).not.toContain("MODEL_CLIP");
 	});
 
+	// At 5 cols even the subagent badge cannot fit, so every part is dropped and
+	// the floor picks from the original parts, where the badge sits ahead of the
+	// tracked right segment ids.
+	it("clips the right status segment, not a badge or neighbour, when a badge was unshifted ahead of it", () => {
+		const component = buildNarrowComponent({ left: [], right: ["model", "status"] });
+		component.setHookStatus("test", "kb omp WATCH");
+		component.setRunningSubagents(["agent-a"]);
+		const stripped = stripAnsi(component.getTopBorder(5).content).trim();
+		expect(stripped).toContain("kb");
+		expect(stripped).not.toContain("⬢");
+		expect(stripped).not.toContain("👥");
+	});
+
+	it("clips the first configured right segment, not a badge, when no status is configured", () => {
+		const component = buildNarrowComponent({ left: [], right: ["model"] });
+		component.setRunningSubagents(["agent-a"]);
+		const stripped = stripAnsi(component.getTopBorder(5).content).trim();
+		// The 3-cell budget leaves the model segment's icon and an ellipsis.
+		expect(stripped).toContain("⬢");
+		expect(stripped).not.toContain("👥");
+	});
+
 	it("leaves wide panes unchanged: the full long model segment still renders at 80 and 120 cols", () => {
 		const component = buildNarrowComponent({ left: ["pi", "model"], right: [] });
 		for (const width of [80, 120]) {

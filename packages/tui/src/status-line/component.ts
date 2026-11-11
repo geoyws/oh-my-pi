@@ -3252,6 +3252,9 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			// first (it carries the live hook status text), then the configured
 			// left-to-right order — so the bar always paints something.
 			if (left.length === 0 && right.length === 0 && topFillWidth >= 4) {
+				// Badge/job parts were unshifted ahead of the tracked right segment
+				// ids, so a right segment id index maps to parts after that offset.
+				const rightBadgeOffset = originalRightParts.length - originalRightSegIds.length;
 				const statusLeftIdx = originalLeftSegIds.indexOf("status");
 				const statusRightIdx = originalRightSegIds.indexOf("status");
 				let survivor: string | undefined;
@@ -3260,13 +3263,13 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 					survivor = originalLeftParts[statusLeftIdx];
 					survivorId = "status";
 				} else if (statusRightIdx >= 0) {
-					survivor = originalRightParts[statusRightIdx];
+					survivor = originalRightParts[statusRightIdx + rightBadgeOffset];
 					survivorId = "status";
 				} else if (originalLeftParts.length > 0) {
 					survivor = originalLeftParts[0];
 					survivorId = originalLeftSegIds[0];
-				} else if (originalRightParts.length > 0) {
-					survivor = originalRightParts[0];
+				} else if (originalRightSegIds.length > 0) {
+					survivor = originalRightParts[rightBadgeOffset];
 					survivorId = originalRightSegIds[0];
 				}
 				if (survivor && survivorId) {
