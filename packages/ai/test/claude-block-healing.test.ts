@@ -255,7 +255,7 @@ describe("claude usage-block healing", () => {
 		storages.push(storage);
 		await storage.credentials.reload();
 
-		const health = await storage.health.model("anthropic", { modelId: "claude-opus-5-5" });
+		const health = await storage.health.model("anthropic", { modelId: "claude-opus-5-5", reserveFraction: 0.1 });
 
 		expect(health.accounts.find(account => account.credentialId === 1)?.state).toBe("healthy");
 		expect(health.accounts.find(account => account.credentialId === 2)?.state).toBe("depleted");
