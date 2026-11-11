@@ -174,7 +174,8 @@ describe("PI_REQ_DEBUG request/response recording", () => {
 	it("never logs the access token minted by Google service-account impersonation", async () => {
 		Bun.env.PI_REQ_DEBUG = "1";
 		const minted = JSON.stringify({ accessToken: "minted-impersonation-value", expireTime: "2026-10-28T12:00:00Z" });
-		const fetchImpl: FetchImpl = async () => new Response(minted, { headers: { "content-type": "application/json" } });
+		const fetchImpl: FetchImpl = async () =>
+			new Response(minted, { headers: { "content-type": "application/json" } });
 		const response = await transportFetch(debugModel(), fetchImpl)(
 			"https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/sa@proj.iam.gserviceaccount.com:generateAccessToken",
 			{

@@ -92,7 +92,15 @@ describe("isRebindingSafeHost", () => {
 	});
 
 	it("refuses domain names, which DNS rebinding needs, and malformed or missing hosts", () => {
-		for (const host of ["evil.example:9224", "127.0.0.1.nip.io:9224", "localhost.evil.com", "", "a b", "x@127.0.0.1", null]) {
+		for (const host of [
+			"evil.example:9224",
+			"127.0.0.1.nip.io:9224",
+			"localhost.evil.com",
+			"",
+			"a b",
+			"x@127.0.0.1",
+			null,
+		]) {
 			expect(isRebindingSafeHost(host)).toBe(false);
 		}
 	});
