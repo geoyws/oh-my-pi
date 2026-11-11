@@ -187,4 +187,61 @@ describe("daemon broker idle shutdown", () => {
 			process.title = previousTitle;
 		}
 	}, 30_000);
+
+	it("shuts down after its last client leaves with no daemons, even while an omp in the project lives", async () => {
+		using tempDir = TempDir.createSync("@omp-launch-idle-");
+		const { projectDir, runtimeDir } = await scope(tempDir);
+		const previousTitle = process.title;
+		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 20 });
+		const presence = await registerDaemonProjectPresence(projectDir, runtimeDir);
+		const { finished: broker } = await startBroker(projectDir, runtimeDir, 20);
+		try {
+			expect((await client.request({ op: "ping" })).op).toBe("ping");
+			client.close();
+			// Presence stays registered for the whole wait. Before the fix the broker re-armed on it
+			// forever and this await never resolved (omp t-b6bee738).
+			await broker;
+		} finally {
+			await presence.close();
+			process.title = previousTitle;
+		}
+	}, 30_000);
+
+	it("stays up for a live session daemon while an omp in the project lives", async () => {
+		using tempDir = TempDir.createSync("@omp-launch-idle-");
+		const { projectDir, runtimeDir } = await scope(tempDir);
+		const previousTitle = process.title;
+		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 20 });
+		const presence = await registerDaemonProjectPresence(projectDir, runtimeDir);
+		const { finished: broker } = await startBroker(projectDir, runtimeDir, 20);
+		try {
+			const started = await client.request({
+				op: "start",
+				spec: {
+					name: "session-daemon",
+					application: process.execPath,
+					args: ["-e", "setTimeout(() => {}, 60_000)"],
+					env: {},
+					cwd: projectDir,
+					pty: false,
+					restart: "no",
+					persist: false,
+					detached: false,
+				},
+			});
+			expect(started.op).toBe("start");
+			client.close();
+
+			// Ten idle graces of real time: "nothing happened" has no event to await.
+			const outcome = await Promise.race([broker.then(() => "shut down"), Bun.sleep(200).then(() => "still serving")]);
+			expect(outcome).toBe("still serving");
+
+			// Once the project's last omp leaves, the broker stops the daemon and idles out.
+			await presence.close();
+			await broker;
+		} finally {
+			await presence.close();
+			process.title = previousTitle;
+		}
+	}, 30_000);
 });

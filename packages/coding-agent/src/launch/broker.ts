@@ -459,6 +459,12 @@ class DaemonBroker {
 	#server: IpcServer | undefined;
 	#idleTimer: NodeJS.Timeout | undefined;
 	#shuttingDown = false;
+	/**
+	 * Set once any client authenticates. Before that, live project presence pins
+	 * the broker so the omp that spawned it can connect however loaded the host
+	 * is; after it, presence only protects live daemon records.
+	 */
+	#servedClient = false;
 
 	constructor(
 		projectDir: string,
@@ -529,6 +535,7 @@ class DaemonBroker {
 					if (authenticated) return;
 					authenticated = true;
 					this.#clients.add(socket);
+					this.#servedClient = true;
 					clearTimeout(this.#idleTimer);
 					this.#idleTimer = undefined;
 				});
@@ -1585,7 +1592,16 @@ class DaemonBroker {
 					record => record.spec.persist && !terminalState(record.snapshot.state),
 				);
 				if (this.#hasConnections() || livePersistent) return;
-				if (await hasLiveDaemonProjectPresence(this.#runtimeDir)) {
+				// Read presence every time: the read also deletes entries whose owner is gone.
+				const presenceLive = await hasLiveDaemonProjectPresence(this.#runtimeDir);
+				// Presence keeps session daemons alive for the omp processes in this project, and
+				// holds a fresh broker for its first client. With no live record left after a
+				// client came and went, it protects nothing: a broker would otherwise idle for
+				// as long as any omp in the project lives (omp t-b6bee738). The next client
+				// spawns a new broker.
+				const pinnedByPresence =
+					!this.#servedClient || [...this.#records.values()].some(record => !terminalState(record.snapshot.state));
+				if (presenceLive && pinnedByPresence) {
 					this.#scheduleIdleShutdown();
 					return;
 				}
