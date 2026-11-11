@@ -97,6 +97,7 @@ function printSession(manager: MCPManager, refreshGate?: Promise<void>, onRefres
 		disableStopTimeTodoReminders: () => {},
 		prepareForHeadlessAdvisorDrain: () => {},
 		waitForIdle: async () => {},
+		hasPendingAsyncWork: () => false,
 		setTextOutputCommitted: () => {},
 		waitForAdvisorCatchup: async () => true,
 		dispose: async () => {

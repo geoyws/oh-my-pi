@@ -221,6 +221,7 @@ describe("print-mode refusal", () => {
 			setTextOutputCommitted: () => {},
 			waitForAdvisorCatchup: async () => true,
 			waitForIdle: async () => {},
+			hasPendingAsyncWork: () => false,
 			dispose: async () => {},
 		} as unknown as AgentSession;
 	}

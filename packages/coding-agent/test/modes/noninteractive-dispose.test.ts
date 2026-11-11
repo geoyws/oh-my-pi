@@ -46,6 +46,7 @@ describe("print mode disposes the session before terminating", () => {
 			disableStopTimeTodoReminders: () => {},
 			prepareForHeadlessAdvisorDrain: () => {},
 			waitForIdle: async () => {},
+			hasPendingAsyncWork: () => false,
 			setTextOutputCommitted: () => {},
 			waitForAdvisorCatchup: async () => {
 				order.push("catchup");
@@ -127,6 +128,7 @@ describe("print mode disposes the session before terminating", () => {
 			disableStopTimeTodoReminders: () => {},
 			prepareForHeadlessAdvisorDrain: () => {},
 			waitForIdle: async () => {},
+			hasPendingAsyncWork: () => false,
 			setTextOutputCommitted: () => {},
 			waitForAdvisorCatchup: async () => true,
 			// Mimic a real mid-turn signal: the postmortem teardown fires (which

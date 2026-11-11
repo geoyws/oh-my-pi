@@ -63,6 +63,7 @@ function createMockSession(
 		setTextOutputCommitted: () => {},
 		waitForAdvisorCatchup: async () => true,
 		waitForIdle: async () => {},
+		hasPendingAsyncWork: () => false,
 		dispose,
 	} as unknown as AgentSession;
 }
