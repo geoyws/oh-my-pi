@@ -277,15 +277,18 @@ it("drops covered-row records a large height shrink moves off the screen", async
 	Bun.env.PI_TUI_RESIZE_IN_PLACE = "1";
 	const history = Array.from({ length: 6 }, (_, index) => `hist-${index}`);
 	// Eight overlay rows leave six above the two-row viewport (rows 16-21);
-	// the shrink to six rows moves the top two of them above the screen.
+	// the shrink to six rows scrolls the top two, still showing the overlay,
+	// into scrollback, where the renderer can no longer reach them.
 	const { terminal, scheduler, tui, handle } = await openOverHistory(history, "append", 8);
 	try {
 		terminal.resize(80, 6);
 		await scheduler.advance(terminal, 160);
 		handle.hide();
 		await scheduler.settle(terminal);
-		expect(ledger(terminal, /OVERLAY-\d/), "no overlay row survives the close").toEqual([]);
-		expect(ledger(terminal, HISTORY_ROW), "history reachable exactly once").toEqual(history);
+		expect(rowsContaining(activeGrid(terminal), "OVERLAY-"), "no overlay row left on screen").toEqual([]);
+		expect(ledger(terminal, HISTORY_ROW), "on-screen rows restored once, off-screen ones untouched").toEqual(
+			history.slice(2),
+		);
 		expect(rowsContaining(activeGrid(terminal), EDITOR_TEXT)).toHaveLength(1);
 	} finally {
 		delete Bun.env.PI_TUI_RESIZE_IN_PLACE;
