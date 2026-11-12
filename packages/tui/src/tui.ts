@@ -699,25 +699,26 @@ function paintsBeyondRow(row: PreparedLine): boolean {
 
 /**
  * Whether an overlay may paint over on-screen history row `index` and later
- * restore it by rewriting that row. Unknown rows cannot be rewritten. Images
- * and scaled OSC 66 text own cells beyond their row — a SIXEL lifts into the
- * blank rows above it, a Kitty placement and a scaled heading cover the blank
- * rows below — so neither they nor a blank run touching them is restorable.
+ * restore it by rewriting that row. Images and scaled OSC 66 text own cells
+ * beyond their row — a SIXEL lifts into the blank rows above it, a Kitty
+ * placement and a scaled heading cover the blank rows below — so neither they
+ * nor a blank run touching them is restorable.
+ *
+ * Every row is known: an inline overlay reaches the normal-buffer frame only
+ * while the viewport starts at row zero (otherwise it borrows the alternate
+ * buffer), so the rows above the new viewport are the ones this frame writes.
  */
 function overlayCanRestoreRow(rows: readonly (PreparedLine | undefined)[], index: number): boolean {
-	const row = rows[index];
-	if (row === undefined) return false;
+	const row = rows[index]!;
 	if (row.line !== "") return !paintsBeyondRow(row);
 	for (let above = index - 1; above >= 0; above--) {
-		const neighbour = rows[above];
-		if (neighbour === undefined) return false;
+		const neighbour = rows[above]!;
 		if (neighbour.line === "") continue;
 		if (paintsBeyondRow(neighbour)) return false;
 		break;
 	}
 	for (let below = index + 1; below < rows.length; below++) {
-		const neighbour = rows[below];
-		if (neighbour === undefined) return false;
+		const neighbour = rows[below]!;
 		if (neighbour.line === "") continue;
 		return !paintsBeyondRow(neighbour);
 	}
@@ -3383,9 +3384,10 @@ export class TUI extends Container {
 	/**
 	 * Prepare the overlay rows that land outside the mutable viewport
 	 * `[viewportTop, viewportEnd)`. Rows above it composite over the history
-	 * `screen` leaves there (bottom-aligned to `viewportTop`); rows below it
-	 * composite over blank rows. Cursor markers are stripped into `markers` in
-	 * physical rows.
+	 * `screen` leaves there (bottom-aligned to `viewportTop`, and covering every
+	 * row above it: overlays only reach this frame with the viewport starting at
+	 * row zero); rows below it composite over blank rows. Cursor markers are
+	 * stripped into `markers` in physical rows.
 	 */
 	#prepareOuterOverlayRows(
 		overlays: readonly OverlayRowPatch[],
@@ -3401,7 +3403,7 @@ export class TUI extends Container {
 		for (const patch of overlays) {
 			if (patch.row >= viewportTop && patch.row < viewportEnd) continue;
 			const base =
-				composed.get(patch.row) ?? (patch.row < viewportTop ? (screen[patch.row - screenStart]?.line ?? "") : "");
+				composed.get(patch.row) ?? (patch.row < viewportTop ? screen[patch.row - screenStart]!.line : "");
 			composed.set(patch.row, compositeLineAt(base, patch.line, patch.col, patch.width, width));
 		}
 		if (composed.size === 0) return NO_OUTER_ROWS;
@@ -3863,7 +3865,7 @@ export class TUI extends Container {
 		const startTop = destructiveReset ? 0 : Math.min(this.#providerViewportTop, Math.max(0, height - 1));
 		let newTop = Math.max(0, Math.min(startTop + historyRows.length, height - viewport.length));
 		// An overlay row above the viewport paints over the history row left
-		// there. When that row cannot be restored (unknown, image, OSC 66),
+		// there. When that row cannot be restored (image, OSC 66),
 		// extend the viewport upward with blank rows instead: the extra scroll
 		// pushes the covered history into scrollback intact, and the overlay
 		// lands on rows the viewport owns.

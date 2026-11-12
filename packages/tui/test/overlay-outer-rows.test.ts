@@ -76,15 +76,19 @@ function startFull() {
  * viewport plus `historyRows` and shrink the live tail to two rows in one
  * frame: the overlay's top rows land above the viewport, over history.
  */
-async function openOverHistory(historyRows: readonly string[], kind: "append" | "replay" = "append") {
+async function openOverHistory(
+	historyRows: readonly string[],
+	kind: "append" | "replay" = "append",
+	overlayRows = 6,
+) {
 	const { terminal, scheduler, tui, provider } = startFull();
 	await scheduler.settle(terminal);
-	const panel = new RowsBlock("OVERLAY", 6);
+	const panel = new RowsBlock("OVERLAY", overlayRows);
 	const handle = tui.showOverlay(panel, { anchor: "bottom-center", width: "100%", maxHeight: "100%", margin: 0 });
 	await scheduler.settle(terminal);
-	expect(rowsContaining(activeGrid(terminal), "OVERLAY-"), "inline overlay on the bottom rows").toEqual([
-		18, 19, 20, 21, 22, 23,
-	]);
+	expect(rowsContaining(activeGrid(terminal), "OVERLAY-"), "inline overlay on the bottom rows").toEqual(
+		Array.from({ length: overlayRows }, (_, index) => ROWS - overlayRows + index),
+	);
 	terminal.takeWrites();
 	provider.history = [...fullViewport().slice(0, ROWS - 1), ...historyRows];
 	provider.kind = kind;
@@ -272,7 +276,9 @@ it("never addresses overlay rows a height shrink left below the screen", async (
 it("drops covered-row records a large height shrink moves off the screen", async () => {
 	Bun.env.PI_TUI_RESIZE_IN_PLACE = "1";
 	const history = Array.from({ length: 6 }, (_, index) => `hist-${index}`);
-	const { terminal, scheduler, tui, handle } = await openOverHistory(history);
+	// Eight overlay rows leave six above the two-row viewport (rows 16-21);
+	// the shrink to six rows moves the top two of them above the screen.
+	const { terminal, scheduler, tui, handle } = await openOverHistory(history, "append", 8);
 	try {
 		terminal.resize(80, 6);
 		await scheduler.advance(terminal, 160);
@@ -306,10 +312,10 @@ it("keeps the hardware cursor on the input when an overlay row above the viewpor
 	try {
 		await scheduler.settle(terminal);
 		const panel = {
-			render: () => [`OVERLAY-0${CURSOR_MARKER}`, ...Array.from({ length: 5 }, (_, index) => `OVERLAY-${index + 1}`)],
+			render: () => [`OVERLAY-0${CURSOR_MARKER}`, "OVERLAY-1", "OVERLAY-2", "OVERLAY-3"],
 			invalidate: () => {},
 		};
-		tui.showOverlay(panel, { anchor: "bottom-center", width: "100%", maxHeight: "100%", margin: 0 });
+		tui.showOverlay(panel, { row: 16, width: "100%" });
 		await scheduler.settle(terminal);
 		terminal.takeWrites();
 		provider.history = fullViewport().slice(0, ROWS - 1);
@@ -317,9 +323,12 @@ it("keeps the hardware cursor on the input when an overlay row above the viewpor
 		tui.requestRender();
 		await scheduler.settle(terminal);
 		const grid = activeGrid(terminal);
-		expect(rowsContaining(grid, "OVERLAY-0"), "the marked overlay row sits above the viewport").toEqual([18]);
-		const shown = [...terminal.takeWrites().join("").matchAll(/\x1b\[(\d+);\d+H\x1b\[\?25h/g)].map(m => Number(m[1]));
-		expect(shown.at(-1), "cursor on the bottom-most marker: the input row").toBe(ROWS);
+		expect(rowsContaining(grid, "OVERLAY-0"), "the marked overlay row sits above the viewport").toEqual([16]);
+		expect(rowsContaining(grid, EDITOR_TEXT), "the input stays uncovered").toEqual([ROWS - 1]);
+		const parked = [...terminal.takeWrites().join("").matchAll(/\x1b\[(\d+);\d+H\x1b\[\?25[hl]/g)].map(m =>
+			Number(m[1]),
+		);
+		expect(parked.at(-1), "cursor on the bottom-most marker: the input row").toBe(ROWS);
 	} finally {
 		tui.stop();
 	}
