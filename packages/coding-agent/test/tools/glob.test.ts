@@ -255,6 +255,33 @@ describe("GlobTool hard-cap limit notice", () => {
 
 		expect(limitNotice(result)).toContain("[50 results limit reached. Use limit=100 for more]");
 	});
+
+	test("a complete nested listing states its total so a count needs no tallying", async () => {
+		const nested = [
+			...Array.from({ length: 14 }, (_, i) => `migrations/${String(i).padStart(3, "0")}_a.sql`),
+			...Array.from({ length: 14 }, (_, i) => `migrations/2026/${String(i).padStart(3, "0")}_b.sql`),
+			...Array.from({ length: 13 }, (_, i) => `migrations/2026/q${(i % 4) + 1}/${String(i).padStart(3, "0")}_c.sql`),
+		];
+		const result = await globToolWith(nested).execute("glob-total", { path: ".", gitignore: false });
+
+		expect(textOf(result)).toContain("41 paths matched.");
+	});
+
+	test("a single match carries no count line", async () => {
+		const result = await globToolWith(["only.sql"]).execute("glob-total-one", { path: ".", gitignore: false });
+
+		expect(textOf(result).trim()).toBe("only.sql");
+	});
+
+	test("a listing cut at the result limit never claims a total", async () => {
+		const result = await globToolWith(files230).execute("glob-total-limited", {
+			path: ".",
+			limit: 50,
+			gitignore: false,
+		});
+
+		expect(textOf(result)).not.toMatch(/\d+ paths? matched\./);
+	});
 });
 
 describe("GlobTool custom backend contract", () => {

@@ -340,6 +340,12 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 				const limitMeta = listLimit.meta;
 				const baseOutput = formatGroupedPaths(limited);
 				const trailingNotes: string[] = [];
+				// A complete multi-path listing states its size, so "how many" never
+				// depends on counting a grouped tree by eye. Partial results carry their
+				// own notices; a single path needs no count.
+				if (limited.length > 1 && !forceTruncated && !limitMeta.resultLimit && !opts?.timedOut) {
+					trailingNotes.push(`${limited.length} paths matched.`);
+				}
 				if (notice) trailingNotes.push(notice);
 				if (clampNotice) trailingNotes.push(clampNotice);
 				if (missingPathsNote) trailingNotes.push(missingPathsNote);
