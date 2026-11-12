@@ -220,6 +220,39 @@ describe("TodoTool operations", () => {
 		expect(bAfter?.blocker).toBeUndefined();
 	});
 
+	it("reopens completed and dropped items while leaving blocked and open items alone", async () => {
+		const tool = new TodoTool(createSession());
+		await tool.execute("call-1", { op: "init", list: [{ phase: "Work", items: ["a", "b", "c", "d"] }] });
+		await tool.execute("call-2", { op: "done", task: "a" });
+		await tool.execute("call-3", { op: "drop", task: "b" });
+		await tool.execute("call-4", { op: "block", task: "c", reason: "waiting on sign-off" });
+
+		const result = await tool.execute("call-5", { op: "reopen", phase: "Work" });
+
+		expect(result.isError).toBeFalsy();
+		const tasks = result.details?.phases[0]?.tasks ?? [];
+		expect(tasks.map(task => ({ content: task.content, status: task.status, blocker: task.blocker }))).toEqual([
+			{ content: "a", status: "pending", blocker: undefined },
+			{ content: "b", status: "pending", blocker: undefined },
+			{ content: "c", status: "blocked", blocker: "waiting on sign-off" },
+			{ content: "d", status: "in_progress", blocker: undefined },
+		]);
+	});
+
+	it("reopening a done item puts it back among the remaining items", async () => {
+		const tool = new TodoTool(createSession());
+		await tool.execute("call-1", { op: "init", list: [{ phase: "Tasks", items: ["alpha", "bravo", "charlie"] }] });
+		await tool.execute("call-2", { op: "done", phase: "Tasks" });
+
+		const result = await tool.execute("call-3", { op: "reopen", task: "bravo" });
+
+		const summary = result.content.find(part => part.type === "text");
+		if (summary?.type !== "text") throw new Error("Expected text summary from todo");
+		expect(summary.text).toContain("Remaining items (1):");
+		expect(summary.text).toContain("bravo");
+		expect(summary.text).toContain("Overall: 2/3 done, 1 open.");
+	});
+
 	it("does not auto-promote a blocked task to in_progress", async () => {
 		const tool = new TodoTool(createSession());
 		await tool.execute("call-1", { op: "init", list: [{ phase: "Work", items: ["only"] }] });

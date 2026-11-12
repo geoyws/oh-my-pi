@@ -336,7 +336,8 @@ export class TodoTracker {
 		const reminder =
 			TODO_REMINDER_HEAD +
 			`${incomplete.length} incomplete todo item(s):\n${todoList}\n\n` +
-			`Please continue working on these tasks or mark them complete if finished.\n` +
+			`Continue working on these tasks; mark one complete only when its work is actually done. ` +
+			`Items that only record what the user asked you to list are not your work: leave them open and stop.\n` +
 			`(Reminder ${this.#reminderCount}/${remindersMax})\n` +
 			`</system-reminder>`;
 		logger.debug("Todo completion: sending reminder", {

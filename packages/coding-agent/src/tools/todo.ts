@@ -50,7 +50,7 @@ export function committedTodoPhases(result: AgentToolResult): TodoPhase[] | unde
 // Schema
 // =============================================================================
 
-const TodoOp = type('"init" | "start" | "done" | "rm" | "drop" | "block" | "unblock" | "append" | "view"');
+const TodoOp = type('"init" | "start" | "done" | "reopen" | "rm" | "drop" | "block" | "unblock" | "append" | "view"');
 
 const InitListEntry = type({
 	phase: type("string"),
@@ -423,6 +423,13 @@ function applyEntry(phases: TodoPhase[], entry: TodoOpEntryValue, errors: string
 		case "drop": {
 			for (const task of getTaskTargets(phases, entry, errors)) {
 				task.status = "abandoned";
+			}
+			return phases;
+		}
+		case "reopen": {
+			// Only finished items reopen; open or blocked work keeps its state and blocker note.
+			for (const task of getTaskTargets(phases, entry, errors)) {
+				if (task.status === "completed" || task.status === "abandoned") task.status = "pending";
 			}
 			return phases;
 		}
