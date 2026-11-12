@@ -3966,15 +3966,16 @@ export class TUI extends Container {
 		const shifted = reusable && !inPlace && history?.kind !== "replay" && this.#canShiftViewport(prepared.rows);
 		buffer += this.#retireImagePlacements(this.#screenImagePlacements, prepared.lines, newTop, !inPlace, outer);
 		// Put back what earlier overlay rows covered before anything below can
-		// scroll them away. In place, rows painted again or now owned by the
-		// viewport are simply overwritten.
+		// scroll them away. In place, rows the viewport now owns are simply
+		// overwritten. (An in-place frame never carries outer rows from the frame
+		// before: outer rows leave a short or lowered viewport, and the next frame
+		// with that overlay open borrows the alternate buffer.)
 		for (const row of previousOuter.keys()) {
 			if (row >= height) continue;
-			if (inPlace && (outer.has(row) || (row >= newTop && row < newTop + rows))) continue;
+			if (inPlace && row >= newTop && row < newTop + rows) continue;
 			buffer += this.#restoreOverlayRowSequence(row, width);
 		}
 		for (const sequence of this.#imageBudget.takeTransmits()) append(sequence);
-		let tailErased = false;
 		if (inPlace) {
 			for (let index = 0; index < rows; index++) {
 				if (
@@ -4000,7 +4001,6 @@ export class TUI extends Container {
 			}
 			if (this.#providerWindow.length > rows && newTop + rows < height) {
 				buffer += `\x1b[${newTop + rows + 1};1H\x1b[J`;
-				tailErased = true;
 			}
 		} else if (shifted) {
 			// Append the batch exactly like a full paint: it overwrites the old
@@ -4099,10 +4099,8 @@ export class TUI extends Container {
 			if (newTop + rows < height) buffer += `\x1b[${newTop + rows + 1};1H\x1b[J`;
 		}
 		// Overlay rows outside the viewport paint last, over the rows written
-		// above. In place, an unchanged row is still on screen unless the tail
-		// erase just cleared it.
+		// above.
 		for (const [row, line] of outer) {
-			if (inPlace && previousOuter.get(row) === line && !(tailErased && row >= newTop + rows)) continue;
 			buffer += `\x1b[${row + 1};1H${this.#lineRewriteSequence(line, width, row, -1, {
 				imagePlacements: this.#screenImagePlacements,
 				imageRow: row,

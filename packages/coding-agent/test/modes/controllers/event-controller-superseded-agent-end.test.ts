@@ -117,6 +117,30 @@ describe("EventController superseded agent_end", () => {
 		expect(ctx.loadingAnimation).toBeUndefined();
 	});
 
+	it("shows idle auto-compaction in the status area and reports its cancellation", async () => {
+		const { ctx } = createContext();
+		const controller = new EventController(ctx);
+
+		await controller.handleEvent({
+			type: "auto_compaction_start",
+			reason: "idle",
+			action: "context-full",
+		} as unknown as AgentSessionEvent);
+		expect(ctx.autoCompactionLoader).toBeDefined();
+		expect(ctx.statusContainer.children).toEqual([ctx.autoCompactionLoader]);
+
+		// An aborted compaction leaves no rebuilt transcript: the loader goes and
+		// the status line names the cancelled maintenance instead.
+		await controller.handleEvent({
+			type: "auto_compaction_end",
+			action: "context-full",
+			aborted: true,
+		} as unknown as AgentSessionEvent);
+		expect(ctx.autoCompactionLoader).toBeUndefined();
+		expect(ctx.statusContainer.children).toEqual([]);
+		expect(ctx.showStatus).toHaveBeenLastCalledWith("Auto context-full maintenance cancelled");
+	});
+
 	it("flushes queued command panels at a non-terminal settle", async () => {
 		const { ctx, streamState } = createContext();
 		const controller = new EventController(ctx);
