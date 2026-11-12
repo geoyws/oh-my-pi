@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Removed `ComposerPreferences.completeScrollback`, `RuntimeChildrenOptions.transientChrome`/`selfClearingChrome`, `Composer.setRunActive()` and `TUI.scheduleAfter()`: the composer always bills retirement against the chrome painted in the frame, so rows displaced by growing chrome go to scrollback at once and the input stays on the bottom row when it shrinks
+
 ### Added
 
 - `StatusLineComponent.setPendingModelSwitch()` and `SegmentContext.pendingModelSwitch`: while the session streams, the `model` segment renders a queued switch as `A -> B` followed by a dim ` (after this turn)`; `StatusLineComponent.hasSegment()` reports whether the effective layout shows a segment
@@ -9,6 +13,11 @@
 ### Fixed
 - The status line paints at narrow pane widths again: when overflow handling drops every segment because even the last one cannot fit (live grp-socket panes at ≤51 columns), one segment is clipped to the available width instead of rendering an empty bar — the status segment first, then the configured left-to-right order.
 - The usage dashboard now labels Anthropic accounts as Claude.
+- Fixed transcript rows clipped by growing chrome being missing from both the screen and scrollback until the chrome shrank; composer input and status stay at the terminal bottom from startup through short sessions and chrome contraction
+- Fixed inline overlays moving a short viewport and losing covered history during resize; short-viewport overlays borrow the alternate buffer over a text snapshot, and closing a resized overlay recovers the original viewport cursor offset before repainting
+- Added `RuntimeChildrenOptions.dismissibleChrome`: below-transcript panels listed there, and the editor's autocomplete dropdown, cover the transcript tail while open instead of retiring the rows they displace, so closing them puts those rows back in place with no blank band above the input (`Editor.takeRenderedAutocompleteRows()` reports the dropdown rows a frame painted)
+- Fixed growing the terminal over a short session scrolling the on-screen welcome and history away behind a blank screen once the resize settled; the input re-anchors to the new bottom row beneath the rows still on screen
+- Stable-geometry history appends now scroll the screen and rewrite only the viewport rows whose content changed, instead of repainting the whole viewport
 - Task progress shows a subagent's provider-internal retry wait (`provider retrying N/M in …`) instead of a stalled running row ([#12785](https://github.com/can1357/oh-my-pi/pull/12785))
 ## [18.14.0] - 2026-10-29
 

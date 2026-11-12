@@ -219,4 +219,26 @@ describe("composer chrome span recording", () => {
 			composer.stop();
 		}
 	});
+
+	it("bottom-clips a transcript-less runtime frame and records no click targets", () => {
+		const term = new VirtualTerminal(80, 24);
+		const composer = new Composer({ terminal: term, preferences: { ...COMPOSER_DEFAULTS, quiet: true } });
+		composer.start();
+		try {
+			const rows = Array.from({ length: 8 }, (_, index) => `chrome ${index}`);
+			composer.setRuntimeChildren([new RowTarget(rows, ["AgentC"])]);
+			const frame = composer.renderFrame({ columns: 80, rows: 5 });
+			expect(frame.history).toBeUndefined();
+			expect(frame.viewport.map(line => Bun.stripANSI(line).trimEnd())).toEqual([
+				"chrome 3",
+				"chrome 4",
+				"chrome 5",
+				"chrome 6",
+				"chrome 7",
+			]);
+			expect(composer.viewportClickCandidates(0)).toEqual([]);
+		} finally {
+			composer.stop();
+		}
+	});
 });

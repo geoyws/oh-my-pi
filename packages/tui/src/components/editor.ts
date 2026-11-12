@@ -864,6 +864,8 @@ export class Editor implements Component, Focusable {
 	#autocompleteProvider?: AutocompleteProvider;
 	#textAssistProvider?: EditorTextAssistProvider;
 	#autocompleteList?: SelectList;
+	/** Autocomplete dropdown rows the last {@link render} appended below the input. */
+	#renderedAutocompleteRows = 0;
 	#autocompleteState: "regular" | "force" | "assist" | null = null;
 	#textAssistReplacement:
 		| { line: number; startCol: number; endCol: number; original: string; cursorOffset: number }
@@ -1047,9 +1049,6 @@ export class Editor implements Component, Focusable {
 	setPromptGutter(promptGutter: string | undefined): void {
 		this.#promptGutter = promptGutter;
 	}
-	getBorderStyle(): EditorBorderStyle {
-		return this.#borderStyle;
-	}
 
 	setBorderStyle(style: EditorBorderStyle): void {
 		if (this.#borderStyle === style) return;
@@ -1059,6 +1058,17 @@ export class Editor implements Component, Focusable {
 	/** True while the autocomplete/slash-command menu is open below the editor. */
 	isAutocompleteActive(): boolean {
 		return this.#autocompleteState !== null;
+	}
+
+	/**
+	 * Autocomplete dropdown rows painted since the previous call, then reset.
+	 * A frame takes it once before and once after rendering, so a dropdown
+	 * that was not painted in that frame counts as zero.
+	 */
+	takeRenderedAutocompleteRows(): number {
+		const rows = this.#renderedAutocompleteRows;
+		this.#renderedAutocompleteRows = 0;
+		return rows;
 	}
 
 	/**
@@ -1821,6 +1831,7 @@ export class Editor implements Component, Focusable {
 
 		// Add autocomplete list if active
 		const autocompleteList = this.#visibleAutocompleteList();
+		this.#renderedAutocompleteRows = 0;
 		if (autocompleteList) {
 			// Clamp the dropdown to the terminal viewport: the editor rows already
 			// rendered above plus a small reserve must stay visible.
@@ -1828,7 +1839,9 @@ export class Editor implements Component, Focusable {
 			autocompleteList.setMaxVisible(
 				Math.max(3, Math.min(this.#autocompleteMaxVisible, viewportRows - result.length - 2)),
 			);
-			result.push(...autocompleteList.render(width));
+			const rows = autocompleteList.render(width);
+			this.#renderedAutocompleteRows = rows.length;
+			result.push(...rows);
 		}
 
 		return result;
