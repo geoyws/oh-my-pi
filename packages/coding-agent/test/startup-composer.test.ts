@@ -96,9 +96,18 @@ class InputTrackingTerminal extends CountingTerminal {
 	}
 }
 
+// Ambient PI_CONFIG_FILES overlays (a running omp exports its own) outrank the
+// settings these tests set, e.g. a borderless or quiet-startup overlay.
+const ORIGINAL_CONFIG_FILES = process.env.PI_CONFIG_FILES;
+beforeEach(() => {
+	delete process.env.PI_CONFIG_FILES;
+});
+
 // `runRootCommand` registers the CLI's extension roots (`--no-extensions` → explicit-only) process-wide.
 afterEach(() => {
 	clearOmpExtensionCliRoots();
+	if (ORIGINAL_CONFIG_FILES === undefined) delete process.env.PI_CONFIG_FILES;
+	else process.env.PI_CONFIG_FILES = ORIGINAL_CONFIG_FILES;
 });
 
 describe("outer startup collaboration gate", () => {

@@ -19,6 +19,9 @@ type Harness = {
 };
 
 let harness: Harness | undefined;
+// Ambient PI_CONFIG_FILES overlays (a running omp exports its own) outrank the
+// statusLine.sessionAccent value these tests set.
+const ORIGINAL_CONFIG_FILES = process.env.PI_CONFIG_FILES;
 
 function defined<T>(value: T | undefined): T {
 	if (value === undefined) throw new Error("Expected value to be defined");
@@ -45,6 +48,7 @@ async function createHarness(sessionName: string): Promise<Harness> {
 	}
 
 	const tempDir = TempDir.createSync("@pi-working-accent-");
+	delete process.env.PI_CONFIG_FILES;
 	await Settings.init({ inMemory: true, cwd: tempDir.path() });
 	await initTheme(false);
 	const sessionManager = SessionManager.inMemory(tempDir.path());
@@ -102,6 +106,8 @@ afterAll(() => {
 	harness?.tempDir.removeSync();
 	harness = undefined;
 	resetSettingsForTest();
+	if (ORIGINAL_CONFIG_FILES === undefined) delete process.env.PI_CONFIG_FILES;
+	else process.env.PI_CONFIG_FILES = ORIGINAL_CONFIG_FILES;
 });
 
 describe("InteractiveMode working-message session accent cache", () => {
