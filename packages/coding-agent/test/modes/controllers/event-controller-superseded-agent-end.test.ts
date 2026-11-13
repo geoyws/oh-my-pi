@@ -126,8 +126,9 @@ describe("EventController superseded agent_end", () => {
 			reason: "idle",
 			action: "context-full",
 		} as unknown as AgentSessionEvent);
-		expect(ctx.autoCompactionLoader).toBeDefined();
-		expect(ctx.statusContainer.children).toEqual([ctx.autoCompactionLoader]);
+		const loader = ctx.autoCompactionLoader;
+		expect(loader).toBeDefined();
+		expect(ctx.statusContainer.children).toEqual([loader!]);
 
 		// An aborted compaction leaves no rebuilt transcript: the loader goes and
 		// the status line names the cancelled maintenance instead.
