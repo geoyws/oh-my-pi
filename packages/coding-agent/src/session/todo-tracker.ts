@@ -119,6 +119,11 @@ export class TodoTracker {
 	 * Starts true so a session that never began a prompt cycle keeps reminding.
 	 */
 	#todoTouchedThisCycle = true;
+	/**
+	 * Whether a tool other than `todo` ran since the current user prompt began.
+	 * Starts true for the same reason as {@link #todoTouchedThisCycle}.
+	 */
+	#otherToolUsedThisCycle = true;
 
 	constructor(host: TodoTrackerHost) {
 		this.#host = host;
@@ -155,6 +160,7 @@ export class TodoTracker {
 		this.#mutationsSinceLastTouch = 0;
 		this.#midRunNudgeCount = 0;
 		this.#todoTouchedThisCycle = false;
+		this.#otherToolUsedThisCycle = false;
 	}
 
 	/** Records a completed tool result before asynchronous event processing begins. */
@@ -162,8 +168,9 @@ export class TodoTracker {
 		if (toolName === "todo") {
 			this.#mutationsSinceLastTouch = 0;
 			this.#todoTouchedThisCycle = true;
-		} else if (!isError && isMutatingResult(toolName, details)) {
-			this.#mutationsSinceLastTouch++;
+		} else {
+			this.#otherToolUsedThisCycle = true;
+			if (!isError && isMutatingResult(toolName, details)) this.#mutationsSinceLastTouch++;
 		}
 		this.#reminderAwaitingProgress = false;
 	}
@@ -266,6 +273,14 @@ export class TodoTracker {
 			logger.debug("Todo completion: todos untouched since the user prompt; skipping reminder");
 			return false;
 		}
+		if (!this.#otherToolUsedThisCycle) {
+			// Only `todo` ran this prompt: the list itself was the request (write,
+			// tick or reopen items), not a plan the agent started working. A
+			// "continue working" reminder here either closes the user's items or
+			// makes the reply about the reminder instead of the answer (omp t-08d53198).
+			logger.debug("Todo completion: only todo ran since the user prompt; skipping reminder");
+			return false;
+		}
 		if (this.#reminderAwaitingProgress) {
 			logger.debug("Todo completion: prior reminder still awaiting agent action; staying silent", {
 				attempt: this.#reminderCount,
@@ -336,8 +351,7 @@ export class TodoTracker {
 		const reminder =
 			TODO_REMINDER_HEAD +
 			`${incomplete.length} incomplete todo item(s):\n${todoList}\n\n` +
-			`Continue working on these tasks; mark one complete only when its work is actually done. ` +
-			`Items that only record what the user asked you to list are not your work: leave them open and stop.\n` +
+			`Continue working on these tasks; mark one complete only when its work is actually done.\n` +
 			`(Reminder ${this.#reminderCount}/${remindersMax})\n` +
 			`</system-reminder>`;
 		logger.debug("Todo completion: sending reminder", {
