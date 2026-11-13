@@ -169,12 +169,18 @@ type PromptTurnState = {
 	 */
 	errorTextDelivery: Promise<boolean> | undefined;
 	/**
-	 * `abort()` is in-flight (or its bounded-timeout race). `undefined` while the turn is
-	 * running normally and after cleanup completes. The turn occupies `record.promptTurn`
-	 * for as long as either `!settled` or `cleanup` is set — that combined window is the
-	 * "turn in flight" predicate (`isPromptTurnInFlight`) every consumer gates on.
+	 * Cancel cleanup barrier: `abort()` plus its bounded-timeout race, then the
+	 * cancelled response. Set once cancellation begins and kept readable after it
+	 * settles so a prompt queued behind this turn still observes a timeout
+	 * rejection. `undefined` only while the turn was never cancelled.
 	 */
 	cleanup: Promise<void> | undefined;
+	/**
+	 * `cleanup` is still running. The turn occupies `record.promptTurn` for as long as
+	 * either `!settled` or `cleanupPending` — that combined window is the "turn in
+	 * flight" predicate (`isPromptTurnInFlight`) every consumer gates on.
+	 */
+	cleanupPending: boolean;
 	usageBaseline: UsageStatistics;
 	unsubscribe: (() => void) | undefined;
 	resolve: (value: PromptResponse) => void;
@@ -189,7 +195,7 @@ type PromptTurnState = {
  * onto, or forward late events for.
  */
 function isPromptTurnInFlight(turn: PromptTurnState | undefined): turn is PromptTurnState {
-	return turn !== undefined && (!turn.settled || turn.cleanup !== undefined);
+	return turn !== undefined && (!turn.settled || turn.cleanupPending);
 }
 
 /**
@@ -1023,7 +1029,7 @@ export class AcpAgent implements Agent {
 		// idle new turn (queued normally) or inside the abort window — where
 		// the implicit cancel below matches the user's stop intent. No
 		// resubmission bookkeeping is needed here anymore.
-		if (activeTurn && !activeTurn.settled && record.session.isStreaming) {
+		if (activeTurn && !activeTurn.settled && !activeTurn.cancelRequested && record.session.isStreaming) {
 			// New prompt arrived while the previous turn is still in-flight (e.g. the
 			// client sent a message immediately after pressing stop, before or without
 			// a preceding session/cancel notification). Implicitly cancel the running
@@ -1069,6 +1075,7 @@ export class AcpAgent implements Agent {
 					settled: false,
 					errorTextDelivery: undefined,
 					cleanup: undefined,
+					cleanupPending: false,
 					usageBaseline: this.#cloneUsageStatistics(record.session.sessionManager.getUsageStatistics()),
 					unsubscribe: undefined,
 					resolve: pendingPrompt.resolve,
@@ -1086,7 +1093,7 @@ export class AcpAgent implements Agent {
 				// has already stopped.
 				if (cancellation.cancelled) {
 					const cleanup = this.#beginCancelCleanup(record, record.promptTurn);
-					// The wire response already says cancelled, but the cleanup
+					// The wire response settles cancelled once cleanup finishes, but the
 					// barrier must still be observed: an abort that hangs past
 					// the timeout closes the managed session here instead of
 					// surfacing an unhandled rejection (mirrors cancel() and
@@ -1345,7 +1352,7 @@ export class AcpAgent implements Agent {
 		// the autonomous-run branch below — a second, uncoalesced
 		// AgentSession.abort() there can reset or interrupt a replacement
 		// prompt that started after the first cleanup.
-		if (promptTurn && (!promptTurn.settled || promptTurn.cleanup)) {
+		if (isPromptTurnInFlight(promptTurn)) {
 			const cleanup = this.#beginCancelCleanup(record, promptTurn);
 			try {
 				await cleanup;
@@ -1385,11 +1392,14 @@ export class AcpAgent implements Agent {
 	}
 
 	/**
-	 * Transition a still-running turn into cancellation: mark intent, drop the live-event
-	 * subscription, start the bounded `abort()` race, and resolve the ACP prompt response
-	 * with `stopReason: "cancelled"` so the client sees acceptance immediately. The
-	 * returned promise is the cleanup barrier — it resolves when `abort()` completes and
-	 * rejects when the timeout fires. Idempotent: a second call returns the same barrier.
+	 * Transition a still-running turn into cancellation: mark intent, abort the turn's
+	 * controller and start the bounded `abort()` race. The prompt stays subscribed so
+	 * `tool_execution_update`/`tool_execution_end` for already-announced tool calls
+	 * still reach the client; the ACP prompt response resolves `cancelled` only after
+	 * the abort settles and those pending updates were sent (ACP prompt-turn
+	 * Cancellation). The returned promise is the cleanup barrier — it resolves when
+	 * `abort()` completes and rejects when the timeout fires (the prompt response
+	 * still resolves `cancelled`). Idempotent: a second call returns the same barrier.
 	 */
 	#beginCancelCleanup(record: ManagedSessionRecord, promptTurn: PromptTurnState): Promise<void> {
 		if (promptTurn.cleanup) {
@@ -1397,32 +1407,31 @@ export class AcpAgent implements Agent {
 		}
 		promptTurn.cancelRequested = true;
 		promptTurn.abortController.abort();
-		promptTurn.unsubscribe?.();
+		promptTurn.cleanupPending = true;
 		const cleanup = this.#runCancelCleanup(record, promptTurn);
 		promptTurn.cleanup = cleanup;
-		this.#finishPrompt(record, {
-			stopReason: "cancelled",
-			usage: this.#buildTurnUsage(promptTurn.usageBaseline, record.session.sessionManager.getUsageStatistics()),
-		});
 		return cleanup;
 	}
 
 	async #runCancelCleanup(record: ManagedSessionRecord, promptTurn: PromptTurnState): Promise<void> {
-		let timer: NodeJS.Timeout | undefined;
-		const timeout = new Promise<never>((_, reject) => {
-			timer = setTimeout(
-				() => reject(RequestError.resourceNotFound(record.session.sessionId)),
-				this.#cancelCleanupTimeoutMs,
-			);
-		});
+		const timeout = Promise.withResolvers<never>();
+		const timer = setTimeout(
+			() => timeout.reject(RequestError.resourceNotFound(record.session.sessionId)),
+			this.#cancelCleanupTimeoutMs,
+		);
 		try {
-			await Promise.race([record.session.abort({ reason: USER_INTERRUPT_LABEL }), timeout]);
+			await Promise.race([record.session.abort({ reason: USER_INTERRUPT_LABEL }), timeout.promise]);
+			// Pending tool updates are sent before the cancelled response.
+			await this.#waitForPromptEventHandlers(record);
 		} finally {
-			if (timer) clearTimeout(timer);
-			// Order matters: clear `cleanup` before evicting the slot so the slot-eviction
-			// branch matches what `#finishPrompt` saw if it ran first.
-			promptTurn.cleanup = undefined;
-			if (promptTurn.settled && record.promptTurn === promptTurn) {
+			clearTimeout(timer);
+			// Cancellation is never an error on the wire, even when abort() timed out.
+			this.#settlePromptTurn(record, promptTurn, {
+				stopReason: "cancelled",
+				usage: this.#buildTurnUsage(promptTurn.usageBaseline, record.session.sessionManager.getUsageStatistics()),
+			});
+			promptTurn.cleanupPending = false;
+			if (record.promptTurn === promptTurn) {
 				record.promptTurn = undefined;
 			}
 		}
@@ -1809,7 +1818,12 @@ export class AcpAgent implements Agent {
 
 	async #handlePromptEvent(record: ManagedSessionRecord, event: AgentSessionEvent): Promise<void> {
 		const promptTurn = record.promptTurn;
-		if (!promptTurn || promptTurn.settled || promptTurn.cancelRequested) {
+		if (!promptTurn || promptTurn.settled) {
+			return;
+		}
+		// While cancel cleanup runs, only terminal progress for already-announced tool
+		// calls is forwarded; text, new tool starts and `agent_end` stay suppressed.
+		if (promptTurn.cancelRequested && event.type !== "tool_execution_update" && event.type !== "tool_execution_end") {
 			return;
 		}
 
@@ -2014,14 +2028,27 @@ export class AcpAgent implements Agent {
 
 	#finishPrompt(record: ManagedSessionRecord, response?: PromptResponse, error?: unknown): void {
 		const promptTurn = record.promptTurn;
-		if (!promptTurn || promptTurn.settled) {
+		// A cancelled turn is settled `cancelled` by `#runCancelCleanup` only.
+		if (!promptTurn || promptTurn.cancelRequested) {
+			return;
+		}
+		this.#settlePromptTurn(record, promptTurn, response, error);
+	}
+
+	#settlePromptTurn(
+		record: ManagedSessionRecord,
+		promptTurn: PromptTurnState,
+		response?: PromptResponse,
+		error?: unknown,
+	): void {
+		if (promptTurn.settled) {
 			return;
 		}
 		promptTurn.settled = true;
 		promptTurn.unsubscribe?.();
 		// Keep the slot occupied until cancel cleanup finishes — `#runCancelCleanup`
-		// evicts the slot in its finally block once both flags say it's safe.
-		if (!promptTurn.cleanup && record.promptTurn === promptTurn) {
+		// evicts the slot once cleanup is done.
+		if (!promptTurn.cleanupPending && record.promptTurn === promptTurn) {
 			record.promptTurn = undefined;
 		}
 		if (error !== undefined) {
@@ -3199,7 +3226,7 @@ export class AcpAgent implements Agent {
 		if (!isPromptTurnInFlight(promptTurn)) {
 			return;
 		}
-		const cleanup = promptTurn.cleanup ?? this.#beginCancelCleanup(record, promptTurn);
+		const cleanup = this.#beginCancelCleanup(record, promptTurn);
 		try {
 			await cleanup;
 		} catch (error) {

@@ -2549,19 +2549,22 @@ describe("ACP agent", () => {
 			prompt: [{ type: "text", text: "overlap" }],
 		} as PromptRequest);
 
-		// First resolves immediately as cancelled
-		const firstResponse = await firstPrompt;
-		expect(firstResponse.stopReason).toBe("cancelled");
-
 		// abort() must have been called as part of cancel cleanup
 		await abortStarted.promise;
 
-		// Second prompt must NOT start until abort cleanup completes
+		// The cancelled response and the second prompt both wait for abort cleanup
+		let firstSettled = false;
+		void firstPrompt.then(() => {
+			firstSettled = true;
+		});
 		await Bun.sleep(0);
+		expect(firstSettled).toBe(false);
 		expect(session.promptCalls).toEqual(["long running"]);
 
-		// Release abort — second session.prompt should now start
+		// Release abort — the first prompt settles cancelled, then the second session.prompt starts
 		releaseAbort();
+		const firstResponse = await firstPrompt;
+		expect(firstResponse.stopReason).toBe("cancelled");
 		await Bun.sleep(0);
 		expect(session.promptCalls).toEqual(["long running", "overlap"]);
 
@@ -2651,16 +2654,16 @@ describe("ACP agent", () => {
 		}
 		expect(session.promptCalls).toEqual(["long running"]);
 
-		// Cancel the live turn: its wire response settles immediately, but its
-		// cleanup parks behind the blocked first abort.
+		// Cancel the live turn: its wire response and cleanup both park behind
+		// the blocked first abort.
 		const firstCancel = harness.agent.cancel({ sessionId: created.sessionId });
 		for (let i = 0; i < 20 && abortCalls === 0; i++) {
 			await Bun.sleep(0);
 		}
 		expect(abortCalls).toBe(1);
 
-		// A second prompt arrives while the first turn is settled but its
-		// cleanup is still in flight: the queue callback parks on
+		// A second prompt arrives while the first turn's cleanup is still in
+		// flight: the queue callback parks on the first turn's response and
 		// `previousTurn.cleanup` before creating its turn slot.
 		const secondPrompt = harness.agent.prompt({
 			sessionId: created.sessionId,
@@ -2672,7 +2675,7 @@ describe("ACP agent", () => {
 		// The user cancels again while the first cleanup is still unwinding
 		// and that second prompt is still inside its dispatch window: the
 		// stop must mark the queued prompt, and it must REUSE the first
-		// cleanup's barrier (the turn is settled but still in flight) rather
+		// cleanup's barrier (the turn is still in flight) rather
 		// than starting a second, uncoalesced abort that could reset a
 		// replacement prompt.
 		const secondCancel = harness.agent.cancel({ sessionId: created.sessionId });
@@ -3044,7 +3047,7 @@ describe("ACP agent", () => {
 		}
 	});
 
-	it("suppresses late updates after cancel and waits cleanup before the next prompt", async () => {
+	it("withholds the cancelled response until abort settles and keeps late assistant text suppressed", async () => {
 		const harness = await createHarness();
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		const session = harness.findSession(created.sessionId)!;
@@ -3067,14 +3070,13 @@ describe("ACP agent", () => {
 		} as PromptRequest);
 		await Bun.sleep(0);
 		const beforeCancelUpdates = harness.updates.length;
+		let firstSettled = false;
+		void firstPrompt.then(() => {
+			firstSettled = true;
+		});
 
 		const cancelPrompt = harness.agent.cancel({ sessionId: created.sessionId });
 		await abortBlocked.promise;
-		const returnedBeforeCleanup = await Promise.race([firstPrompt.then(() => true), Bun.sleep(0).then(() => false)]);
-		expect(returnedBeforeCleanup).toBe(true);
-		const cancelledResponse = await firstPrompt;
-		expect(cancelledResponse.stopReason).toBe("cancelled");
-
 		for (const listener of session.listeners()) {
 			listener({
 				type: "message_update",
@@ -3082,6 +3084,8 @@ describe("ACP agent", () => {
 				assistantMessageEvent: { type: "text_delta", delta: "late" },
 			} as AgentSessionEvent);
 		}
+		await Bun.sleep(0);
+		expect(firstSettled).toBe(false);
 		expect(harness.updates).toHaveLength(beforeCancelUpdates);
 
 		const secondPrompt = harness.agent.prompt({
@@ -3093,6 +3097,9 @@ describe("ACP agent", () => {
 		expect(session.promptCalls).toEqual(["cancel me"]);
 
 		releaseAbort();
+		const cancelledResponse = await firstPrompt;
+		expect(cancelledResponse.stopReason).toBe("cancelled");
+		expect(harness.updates).toHaveLength(beforeCancelUpdates);
 		await cancelPrompt;
 		finishPrompt();
 		await secondPrompt;
@@ -3101,6 +3108,90 @@ describe("ACP agent", () => {
 		harness.abortController.abort();
 		await Bun.sleep(0);
 	});
+
+	it.each(["explicit cancel", "implicit cancel"] as const)(
+		"delivers a running tool's terminal update before the cancelled response (%s)",
+		async trigger => {
+			const harness = await createHarness();
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			const session = harness.findSession(created.sessionId)!;
+			const releaseAbort = Promise.withResolvers<void>();
+			const abortBlocked = Promise.withResolvers<void>();
+			session.abort = async () => {
+				session.isStreaming = false;
+				abortBlocked.resolve();
+				await releaseAbort.promise;
+			};
+			const finishPrompt = holdPromptStreaming(session);
+
+			let updatesAtResponse = -1;
+			const firstPrompt = harness.agent
+				.prompt({
+					sessionId: created.sessionId,
+					messageId: "00000000-0000-4000-8000-000000000060",
+					prompt: [{ type: "text", text: "read a file" }],
+				} as PromptRequest)
+				.then(response => {
+					updatesAtResponse = harness.updates.length;
+					return response;
+				});
+			for (let i = 0; i < 20 && session.promptCalls.length === 0; i++) {
+				await Bun.sleep(0);
+			}
+			for (const listener of session.listeners()) {
+				listener({
+					type: "tool_execution_start",
+					toolCallId: "read_1",
+					toolName: "read",
+					args: { path: "notes.txt" },
+				} as AgentSessionEvent);
+			}
+			await Bun.sleep(0);
+
+			const cancelling =
+				trigger === "explicit cancel"
+					? harness.agent.cancel({ sessionId: created.sessionId })
+					: harness.agent.prompt({
+							sessionId: created.sessionId,
+							messageId: "00000000-0000-4000-8000-000000000061",
+							prompt: [{ type: "text", text: "overlap" }],
+						} as PromptRequest);
+			await abortBlocked.promise;
+			for (const listener of session.listeners()) {
+				listener({
+					type: "tool_execution_end",
+					toolCallId: "read_1",
+					toolName: "read",
+					isError: false,
+					result: { content: [{ type: "text", text: "file body" }] },
+				} as AgentSessionEvent);
+			}
+			releaseAbort.resolve();
+
+			expect((await firstPrompt).stopReason).toBe("cancelled");
+			const toolEndIndex = harness.updates.findIndex(
+				notification =>
+					notification.update.sessionUpdate === "tool_call_update" &&
+					notification.update.toolCallId === "read_1" &&
+					notification.update.status === "completed" &&
+					JSON.stringify(notification.update.content).includes("file body"),
+			);
+			expect(toolEndIndex).toBeGreaterThanOrEqual(0);
+			expect(toolEndIndex).toBeLessThan(updatesAtResponse);
+
+			if (trigger === "implicit cancel") {
+				for (let i = 0; i < 20 && session.promptCalls.length < 2; i++) {
+					await Bun.sleep(0);
+				}
+				expect(session.promptCalls).toEqual(["read a file", "overlap"]);
+			}
+			finishPrompt();
+			await cancelling;
+
+			harness.abortController.abort();
+			await Bun.sleep(0);
+		},
+	);
 
 	it("keeps a cancelled bare rename from updating or settling its successor", async () => {
 		const harness = await createHarness();
@@ -3212,10 +3303,10 @@ describe("ACP agent", () => {
 		vi.useFakeTimers();
 		try {
 			const cancelPrompt = harness.agent.cancel({ sessionId: created.sessionId });
-			expect((await firstPrompt).stopReason).toBe("cancelled");
 			vi.advanceTimersByTime(5_200);
 			abortRelease.resolve();
 			await cancelPrompt;
+			expect((await firstPrompt).stopReason).toBe("cancelled");
 			expect(session.disposed).toBe(false);
 
 			const secondPrompt = harness.agent.prompt({
@@ -3249,9 +3340,9 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 
 		const cancelPrompt = harness.agent.cancel({ sessionId: created.sessionId });
-		const returnedBeforeTimeout = await Promise.race([firstPrompt.then(() => true), Bun.sleep(0).then(() => false)]);
-		expect(returnedBeforeTimeout).toBe(true);
 		await expect(cancelPrompt).resolves.toBeUndefined();
+		// Cancellation is never an error: the response settles cancelled even when abort() hangs.
+		expect((await firstPrompt).stopReason).toBe("cancelled");
 		expect(session.disposed).toBe(true);
 		await expect(
 			harness.agent.prompt({
@@ -3282,7 +3373,8 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 
 		const cancelPrompt = harness.agent.cancel({ sessionId: created.sessionId });
-		await firstPrompt;
+		await Bun.sleep(0);
+		// Queued behind the cancelled turn while its cleanup is still pending.
 		const queuedPrompt = harness.agent
 			.prompt({
 				sessionId: created.sessionId,
@@ -3292,6 +3384,7 @@ describe("ACP agent", () => {
 			.catch(error => error);
 
 		await cancelPrompt;
+		expect((await firstPrompt).stopReason).toBe("cancelled");
 		const queuedError = await queuedPrompt;
 		expect(queuedError).toMatchObject({ code: -32002 });
 		expect(session.promptCalls).toEqual(["stuck cancel before queued"]);
@@ -3353,7 +3446,6 @@ describe("ACP agent", () => {
 
 		const cancelPrompt = harness.agent.cancel({ sessionId: created.sessionId });
 		await abortBlocked.promise;
-		await firstPrompt;
 
 		const closePrompt = harness.agent.closeSession({ sessionId: created.sessionId });
 		await Bun.sleep(0);
@@ -3361,6 +3453,7 @@ describe("ACP agent", () => {
 
 		releaseAbort();
 		await cancelPrompt;
+		expect((await firstPrompt).stopReason).toBe("cancelled");
 		await closePrompt;
 		expect(session.disposed).toBe(true);
 
@@ -3394,7 +3487,6 @@ describe("ACP agent", () => {
 
 		const cancelPrompt = harness.agent.cancel({ sessionId: created.sessionId });
 		await abortBlocked.promise;
-		await firstPrompt;
 
 		await expect(
 			harness.agent.unstable_forkSession({
@@ -3406,6 +3498,7 @@ describe("ACP agent", () => {
 
 		releaseAbort();
 		await cancelPrompt;
+		expect((await firstPrompt).stopReason).toBe("cancelled");
 		finishPrompt();
 		harness.abortController.abort();
 		await Bun.sleep(0);
