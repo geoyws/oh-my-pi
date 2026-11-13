@@ -19,6 +19,7 @@ import {
 import type { CompactionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import { sessionEntryToContextMessages } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-coding-agent-shim";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -327,6 +328,58 @@ describe("experimental context management", () => {
 		} finally {
 			await resumed.close();
 			await manager.close();
+		}
+	});
+
+	it("reopens a session rolled over by an older build with the current boundary, keeping hook and LLM summaries verbatim", async () => {
+		using tempDir = TempDir.createSync("@pi-rollover-boundary-reopen-");
+		const sessionDir = path.join(tempDir.path(), "sessions");
+		const currentBoundary = fs.readFileSync(
+			path.join(import.meta.dir, "../src/prompts/system/experimental-context-rollover.md"),
+			"utf8",
+		);
+		const OLD_BOUNDARY = "<context-window-rollover>\nOLDER_BUILD_BOUNDARY_WORDING\n</context-window-rollover>";
+		const HOOK_SUMMARY = "HOOK_SUPPLIED_ROLLOVER_SUMMARY";
+		const LLM_SUMMARY = "LLM_COMPACTION_SUMMARY";
+		const contextOf = (manager: SessionManager): string => JSON.stringify(manager.buildSessionContext().messages);
+
+		const builtIn = SessionManager.create(tempDir.path(), sessionDir);
+		builtIn.appendMessage(user("compute the product"));
+		const kept = builtIn.appendMessage(assistant("The product is 64408536."));
+		builtIn.appendCompaction(OLD_BOUNDARY, undefined, kept, 100, {
+			details: { kind: "experimental-context-rollover", version: 1 },
+		});
+		await builtIn.ensureOnDisk();
+		const builtInFile = builtIn.getSessionFile();
+		if (!builtInFile) throw new Error("Expected persisted rollover session");
+		expect(fs.readFileSync(builtInFile, "utf8")).toContain("OLDER_BUILD_BOUNDARY_WORDING");
+		const reopened = await SessionManager.open(builtInFile, sessionDir);
+
+		const hooked = SessionManager.inMemory();
+		hooked.appendMessage(user("compute the product"));
+		hooked.appendCompaction(HOOK_SUMMARY, undefined, hooked.appendMessage(assistant("done")), 100, {
+			details: { kind: "experimental-context-rollover", version: 1, hookDetails: { source: "hook" } },
+		});
+		const summarized = SessionManager.inMemory();
+		summarized.appendMessage(user("compute the product"));
+		summarized.appendCompaction(LLM_SUMMARY, undefined, summarized.appendMessage(assistant("done")), 100);
+		try {
+			for (const rebuilt of [contextOf(builtIn), contextOf(reopened)]) {
+				expect(rebuilt).toContain(JSON.stringify(currentBoundary).slice(1, -1));
+				expect(rebuilt).not.toContain("OLDER_BUILD_BOUNDARY_WORDING");
+			}
+			const reopenedBoundary = reopened.getEntries().find(candidate => candidate.type === "compaction");
+			if (!reopenedBoundary) throw new Error("Expected reopened rollover entry");
+			const legacy = JSON.stringify(sessionEntryToContextMessages(reopenedBoundary));
+			expect(legacy).toContain(JSON.stringify(currentBoundary).slice(1, -1));
+			expect(legacy).not.toContain("OLDER_BUILD_BOUNDARY_WORDING");
+			expect(contextOf(hooked)).toContain(HOOK_SUMMARY);
+			expect(contextOf(hooked)).not.toContain("<context-window-rollover>");
+			expect(contextOf(summarized)).toContain(LLM_SUMMARY);
+			expect(contextOf(summarized)).not.toContain("<context-window-rollover>");
+		} finally {
+			await reopened.close();
+			await builtIn.close();
 		}
 	});
 
@@ -877,6 +930,77 @@ describe("experimental context management", () => {
 			expect(manager.getEntries().filter(entry => entry.type === "compaction")).toHaveLength(0);
 		} finally {
 			tempDir.removeSync();
+		}
+	});
+
+	it("keeps a detail-less hook rollover summary verbatim after persist and reopen", async () => {
+		using tempDir = TempDir.createSync("@pi-hook-rollover-reopen-");
+		const sessionDir = path.join(tempDir.path(), "sessions");
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled model");
+		const HOOK_SUMMARY = "HOOK_ROLLOVER_SUMMARY_WITHOUT_DETAILS";
+		const manager = SessionManager.create(tempDir.path(), sessionDir);
+		const seed = [user("first task"), assistant("first result ".repeat(512)), user("second task"), assistant("second result")];
+		for (const message of seed) manager.appendMessage(message);
+		const settings = Settings.isolated({
+			"compaction.experimentalContextManagement": true,
+			"compaction.keepRecentTokens": 1,
+		});
+		const runtime = new ExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			pi => {
+				// Like examples/hooks/custom-compaction.ts: a result with no `details`.
+				pi.on("session_before_compact", async event => ({
+					compaction: {
+						summary: HOOK_SUMMARY,
+						firstKeptEntryId: event.preparation.firstKeptEntryId,
+						tokensBefore: event.preparation.tokensBefore,
+					},
+				}));
+			},
+			tempDir.path(),
+			new EventBus(),
+			runtime,
+			"detail-less-hook",
+		);
+		const extensionRunner = new ExtensionRunner([extension], runtime, tempDir.path(), manager, modelRegistry);
+		const { tools } = createRolloverTools(manager, settings);
+		const agent = new Agent({ initialState: { model, systemPrompt: ["test"], messages: seed, tools } });
+		session = new AgentSession({
+			agent,
+			sessionManager: manager,
+			settings,
+			modelRegistry,
+			toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
+			builtInToolNames: BUILTIN_TOOL_NAMES,
+			extensionRunner,
+		});
+		await session.compact();
+		await manager.ensureOnDisk();
+		const sessionFile = manager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected persisted rollover session");
+		const persisted = fs
+			.readFileSync(sessionFile, "utf8")
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as { type: string; details?: unknown; fromExtension?: boolean });
+		const boundary = persisted.find(entry => entry.type === "compaction");
+		expect(boundary?.details).toEqual({ kind: "experimental-context-rollover", version: 1 });
+		expect(boundary?.fromExtension).toBe(true);
+
+		const reopened = await SessionManager.open(sessionFile, sessionDir);
+		try {
+			const rebuilt = JSON.stringify(reopened.buildSessionContext().messages);
+			expect(rebuilt).toContain(HOOK_SUMMARY);
+			expect(rebuilt).not.toContain("<context-window-rollover>");
+			const entry = reopened.getEntries().find(candidate => candidate.type === "compaction");
+			if (!entry) throw new Error("Expected reopened rollover entry");
+			const legacy = JSON.stringify(sessionEntryToContextMessages(entry));
+			expect(legacy).toContain(HOOK_SUMMARY);
+			expect(legacy).not.toContain("<context-window-rollover>");
+		} finally {
+			await reopened.close();
+			await manager.close();
 		}
 	});
 });
