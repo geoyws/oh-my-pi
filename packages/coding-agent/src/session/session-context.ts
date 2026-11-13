@@ -31,15 +31,23 @@ import experimentalContextRolloverPrompt from "../prompts/system/experimental-co
 
 /**
  * Summary text a compaction contributes to a rebuilt context. A built-in
- * notes-backed rollover boundary (no hook-supplied summary) is fixed template
- * text, not a summary of anything, so every rebuild renders the current
- * template: a session that rolled over under an older build and is reopened
- * under this one gets today's boundary instructions instead of the wording
- * frozen into the entry. Hook and LLM summaries are content and stay verbatim.
+ * notes-backed rollover boundary is fixed template text, not a summary of
+ * anything, so every rebuild renders the current template: a session that
+ * rolled over under an older build and is reopened under this one gets
+ * today's boundary instructions instead of the wording frozen into the entry.
+ * Hook and LLM summaries are content and stay verbatim. A hook rollover is
+ * recognised by the persisted `fromExtension` flag, not by `hookDetails`:
+ * a hook result without `details` stores `hookDetails: undefined`, which
+ * JSON persistence drops, so after a reopen only `fromExtension` remains.
  */
-function compactionContextSummary(entry: CompactionEntry): string {
+export function compactionContextSummary(entry: CompactionEntry): string {
 	const details = entry.details;
-	if (isRecord(details) && details.kind === "experimental-context-rollover" && !("hookDetails" in details)) {
+	if (
+		entry.fromExtension !== true &&
+		isRecord(details) &&
+		details.kind === "experimental-context-rollover" &&
+		details.hookDetails === undefined
+	) {
 		return experimentalContextRolloverPrompt;
 	}
 	return entry.summary;
