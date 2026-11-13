@@ -609,7 +609,9 @@ raw invocation (the typed draft/args) and once on the rendered skill text
 before either is persisted or sent, on every ingress (interactive Enter,
 RPC, ACP, compaction drain). A skill refusal behaves like any other refusal
 for its ingress — the interactive draft (the raw `/skill:` text) is handed
-back for editing, RPC/ACP fail with only the notice.
+back for editing, RPC fails with only the notice, and ACP ends the prompt with
+`stopReason: "refusal"` after one `agent_message_chunk` carrying the notice,
+tagged `_meta: { notice: "user_message_refused" }`.
 
 Visible user-attributed custom prompts from writable-collab peers are gated
 the same way, so an idle host gates exactly what a streaming host's recheck
