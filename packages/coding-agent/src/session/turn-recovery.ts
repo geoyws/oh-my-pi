@@ -3259,8 +3259,12 @@ export class TurnRecovery {
 						recordedUsageLimitOutcome?.retryAfterMs ?? parsedRetryAfterMs ?? Infinity,
 						siblingAvailabilityWaitMs,
 					));
+		// Only a sibling that frees within the cap is a short sibling unblock. The
+		// effective wait also folds in the active account's own retry-after, which
+		// alone must not bypass quota recovery while every sibling stays blocked.
 		const waitForSiblingCredential =
 			siblingAvailabilityWaitMs !== undefined &&
+			siblingAvailabilityWaitMs <= retrySettings.maxDelayMs &&
 			effectiveUsageLimitWaitMs !== undefined &&
 			effectiveUsageLimitWaitMs <= retrySettings.maxDelayMs;
 		const longUsageLimitFallback =

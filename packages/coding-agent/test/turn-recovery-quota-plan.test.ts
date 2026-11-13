@@ -340,6 +340,64 @@ describe("TurnRecovery quota recovery planning", () => {
 		expect(continues).toBe(0);
 	});
 
+	it("plans and announces a wake when only the active account's own wait fits the cap and every sibling stays blocked", async () => {
+		const now = Date.now();
+		const resetAt = now + 1_000;
+		const siblingBlocked = depleted(2, now + 60_000, true);
+		stubHealth(
+			[
+				{ "anthropic/claude-sonnet-4-5": pool([depleted(1, resetAt, true), siblingBlocked]) },
+				{ "anthropic/claude-sonnet-4-5": pool([healthy(1), siblingBlocked]) },
+			],
+			[resetAt],
+		);
+		// The only other account frees well past the one-second cap.
+		vi.spyOn(authStorage.limits, "markReached").mockResolvedValue({ switched: false, retryAtMs: now + 59_000 });
+		mockSchedulerWaitWithClock();
+		const { recovery, failure } = createRecovery({
+			"retry.modelFallback": false,
+			"retry.waitForUsageReset": true,
+			"retry.maxDelayMs": 1_000,
+		});
+		failure.errorMessage = `${QUOTA_ERROR} retry-after-ms=1000`;
+
+		await recovery.recordUsageLimitOutcome(failure);
+		expect(await recovery.handleRetryableError(failure)).toBe(true);
+
+		const waiting = notices().find(message => message.startsWith("waiting for"));
+		expect(waiting).toContain("account #1");
+		expect(waiting).toContain(new Date(resetAt).toISOString());
+		expect(calls).toContain("invalidate:anthropic");
+		// Resumes on the armed account, and not before its reset.
+		expect(Date.now()).toBeGreaterThanOrEqual(resetAt);
+		expect(calls).toContain(`pin:anthropic:${SESSION_ID}:1`);
+		expect(continues).toBe(1);
+	});
+
+	it("keeps the ordinary short wait when a sibling frees within the cap", async () => {
+		const now = Date.now();
+		stubHealth([{ "anthropic/claude-sonnet-4-5": pool([depleted(1, now + 1_000, true), depleted(2, now, true)]) }]);
+		vi.spyOn(authStorage.limits, "markReached").mockResolvedValue({ switched: false, retryAtMs: now });
+		mockSchedulerWaitWithClock();
+		const { recovery, failure } = createRecovery({
+			"retry.modelFallback": false,
+			"retry.waitForUsageReset": true,
+			"retry.maxDelayMs": 1_000,
+		});
+		failure.errorMessage = `${QUOTA_ERROR} retry-after-ms=1000`;
+
+		await recovery.recordUsageLimitOutcome(failure);
+		expect(await recovery.handleRetryableError(failure)).toBe(true);
+
+		// The sibling unblock owns the wait: no planning, no announced wake.
+		expect(notices()).toEqual([]);
+		expect(calls.some(call => call.startsWith("invalidate:") || call.startsWith("health:"))).toBe(false);
+		const start = events.find(event => event.type === "auto_retry_start");
+		if (start?.type !== "auto_retry_start") throw new Error("Expected auto_retry_start");
+		expect(start.delayMs).toBeLessThanOrEqual(1_000);
+		expect(continues).toBe(1);
+	});
+
 	it("cancels an armed wake through abortRetry without refreshing or resuming", async () => {
 		const now = Date.now();
 		stubHealth([{ "anthropic/claude-sonnet-4-5": pool([depleted(1, now + HOUR_MS, true)]) }]);
