@@ -1821,9 +1821,18 @@ export class AcpAgent implements Agent {
 		if (!promptTurn || promptTurn.settled) {
 			return;
 		}
-		// While cancel cleanup runs, only terminal progress for already-announced tool
-		// calls is forwarded; text, new tool starts and `agent_end` stay suppressed.
-		if (promptTurn.cancelRequested && event.type !== "tool_execution_update" && event.type !== "tool_execution_end") {
+		// While cancel cleanup runs, only progress for tool calls the client already saw
+		// is forwarded; text, new tool starts and `agent_end` stay suppressed. A call is
+		// announced iff its pre-cancel start (or update) recorded it in `toolArgsById`:
+		// the agent loop emits a synthetic start+end pair for tools aborted before they
+		// ran, and that end must not surface as an update for an unknown toolCallId.
+		if (
+			promptTurn.cancelRequested &&
+			!(
+				(event.type === "tool_execution_update" || event.type === "tool_execution_end") &&
+				record.toolArgsById.has(event.toolCallId)
+			)
+		) {
 			return;
 		}
 

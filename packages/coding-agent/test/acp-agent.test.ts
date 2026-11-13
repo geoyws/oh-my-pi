@@ -3110,7 +3110,7 @@ describe("ACP agent", () => {
 	});
 
 	it.each(["explicit cancel", "implicit cancel"] as const)(
-		"delivers a running tool's terminal update before the cancelled response (%s)",
+		"delivers an announced tool's terminal update before the cancelled response and drops unannounced tool calls (%s)",
 		async trigger => {
 			const harness = await createHarness();
 			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
@@ -3165,6 +3165,29 @@ describe("ACP agent", () => {
 					isError: false,
 					result: { content: [{ type: "text", text: "file body" }] },
 				} as AgentSessionEvent);
+				// A batch tool the abort reached before it ran: the agent loop emits a
+				// synthetic start+end pair after cancellation. The client never saw its
+				// start, so neither event may surface (no update for an unknown id).
+				listener({
+					type: "tool_execution_start",
+					toolCallId: "read_2",
+					toolName: "read",
+					args: { path: "other.txt" },
+				} as AgentSessionEvent);
+				listener({
+					type: "tool_execution_update",
+					toolCallId: "read_2",
+					toolName: "read",
+					args: { path: "other.txt" },
+					partialResult: { content: [{ type: "text", text: "partial" }] },
+				} as AgentSessionEvent);
+				listener({
+					type: "tool_execution_end",
+					toolCallId: "read_2",
+					toolName: "read",
+					isError: true,
+					result: { content: [{ type: "text", text: "aborted" }] },
+				} as AgentSessionEvent);
 			}
 			releaseAbort.resolve();
 
@@ -3178,6 +3201,11 @@ describe("ACP agent", () => {
 			);
 			expect(toolEndIndex).toBeGreaterThanOrEqual(0);
 			expect(toolEndIndex).toBeLessThan(updatesAtResponse);
+			expect(
+				harness.updates.some(
+					notification => "toolCallId" in notification.update && notification.update.toolCallId === "read_2",
+				),
+			).toBe(false);
 
 			if (trigger === "implicit cancel") {
 				for (let i = 0; i < 20 && session.promptCalls.length < 2; i++) {
