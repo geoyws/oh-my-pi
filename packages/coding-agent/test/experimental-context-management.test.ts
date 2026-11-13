@@ -330,6 +330,53 @@ describe("experimental context management", () => {
 		}
 	});
 
+	it("reopens a session rolled over by an older build with the current boundary, keeping hook and LLM summaries verbatim", async () => {
+		using tempDir = TempDir.createSync("@pi-rollover-boundary-reopen-");
+		const sessionDir = path.join(tempDir.path(), "sessions");
+		const currentBoundary = fs.readFileSync(
+			path.join(import.meta.dir, "../src/prompts/system/experimental-context-rollover.md"),
+			"utf8",
+		);
+		const OLD_BOUNDARY = "<context-window-rollover>\nOLDER_BUILD_BOUNDARY_WORDING\n</context-window-rollover>";
+		const HOOK_SUMMARY = "HOOK_SUPPLIED_ROLLOVER_SUMMARY";
+		const LLM_SUMMARY = "LLM_COMPACTION_SUMMARY";
+		const contextOf = (manager: SessionManager): string => JSON.stringify(manager.buildSessionContext().messages);
+
+		const builtIn = SessionManager.create(tempDir.path(), sessionDir);
+		builtIn.appendMessage(user("compute the product"));
+		const kept = builtIn.appendMessage(assistant("The product is 64408536."));
+		builtIn.appendCompaction(OLD_BOUNDARY, undefined, kept, 100, {
+			details: { kind: "experimental-context-rollover", version: 1 },
+		});
+		await builtIn.ensureOnDisk();
+		const builtInFile = builtIn.getSessionFile();
+		if (!builtInFile) throw new Error("Expected persisted rollover session");
+		expect(fs.readFileSync(builtInFile, "utf8")).toContain("OLDER_BUILD_BOUNDARY_WORDING");
+		const reopened = await SessionManager.open(builtInFile, sessionDir);
+
+		const hooked = SessionManager.inMemory();
+		hooked.appendMessage(user("compute the product"));
+		hooked.appendCompaction(HOOK_SUMMARY, undefined, hooked.appendMessage(assistant("done")), 100, {
+			details: { kind: "experimental-context-rollover", version: 1, hookDetails: { source: "hook" } },
+		});
+		const summarized = SessionManager.inMemory();
+		summarized.appendMessage(user("compute the product"));
+		summarized.appendCompaction(LLM_SUMMARY, undefined, summarized.appendMessage(assistant("done")), 100);
+		try {
+			for (const rebuilt of [contextOf(builtIn), contextOf(reopened)]) {
+				expect(rebuilt).toContain(JSON.stringify(currentBoundary).slice(1, -1));
+				expect(rebuilt).not.toContain("OLDER_BUILD_BOUNDARY_WORDING");
+			}
+			expect(contextOf(hooked)).toContain(HOOK_SUMMARY);
+			expect(contextOf(hooked)).not.toContain("<context-window-rollover>");
+			expect(contextOf(summarized)).toContain(LLM_SUMMARY);
+			expect(contextOf(summarized)).not.toContain("<context-window-rollover>");
+		} finally {
+			await reopened.close();
+			await builtIn.close();
+		}
+	});
+
 	it("closes the lifecycle when cancellation occurs during awaited start dispatch", async () => {
 		const { session, manager } = await createRolloverSession();
 		const events: AgentSessionEvent[] = [];
