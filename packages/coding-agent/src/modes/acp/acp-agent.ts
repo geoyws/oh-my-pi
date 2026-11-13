@@ -70,6 +70,7 @@ import { isSilentAbort, SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "
 import type { UsageStatistics } from "../../session/session-entries";
 import type { SessionInfo as StoredSessionInfo } from "../../session/session-listing";
 import { SessionManager } from "../../session/session-manager";
+import { UserMessageRefusedError } from "../../session/user-message-refused-error";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands, toAcpAvailableCommands } from "../../slash-commands/available-commands";
 import { DEFAULT_STT_MODEL_KEY, STT_MODELS } from "../../stt/models";
@@ -1112,7 +1113,32 @@ export class AcpAgent implements Agent {
 				// guard above cannot fire and a client prompt lands on AgentSession's busy
 				// guard. Type that failure for the wire instead of letting transport.ts wrap
 				// it as a generic -32603 internal error.
-				this.#runPromptOrCommand(record, converted.text, converted.images).catch((error: unknown) => {
+				this.#runPromptOrCommand(record, converted.text, converted.images).catch(async (error: unknown) => {
+					// A `before_user_message` refusal is an outcome, not a failure: the
+					// message was never sent, persisted or queued. Show the handler's safe
+					// notice (never the message text) as one chunk tagged
+					// `_meta.notice: "user_message_refused"`, then end the turn with
+					// `refusal` so clients render it instead of a -32603.
+					if (error instanceof UserMessageRefusedError) {
+						await this.#connection
+							.sessionUpdate({
+								sessionId: record.session.sessionId,
+								update: {
+									sessionUpdate: "agent_message_chunk",
+									content: { type: "text", text: error.notice },
+									messageId: crypto.randomUUID(),
+									_meta: { notice: "user_message_refused" },
+								},
+							})
+							.catch((sendError: unknown) => {
+								logger.warn("ACP refusal notice delivery failed", {
+									sessionId: record.session.sessionId,
+									error: sendError,
+								});
+							});
+						this.#finishPrompt(record, { stopReason: "refusal" });
+						return;
+					}
 					this.#finishPrompt(
 						record,
 						undefined,
