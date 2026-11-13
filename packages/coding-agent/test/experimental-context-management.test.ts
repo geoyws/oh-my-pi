@@ -940,7 +940,12 @@ describe("experimental context management", () => {
 		if (!model) throw new Error("Expected bundled model");
 		const HOOK_SUMMARY = "HOOK_ROLLOVER_SUMMARY_WITHOUT_DETAILS";
 		const manager = SessionManager.create(tempDir.path(), sessionDir);
-		const seed = [user("first task"), assistant("first result ".repeat(512)), user("second task"), assistant("second result")];
+		const seed = [
+			user("first task"),
+			assistant("first result ".repeat(512)),
+			user("second task"),
+			assistant("second result"),
+		];
 		for (const message of seed) manager.appendMessage(message);
 		const settings = Settings.isolated({
 			"compaction.experimentalContextManagement": true,
