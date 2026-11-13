@@ -9,6 +9,7 @@
 
 ### Added
 
+- Added a `beforeRetry(delayMs, attempt)` option to `fetchWithRetry()`: it runs before each backoff sleep with the delay about to be slept, and a throw ends the retries with that error without waiting.
 - `pruneStaleBuilds` in `@oh-my-pi/pi-utils/browsers` removes managed Chrome builds older than the current one once the current build has been installed for a grace period, skipping builds a running process uses and builds whose install lock is held; `compareBuildIds` orders dotted Chrome build ids numerically.
 ## [18.14.0] - 2026-10-29
 

@@ -2222,7 +2222,7 @@ async function openCodexSseTransport(
 				requestSetup.requestSignal,
 				requestSetup.firstEventTimeoutMs,
 				options?.codexSseMaxAttempts,
-				() => assertCodexTransportAttemptAllowed(options, requestSetup),
+				delayMs => assertCodexTransportAttemptAllowed(options, requestSetup, delayMs),
 				firstOperationTransport,
 				event => options?.onSseEvent?.(event, model),
 				options?.fetch,
@@ -5001,7 +5001,7 @@ async function openCodexSseEventStream(
 	signal: AbortSignal | undefined,
 	firstEventTimeoutMs: number | undefined,
 	codexSseMaxAttempts: number | undefined,
-	assertAttemptAllowed: () => void,
+	assertAttemptAllowed: (delayMs?: number) => void,
 	firstOperationTransport: boolean,
 	onSseEvent?: OpenAICodexResponsesOptions["onSseEvent"],
 	fetchOverride?: FetchImpl,
@@ -5085,6 +5085,9 @@ async function openCodexSseEventStream(
 				clearPreResponseTimeout = watchdog.clear;
 				return { signal: watchdog.signal };
 			},
+			// Refuse a backoff that would land past the operation deadline before
+			// sleeping it; prepareInit's recheck then covers time spent elsewhere.
+			beforeRetry: delayMs => assertAttemptAllowed(delayMs),
 			maxAttempts: resolveCodexSseMaxAttempts(codexSseMaxAttempts),
 			defaultDelayMs: attempt => CODEX_RETRY_DELAY_MS * (attempt + 1),
 			maxDelayMs: CODEX_RATE_LIMIT_BUDGET_MS,

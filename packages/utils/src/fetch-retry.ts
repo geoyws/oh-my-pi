@@ -308,6 +308,12 @@ export interface FetchWithRetryOptions extends RequestInit {
 	 */
 	shouldRetryResponse?: (response: Response, bodyText: string, attempt: number) => boolean | Promise<boolean>;
 	/**
+	 * Optional gate run before each backoff sleep with the delay about to be
+	 * slept. Throwing stops the retries with that error before any wait, so a
+	 * caller can refuse a backoff that would outlive its own deadline.
+	 */
+	beforeRetry?: (delayMs: number, attempt: number) => void | Promise<void>;
+	/**
 	 * Bun extension forwarded verbatim to the underlying `fetch` call. `false`
 	 * disables Bun's native ~300s pre-response timeout (callers that own a
 	 * configurable first-event/idle watchdog or an external `AbortSignal`
@@ -339,6 +345,7 @@ export async function fetchWithRetry(
 		defaultDelayMs,
 		prepareInit,
 		shouldRetryResponse,
+		beforeRetry,
 		fetch: fetchImpl = fetch,
 		timeout = false,
 		...baseInit
@@ -368,7 +375,9 @@ export async function fetchWithRetry(
 			if (signal?.aborted) throw new Error("Request was aborted");
 			const wrapped = wrapNetworkError(error);
 			if (attempt + 1 >= maxAttempts) throw wrapped;
-			await waitForRetry(resolveDefaultDelay(defaultDelayMs, attempt, maxDelayMs), signal);
+			const delayMs = resolveDefaultDelay(defaultDelayMs, attempt, maxDelayMs);
+			await beforeRetry?.(delayMs, attempt);
+			await waitForRetry(delayMs, signal);
 			continue;
 		}
 
@@ -384,6 +393,7 @@ export async function fetchWithRetry(
 		const delayMs = Math.min(hint ?? resolveDefaultDelay(defaultDelayMs, attempt, maxDelayMs), maxDelayMs);
 		// The retried response is discarded; release its unread tee branch.
 		if (!response.bodyUsed) response.body?.cancel().catch(() => {});
+		await beforeRetry?.(delayMs, attempt);
 		await waitForRetry(delayMs, signal);
 	}
 }
