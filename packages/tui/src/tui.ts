@@ -3402,8 +3402,7 @@ export class TUI extends Container {
 		const screenStart = viewportTop - screen.length;
 		for (const patch of overlays) {
 			if (patch.row >= viewportTop && patch.row < viewportEnd) continue;
-			const base =
-				composed.get(patch.row) ?? (patch.row < viewportTop ? screen[patch.row - screenStart]!.line : "");
+			const base = composed.get(patch.row) ?? (patch.row < viewportTop ? screen[patch.row - screenStart]!.line : "");
 			composed.set(patch.row, compositeLineAt(base, patch.line, patch.col, patch.width, width));
 		}
 		if (composed.size === 0) return NO_OUTER_ROWS;

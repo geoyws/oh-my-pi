@@ -76,11 +76,7 @@ function startFull() {
  * viewport plus `historyRows` and shrink the live tail to two rows in one
  * frame: the overlay's top rows land above the viewport, over history.
  */
-async function openOverHistory(
-	historyRows: readonly string[],
-	kind: "append" | "replay" = "append",
-	overlayRows = 6,
-) {
+async function openOverHistory(historyRows: readonly string[], kind: "append" | "replay" = "append", overlayRows = 6) {
 	const { terminal, scheduler, tui, provider } = startFull();
 	await scheduler.settle(terminal);
 	const panel = new RowsBlock("OVERLAY", overlayRows);
@@ -223,7 +219,10 @@ async function openBelowShrunkenViewport() {
 	const grid = activeGrid(terminal);
 	expect(grid.slice(0, 2), "collapsed tail on the top rows").toEqual(["live-0", EDITOR_TEXT]);
 	expect(rowsContaining(grid, "OVERLAY-"), "overlay kept over the erased rows").toEqual([18, 19, 20, 21, 22, 23]);
-	expect(grid.slice(2, 18).every(row => row === ""), "the old tail erased").toBe(true);
+	expect(
+		grid.slice(2, 18).every(row => row === ""),
+		"the old tail erased",
+	).toBe(true);
 	return { terminal, scheduler, tui, provider, handle };
 }
 
@@ -263,7 +262,12 @@ it("never addresses overlay rows a height shrink left below the screen", async (
 		terminal.resize(80, 16);
 		await scheduler.advance(terminal, 160);
 		await scheduler.settle(terminal);
-		const rowsAddressed = [...terminal.takeWrites().join("").matchAll(/\x1b\[(\d+);\d+H/g)].map(m => Number(m[1]));
+		const rowsAddressed = [
+			...terminal
+				.takeWrites()
+				.join("")
+				.matchAll(/\x1b\[(\d+);\d+H/g),
+		].map(m => Number(m[1]));
 		expect(Math.max(...rowsAddressed), "every cursor move stays on the 16-row screen").toBeLessThanOrEqual(16);
 		expect(ledger(terminal, /OVERLAY-\d/)).toEqual([]);
 		expect(rowsContaining(activeGrid(terminal), EDITOR_TEXT)).toHaveLength(1);
@@ -328,9 +332,12 @@ it("keeps the hardware cursor on the input when an overlay row above the viewpor
 		const grid = activeGrid(terminal);
 		expect(rowsContaining(grid, "OVERLAY-0"), "the marked overlay row sits above the viewport").toEqual([16]);
 		expect(rowsContaining(grid, EDITOR_TEXT), "the input stays uncovered").toEqual([ROWS - 1]);
-		const parked = [...terminal.takeWrites().join("").matchAll(/\x1b\[(\d+);\d+H\x1b\[\?25[hl]/g)].map(m =>
-			Number(m[1]),
-		);
+		const parked = [
+			...terminal
+				.takeWrites()
+				.join("")
+				.matchAll(/\x1b\[(\d+);\d+H\x1b\[\?25[hl]/g),
+		].map(m => Number(m[1]));
 		expect(parked.at(-1), "cursor on the bottom-most marker: the input row").toBe(ROWS);
 	} finally {
 		tui.stop();
@@ -345,7 +352,9 @@ it("leaves a scaled history row out of the alternate-buffer copy an overlay pain
 		provider.viewport = ["live-0", `${EDITOR_TEXT}${CURSOR_MARKER}`];
 		tui.requestRender();
 		await scheduler.settle(terminal);
-		expect(rowsContaining(activeGrid(terminal), "MARK-OSC"), "scaled row on screen above the viewport").toHaveLength(1);
+		expect(rowsContaining(activeGrid(terminal), "MARK-OSC"), "scaled row on screen above the viewport").toHaveLength(
+			1,
+		);
 		const handle = tui.showOverlay(new RowsBlock("OVERLAY", 2), { anchor: "top-left", width: 20 });
 		await scheduler.settle(terminal);
 		const covered = activeGrid(terminal);
