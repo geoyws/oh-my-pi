@@ -366,6 +366,72 @@ describe("TUI overlay focus", () => {
 		}
 	});
 
+	it("redirects input to preFocus when the focused overlay becomes invisible", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		const overlay = new FocusRecorder("overlay");
+		let visible = true;
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start();
+			tui.showOverlay(overlay, { visible: () => visible });
+			expect(tui.getFocused()).toBe(overlay);
+			visible = false;
+			terminal.sendInput("k");
+			expect(tui.getFocused()).toBe(editor);
+			expect(editor.inputs).toEqual(["k"]);
+			expect(overlay.inputs).toEqual([]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("redirects input to the topmost visible overlay when the focused overlay becomes invisible", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		const lower = new FocusRecorder("lower");
+		const upper = new FocusRecorder("upper");
+		let upperVisible = true;
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start();
+			tui.showOverlay(lower);
+			tui.showOverlay(upper, { visible: () => upperVisible });
+			expect(tui.getFocused()).toBe(upper);
+			upperVisible = false;
+			terminal.sendInput("k");
+			expect(tui.getFocused()).toBe(lower);
+			expect(lower.inputs).toEqual(["k"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("delivers listener-transformed input and swallows input emptied by a listener", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+		tui.addInputListener(data => (data === "a" ? { data: "A" } : data === "z" ? { data: "" } : undefined));
+
+		try {
+			tui.start();
+			terminal.sendInput("a");
+			terminal.sendInput("z");
+			terminal.sendInput("b");
+			expect(editor.inputs).toEqual(["A", "b"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
 	it("runs prepended input listeners first and stops notifying removed listeners", () => {
 		const terminal = new MinimalTerminal();
 		const tui = new TUI(terminal);
