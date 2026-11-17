@@ -366,6 +366,38 @@ describe("TUI overlay focus", () => {
 		}
 	});
 
+	it("runs prepended input listeners first and stops notifying removed listeners", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+		const order: string[] = [];
+		const removed = (data: string) => {
+			order.push(`removed:${data}`);
+			return undefined;
+		};
+		tui.addInputListener(removed);
+		tui.addInputListener(
+			data => {
+				order.push(`first:${data}`);
+				return undefined;
+			},
+			{ prepend: true },
+		);
+
+		try {
+			tui.start();
+			terminal.sendInput("x");
+			expect(order).toEqual(["first:x", "removed:x"]);
+			tui.removeInputListener(removed);
+			terminal.sendInput("y");
+			expect(order).toEqual(["first:x", "removed:x", "first:y"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
 	it("moves focus to preFocus when the focused overlay is hidden and back when shown again", () => {
 		const terminal = new MinimalTerminal();
 		const tui = new TUI(terminal);

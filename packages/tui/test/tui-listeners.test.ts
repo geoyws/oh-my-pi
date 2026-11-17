@@ -50,6 +50,27 @@ describe("TUI paint and frame-write listeners", () => {
 		}
 	});
 
+	it("counts full redraws and reports no native document without a native surface", async () => {
+		const terminal = new VirtualTerminal(40, 6);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		tui.addChild(new Text("hello", 0, 0));
+		try {
+			tui.start();
+			await scheduler.settle(terminal);
+			expect(tui.fullRedraws).toBeGreaterThanOrEqual(0);
+			expect(tui.getNativeDocument()).toBeUndefined();
+			expect(tui.getNativeFrames()).toEqual([]);
+			expect(tui.getNativeFrames(2)).toEqual([]);
+			const before = tui.fullRedraws;
+			tui.requestRender(true);
+			await scheduler.settle(terminal);
+			expect(tui.fullRedraws).toBeGreaterThanOrEqual(before);
+		} finally {
+			tui.stop();
+		}
+	});
+
 	it("installs and clears a frame provider", async () => {
 		const terminal = new VirtualTerminal(40, 6);
 		const scheduler = new VirtualRenderScheduler();
