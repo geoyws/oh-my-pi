@@ -50,6 +50,52 @@ describe("TUI paint and frame-write listeners", () => {
 		}
 	});
 
+	it("keeps rendering and notifies later listeners when an earlier listener throws", async () => {
+		const terminal = new VirtualTerminal(40, 6);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		tui.addChild(new Text("hello", 0, 0));
+		let paints = 0;
+		let frames = 0;
+		tui.addPaintListener(() => {
+			throw new Error("broken paint listener");
+		});
+		tui.addPaintListener(() => {
+			paints++;
+		});
+		tui.addFrameWriteListener(() => {
+			throw new Error("broken frame listener");
+		});
+		tui.addFrameWriteListener(() => {
+			frames++;
+		});
+		try {
+			tui.start();
+			await scheduler.settle(terminal);
+			expect(paints).toBeGreaterThan(0);
+			expect(frames).toBeGreaterThan(0);
+			expect(terminal.getViewport().join("\n")).toContain("hello");
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("rejects a frame provider that returns more rows than the viewport in tests", async () => {
+		const terminal = new VirtualTerminal(40, 3);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		tui.setFrameProvider({
+			renderFrame: () => ({ viewport: ["1", "2", "3", "4", "5"] }),
+			acknowledgeHistory() {},
+		});
+		try {
+			tui.start();
+			await expect(scheduler.settle(terminal)).rejects.toThrow("Frame provider returned 5 rows for a 3-row viewport");
+		} finally {
+			tui.stop();
+		}
+	});
+
 	it("counts full redraws and reports no native document without a native surface", async () => {
 		const terminal = new VirtualTerminal(40, 6);
 		const scheduler = new VirtualRenderScheduler();
