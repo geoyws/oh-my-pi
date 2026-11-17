@@ -123,6 +123,21 @@ describe("coalesceAdjacentSgr", () => {
 		expect(coalesceAdjacentSgr(input)).toBe("\x1b[38;2;255;0;0;31mX");
 	});
 
+	it("keeps an empty reset separate when merging it would overflow the parameter cap", () => {
+		const input = "\x1b[m\x1b[1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16mX";
+		expect(coalesceAdjacentSgr(input)).toBe("\x1b[0m\x1b[1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16mX");
+	});
+
+	it("passes input through unchanged when PI_NO_SGR_COALESCE disables coalescing", () => {
+		const script = `import { coalesceAdjacentSgr } from "./src/tui.ts"; console.log(JSON.stringify(coalesceAdjacentSgr("\\x1b[39m\\x1b[38;2;1;2;3m")));`;
+		const proc = Bun.spawnSync(["bun", "-e", script], {
+			cwd: `${import.meta.dir}/..`,
+			env: { ...process.env, PI_NO_SGR_COALESCE: "1" },
+		});
+		expect(proc.exitCode).toBe(0);
+		expect(proc.stdout.toString().trim()).toBe(JSON.stringify("\x1b[39m\x1b[38;2;1;2;3m"));
+	});
+
 	it("does not merge an SGR followed by an adjacent non-SGR CSI sequence", () => {
 		// The adjacent candidate is a cursor move, not an SGR: both sequences
 		// must pass through verbatim and in order.
