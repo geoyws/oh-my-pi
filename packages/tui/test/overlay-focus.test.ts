@@ -366,6 +366,104 @@ describe("TUI overlay focus", () => {
 		}
 	});
 
+	it("does not focus an overlay that is invisible when shown", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		const overlay = new FocusRecorder("overlay");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start();
+			const handle = tui.showOverlay(overlay, { visible: () => false });
+			expect(handle.isHidden()).toBe(false);
+			expect(tui.getFocused()).toBe(editor);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("hiding the top of two overlays returns focus to the lower overlay", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		const lower = new FocusRecorder("lower");
+		const upper = new FocusRecorder("upper");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start();
+			tui.showOverlay(lower);
+			const upperHandle = tui.showOverlay(upper);
+			expect(tui.getFocused()).toBe(upper);
+			upperHandle.hide();
+			expect(tui.getFocused()).toBe(lower);
+			// Hiding again is a no-op for the already-removed overlay.
+			upperHandle.hide();
+			expect(tui.getFocused()).toBe(lower);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("does not focus an overlay shown again while its visible callback is false", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		const overlay = new FocusRecorder("overlay");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start();
+			const handle = tui.showOverlay(overlay, { visible: () => false });
+			handle.setHidden(true);
+			handle.setHidden(false);
+			expect(tui.getFocused()).toBe(editor);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("keeps focus on a key-holder overlay when focus is cleared to null", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		const overlay = new FocusRecorder("overlay");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start();
+			tui.showOverlay(overlay);
+			tui.setFocus(null);
+			expect(tui.getFocused()).toBe(overlay);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("consumes a live cell-size reply instead of delivering it to the editor", () => {
+		const previous = { ...getCellDimensions() };
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start();
+			terminal.sendInput("\x1b[6;20;10t");
+			expect(getCellDimensions()).toEqual({ widthPx: 10, heightPx: 20 });
+			expect(editor.inputs).toEqual([]);
+		} finally {
+			tui.stop();
+			setCellDimensions(previous);
+		}
+	});
+
 	it("redirects input to preFocus when the focused overlay becomes invisible", () => {
 		const terminal = new MinimalTerminal();
 		const tui = new TUI(terminal);
