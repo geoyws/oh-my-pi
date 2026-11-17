@@ -196,6 +196,57 @@ describe("TUI provider history flush and component renders", () => {
 	});
 });
 
+describe("TUI settled-resize history replay", () => {
+	function provider(replays: { count: number }) {
+		return {
+			renderFrame: (size: { columns: number }) => ({ viewport: [`w-${size.columns}`] }),
+			acknowledgeHistory() {},
+			beginHistoryReplay: () => {
+				replays.count++;
+			},
+		};
+	}
+
+	it("replays provider history after a settled width change in append mode", async () => {
+		const terminal = new VirtualTerminal(40, 6);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		const replays = { count: 0 };
+		tui.setFrameProvider(provider(replays));
+		tui.setResizeScrollback("append");
+		try {
+			tui.start();
+			await scheduler.settle(terminal);
+			terminal.resize(50, 6);
+			await scheduler.advance(terminal, 300);
+			await scheduler.settle(terminal);
+			expect(replays.count).toBeGreaterThan(0);
+			expect(terminal.getViewport().join("\n")).toContain("w-50");
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("does not replay provider history for a height-only change in rebuild mode", async () => {
+		const terminal = new VirtualTerminal(40, 6);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		const replays = { count: 0 };
+		tui.setFrameProvider(provider(replays));
+		tui.setResizeScrollback("rebuild");
+		try {
+			tui.start();
+			await scheduler.settle(terminal);
+			terminal.resize(40, 8);
+			await scheduler.advance(terminal, 300);
+			await scheduler.settle(terminal);
+			expect(replays.count).toBe(0);
+		} finally {
+			tui.stop();
+		}
+	});
+});
+
 describe("TUI synchronous and reset renders", () => {
 	it("renderNow paints synchronously and is a no-op after stop", async () => {
 		const terminal = new VirtualTerminal(40, 6);

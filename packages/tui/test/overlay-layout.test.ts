@@ -65,6 +65,27 @@ describe("TUI overlay layout options", () => {
 		expect(invalid.row).toBeGreaterThan(0);
 	});
 
+	it("renders only the visible overlay when another overlay is hidden", async () => {
+		const terminal = new VirtualTerminal(40, 10);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		tui.addChild(new Text("base", 0, 0));
+		tui.start();
+		try {
+			await scheduler.settle(terminal);
+			const lower = tui.showOverlay(new Text("LOWER", 0, 0), { width: 6, row: 1, col: 0 });
+			tui.showOverlay(new Text("UPPER", 0, 0), { width: 6, row: 3, col: 0 });
+			await scheduler.settle(terminal);
+			lower.setHidden(true);
+			await scheduler.settle(terminal);
+			const viewport = terminal.getViewport().join("\n");
+			expect(viewport).toContain("UPPER");
+			expect(viewport).not.toContain("LOWER");
+		} finally {
+			tui.stop();
+		}
+	});
+
 	it("falls back to the default width for an invalid percentage width", async () => {
 		const { row, col } = await showOverlay({ width: "bogus%" as never, row: 1, col: 1 });
 		expect(row).toBe(1);
