@@ -65,6 +65,31 @@ describe("TUI overlay layout options", () => {
 		expect(invalid.row).toBeGreaterThan(0);
 	});
 
+	it("honours minWidth when resolving overlay width", async () => {
+		const terminal = new VirtualTerminal(40, 10);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		const widths: number[] = [];
+		tui.addChild(new Text("base", 0, 0));
+		tui.start();
+		try {
+			await scheduler.settle(terminal);
+			tui.showOverlay(
+				{
+					render: (width: number) => {
+						widths.push(width);
+						return ["WIDE"];
+					},
+				},
+				{ width: 4, minWidth: 12, row: 0, col: 0 },
+			);
+			await scheduler.settle(terminal);
+			expect(Math.max(...widths)).toBe(12);
+		} finally {
+			tui.stop();
+		}
+	});
+
 	it("renders only the visible overlay when another overlay is hidden", async () => {
 		const terminal = new VirtualTerminal(40, 10);
 		const scheduler = new VirtualRenderScheduler();
