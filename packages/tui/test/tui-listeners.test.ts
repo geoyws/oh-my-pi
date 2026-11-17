@@ -308,6 +308,127 @@ describe("TUI settled-resize history replay", () => {
 	});
 });
 
+describe("TUI degenerate geometry and history re-offers", () => {
+	it("skips the stop history flush on a zero-width terminal", async () => {
+		const terminal = new VirtualTerminal(40, 6);
+		Object.defineProperty(terminal, "columns", { get: () => 0 });
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		let flushes = 0;
+		tui.setFrameProvider({
+			beginHistoryFlush: () => {
+				flushes++;
+			},
+			renderFrame: () => ({ viewport: ["live"], history: { id: 1, rows: ["h"], kind: "append" as const } }),
+			acknowledgeHistory() {},
+		});
+		tui.start();
+		await scheduler.settle(terminal);
+		tui.stop();
+		expect(flushes).toBe(0);
+	});
+
+	it("slices an oversized provider viewport during the stop flush", async () => {
+		const terminal = new VirtualTerminal(40, 3);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		let pending = false;
+		let acknowledged: number | undefined;
+		tui.setFrameProvider({
+			beginHistoryFlush: () => {},
+			renderFrame: () => ({
+				viewport: pending ? ["1", "2", "3", "4", "5"] : ["live"],
+				history: pending ? { id: 9, rows: ["hist"], kind: "append" as const } : undefined,
+			}),
+			acknowledgeHistory: (id: number) => {
+				acknowledged = id;
+				pending = false;
+			},
+		});
+		tui.start();
+		await scheduler.settle(terminal);
+		pending = true;
+		expect(() => tui.stop()).not.toThrow();
+		expect(acknowledged).toBe(9);
+	});
+
+	it("does not call a frame provider on a zero-width terminal", async () => {
+		const terminal = new VirtualTerminal(40, 6);
+		Object.defineProperty(terminal, "columns", { get: () => 0 });
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		let calls = 0;
+		tui.setFrameProvider({
+			renderFrame: () => {
+				calls++;
+				return { viewport: ["live"] };
+			},
+			acknowledgeHistory() {},
+		});
+		try {
+			tui.start();
+			await scheduler.settle(terminal);
+			expect(calls).toBe(0);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it.each([
+		[40, 1],
+		[1, 6],
+	] as const)("renders text on a %sx%s terminal", async (cols, rows) => {
+		const terminal = new VirtualTerminal(cols, rows);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		tui.addChild(new Text("body", 0, 0));
+		try {
+			tui.start();
+			await scheduler.settle(terminal);
+			expect(terminal.getViewport().join("\n")).toContain("b");
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("acknowledges a re-offered history batch without painting it twice", async () => {
+		class WriteCapture extends VirtualTerminal {
+			readonly writes: string[] = [];
+			override write(data: string): void {
+				this.writes.push(data);
+				super.write(data);
+			}
+		}
+		const terminal = new WriteCapture(40, 6);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		let offer = true;
+		const acks: number[] = [];
+		tui.setFrameProvider({
+			renderFrame: () => ({
+				viewport: ["live"],
+				history: offer ? { id: 7, rows: ["hist-row"], kind: "append" as const } : undefined,
+			}),
+			acknowledgeHistory: (id: number) => {
+				acks.push(id);
+			},
+		});
+		try {
+			tui.start();
+			await scheduler.settle(terminal);
+			const firstPaints = terminal.writes.join("").split("hist-row").length - 1;
+			expect(firstPaints).toBeGreaterThan(0);
+			// Re-offer the same batch id: it is acknowledged, not repainted.
+			tui.requestRender(true);
+			await scheduler.settle(terminal);
+			expect(acks.filter(id => id === 7).length).toBeGreaterThanOrEqual(2);
+			expect(terminal.writes.join("").split("hist-row").length - 1).toBe(firstPaints);
+		} finally {
+			tui.stop();
+		}
+	});
+});
+
 describe("TUI synchronous and reset renders", () => {
 	it("renderNow paints synchronously and is a no-op after stop", async () => {
 		const terminal = new VirtualTerminal(40, 6);
