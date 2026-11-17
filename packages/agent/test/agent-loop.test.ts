@@ -9447,6 +9447,62 @@ describe("agentLoop steering during the provider wait", () => {
 		expect(queue.size).toBe(0);
 	});
 
+	it("builds the first dispatch with a steer queued during credential resolution behind a leftover", async () => {
+		// An event-driven watch armed while a leftover is parked cannot be woken
+		// by an arrival (the host's waiter resolves on any non-empty queue), so it
+		// falls back to the poll cadence. A steer queued while the credential
+		// resolves must still make the dispatch, not a stale request cancelled at
+		// the next tick.
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [] };
+		const queue = createSteeringQueue(true);
+		queue.push("delivered with the prompt");
+		queue.push("left over from the last turn");
+		const mock = createMockModel();
+		const resolverStarted = Promise.withResolvers<void>();
+		const releaseCredential = Promise.withResolvers<string>();
+		const contexts: Context[] = [];
+
+		const streamFn: StreamFn = (_model, llmContext) => {
+			contexts.push(llmContext);
+			const response = new AssistantMessageEventStream();
+			queueMicrotask(() => pushAnswer(response, "answer with steer"));
+			return response;
+		};
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			interruptMode: "immediate",
+			getApiKey: () => async () => {
+				resolverStarted.resolve();
+				return releaseCredential.promise;
+			},
+			...queue.config,
+		};
+
+		const run = (async (): Promise<AgentEvent[]> => {
+			const events: AgentEvent[] = [];
+			for await (const event of agentLoop([createUserMessage("start")], context, config, undefined, streamFn)) {
+				events.push(event);
+			}
+			return events;
+		})();
+
+		await resolverStarted.promise;
+		queue.push("actually, do X instead");
+		await drainWatcherTurn();
+		// Released well inside the first 250ms poll tick.
+		releaseCredential.resolve("resolved-key");
+		const events = await run;
+
+		expect(contexts).toHaveLength(1);
+		expect(contexts[0]?.messages.some(m => m.role === "user" && m.content === "actually, do X instead")).toBe(true);
+		expect(contexts[0]?.messages.some(m => m.role === "user" && m.content === "left over from the last turn")).toBe(
+			true,
+		);
+		expect(assistantTexts(events)).toEqual(["answer with steer"]);
+		expect(queue.size).toBe(0);
+	});
+
 	it("cancels within one poll cadence for a host with no steering wake-up", async () => {
 		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [] };
 		const queue = createSteeringQueue();

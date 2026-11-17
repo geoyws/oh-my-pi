@@ -27,6 +27,31 @@ import {
 	type SessionEntry,
 	type SessionMessageEntry,
 } from "./session-entries";
+import experimentalContextRolloverPrompt from "../prompts/system/experimental-context-rollover.md" with { type: "text" };
+
+/**
+ * Summary text a compaction contributes to a rebuilt context. A built-in
+ * notes-backed rollover boundary is fixed template text, not a summary of
+ * anything, so every rebuild renders the current template: a session that
+ * rolled over under an older build and is reopened under this one gets
+ * today's boundary instructions instead of the wording frozen into the entry.
+ * Hook and LLM summaries are content and stay verbatim. A hook rollover is
+ * recognised by the persisted `fromExtension` flag, not by `hookDetails`:
+ * a hook result without `details` stores `hookDetails: undefined`, which
+ * JSON persistence drops, so after a reopen only `fromExtension` remains.
+ */
+export function compactionContextSummary(entry: CompactionEntry): string {
+	const details = entry.details;
+	if (
+		entry.fromExtension !== true &&
+		isRecord(details) &&
+		details.kind === "experimental-context-rollover" &&
+		details.hookDetails === undefined
+	) {
+		return experimentalContextRolloverPrompt;
+	}
+	return entry.summary;
+}
 
 // #4470 crash artifacts had legacy frames (no shape metadata) with 17 frames,
 // ~306k archive chars, and ~1.5M truncated chars. Current snapcompact frames
@@ -466,7 +491,7 @@ export function buildSessionContext(
 				const snapcompactArchive = active ? snapcompact.getPreservedArchive(entry.preserveData) : undefined;
 				pushMessage(
 					createCompactionSummaryMessage(
-						active ? entry.summary : SUPERSEDED_COMPACTION_SUMMARY,
+						active ? compactionContextSummary(entry) : SUPERSEDED_COMPACTION_SUMMARY,
 						entry.tokensBefore,
 						entry.timestamp,
 						{
@@ -547,7 +572,7 @@ export function buildSessionContext(
 		// reading the archived history after every context rebuild.
 		const snapcompactArchive = snapcompact.getPreservedArchive(compaction.preserveData);
 		const compactionSummaryMsg = createCompactionSummaryMessage(
-			compaction.summary,
+			compactionContextSummary(compaction),
 			compaction.tokensBefore,
 			compaction.timestamp,
 			{

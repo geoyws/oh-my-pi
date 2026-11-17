@@ -16,6 +16,10 @@ const stdinIsTtyDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "isT
 const stdoutIsTtyDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
 const stdinSetRawModeDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "setRawMode");
 let previousHeadless = false;
+// A tmux session (TMUX, or a tmux* TERM) makes ProcessTerminal re-arm bracketed
+// paste on every write, prefixing `?2004h` to the captured bytes.
+const ORIGINAL_TMUX = Bun.env.TMUX;
+const ORIGINAL_TERM = Bun.env.TERM;
 
 function restoreProperty(target: object, key: string, descriptor: PropertyDescriptor | undefined): void {
 	if (descriptor) {
@@ -51,11 +55,17 @@ function startCapturedTerminal() {
 describe("ProcessTerminal cursor-visibility dedupe", () => {
 	beforeEach(() => {
 		previousHeadless = setTerminalHeadless(false);
+		delete Bun.env.TMUX;
+		delete Bun.env.TERM;
 	});
 
 	afterEach(() => {
 		setTerminalHeadless(previousHeadless);
 		vi.restoreAllMocks();
+		if (ORIGINAL_TMUX === undefined) delete Bun.env.TMUX;
+		else Bun.env.TMUX = ORIGINAL_TMUX;
+		if (ORIGINAL_TERM === undefined) delete Bun.env.TERM;
+		else Bun.env.TERM = ORIGINAL_TERM;
 		restoreProperty(process.stdin, "isTTY", stdinIsTtyDescriptor);
 		restoreProperty(process.stdout, "isTTY", stdoutIsTtyDescriptor);
 		restoreProperty(process.stdin, "setRawMode", stdinSetRawModeDescriptor);

@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import { AttachmentChipsBand } from "@oh-my-pi/pi-tui/prompt/attachment-chips";
 import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import { chipLabel } from "@oh-my-pi/pi-tui/prompt/composer-attachments";
@@ -93,6 +93,16 @@ describe("AttachmentChipsBand", () => {
 });
 
 describe("AttachmentChipsBand — Kitty placeholder thumbnails", () => {
+	// Inside tmux the transmit is wrapped in DCS passthrough, so the payload would no
+	// longer follow the first `;`. A suite run from a tmux pane must not count.
+	const originalTmux = Bun.env.TMUX;
+	beforeEach(() => {
+		delete Bun.env.TMUX;
+	});
+	afterEach(() => {
+		if (originalTmux === undefined) delete Bun.env.TMUX;
+		else Bun.env.TMUX = originalTmux;
+	});
 	it("keeps every card row exactly card-width so the borders align", () => {
 		const mutable = TERMINAL as unknown as { imageProtocol: ImageProtocol | null };
 		const originalProtocol = TERMINAL.imageProtocol;

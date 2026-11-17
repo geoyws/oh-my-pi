@@ -324,6 +324,13 @@ interface SteeringWatch {
 	readonly ready: Promise<void>;
 	/** Runs an authoritative queue peek at the caller's final pre-dispatch boundary. */
 	refresh: () => Promise<void>;
+	/**
+	 * True while arrivals can go unseen until the next poll tick: the host has no
+	 * wake-up, or the queue still held a message when the watch armed (a waiter
+	 * that resolves on a merely non-empty queue cannot signal the arrival, so the
+	 * watch falls back to the poll cadence).
+	 */
+	throttled: () => boolean;
 	/** Stops watching. Idempotent; MUST be called or the timer/wait leaks. */
 	stop: () => void;
 }
@@ -454,6 +461,7 @@ function watchSteeringQueue(
 		fired,
 		ready,
 		refresh: check,
+		throttled: () => !config.waitForSteeringMessages || (baseline !== undefined && baseline > 0),
 		stop: () => {
 			settleReady();
 			clearInterval(timer);
@@ -2684,14 +2692,16 @@ async function streamAssistantResponse(
 
 	try {
 		return await runInActiveSpan(chatSpan, async () => {
-			// A poll-only host re-peeks only on its 250ms tick, so a steer queued
-			// after the baseline — typically while credential resolution was in
-			// flight — may not have been seen yet. Peek once more at the last await
-			// before dispatch: sending a request built without the steer could let
-			// it start streaming (closing the interrupt window) before that tick.
-			// An event-driven watch is woken by the arrival itself and gets no
-			// extra peek, so its dispatch timing is unchanged.
-			if (!config.waitForSteeringMessages) await steerWatch?.refresh();
+			// A throttled watch re-peeks only on its 250ms tick: a poll-only host,
+			// or an event-driven one whose queue held a leftover at arm (its waiter
+			// resolves on any non-empty queue, so an arrival cannot wake it). A
+			// steer queued after the baseline — typically while credential
+			// resolution was in flight — may not have been seen yet. Peek once more
+			// at the last await before dispatch: sending a request built without
+			// the steer could let it start streaming (closing the interrupt window)
+			// before that tick. A watch the arrival itself wakes gets no extra peek,
+			// so its dispatch timing is unchanged.
+			if (steerWatch?.throttled()) await steerWatch.refresh();
 			if (steerWindow?.detected && !requestSignal?.aborted) {
 				abortForSteer();
 				throw new SteerInterruption(resolvedCredential);

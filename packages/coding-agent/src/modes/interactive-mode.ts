@@ -1362,6 +1362,9 @@ export class InteractiveMode implements InteractiveModeContext {
 	keybindings: KeybindingsManager;
 	agent: Agent;
 	historyStorage?: HistoryStorage;
+	/** Every editor's history admission: the current session's `before_user_message` gate. */
+	readonly #admitPromptHistory = (prompt: string): boolean | Promise<boolean> =>
+		this.session.admitsPromptHistory(prompt);
 
 	/** Canonical composer shared by cold prepaint and the session-aware runtime. */
 	readonly composer: Composer;
@@ -2212,6 +2215,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		};
 		process.stdout.on("resize", this.#resizeHandler);
 		setWordPredictionHost(textPredictionBackend);
+		// A prompt the `before_user_message` gate refuses never enters history,
+		// whichever submit path records it (kb omp t-70e36c50).
+		this.editor.setHistoryAdmission(this.#admitPromptHistory);
 		try {
 			this.historyStorage = HistoryStorage.open();
 			this.editor.setHistoryStorage(this.historyStorage);
@@ -8543,6 +8549,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.composer.setEditor(nextEditor);
 		this.syncComposerShape();
 		nextEditor.setMaxHeight(this.#computeEditorMaxHeight());
+		nextEditor.setHistoryAdmission(this.#admitPromptHistory);
 		if (this.historyStorage) {
 			nextEditor.setHistoryStorage(this.historyStorage);
 		}

@@ -12,6 +12,7 @@
 - A steering message sent while a model request has not produced any output is applied immediately instead of waiting for the response, subject to `interruptMode`; the session shows whether a queued steer will interrupt or wait. ([#12787](https://github.com/can1357/oh-my-pi/pull/12787) by [@geoyws](https://github.com/geoyws))
 - Fixed a steer queued while the loop synced context, prepared the provider request or ran `beforeModelCall` being folded into the steer watch's baseline: the request went out without it and was never cancelled. The watch now arms before that preparation, so the call is cancelled before it produces output and re-issued with the steer.
 - Fixed steering drained by a cancelled model call reaching the transcript before its replacement call was prepared, so interrupting the run in that window recorded the steer and its prepared context instead of returning them to the queue. The drained steer's `message_start`/`message_end` events now wait, like any other queued input, until the replacement call is prepared or its preparation fails or is gate-stopped.
+- Fixed a steer queued during credential resolution while an earlier steer was still parked in the queue reaching the provider only after a stale request had been sent and cancelled at the next 250 ms tick. A steering watch that cannot be woken by an arrival now peeks once more right before dispatch, like a poll-only host.
 ## [18.14.0] - 2026-10-29
 
 ### Breaking Changes

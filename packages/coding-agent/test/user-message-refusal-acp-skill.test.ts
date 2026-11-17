@@ -13,12 +13,11 @@ import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensi
 import type { BeforeUserMessageEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { AcpAgent } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-agent";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { UserMessageRefusedError } from "@oh-my-pi/pi-coding-agent/session/user-message-refused-error";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
-import type { AgentSideConnection } from "@oh-my-pi/pi-utils/acp";
+import type { AgentSideConnection, SessionNotification } from "@oh-my-pi/pi-utils/acp";
 
 const SECRET = "token FAKE-SECRET-NOT-REAL-0000";
 const NOTICE = "Blocked: this message looks like it contains a secret. It was not sent or saved.";
@@ -131,7 +130,7 @@ async function createSession(): Promise<AcpSkillHarness> {
 	};
 }
 
-describe("ACP /skill: refusal", () => {
+describe("ACP prompt refusal", () => {
 	let initial: AcpSkillHarness | undefined;
 	let factorySession: AcpSkillHarness | undefined;
 	let cwd: string | undefined;
@@ -146,7 +145,53 @@ describe("ACP /skill: refusal", () => {
 		cwd = undefined;
 	});
 
-	it("refused /skill: fails with only the notice and is never persisted", async () => {
+	it.each([
+		["a plain prompt", `please use ${SECRET}`],
+		["/skill:", `/skill:reviewer please use ${SECRET}`],
+	])("refused %s ends the turn with refusal and one tagged notice, never persisted", async (_label, text) => {
+		initial = await createSession();
+		factorySession = await createSession();
+		cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-acp-skill-cwd-"));
+		const updates: SessionNotification[] = [];
+		const connection = {
+			sessionUpdate: async (notification: SessionNotification) => {
+				updates.push(notification);
+			},
+			signal: new AbortController().signal,
+			closed: Promise.withResolvers<void>().promise,
+		} as unknown as AgentSideConnection;
+		const agent = new AcpAgent(
+			connection,
+			async () => ({ session: factorySession!.session, setToolUIContext: () => {} }),
+			initial.session,
+		);
+		const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+		const entriesBefore = structuredClone(factorySession.sessionManager.getEntries());
+		const sent = updates.length;
+
+		const response = await agent.prompt({ sessionId, prompt: [{ type: "text", text }] });
+
+		expect(response.stopReason).toBe("refusal");
+		const turnOutput = updates
+			.slice(sent)
+			.map(notification => notification.update)
+			.filter(update => ["agent_message_chunk", "agent_thought_chunk", "tool_call"].includes(update.sessionUpdate));
+		expect(turnOutput).toEqual([
+			{
+				sessionUpdate: "agent_message_chunk",
+				content: { type: "text", text: NOTICE },
+				messageId: expect.any(String),
+				_meta: { notice: "user_message_refused" },
+			},
+		]);
+		expect(JSON.stringify(updates)).not.toContain("FAKE-SECRET");
+		expect(factorySession.streamCalls).toBe(0);
+		expect(factorySession.sessionManager.getEntries()).toEqual(entriesBefore);
+		expect(JSON.stringify(factorySession.session.agent.state.messages)).not.toContain("FAKE-SECRET");
+		expect(JSON.stringify(factorySession.contexts)).not.toContain("FAKE-SECRET");
+	});
+
+	it("the session stays usable: a clean prompt after a refusal runs normally", async () => {
 		initial = await createSession();
 		factorySession = await createSession();
 		cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-acp-skill-cwd-"));
@@ -161,19 +206,12 @@ describe("ACP /skill: refusal", () => {
 			initial.session,
 		);
 		const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
-		const entriesBefore = structuredClone(factorySession.sessionManager.getEntries());
-		const error = await agent
-			.prompt({ sessionId, prompt: [{ type: "text", text: `/skill:reviewer please use ${SECRET}` }] })
-			.then(
-				() => null,
-				(error: unknown) => error,
-			);
-		expect(error).toBeInstanceOf(UserMessageRefusedError);
-		expect((error as Error).message).toBe(NOTICE);
-		expect(factorySession.streamCalls).toBe(0);
-		expect(factorySession.sessionManager.getEntries()).toEqual(entriesBefore);
-		expect(JSON.stringify(factorySession.sessionManager.getEntries())).not.toContain("FAKE-SECRET");
-		expect(JSON.stringify(factorySession.session.agent.state.messages)).not.toContain("FAKE-SECRET");
+
+		await agent.prompt({ sessionId, prompt: [{ type: "text", text: `please use ${SECRET}` }] });
+		const response = await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hello" }] });
+
+		expect(response.stopReason).toBe("end_turn");
+		expect(factorySession.streamCalls).toBe(1);
 		expect(JSON.stringify(factorySession.contexts)).not.toContain("FAKE-SECRET");
 	});
 });

@@ -9,6 +9,7 @@
 ### Added
 
 - `StatusLineComponent.setPendingModelSwitch()` and `SegmentContext.pendingModelSwitch`: while the session streams, the `model` segment renders a queued switch as `A -> B` followed by a dim ` (after this turn)`; `StatusLineComponent.hasSegment()` reports whether the effective layout shows a segment
+- `Editor.setHistoryAdmission()` installs a check every `addToHistory()` entry must pass before it reaches up/down recall or the history store; a promise verdict defers the entry, entries keep submission order, and a throw or rejection refuses it. `Editor.whenHistorySettled()` resolves once every pending entry was recorded or refused
 
 ### Fixed
 - The status line paints at narrow pane widths again: when overflow handling drops every segment because even the last one cannot fit (live grp-socket panes at ≤51 columns), one segment is clipped to the available width instead of rendering an empty bar — the status segment first, then the configured left-to-right order.

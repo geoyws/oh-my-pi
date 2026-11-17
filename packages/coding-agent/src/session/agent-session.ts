@@ -8658,6 +8658,27 @@ export class AgentSession implements SettingsScope {
 		await this.#checkUserMessageRefusal(text, images, source);
 	}
 
+	/**
+	 * Whether prompt history (history.db and up-arrow recall) may keep `text`:
+	 * the `before_user_message` handlers judge it as they would the submission,
+	 * so text they refuse is never persisted by any submit path, including one
+	 * that records history before its own gate runs. Handler failure refuses
+	 * (fail-closed). A synchronous `true` when no handler can run, so history
+	 * stays immediate for sessions without the gate.
+	 */
+	admitsPromptHistory(text: string): boolean | Promise<boolean> {
+		if (!this.hasPendingDeferredExtensions && !this.#extensionRunner?.hasHandlers("before_user_message")) {
+			return true;
+		}
+		return (async () => {
+			if (this.hasPendingDeferredExtensions) await this.loadDeferredExtensions();
+			const runner = this.#extensionRunner;
+			if (!runner?.hasHandlers("before_user_message")) return true;
+			const { refused } = await runner.emitBeforeUserMessage(text, undefined, "interactive");
+			return !refused;
+		})();
+	}
+
 	async #promptCustomMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
 		options?: Pick<PromptOptions, "streamingBehavior" | "toolChoice" | "onPromptAdmitted"> & {

@@ -340,9 +340,20 @@ describe("advisor tool-call loop guard", () => {
 		if (!session) throw new Error("Expected live session");
 		const live = session;
 		activateTodoTool(live, tempDir.path());
+		const workSchema = type({});
+		const workTool: AgentTool<typeof workSchema, undefined> = {
+			name: "work",
+			label: "Work",
+			description: "Scripted work step",
+			parameters: workSchema,
+			async execute() {
+				return { content: [{ type: "text", text: "worked" }], details: undefined };
+			},
+		};
+		live.agent.setTools([...live.agent.state.tools, workTool]);
 		live.setTodoPhases([{ name: "Work", tasks: [{ content: "Finish the migration", status: "in_progress" }] }]);
-		// Completion reminders cover the list the agent works during the prompt, so
-		// the primary's first step views the todo list before it completes.
+		// Completion reminders cover a list the agent works during the prompt alongside
+		// other work, so the primary's first step views the todo list and does a work step.
 		const primaryStream = live.agent.streamFn;
 		let viewedTodos = false;
 		live.agent.streamFn = (model, ...rest) => {
@@ -350,7 +361,10 @@ describe("advisor tool-call loop guard", () => {
 			viewedTodos = true;
 			const message: AssistantMessage = {
 				role: "assistant",
-				content: [{ type: "toolCall", id: "primary-todo-view", name: "todo", arguments: { op: "view" } }],
+				content: [
+					{ type: "toolCall", id: "primary-todo-view", name: "todo", arguments: { op: "view" } },
+					{ type: "toolCall", id: "primary-work", name: "work", arguments: {} },
+				],
 				api: model.api,
 				provider: model.provider,
 				model: model.id,

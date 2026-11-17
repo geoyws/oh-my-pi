@@ -674,6 +674,13 @@ interface HistoryStorage {
 	getRecent(limit: number): HistoryEntry[];
 }
 
+/**
+ * Decides whether a submitted prompt may enter history (up/down recall and the
+ * persistent store). A synchronous `true`/`false` is applied at once; a
+ * promise defers the entry until it settles. A throw or rejection refuses.
+ */
+export type HistoryAdmission = (prompt: string) => boolean | Promise<boolean>;
+
 interface LocalHistoryEntry {
 	text: string;
 	draft?: {
@@ -909,6 +916,9 @@ export class Editor implements Component, Focusable {
 	#history: LocalHistoryEntry[] = [];
 	#historyIndex: number = -1; // -1 = not browsing, 0 = most recent, 1 = older, etc.
 	#historyStorage?: HistoryStorage;
+	#historyAdmission?: HistoryAdmission;
+	// Pending admissions, chained so entries land in submission order.
+	#historyQueue?: Promise<void>;
 	// Recalled payloads outlive browsing when an edit resets #historyIndex.
 	#historyDraftActive = false;
 
@@ -1185,14 +1195,68 @@ export class Editor implements Component, Focusable {
 		this.#historyIndex = -1;
 	}
 
+	/** Install the check every {@link addToHistory} entry must pass first. */
+	setHistoryAdmission(admit: HistoryAdmission | undefined): void {
+		this.#historyAdmission = admit;
+	}
+
+	/** Resolves once every prompt passed to {@link addToHistory} so far was recorded or refused. */
+	whenHistorySettled(): Promise<void> {
+		return this.#historyQueue ?? Promise.resolve();
+	}
+
 	/**
-	 * Add a prompt to history for up/down arrow navigation.
-	 * Called after successful submission.
+	 * Add a prompt to history for up/down arrow navigation and the persistent
+	 * store, once the history admission (if any) accepts it. A refused prompt
+	 * is never written anywhere.
 	 */
 	addToHistory(text: string): void {
 		const trimmed = text.trim();
 		if (!trimmed) return;
 
+		const previous = this.#historyQueue;
+		if (!previous) {
+			const verdict = this.#admitHistory(trimmed);
+			if (verdict === true) this.#recordHistory(trimmed);
+			else if (verdict !== false) this.#enqueueHistory(verdict.then(ok => ok && this.#recordHistory(trimmed)));
+			return;
+		}
+		this.#enqueueHistory(
+			previous.then(async () => (await this.#admitHistory(trimmed)) && this.#recordHistory(trimmed)),
+		);
+	}
+
+	#admitHistory(prompt: string): boolean | Promise<boolean> {
+		const admit = this.#historyAdmission;
+		if (!admit) return true;
+		const refuse = (error: unknown): false => {
+			// Never log the prompt: it may be exactly what the admission refuses.
+			logger.warn("History admission failed; prompt not recorded", { error: String(error) });
+			return false;
+		};
+		try {
+			const verdict = admit(prompt);
+			return typeof verdict === "boolean" ? verdict : verdict.catch(refuse);
+		} catch (error) {
+			return refuse(error);
+		}
+	}
+
+	#enqueueHistory(work: Promise<unknown>): void {
+		const queued: Promise<void> = work
+			.then(
+				() => {},
+				error => {
+					logger.error("History record failed", { error: String(error) });
+				},
+			)
+			.finally(() => {
+				if (this.#historyQueue === queued) this.#historyQueue = undefined;
+			});
+		this.#historyQueue = queued;
+	}
+
+	#recordHistory(trimmed: string): void {
 		const stor = this.#historyStorage;
 		if (stor) {
 			stor.add(trimmed, getProjectDir()).catch(error => {

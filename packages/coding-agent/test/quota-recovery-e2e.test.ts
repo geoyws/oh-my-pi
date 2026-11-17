@@ -671,7 +671,17 @@ test("a fallback model that resets before every sibling wins the wake at its con
 	expectMediumFallbackEffort(served, run);
 	expect(served.at - t0, diagnostics(run)).toBeGreaterThanOrEqual(3_000);
 	expect(served.at - t0, diagnostics(run)).toBeLessThan(7_000);
-	expectWakeAnnounced(run, FALLBACK, "zulu", t0 + 3_000);
+	// As with the sibling case above, a loaded host can start recovery after
+	// zulu's reset. An immediate selection must then rest on a fresh probe;
+	// otherwise the fallback owns an announced wake.
+	if (recoveryLines(run, FALLBACK, "zulu").some(line => line.includes("using ") && line.includes(" now."))) {
+		expect(
+			run.probes.some(probe => probe.account === "zulu" && probe.at >= t0 + 3_000 && probe.at <= served.at),
+			diagnostics(run),
+		).toBe(true);
+	} else {
+		expectWakeAnnounced(run, FALLBACK, "zulu", t0 + 3_000);
+	}
 }, 90_000);
 
 test("an immediately usable fallback answers without waiting for any reset", async () => {

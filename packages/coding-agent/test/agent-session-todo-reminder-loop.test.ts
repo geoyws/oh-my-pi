@@ -436,6 +436,7 @@ describe("AgentSession todo reminder self-continuation suppression", () => {
 		await session.prompt("Carry on with the review slices.");
 
 		emitToolResult("todo", { phases: session.getTodoPhases() });
+		emitToolResult("read");
 		emitTextOnlyStop("Started slice 81.");
 		await session.waitForIdle();
 
@@ -459,14 +460,15 @@ describe("AgentSession todo reminder self-continuation suppression", () => {
 		expect(continueSpy).toHaveBeenCalledTimes(1);
 	});
 
-	it("reminds again on a later prompt once the list changed after the earlier reminder", async () => {
+	it("reminds again on a later prompt once the agent changed the list while working", async () => {
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
 		vi.spyOn(session.agent, "prompt").mockResolvedValue();
 		emitTextOnlyStop();
 		await session.waitForIdle();
 		expect(reminderAttempts).toEqual([1]);
 
-		await session.prompt("Mark slice 81 done.");
+		await session.prompt("Finish slice 81, then continue.");
+		emitToolResult("edit");
 		emitToolResult("todo", {
 			phases: [
 				{
@@ -483,5 +485,27 @@ describe("AgentSession todo reminder self-continuation suppression", () => {
 
 		expect(reminderAttempts).toEqual([1, 1]);
 		expect(continueSpy).toHaveBeenCalledTimes(2);
+	});
+
+	it("stays silent when the new prompt only edits the list itself", async () => {
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		await session.prompt("Mark slice 81 done.");
+		emitToolResult("todo", {
+			phases: [
+				{
+					name: "Pending review",
+					tasks: [
+						{ content: "Slice 81", status: "completed" },
+						{ content: "Slice 82", status: "pending" },
+					],
+				},
+			],
+		});
+		emitTextOnlyStop("Marked slice 81 done; slice 82 is still open.");
+		await session.waitForIdle();
+
+		expect(reminderAttempts).toEqual([]);
+		expect(continueSpy).not.toHaveBeenCalled();
 	});
 });

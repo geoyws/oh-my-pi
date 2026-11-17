@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- OpenAI Codex nested SSE retries (network failures and HTTP 408/429/5xx) now refuse a backoff that would land past `operationTimeoutMs` before sleeping it, instead of sleeping the full delay (a `Retry-After` hint can be up to 5 minutes) and only then failing; the access-program replay can no longer spend that wait twice.
 - Fixed OpenAI Codex WebSocket turns, steering continuations, and remote compaction failing before streaming while preserving raw-event callbacks and request telemetry.
 - Claude accounts with recovered quota no longer remain excluded by an old usage-limit cooldown when the usage endpoint explicitly reports an inactive shared window as `null`. Missing or malformed windows, exhausted generic limits, recent rejections, and auth/account-policy blocks retain their existing protection.
 - Fixed `PI_REQ_DEBUG=1` dumps leaking credentials: dumps now go to a private `0700` directory under the state dir (`PI_REQ_DEBUG_DIR` overrides it and must already be private) instead of the working directory, as `0600` files named `rr-session-<pid>-<n>`; credential fields in JSON bodies (any depth) and OAuth form bodies read `[redacted]`, and the response bodies of token exchanges and Google IAM credential mints (`:generateAccessToken`, used by impersonated ADC) are omitted.

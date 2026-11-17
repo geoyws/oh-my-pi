@@ -63,6 +63,7 @@ import {
 	truncateHead,
 	truncateTail,
 } from "@oh-my-pi/pi-tui/tools/streaming-output";
+import { compactionContextSummary } from "../session/session-context";
 import type { SessionEntry } from "../session/session-entries";
 import type { Tool, ToolSession } from "../tools";
 import { BashTool } from "../tools/bash";
@@ -1634,7 +1635,7 @@ export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage
 		return [createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp)];
 	}
 	if (entry.type === "compaction") {
-		return [createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp)];
+		return [createCompactionSummaryMessage(compactionContextSummary(entry), entry.tokensBefore, entry.timestamp)];
 	}
 	return [];
 }

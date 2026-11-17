@@ -8451,6 +8451,61 @@ describe("openai-codex recovery attempt gate", () => {
 		);
 	}
 
+	// A backoff that would land past the deadline is refused before the sleep,
+	// not after it: otherwise a Retry-After hint (up to the 5 min rate-limit cap)
+	// is slept in full and the replayed access-program open can pay it again.
+	const BACKOFF_CASES = [
+		["HTTP 429 Retry-After", 429, 120_000],
+		["HTTP 503 Retry-After", 503, 120_000],
+		["network failure default backoff", undefined, 500],
+	] as const;
+	for (const [label, status, backoffMs] of BACKOFF_CASES) {
+		it.each(["past the deadline", "within the budget"] as const)(
+			"bounds the nested " + label + " by the operation deadline (%s)",
+			async mode => {
+				const remainingMs = mode === "past the deadline" ? backoffMs / 2 : backoffMs * 2;
+				const options = {
+					apiKey: createCodexTestToken(),
+					codexSseMaxAttempts: 2,
+					operationTimeoutMs: 600_000,
+					operationDeadlineAt: Date.now() + remainingMs,
+				};
+				const waits: number[] = [];
+				vi.spyOn(scheduler, "wait").mockImplementation(async delay => {
+					waits.push(Number(delay));
+				});
+				let requests = 0;
+				const fetchMock: FetchImpl = async () => {
+					requests += 1;
+					if (requests === 1) {
+						if (status === undefined) throw new TypeError("fetch failed");
+						return new Response("rate limited", {
+							status,
+							headers: { "retry-after": String(backoffMs / 1000) },
+						});
+					}
+					return new Response(createStatefulCodexSse("Recovered", "resp_backoff"), { headers: SSE_HEADERS });
+				};
+				const result = await streamOpenAICodexResponses(
+					{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+					createCodexTestContext(),
+					Object.assign(options, { fetch: fetchMock }),
+				).result();
+
+				if (mode === "past the deadline") {
+					expect(waits).toEqual([]);
+					expect(requests).toBe(1);
+					expect(result.stopReason).toBe("error");
+					expect(result.errorMessage).toContain(BUDGET_EXHAUSTED);
+				} else {
+					expect(waits).toEqual([backoffMs]);
+					expect(requests).toBe(2);
+					expect(result.stopReason).toBe("stop");
+				}
+			},
+		);
+	}
+
 	for (const status of [400, 415]) {
 		it.each(["spent budget", "caller abort", "live budget"] as const)(
 			"gates the uncompressed replay after HTTP " + status + " (%s)",
