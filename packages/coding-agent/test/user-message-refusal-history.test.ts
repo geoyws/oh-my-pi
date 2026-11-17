@@ -44,6 +44,8 @@ describe("refused prompts never reach prompt history", () => {
 	let mode: InteractiveMode;
 	let controller: InputController;
 	let history: HistoryStorage;
+	/** When set, the next provider turn signals `started` and waits for `release`. */
+	let heldTurn: { started: PromiseWithResolvers<void>; release: Promise<void> } | undefined;
 
 	beforeAll(() => {
 		initTheme();
@@ -90,10 +92,18 @@ describe("refused prompts never reach prompt history", () => {
 					timestamp: Date.now(),
 				};
 				const stream = new AssistantMessageEventStream();
-				queueMicrotask(() => {
+				const hold = heldTurn;
+				heldTurn = undefined;
+				void (async () => {
+					// Push after the caller has the stream, as a real provider would.
+					await Promise.resolve();
+					if (hold) {
+						hold.started.resolve();
+						await hold.release;
+					}
 					stream.push({ type: "start", partial: message });
 					stream.push({ type: "done", reason: "stop", message });
-				});
+				})();
 				return stream;
 			},
 		});
@@ -182,6 +192,26 @@ describe("refused prompts never reach prompt history", () => {
 		await settle();
 		expect(storedPrompts()).toContain("an admitted follow-up");
 		expect(recallLatest()).toBe("an admitted follow-up");
+	});
+
+	it("Enter while a turn streams (steer): a refused prompt leaves no history row; an admitted one lands", async () => {
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		heldTurn = { started, release: release.promise };
+		const turn = mode.editor.onSubmit?.("start a long turn");
+		await started.promise;
+		expect(session.isStreaming).toBe(true);
+
+		await mode.editor.onSubmit?.(SECRET);
+		await mode.editor.onSubmit?.("an admitted steer");
+		release.resolve();
+		await turn;
+		await settle();
+
+		expect(storedPrompts().filter(p => p.includes(MARKER))).toEqual([]);
+		expect(storedPrompts()).toContain("an admitted steer");
+		// The idle prompt records itself when its turn ends, so it, not the steer, is newest.
+		expect(recallLatest()).toBe("start a long turn");
 	});
 
 	it("! shell command: a refused command leaves no history row", async () => {
