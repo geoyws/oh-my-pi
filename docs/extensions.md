@@ -600,9 +600,16 @@ persists it. It fires at submission for `prompt`, `steer`, `followUp`,
 `sendUserMessage`, and `promptCustomMessage`, and again at queued/aside
 delivery for messages enqueued before extensions finished registering — so a
 late-registered handler still faces every message. Each message passes the
-handlers once: already-gated messages skip the delivery recheck. Synthetic
+send gate once: already-gated messages skip the delivery recheck. Synthetic
 prompts (agent continuations) and agent-attributed or hidden custom messages
 are not user input and skip the gate.
+
+Interactive prompt history (up-arrow recall and `history.db`) runs the same
+handlers again on each line the editor records, including locally handled
+slash commands, with `source: "interactive"` and text only (no images); a
+refused or failed check keeps the line out of history. Handlers must
+therefore be idempotent: a typed prompt can reach them twice, once for the
+turn and once for history.
 
 User-invoked `/skill:` expansions are gated too: the handler runs once on the
 raw invocation (the typed draft/args) and once on the rendered skill text

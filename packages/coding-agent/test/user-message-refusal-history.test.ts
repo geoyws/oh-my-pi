@@ -9,6 +9,7 @@ import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import type { BeforeUserMessageEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import { submitInteractiveInput } from "@oh-my-pi/pi-coding-agent/main";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -37,6 +38,21 @@ const zeroUsage = {
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 } satisfies AssistantMessage["usage"];
 
+/** An extension whose `before_user_message` handler refuses any text carrying MARKER. */
+function loadRefusingExtension(runtime: ExtensionRuntime, cwd: string) {
+	return loadExtensionFromFactory(
+		pi => {
+			pi.on("before_user_message", (event: BeforeUserMessageEvent) =>
+				event.text.includes(MARKER) ? { refuse: true, notice: "Blocked: secret." } : undefined,
+			);
+		},
+		cwd,
+		new EventBus(),
+		runtime,
+		"refusal-history-test",
+	);
+}
+
 describe("refused prompts never reach prompt history", () => {
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
@@ -44,6 +60,7 @@ describe("refused prompts never reach prompt history", () => {
 	let mode: InteractiveMode;
 	let controller: InputController;
 	let history: HistoryStorage;
+	let modelRegistry: ModelRegistry;
 	/** When set, the next provider turn signals `started` and waits for `release`. */
 	let heldTurn: { started: PromiseWithResolvers<void>; release: Promise<void> } | undefined;
 
@@ -60,20 +77,10 @@ describe("refused prompts never reach prompt history", () => {
 
 		authStorage = await AuthStorage.create(":memory:");
 		authStorage.keys.setRuntime("openai", "openai-test-key");
-		const modelRegistry = new ModelRegistry(authStorage);
+		modelRegistry = new ModelRegistry(authStorage);
 		const sessionManager = SessionManager.inMemory();
 		const runtime = new ExtensionRuntime();
-		const extension = await loadExtensionFromFactory(
-			pi => {
-				pi.on("before_user_message", (event: BeforeUserMessageEvent) =>
-					event.text.includes(MARKER) ? { refuse: true, notice: "Blocked: secret." } : undefined,
-				);
-			},
-			tempDir.path(),
-			new EventBus(),
-			runtime,
-			"refusal-history-test",
-		);
+		const extension = await loadRefusingExtension(runtime, tempDir.path());
 		const extensionRunner = new ExtensionRunner([extension], runtime, tempDir.path(), sessionManager, modelRegistry);
 		const model = createMockModel({ provider: "openai", id: "gpt-test" }).model;
 		const agent = new Agent({
@@ -226,5 +233,75 @@ describe("refused prompts never reach prompt history", () => {
 		await settle();
 		expect(storedPrompts().filter(p => p.includes(MARKER))).toEqual([]);
 		expect(recallLatest()).not.toContain(MARKER);
+	});
+
+	it("Enter with the main loop waiting for input: typed and pasted refused prompts leave no history row", async () => {
+		// init() lifts the composer's bootstrap submit gate; this harness skips init().
+		mode.editor.disableSubmit = false;
+		// The interactive main loop: wait for input, then submit it (main.ts).
+		const typed = mode.getUserInput();
+		await mode.editor.onSubmit?.(SECRET);
+		await submitInteractiveInput(mode, session, await typed);
+		await settle();
+
+		const pasted = mode.getUserInput();
+		mode.editor.handleInput(`\x1b[200~${SECRET}\nsecond line of the paste\x1b[201~`);
+		mode.editor.handleInput("\r");
+		await submitInteractiveInput(mode, session, await pasted);
+		await settle();
+
+		expect(storedPrompts().filter(p => p.includes(MARKER))).toEqual([]);
+		expect(recallLatest()).not.toContain(MARKER);
+
+		const admitted = mode.getUserInput();
+		await mode.editor.onSubmit?.("an admitted main-loop prompt");
+		await submitInteractiveInput(mode, session, await admitted);
+		await settle();
+		expect(storedPrompts()).toContain("an admitted main-loop prompt");
+		expect(recallLatest()).toBe("an admitted main-loop prompt");
+	});
+
+	it("history admission loads startup-deferred extensions before judging", async () => {
+		const runtime = new ExtensionRuntime();
+		const sessionManager = SessionManager.inMemory();
+		const runner = new ExtensionRunner([], runtime, tempDir.path(), sessionManager, modelRegistry);
+		const model = createMockModel({ provider: "openai", id: "gpt-test" }).model;
+		const deferred = new AgentSession({
+			agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry,
+			extensionRunner: runner,
+		});
+		try {
+			deferred.setDeferredExtensionLoader(async () => {
+				await runner.addExtensions([await loadRefusingExtension(runtime, tempDir.path())]);
+			});
+			// No handler is bound yet, but the pending load may bind one: never a sync admit.
+			const verdict = deferred.admitsPromptHistory(SECRET);
+			expect(verdict).toBeInstanceOf(Promise);
+			expect(await verdict).toBe(false);
+			expect(await deferred.admitsPromptHistory("a clean line")).toBe(true);
+		} finally {
+			await deferred.dispose();
+		}
+	});
+
+	it("history admission admits when the deferred load binds no handler", async () => {
+		const sessionManager = SessionManager.inMemory();
+		const model = createMockModel({ provider: "openai", id: "gpt-test" }).model;
+		const deferred = new AgentSession({
+			agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry,
+		});
+		try {
+			deferred.setDeferredExtensionLoader(async () => {});
+			expect(await deferred.admitsPromptHistory(SECRET)).toBe(true);
+			expect(deferred.admitsPromptHistory(SECRET)).toBe(true);
+		} finally {
+			await deferred.dispose();
+		}
 	});
 });

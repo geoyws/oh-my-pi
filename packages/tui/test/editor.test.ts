@@ -337,6 +337,43 @@ describe("Editor component", () => {
 			expect(editor.getText()).toBe("slow admitted");
 		});
 
+		it("drops a synchronously refused prompt at once and keeps recording after a queued write throws", async () => {
+			const persisted: string[] = [];
+			let failNextWrite = false;
+			const editor = new Editor(defaultEditorTheme);
+			editor.setHistoryStorage({
+				add: prompt => {
+					if (failNextWrite) {
+						failNextWrite = false;
+						throw new Error("disk full");
+					}
+					if (prompt === "write rejects") return Promise.reject(new Error("database locked"));
+					persisted.push(prompt);
+					return Promise.resolve();
+				},
+				getRecent: () => [],
+			});
+			const slow = Promise.withResolvers<boolean>();
+			editor.setHistoryAdmission(prompt => (prompt === "refused" ? false : prompt === "slow" ? slow.promise : true));
+
+			editor.addToHistory("refused");
+			await editor.whenHistorySettled();
+			editor.handleInput("\x1b[A");
+			expect(editor.getText()).toBe("");
+
+			editor.addToHistory("slow");
+			editor.addToHistory("after");
+			editor.addToHistory("write rejects");
+			failNextWrite = true;
+			slow.resolve(true);
+			await editor.whenHistorySettled();
+
+			// A failed write loses at most its own store row; the queue goes on.
+			expect(persisted).toEqual(["after"]);
+			editor.handleInput("\x1b[A");
+			expect(editor.getText()).toBe("write rejects");
+		});
+
 		it("allows non-consecutive duplicates in history", () => {
 			const editor = new Editor(defaultEditorTheme);
 
