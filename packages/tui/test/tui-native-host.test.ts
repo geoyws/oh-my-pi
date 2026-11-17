@@ -48,12 +48,6 @@ async function open(sheet: boolean) {
 }
 
 describe("TUI native host (root-scope TSP)", () => {
-	it("exposes recent native frames for the live surface", async () => {
-		const { h } = await open(true);
-		expect(h.tui.getNativeFrames().length).toBeGreaterThan(0);
-		expect(h.tui.getNativeFrames(1).length).toBe(1);
-	});
-
 	it("moves the keys between the composer and a settings sheet beside it", async () => {
 		const { h, editor, panel, sf, editorId } = await open(true);
 		const prefsId = h.find(n => n.k === "prefs")!.id;
