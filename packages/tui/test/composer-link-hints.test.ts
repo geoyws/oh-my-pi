@@ -126,6 +126,10 @@ describe("Composer viewport links and link hints", () => {
 			// Tags past the alphabet are two letters: the first only narrows.
 			expect(composer.typeLinkHint("a")).toBe(true);
 			expect(composer.linkHintsActive).toBe(true);
+			// The next frame paints only tags still matching the typed prefix.
+			const narrowed = composer.renderFrame({ columns: 80, rows: 40 });
+			expect(narrowed.viewport.join("\n")).toContain("aa");
+			expect(composer.linkHintsActive).toBe(true);
 			const picked = composer.typeLinkHint("a");
 			expect(picked).toMatchObject({ url: "demo:open/0" });
 			expect(composer.linkHintsActive).toBe(false);
