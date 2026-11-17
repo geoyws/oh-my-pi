@@ -35,7 +35,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def _assert_e2e_host() -> None:
-    """Refuse the integration run on hosts barred from omp e2e (kb rule g-ca3365d2)."""
+    """Refuse the integration run on hosts the shared e2e host guard refuses (native Darwin, remote docker)."""
     repo_root = Path(__file__).resolve().parents[3]
     guard = repo_root / "scripts" / "e2e-host-guard.ts"
     try:
