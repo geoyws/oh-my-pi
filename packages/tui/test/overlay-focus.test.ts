@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { type Component, Container, type Focusable, type OverlayFocusOwner, TUI } from "@oh-my-pi/pi-tui";
 import type { Terminal, TerminalAppearance } from "@oh-my-pi/pi-tui/terminal";
 import { getCellDimensions, setCellDimensions } from "@oh-my-pi/pi-tui/terminal-capabilities";
+import { setKittyProtocolActive } from "@oh-my-pi/pi-tui/keys";
 
 class MinimalTerminal implements Terminal {
 	columns = 80;
@@ -610,6 +611,73 @@ describe("TUI overlay focus", () => {
 			handle.setHidden(false);
 			// Showing a visible overlay restores focus to it per the handle contract.
 			expect(tui.getFocused()).toBe(overlay);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("fires onDebug for shift+ctrl+d and delivers the key normally without a handler", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+		let debugCalls = 0;
+		tui.onDebug = () => {
+			debugCalls++;
+		};
+
+		try {
+			tui.start();
+			terminal.sendInput("\x1b[100;6u");
+			expect(debugCalls).toBe(1);
+			expect(editor.inputs).toEqual([]);
+			tui.onDebug = undefined;
+			terminal.sendInput("\x1b[100;6u");
+			expect(debugCalls).toBe(1);
+			expect(editor.inputs).toEqual(["\x1b[100;6u"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("filters key-release events unless the focus target opts in", () => {
+		const terminal = new MinimalTerminal();
+		setKittyProtocolActive(true);
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start();
+			terminal.sendInput("\x1b[97;1:3u");
+			expect(editor.inputs).toEqual([]);
+			terminal.sendInput("a");
+			expect(editor.inputs).toEqual(["a"]);
+		} finally {
+			tui.stop();
+			setKittyProtocolActive(false);
+		}
+	});
+
+	it("releases the deferred-start hold when Ctrl+C arrives", () => {
+		const terminal = new MinimalTerminal();
+		(terminal as { tspExpected?: boolean }).tspExpected = true;
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start({ deferInput: true });
+			terminal.sendInput("\x1b[B");
+			expect(editor.inputs).toEqual([]);
+			terminal.sendInput("\x03");
+			expect(editor.inputs).toEqual(["\x1b[B", "\x03"]);
+			// The hold is released: the next shortcut is delivered live.
+			terminal.sendInput("\x1b[A");
+			expect(editor.inputs).toEqual(["\x1b[B", "\x03", "\x1b[A"]);
 		} finally {
 			tui.stop();
 		}
