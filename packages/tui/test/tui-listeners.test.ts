@@ -70,6 +70,37 @@ describe("TUI paint and frame-write listeners", () => {
 	});
 });
 
+describe("TUI inline-image purge", () => {
+	it("clearInlineImages writes no Kitty deletes on a non-Kitty terminal and is a no-op once stopped", async () => {
+		class WriteCapture extends VirtualTerminal {
+			readonly writes: string[] = [];
+			override write(data: string): void {
+				this.writes.push(data);
+				super.write(data);
+			}
+		}
+		const terminal = new WriteCapture(40, 6);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		tui.addChild(new Text("body", 0, 0));
+		try {
+			tui.start();
+			await scheduler.settle(terminal);
+			terminal.writes.length = 0;
+			tui.clearInlineImages();
+			await scheduler.settle(terminal);
+			// No graphics delete sequence is emitted without transmitted Kitty images.
+			expect(terminal.writes.join("")).not.toContain("\x1b_Ga=d");
+		} finally {
+			tui.stop();
+		}
+		// Stopped: purging is refused entirely, still no writes.
+		terminal.writes.length = 0;
+		tui.clearInlineImages();
+		expect(terminal.writes).toEqual([]);
+	});
+});
+
 describe("TUI resize scrollback mode", () => {
 	const previous = Bun.env.PI_TUI_RESIZE_SCROLLBACK;
 	afterEach(() => {

@@ -123,6 +123,24 @@ describe("coalesceAdjacentSgr", () => {
 		expect(coalesceAdjacentSgr(input)).toBe("\x1b[38;2;255;0;0;31mX");
 	});
 
+	it("does not merge an SGR followed by an adjacent non-SGR CSI sequence", () => {
+		// The adjacent candidate is a cursor move, not an SGR: both sequences
+		// must pass through verbatim and in order.
+		const input = "\x1b[31m\x1b[5;1HX";
+		expect(coalesceAdjacentSgr(input)).toBe(input);
+	});
+
+	it("normalizes a trailing empty reset merged into the preceding SGR", () => {
+		expect(coalesceAdjacentSgr("\x1b[31m\x1b[mX")).toBe("\x1b[31;0mX");
+	});
+
+	it("merges an empty reset into an incomplete color list but keeps the guarded boundary", () => {
+		// The empty reset folds into the next list, but that incomplete
+		// truecolor list must not absorb the following fg-red.
+		const input = "\x1b[m\x1b[38;2;255;0m\x1b[31mX";
+		expect(coalesceAdjacentSgr(input)).toBe("\x1b[0;38;2;255;0m\x1b[31mX");
+	});
+
 	it("renders malformed extended-color runs identically (no channel absorption)", () => {
 		const input = "\x1b[38;2;255;0m\x1b[31mX";
 		const out = coalesceAdjacentSgr(input);
