@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { Editor } from "@oh-my-pi/pi-tui/components/editor";
 import { node } from "@oh-my-pi/pi-tui/native/describe";
 import type { NativeNode } from "@oh-my-pi/pi-tui/native/node";
-import type { Component } from "@oh-my-pi/pi-tui/tui";
+import { type Component, TUI } from "@oh-my-pi/pi-tui/tui";
 import { ManualScheduler, TspHarness, TspTestTerminal } from "./native/tsp-harness";
 import { defaultEditorTheme } from "./test-themes";
 
@@ -77,6 +77,34 @@ describe("TUI native host (root-scope TSP)", () => {
 		// Already closed surfaces are not closed again.
 		h.tui.closeNative();
 		expect(h.terminal.surface).toBeUndefined();
+	});
+
+	it("flushes a requested render before closing the native surface", async () => {
+		const { h } = await open(true);
+		h.tui.requestRender();
+		h.tui.closeNative();
+		expect(h.terminal.surface).toBeUndefined();
+	});
+
+	it("re-arms the native confirm deadline after a stalled event loop, then revokes", async () => {
+		const scheduler = new ManualScheduler();
+		const terminal = new TspTestTerminal({ expected: true, reply: false, manualProbe: true });
+		const tui = new TUI(terminal, false, { renderScheduler: scheduler });
+		tui.addChild(new Panel(true));
+		try {
+			tui.start();
+			expect(tui.nativeRendering).toBe(true);
+			// Simulate a stalled loop: the 1000 ms confirm deadline fires far
+			// past its 100 ms grace, so it re-arms instead of revoking.
+			scheduler.advance(5000);
+			scheduler.flush(0, () => terminal.deliver());
+			expect(tui.nativeRendering).toBe(true);
+			// The re-armed deadline fires inside its grace and revokes.
+			scheduler.flush(200, () => terminal.deliver());
+			expect(tui.nativeRendering).toBe(false);
+		} finally {
+			tui.stop();
+		}
 	});
 
 	it("resumes the native surface across a stop and start cycle", async () => {
