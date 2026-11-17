@@ -214,6 +214,29 @@ describe("Composer describeSurface", () => {
 		composer.setHeaderExtras([], []);
 	});
 
+	it("ignores history acknowledgements for unknown batches", () => {
+		const { composer } = makeComposer();
+		expect(() => composer.acknowledgeHistory(999)).not.toThrow();
+		expect(() => composer.beginHistoryReplay()).not.toThrow();
+		expect(() => composer.beginHistoryFlush()).not.toThrow();
+	});
+
+	it("renders no resize frame before start or after stop, and a tail while running", async () => {
+		const { terminal, scheduler, composer } = makeComposer();
+		expect(composer.renderResizeFrame({ columns: 80, rows: 10 })).toEqual([]);
+		expect(composer.rowsBelow(new Text("x", 0, 0))).toBeUndefined();
+		composer.start({ playWelcomeIntro: false });
+		try {
+			await scheduler.settle(terminal);
+			const tail = composer.renderResizeFrame({ columns: 80, rows: 10 });
+			expect(tail.length).toBeGreaterThan(0);
+			expect(tail.length).toBeLessThanOrEqual(10);
+		} finally {
+			composer.stop();
+		}
+		expect(composer.renderResizeFrame({ columns: 80, rows: 10 })).toEqual([]);
+	});
+
 	it("returns the cached surface after stop", async () => {
 		const { terminal, scheduler, composer } = makeComposer();
 		composer.start();
