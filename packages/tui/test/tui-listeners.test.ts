@@ -308,6 +308,65 @@ describe("TUI settled-resize history replay", () => {
 	});
 });
 
+describe("TUI in-place resize CPR probe", () => {
+	class CprTerminal extends VirtualTerminal {
+		readonly writes: string[] = [];
+		constructor(
+			cols: number,
+			rows: number,
+			readonly tagged: boolean,
+		) {
+			super(cols, rows);
+		}
+		override write(data: string): void {
+			this.writes.push(data);
+			super.write(data);
+			const probe = data.match(/\x1b\[(\d+)G\x1b\[6n/);
+			if (probe) {
+				const column = this.tagged ? probe[1] : "1";
+				queueMicrotask(() => this.sendInput(`\x1b[2;${column}R`));
+			}
+		}
+	}
+
+	async function resizeWithReply(tagged: boolean) {
+		const previous = Bun.env.PI_TUI_RESIZE_IN_PLACE;
+		Bun.env.PI_TUI_RESIZE_IN_PLACE = "1";
+		const terminal = new CprTerminal(40, 6, tagged);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		tui.setFrameProvider({
+			renderFrame: (size: { columns: number }) => ({ viewport: [`w-${size.columns}`] }),
+			acknowledgeHistory() {},
+		});
+		try {
+			tui.start();
+			await scheduler.settle(terminal);
+			terminal.writes.length = 0;
+			terminal.resize(50, 8);
+			await scheduler.advance(terminal, 2000);
+			await scheduler.settle(terminal);
+			return terminal;
+		} finally {
+			tui.stop();
+			if (previous === undefined) delete Bun.env.PI_TUI_RESIZE_IN_PLACE;
+			else Bun.env.PI_TUI_RESIZE_IN_PLACE = previous;
+		}
+	}
+
+	it("anchors the settled repaint on a tagged CPR reply", async () => {
+		const terminal = await resizeWithReply(true);
+		expect(terminal.writes.join("")).toContain("\x1b[6n");
+		expect(terminal.getViewport().join("\n")).toContain("w-50");
+	});
+
+	it("ignores an untagged CPR reply and anchors on the probe timeout", async () => {
+		const terminal = await resizeWithReply(false);
+		expect(terminal.writes.join("")).toContain("\x1b[6n");
+		expect(terminal.getViewport().join("\n")).toContain("w-50");
+	});
+});
+
 describe("TUI degenerate geometry and history re-offers", () => {
 	it("skips the stop history flush on a zero-width terminal", async () => {
 		const terminal = new VirtualTerminal(40, 6);
