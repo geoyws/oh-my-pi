@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { type Component, Container, type Focusable, type OverlayFocusOwner, TUI } from "@oh-my-pi/pi-tui";
 import type { Terminal, TerminalAppearance } from "@oh-my-pi/pi-tui/terminal";
+import { getCellDimensions, setCellDimensions } from "@oh-my-pi/pi-tui/terminal-capabilities";
 
 class MinimalTerminal implements Terminal {
 	columns = 80;
@@ -442,6 +443,70 @@ describe("TUI overlay focus", () => {
 			expect(editor.inputs).toEqual(["\x1b[B", "\x1b[A", "\x1b[B"]);
 		} finally {
 			tui.stop();
+		}
+	});
+
+	it("consumes a cell-size reply during the hold instead of delivering or queueing it", () => {
+		const previous = { ...getCellDimensions() };
+		const terminal = new MinimalTerminal();
+		(terminal as { tspExpected?: boolean }).tspExpected = true;
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start({ deferInput: true });
+			terminal.sendInput("\x1b[6;20;10t");
+			expect(getCellDimensions()).toEqual({ widthPx: 10, heightPx: 20 });
+			expect(editor.inputs).toEqual([]);
+			tui.releaseHeldInput();
+			expect(editor.inputs).toEqual([]);
+		} finally {
+			tui.stop();
+			setCellDimensions(previous);
+		}
+	});
+
+	it("consumes a scaled iTerm2 cell-size reply during the hold", () => {
+		const previous = { ...getCellDimensions() };
+		const terminal = new MinimalTerminal();
+		(terminal as { tspExpected?: boolean }).tspExpected = true;
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start({ deferInput: true });
+			terminal.sendInput("\x1b]1337;ReportCellSize=20;10;2\x07");
+			expect(getCellDimensions()).toEqual({ widthPx: 20, heightPx: 40 });
+			tui.releaseHeldInput();
+			expect(editor.inputs).toEqual([]);
+		} finally {
+			tui.stop();
+			setCellDimensions(previous);
+		}
+	});
+
+	it("ignores a zero cell-size reply during the hold", () => {
+		const previous = { ...getCellDimensions() };
+		const terminal = new MinimalTerminal();
+		(terminal as { tspExpected?: boolean }).tspExpected = true;
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start({ deferInput: true });
+			terminal.sendInput("\x1b[6;0;0t");
+			expect(getCellDimensions()).toEqual(previous);
+			tui.releaseHeldInput();
+			expect(editor.inputs).toEqual([]);
+		} finally {
+			tui.stop();
+			setCellDimensions(previous);
 		}
 	});
 
