@@ -196,6 +196,66 @@ describe("TUI provider history flush and component renders", () => {
 	});
 });
 
+describe("TUI synchronous and reset renders", () => {
+	it("renderNow paints synchronously and is a no-op after stop", async () => {
+		const terminal = new VirtualTerminal(40, 6);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		const probe = { renders: 0 };
+		tui.addChild({
+			render: () => {
+				probe.renders++;
+				return ["sync-body"];
+			},
+		});
+		tui.renderNow();
+		expect(probe.renders).toBe(1);
+		try {
+			tui.start();
+			await scheduler.settle(terminal);
+			const settled = probe.renders;
+			tui.renderNow();
+			expect(probe.renders).toBeGreaterThan(settled);
+			expect(terminal.getViewport().join("\n")).toContain("sync-body");
+		} finally {
+			tui.stop();
+		}
+		const afterStop = probe.renders;
+		tui.renderNow();
+		expect(probe.renders).toBe(afterStop);
+	});
+
+	it("resetDisplay repaints while running and is a no-op after stop", async () => {
+		const terminal = new VirtualTerminal(40, 6);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		const probe = { renders: 0, invalidations: 0 };
+		tui.addChild({
+			render: () => {
+				probe.renders++;
+				return ["reset-body"];
+			},
+			invalidate: () => {
+				probe.invalidations++;
+			},
+		});
+		try {
+			tui.start();
+			await scheduler.settle(terminal);
+			const settled = probe.renders;
+			tui.resetDisplay();
+			expect(probe.invalidations).toBeGreaterThan(0);
+			expect(probe.renders).toBeGreaterThan(settled);
+			expect(terminal.getViewport().join("\n")).toContain("reset-body");
+		} finally {
+			tui.stop();
+		}
+		const afterStop = probe.renders;
+		tui.resetDisplay();
+		expect(probe.renders).toBe(afterStop);
+	});
+});
+
 describe("TUI postmortem restore", () => {
 	it("stops the TUI when the postmortem cleanup pass runs", async () => {
 		const terminal = new VirtualTerminal(40, 6);
