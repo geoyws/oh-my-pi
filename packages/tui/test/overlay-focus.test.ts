@@ -364,4 +364,82 @@ describe("TUI overlay focus", () => {
 			tui.stop();
 		}
 	});
+
+	it("moves focus to preFocus when the focused overlay is hidden and back when shown again", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		const overlay = new FocusRecorder("overlay");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start();
+			const handle = tui.showOverlay(overlay);
+			expect(tui.getFocused()).toBe(overlay);
+			expect(handle.isHidden()).toBe(false);
+
+			handle.setHidden(true);
+			expect(handle.isHidden()).toBe(true);
+			expect(tui.getFocused()).toBe(editor);
+
+			// Repeating the same hidden state is a no-op.
+			handle.setHidden(true);
+			expect(tui.getFocused()).toBe(editor);
+
+			handle.setHidden(false);
+			expect(handle.isHidden()).toBe(false);
+			expect(tui.getFocused()).toBe(overlay);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("keeps focus on the editor when a non-focused overlay is hidden and shown", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		const overlay = new FocusRecorder("overlay");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start();
+			const handle = tui.showOverlay(overlay);
+			tui.setFocus(editor);
+
+			handle.setHidden(true);
+			expect(tui.getFocused()).toBe(editor);
+			handle.setHidden(false);
+			// Showing a visible overlay restores focus to it per the handle contract.
+			expect(tui.getFocused()).toBe(overlay);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("hideOverlay pops the topmost overlay, restores focus and hides the cursor when none remain", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		const overlay = new FocusRecorder("overlay");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start();
+			tui.showOverlay(overlay);
+			expect(tui.getFocused()).toBe(overlay);
+
+			tui.hideOverlay();
+			expect(tui.getFocused()).toBe(editor);
+			expect(terminal.cursorHidden).toBe(true);
+
+			// Hiding with an empty stack is a no-op.
+			tui.hideOverlay();
+			expect(tui.getFocused()).toBe(editor);
+		} finally {
+			tui.stop();
+		}
+	});
 });
