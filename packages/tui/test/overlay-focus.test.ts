@@ -804,6 +804,27 @@ describe("TUI overlay focus", () => {
 		}
 	});
 
+	it("consumes an unscaled iTerm2 cell-size reply during the hold", () => {
+		const previous = { ...getCellDimensions() };
+		const terminal = new MinimalTerminal();
+		(terminal as { tspExpected?: boolean }).tspExpected = true;
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start({ deferInput: true });
+			terminal.sendInput("\x1b]1337;ReportCellSize=20;10\x07");
+			expect(getCellDimensions()).toEqual({ widthPx: 10, heightPx: 20 });
+			tui.releaseHeldInput();
+			expect(editor.inputs).toEqual([]);
+		} finally {
+			tui.stop();
+			setCellDimensions(previous);
+		}
+	});
+
 	it("ignores a zero cell-size reply during the hold", () => {
 		const previous = { ...getCellDimensions() };
 		const terminal = new MinimalTerminal();

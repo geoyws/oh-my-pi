@@ -65,6 +65,79 @@ describe("TUI overlay layout options", () => {
 		expect(invalid.row).toBeGreaterThan(0);
 	});
 
+	it("slices overlay lines wider than the resolved width", async () => {
+		const terminal = new VirtualTerminal(40, 10);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		tui.addChild(new Text("base", 0, 0));
+		tui.start();
+		try {
+			await scheduler.settle(terminal);
+			tui.showOverlay({ render: () => ["0123456789ABCDEF"] }, { width: 6, row: 1, col: 2 });
+			await scheduler.settle(terminal);
+			const viewport = terminal.getViewport();
+			expect(viewport[1]).toContain("012345");
+			expect(viewport[1]).not.toContain("6789");
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("keeps the last lines of a bottom-anchored overlay over maxHeight", async () => {
+		const terminal = new VirtualTerminal(40, 10);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		tui.addChild(new Text("base", 0, 0));
+		tui.start();
+		try {
+			await scheduler.settle(terminal);
+			tui.showOverlay({ render: () => ["line-1", "line-2", "line-3", "line-4"] }, {
+				width: 8,
+				maxHeight: 2,
+				anchor: "bottom-left",
+			});
+			await scheduler.settle(terminal);
+			const viewport = terminal.getViewport().join("\n");
+			expect(viewport).toContain("line-3");
+			expect(viewport).toContain("line-4");
+			expect(viewport).not.toContain("line-1");
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("keeps the first lines of a top-anchored overlay over maxHeight", async () => {
+		const terminal = new VirtualTerminal(40, 10);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		tui.addChild(new Text("base", 0, 0));
+		tui.start();
+		try {
+			await scheduler.settle(terminal);
+			tui.showOverlay({ render: () => ["line-1", "line-2", "line-3", "line-4"] }, {
+				width: 8,
+				maxHeight: 2,
+				anchor: "top-left",
+			});
+			await scheduler.settle(terminal);
+			const viewport = terminal.getViewport().join("\n");
+			expect(viewport).toContain("line-1");
+			expect(viewport).toContain("line-2");
+			expect(viewport).not.toContain("line-4");
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("applies numeric and object margins to overlay placement", async () => {
+		const numeric = await showOverlay({ width: 6, anchor: "top-left", margin: 2 });
+		expect(numeric.row).toBe(2);
+		expect(numeric.col).toBe(2);
+		const object = await showOverlay({ width: 6, anchor: "top-left", margin: { top: 1, left: 3 } });
+		expect(object.row).toBe(1);
+		expect(object.col).toBe(3);
+	});
+
 	it("honours minWidth when resolving overlay width", async () => {
 		const terminal = new VirtualTerminal(40, 10);
 		const scheduler = new VirtualRenderScheduler();
