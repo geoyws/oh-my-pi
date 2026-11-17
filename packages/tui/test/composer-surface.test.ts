@@ -390,6 +390,19 @@ describe("Composer describeSurface", () => {
 		}
 	});
 
+	it("constructs with no options and accepts an empty welcome update", async () => {
+		const bare = new Composer();
+		expect(bare.started).toBe(false);
+		const { composer } = makeComposer();
+		composer.start({ playWelcomeIntro: false });
+		try {
+			composer.updateWelcome({});
+			expect(composer.welcome).toBeDefined();
+		} finally {
+			composer.stop();
+		}
+	});
+
 	it("ignores history acknowledgements for unknown batches", () => {
 		const { composer } = makeComposer();
 		expect(() => composer.acknowledgeHistory(999)).not.toThrow();

@@ -134,6 +134,19 @@ describe("Composer viewport links and link hints", () => {
 		}
 	});
 
+	it("paints hint tags into a short viewport without painting past it", async () => {
+		const { composer } = await startWithLink();
+		try {
+			composer.startLinkHints(() => {});
+			const frame = composer.renderFrame({ columns: 80, rows: 1 });
+			expect(frame.viewport.length).toBeLessThanOrEqual(1);
+			expect(composer.linkHintsActive).toBe(true);
+			composer.cancelLinkHints();
+		} finally {
+			composer.stop();
+		}
+	});
+
 	it("clears the hovered click target without candidates", async () => {
 		const { composer } = await startWithLink();
 		try {

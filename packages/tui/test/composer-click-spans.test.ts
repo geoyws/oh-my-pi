@@ -46,6 +46,28 @@ describe("Composer below-transcript click spans", () => {
 		}
 	});
 
+	it("returns no candidates for a row whose target declines it", () => {
+		const composer = startComposer();
+		try {
+			class RowTarget implements Component {
+				render(): readonly string[] {
+					return ["hit-row", "miss-row"];
+				}
+				getClickAgentAtRow(row: number): string | undefined {
+					return row === 0 ? "AgentX" : undefined;
+				}
+			}
+			composer.setRuntimeChildren([new TranscriptContainer(), new RowTarget()]);
+			const frame = composer.renderFrame({ columns: 80, rows: 24 });
+			const hit = frame.viewport.findIndex(line => Bun.stripANSI(line).includes("hit-row"));
+			const miss = frame.viewport.findIndex(line => Bun.stripANSI(line).includes("miss-row"));
+			expect(composer.viewportClickCandidates(hit)).toEqual(["AgentX"]);
+			expect(composer.viewportClickCandidates(miss)).toEqual([]);
+		} finally {
+			composer.stop();
+		}
+	});
+
 	it("tiles candidates for children of a plain container root", () => {
 		const composer = startComposer();
 		try {
