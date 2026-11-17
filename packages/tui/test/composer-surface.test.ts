@@ -16,7 +16,7 @@ function makeComposer() {
 	const composer = new Composer({
 		terminal,
 		tuiOptions: { renderScheduler: scheduler },
-		preferences: { spellingTypoDetection: false, spellingAutocomplete: "off", spellingAutocorrect: false },
+		preferences: { quiet: false, spellingTypoDetection: false, spellingAutocomplete: "off", spellingAutocorrect: false },
 	});
 	return { terminal, scheduler, composer };
 }
@@ -72,6 +72,57 @@ describe("Composer describeSurface", () => {
 			const surface = composer.describeSurface();
 			expect(surface.main).toContain(before);
 			expect(surface.dock).toEqual([after]);
+		} finally {
+			composer.stop();
+		}
+	});
+
+	it("exposes welcome unless quiet and tracks the started lifecycle", async () => {
+		const { terminal, scheduler, composer } = makeComposer();
+		expect(composer.welcome).toBeDefined();
+		expect(composer.started).toBe(false);
+		composer.start({ playWelcomeIntro: false });
+		try {
+			await scheduler.settle(terminal);
+			expect(composer.started).toBe(true);
+			// A second start is a no-op.
+			composer.start({ playWelcomeIntro: false });
+			expect(composer.started).toBe(true);
+		} finally {
+			composer.stop();
+		}
+		expect(composer.started).toBe(false);
+		// Starting after stop does not revive the composer.
+		composer.start({ playWelcomeIntro: false });
+		expect(composer.started).toBe(false);
+		composer.enableInput();
+		expect(composer.started).toBe(false);
+	});
+
+	it("has no welcome component in quiet mode", () => {
+		const terminal = new VirtualTerminal(80, 24);
+		const scheduler = new VirtualRenderScheduler();
+		const composer = new Composer({
+			terminal,
+			tuiOptions: { renderScheduler: scheduler },
+			preferences: {
+				quiet: true,
+				spellingTypoDetection: false,
+				spellingAutocomplete: "off",
+				spellingAutocorrect: false,
+			},
+		});
+		expect(composer.welcome).toBeUndefined();
+	});
+
+	it("starts deferred without playing the welcome intro", async () => {
+		const { terminal, scheduler, composer } = makeComposer();
+		composer.start({ deferInput: true, playWelcomeIntro: false });
+		try {
+			await scheduler.settle(terminal);
+			expect(composer.started).toBe(true);
+			composer.enableInput();
+			expect(composer.started).toBe(true);
 		} finally {
 			composer.stop();
 		}
