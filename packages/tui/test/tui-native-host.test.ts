@@ -3,7 +3,7 @@ import { Editor } from "@oh-my-pi/pi-tui/components/editor";
 import { node } from "@oh-my-pi/pi-tui/native/describe";
 import type { NativeNode } from "@oh-my-pi/pi-tui/native/node";
 import type { Component } from "@oh-my-pi/pi-tui/tui";
-import { TspHarness } from "./native/tsp-harness";
+import { ManualScheduler, TspHarness, TspTestTerminal } from "./native/tsp-harness";
 import { defaultEditorTheme } from "./test-themes";
 
 /** A settings page that docks beside the transcript or, with `sheet` off, a modal panel. */
@@ -67,6 +67,26 @@ describe("TUI native host (root-scope TSP)", () => {
 		h.terminal.send("x");
 		h.flush();
 		expect(panel.keys).toEqual(["x"]);
+	});
+
+	it("repaints on terminal theme and motion events", async () => {
+		const { h, sf } = await open(true);
+		const framesBefore = h.frames.length;
+		h.event({ ev: "theme", dark: false });
+		h.event({ ev: "motion", reduce: true });
+		h.flush();
+		expect(h.frames.length).toBeGreaterThanOrEqual(framesBefore);
+		expect(h.terminal.docs.get(sf)).toBeDefined();
+	});
+
+	it("repaints rows instead of going native when the TSP hello never arrives", async () => {
+		const terminal = new TspTestTerminal({ expected: true, reply: false, manualProbe: true });
+		const hold = new TspHarness(terminal, new ManualScheduler());
+		harness = hold;
+		hold.tui.addChild(new Panel(true));
+		hold.tui.start();
+		hold.flush(1000);
+		expect(hold.tui.nativeRendering).toBe(false);
 	});
 
 	it("leaves the keys with a modal panel when the composer is clicked", async () => {

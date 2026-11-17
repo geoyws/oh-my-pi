@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { Text, TUI } from "@oh-my-pi/pi-tui";
+import * as postmortem from "@oh-my-pi/pi-utils/postmortem";
 import { VirtualRenderScheduler } from "./virtual-render-scheduler";
 import { VirtualTerminal } from "./virtual-terminal";
 
@@ -135,6 +136,29 @@ describe("TUI paint and frame-write listeners", () => {
 		} finally {
 			tui.stop();
 		}
+	});
+});
+
+describe("TUI postmortem restore", () => {
+	it("stops the TUI when the postmortem cleanup pass runs", async () => {
+		const terminal = new VirtualTerminal(40, 6);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		const probe = { renders: 0 };
+		tui.addChild({
+			render: () => {
+				probe.renders++;
+				return ["body"];
+			},
+		});
+		tui.start();
+		await scheduler.settle(terminal);
+		await postmortem.cleanup();
+		await scheduler.settle(terminal);
+		const settled = probe.renders;
+		tui.requestRender(true);
+		await scheduler.settle(terminal);
+		expect(probe.renders).toBe(settled);
 	});
 });
 
