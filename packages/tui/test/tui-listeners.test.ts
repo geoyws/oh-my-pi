@@ -108,6 +108,7 @@ describe("TUI paint and frame-write listeners", () => {
 			expect(tui.getNativeDocument()).toBeUndefined();
 			expect(tui.getNativeFrames()).toEqual([]);
 			expect(tui.getNativeFrames(2)).toEqual([]);
+			expect(tui.nativeFallbackCount).toBe(0);
 			const before = tui.fullRedraws;
 			tui.requestRender(true);
 			await scheduler.settle(terminal);
