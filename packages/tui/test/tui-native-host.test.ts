@@ -69,6 +69,27 @@ describe("TUI native host (root-scope TSP)", () => {
 		expect(panel.keys).toEqual(["x"]);
 	});
 
+	it("closeNative closes the live surface and is a no-op without one", async () => {
+		const { h } = await open(true);
+		expect(h.terminal.surface).toBeDefined();
+		h.tui.closeNative();
+		expect(h.terminal.surface).toBeUndefined();
+		// Already closed surfaces are not closed again.
+		h.tui.closeNative();
+		expect(h.terminal.surface).toBeUndefined();
+	});
+
+	it("resumes the native surface across a stop and start cycle", async () => {
+		const { h } = await open(true);
+		const firstSurface = h.terminal.surface;
+		expect(firstSurface).toBeDefined();
+		h.tui.stop();
+		h.tui.start();
+		h.flush();
+		expect(h.tui.nativeRendering).toBe(true);
+		expect(h.terminal.surface).toBeDefined();
+	});
+
 	it("repaints on terminal theme and motion events", async () => {
 		const { h, sf } = await open(true);
 		const framesBefore = h.frames.length;
