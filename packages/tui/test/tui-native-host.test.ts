@@ -80,7 +80,7 @@ describe("TUI native host (root-scope TSP)", () => {
 	});
 
 	it("repaints rows instead of going native when the TSP hello never arrives", async () => {
-		const terminal = new TspTestTerminal({ expected: true, reply: false, manualProbe: true });
+		const terminal = new TspTestTerminal({ reply: false, manualProbe: true });
 		const hold = new TspHarness(terminal, new ManualScheduler());
 		harness = hold;
 		hold.tui.addChild(new Panel(true));

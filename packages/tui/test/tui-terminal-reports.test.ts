@@ -83,6 +83,36 @@ describe("TUI terminal report callbacks", () => {
 		expect(probe.renders).toBe(settled);
 	});
 
+	it("defers the first Ghostty Kitty paint until the initial-image timer fires", async () => {
+		const mutable = TERMINAL as unknown as { id: string; imageProtocol: ImageProtocol | null };
+		const originalId = mutable.id;
+		mutable.id = "ghostty";
+		setTerminalImageProtocol(ImageProtocol.Kitty);
+		const terminal = new ReportTerminal(40, 12);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		const { Image } = await import("@oh-my-pi/pi-tui/components/image");
+		tui.addChild(
+			new Image(
+				"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGNgAAAAAgABSK+kcQAAAABJRU5ErkJggg==",
+				"image/png",
+				{ fallbackColor: (text: string) => text },
+				{ maxWidthCells: 4, maxHeightCells: 4, budget: tui.imageBudget, imageKey: "ghostty-initial" },
+				{ widthPx: 40, heightPx: 40 },
+			),
+		);
+		try {
+			tui.start();
+			await scheduler.settle(terminal);
+			expect(terminal.writes.join("")).not.toContain("\x1b_Ga=T");
+			await scheduler.advance(terminal, 150);
+			expect(terminal.writes.join("")).toContain("\x1b_G");
+		} finally {
+			tui.stop();
+			mutable.id = originalId;
+		}
+	});
+
 	it("enables SIXEL and queries cell size on a supported SIXEL report", async () => {
 		setTerminalImageProtocol(null);
 		const terminal = new ReportTerminal(40, 6);
