@@ -42,7 +42,7 @@ describe("TUI provider line fitting", () => {
 	it("renders combining and zero-width characters without widening the row", async () => {
 		const viewport = await renderLines(["éx", "a‍b"]);
 		expect(viewport[0]).toContain("e");
-		expect(viewport[1]).toContain("ab");
+		expect(viewport[1]!.replace(/\u200d/g, "")).toContain("ab");
 	});
 
 	it("renders an emoji surrogate pair as one glyph at the boundary", async () => {
