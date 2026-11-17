@@ -35,6 +35,28 @@ describe("TUI overlay layout options", () => {
 		expect(col).toBe(3);
 	});
 
+	it.each([
+		["top-left", 0, 0],
+		["top-center", 0, 17],
+		["top-right", 0, 34],
+		["left-center", 4, 0],
+		["center", 4, 17],
+		["right-center", 4, 34],
+		["bottom-left", 9, 0],
+		["bottom-center", 9, 17],
+		["bottom-right", 9, 34],
+	] as const)("places an overlay at anchor %s", async (anchor, row, col) => {
+		const placed = await showOverlay({ width: 6, anchor });
+		expect(placed.row).toBe(row);
+		expect(placed.col).toBe(col);
+	});
+
+	it("applies row and column offsets to anchored placement", async () => {
+		const placed = await showOverlay({ width: 6, anchor: "top-left", offsetY: 2, offsetX: 3 });
+		expect(placed.row).toBe(2);
+		expect(placed.col).toBe(3);
+	});
+
 	it("falls back to centred placement for invalid percentage row and column", async () => {
 		const centred = await showOverlay({ width: 6 });
 		const invalid = await showOverlay({ width: 6, row: "bogus", col: "bogus" });
