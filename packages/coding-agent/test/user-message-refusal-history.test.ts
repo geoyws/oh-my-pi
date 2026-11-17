@@ -154,6 +154,8 @@ describe("refused prompts never reach prompt history", () => {
 
 	it("Enter: a pasted refused prompt leaves no history row", async () => {
 		// The real Enter key: the editor expands the paste and calls onSubmit itself.
+		// init() lifts the composer's bootstrap submit gate; this harness skips init().
+		mode.editor.disableSubmit = false;
 		const submit = mode.editor.onSubmit;
 		let submitted: unknown;
 		mode.editor.onSubmit = text => {
