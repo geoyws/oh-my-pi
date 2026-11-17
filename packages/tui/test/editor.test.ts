@@ -299,6 +299,44 @@ describe("Editor component", () => {
 			expect(persisted).toEqual(["same"]);
 		});
 
+		it("records only admitted prompts, in submission order, and refuses when admission fails", async () => {
+			const persisted: string[] = [];
+			const editor = new Editor(defaultEditorTheme);
+			editor.setHistoryStorage({
+				add: prompt => {
+					persisted.push(prompt);
+					return Promise.resolve();
+				},
+				getRecent: () => [],
+			});
+			const slow = Promise.withResolvers<boolean>();
+			editor.setHistoryAdmission(prompt => {
+				if (prompt === "slow admitted") return slow.promise;
+				if (prompt === "refused") return Promise.resolve(false);
+				if (prompt === "throws") throw new Error("handler crashed");
+				if (prompt === "rejects") return Promise.reject(new Error("handler crashed"));
+				return true;
+			});
+
+			editor.addToHistory("slow admitted");
+			editor.addToHistory("refused");
+			editor.addToHistory("throws");
+			editor.addToHistory("rejects");
+			editor.addToHistory("fast admitted");
+			// A later synchronous admit waits behind the pending one, keeping order.
+			expect(persisted).toEqual([]);
+			slow.resolve(true);
+			await editor.whenHistorySettled();
+
+			expect(persisted).toEqual(["slow admitted", "fast admitted"]);
+			editor.handleInput("\x1b[A");
+			expect(editor.getText()).toBe("fast admitted");
+			editor.handleInput("\x1b[A");
+			expect(editor.getText()).toBe("slow admitted");
+			editor.handleInput("\x1b[A");
+			expect(editor.getText()).toBe("slow admitted");
+		});
+
 		it("allows non-consecutive duplicates in history", () => {
 			const editor = new Editor(defaultEditorTheme);
 
