@@ -418,6 +418,58 @@ describe("TUI overlay focus", () => {
 		}
 	});
 
+	it("holds shortcut keys during a deferred start and replays them in order on release", () => {
+		const terminal = new MinimalTerminal();
+		// The startup hold only arms for a TSP-expected terminal.
+		(terminal as { tspExpected?: boolean }).tspExpected = true;
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start({ deferInput: true });
+			terminal.sendInput("\x1b[B");
+			terminal.sendInput("\x1b[A");
+			expect(editor.inputs).toEqual([]);
+
+			tui.releaseHeldInput();
+			expect(editor.inputs).toEqual(["\x1b[B", "\x1b[A"]);
+
+			// Releasing again is a no-op; later keys are delivered live.
+			tui.releaseHeldInput();
+			terminal.sendInput("\x1b[B");
+			expect(editor.inputs).toEqual(["\x1b[B", "\x1b[A", "\x1b[B"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("transfers the held-input hold to a replacement focus owner", () => {
+		const terminal = new MinimalTerminal();
+		(terminal as { tspExpected?: boolean }).tspExpected = true;
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		const replacement = new FocusRecorder("replacement");
+		tui.addChild(editor);
+		tui.addChild(replacement);
+		tui.setFocus(editor);
+
+		try {
+			tui.start({ deferInput: true });
+			tui.replaceHeldFocus(editor, replacement);
+			tui.setFocus(replacement);
+			terminal.sendInput("\x1b[B");
+			expect(replacement.inputs).toEqual([]);
+			expect(editor.inputs).toEqual([]);
+
+			tui.releaseHeldInput();
+			expect(replacement.inputs).toEqual(["\x1b[B"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
 	it("hideOverlay pops the topmost overlay, restores focus and hides the cursor when none remain", () => {
 		const terminal = new MinimalTerminal();
 		const tui = new TUI(terminal);
