@@ -304,6 +304,54 @@ describe("Composer describeSurface", () => {
 		expect(exits).toEqual([]);
 	});
 
+	it("repaints through the shimmer handler while a magic keyword is in the focused editor", async () => {
+		const { setMagicKeywords } = await import("@oh-my-pi/pi-tui/prompt/magic-keywords");
+		setMagicKeywords([{ word: "ultrathink", hue: [0, 360] }]);
+		const terminal = new VirtualTerminal(80, 24);
+		const scheduler = new VirtualRenderScheduler();
+		const composer = new Composer({
+			terminal,
+			tuiOptions: { renderScheduler: scheduler },
+			preferences: { spellingTypoDetection: false, spellingAutocomplete: "off", spellingAutocorrect: false },
+		});
+		try {
+			composer.start({ playWelcomeIntro: false });
+			await scheduler.settle(terminal);
+			let renders = 0;
+			const originalRender = composer.editor.render.bind(composer.editor);
+			composer.editor.render = ((...args: Parameters<typeof originalRender>) => {
+				renders++;
+				return originalRender(...args);
+			}) as typeof originalRender;
+			composer.editor.focused = true;
+			composer.editor.setText("please ultrathink");
+			composer.editor.render(60);
+			const before = renders;
+			await new Promise(resolve => setTimeout(resolve, 150));
+			await scheduler.settle(terminal);
+			expect(renders).toBeGreaterThan(before);
+		} finally {
+			composer.stop();
+			setMagicKeywords([]);
+		}
+	});
+
+	it("exits the process through the default exit when no exit is injected", () => {
+		const script = `
+			import { Composer } from "./src/prompt/composer.ts";
+			import { VirtualTerminal } from "./test/virtual-terminal.ts";
+			const composer = new Composer({ terminal: new VirtualTerminal(80, 24) });
+			console.log("before-exit");
+			composer.editor.onExit();
+			console.log("after-exit");
+		`;
+		const proc = Bun.spawnSync(["bun", "-e", script], { cwd: `${import.meta.dir}/..` });
+		expect(proc.exitCode).toBe(0);
+		const out = proc.stdout.toString();
+		expect(out).toContain("before-exit");
+		expect(out).not.toContain("after-exit");
+	});
+
 	it("re-renders an offered history batch at a new width and replays after acknowledgement", async () => {
 		const { terminal, scheduler, composer } = makeComposer();
 		const entries = Array.from({ length: 60 }, (_, i) => `Changelog entry ${i}`);
@@ -317,9 +365,12 @@ describe("Composer describeSurface", () => {
 			expect(first.history).toBeDefined();
 			const again = composer.renderFrame({ columns: 40, rows: 24 });
 			expect(again.history?.id).toBe(first.history!.id);
+			// The re-rendered rows are reflowed to the narrower width, not stale.
+			expect(again.history!.rows).not.toEqual(first.history!.rows);
 			composer.beginHistoryReplay();
 			composer.acknowledgeHistory(first.history!.id);
 			const next = composer.renderFrame({ columns: 80, rows: 24 });
+			expect(next.history?.kind).toBe("replay");
 			expect(next.viewport.join("\n")).toContain("EDITOR");
 		} finally {
 			composer.stop();

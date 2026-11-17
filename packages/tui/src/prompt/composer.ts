@@ -1072,9 +1072,7 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		if (this.#stopped) return;
 		this.#applyWelcomeUpdate(update);
 		if (this.#preferences.quiet) return;
-		this.#ensureWelcome();
-		const welcome = this.#welcome;
-		if (!welcome) return;
+		const welcome = this.#ensureWelcome();
 		if (update.version !== undefined) welcome.setVersion(this.#version);
 		this.ui.requestRender();
 	}
@@ -1171,8 +1169,8 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		if (update.version !== undefined) this.#version = update.version;
 	}
 
-	#ensureWelcome(): void {
-		this.#welcome ??= new WelcomeComponent(this.#version);
+	#ensureWelcome(): WelcomeComponent {
+		return (this.#welcome ??= new WelcomeComponent(this.#version));
 	}
 
 	#rebuildHeader(): void {
