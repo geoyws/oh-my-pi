@@ -683,6 +683,57 @@ describe("TUI overlay focus", () => {
 		}
 	});
 
+	it("drops held keys when releaseHeldInput runs while stopped", () => {
+		const terminal = new MinimalTerminal();
+		(terminal as { tspExpected?: boolean }).tspExpected = true;
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		tui.start({ deferInput: true });
+		terminal.sendInput("\x1b[B");
+		expect(editor.inputs).toEqual([]);
+		tui.stop();
+		tui.releaseHeldInput();
+		expect(editor.inputs).toEqual([]);
+		// A later live start does not replay the dropped hold.
+		tui.start();
+		try {
+			terminal.sendInput("\x1b[A");
+			expect(editor.inputs).toEqual(["\x1b[A"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("aborts start when the terminal disconnects during start", () => {
+		class DisconnectTerminal extends MinimalTerminal {
+			override start(
+				onInput: (data: string) => void,
+				onResize: () => void,
+				onDisconnect?: () => void,
+			): void {
+				super.start(onInput, onResize);
+				onDisconnect?.();
+			}
+		}
+		const terminal = new DisconnectTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+		let starts = 0;
+		tui.addStartListener(() => {
+			starts++;
+		});
+
+		tui.start();
+		// The disconnect stopped the TUI mid-start: no start hooks ran.
+		expect(starts).toBe(0);
+		expect(editor.inputs).toEqual([]);
+	});
+
 	it("holds shortcut keys during a deferred start and replays them in order on release", () => {
 		const terminal = new MinimalTerminal();
 		// The startup hold only arms for a TSP-expected terminal.
