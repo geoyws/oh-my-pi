@@ -139,6 +139,63 @@ describe("TUI paint and frame-write listeners", () => {
 	});
 });
 
+describe("TUI provider history flush and component renders", () => {
+	it("flushes pending provider history when stopped", async () => {
+		const terminal = new VirtualTerminal(40, 6);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		let flushes = 0;
+		let pending = true;
+		let acknowledged: number | undefined;
+		tui.setFrameProvider({
+			beginHistoryFlush: () => {
+				flushes++;
+			},
+			renderFrame: () => ({
+				viewport: ["live"],
+				history: pending ? { id: 7, rows: ["hist-row"], kind: "append" as const } : undefined,
+			}),
+			acknowledgeHistory: (id: number) => {
+				acknowledged = id;
+				pending = false;
+			},
+		});
+		tui.start();
+		await scheduler.settle(terminal);
+		tui.stop();
+		expect(flushes).toBeGreaterThan(0);
+		expect(acknowledged).toBe(7);
+	});
+
+	it("schedules a render for a component render request and reports frame cost", async () => {
+		const terminal = new VirtualTerminal(40, 6);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		const probe = { renders: 0 };
+		const component = {
+			render: () => {
+				probe.renders++;
+				return ["body"];
+			},
+		};
+		tui.addChild(component);
+		// Before start, a component render request is a no-op.
+		tui.requestComponentRender(component);
+		expect(probe.renders).toBe(0);
+		try {
+			tui.start();
+			await scheduler.settle(terminal);
+			expect(tui.lastFrameCostMs).toBeGreaterThanOrEqual(0);
+			const settled = probe.renders;
+			tui.requestComponentRender(component);
+			await scheduler.settle(terminal);
+			expect(probe.renders).toBeGreaterThan(settled);
+		} finally {
+			tui.stop();
+		}
+	});
+});
+
 describe("TUI postmortem restore", () => {
 	it("stops the TUI when the postmortem cleanup pass runs", async () => {
 		const terminal = new VirtualTerminal(40, 6);
