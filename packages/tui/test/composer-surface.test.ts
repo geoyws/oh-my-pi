@@ -2,7 +2,8 @@ import { beforeAll, describe, expect, it } from "bun:test";
 import { Text } from "@oh-my-pi/pi-tui";
 import { TranscriptContainer } from "@oh-my-pi/pi-tui/chrome/transcript-container";
 import { Composer } from "@oh-my-pi/pi-tui/prompt/composer";
-import { initTheme } from "@oh-my-pi/pi-tui/theme";
+import { getEditorTheme, initTheme } from "@oh-my-pi/pi-tui/theme";
+import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import { VirtualRenderScheduler } from "./virtual-render-scheduler";
 import { VirtualTerminal } from "./virtual-terminal";
 
@@ -126,6 +127,91 @@ describe("Composer describeSurface", () => {
 		} finally {
 			composer.stop();
 		}
+	});
+
+	it("clears the draft on first Ctrl+C and exits 130 on a second within the window", () => {
+		const exits: number[] = [];
+		let now = 1000;
+		const terminal = new VirtualTerminal(80, 24);
+		const scheduler = new VirtualRenderScheduler();
+		const composer = new Composer({
+			terminal,
+			tuiOptions: { renderScheduler: scheduler },
+			exit: code => exits.push(code),
+			now: () => now,
+			preferences: { spellingTypoDetection: false, spellingAutocomplete: "off", spellingAutocorrect: false },
+		});
+		composer.editor.setText("draft");
+		composer.editor.onClear?.();
+		expect(composer.editor.getText()).toBe("");
+		expect(exits).toEqual([]);
+		now += 10;
+		composer.editor.onClear?.();
+		expect(exits).toEqual([130]);
+	});
+
+	it("exits 0 through the editor exit hook", () => {
+		const exits: number[] = [];
+		const terminal = new VirtualTerminal(80, 24);
+		const scheduler = new VirtualRenderScheduler();
+		const composer = new Composer({
+			terminal,
+			tuiOptions: { renderScheduler: scheduler },
+			exit: code => exits.push(code),
+			preferences: { spellingTypoDetection: false, spellingAutocomplete: "off", spellingAutocorrect: false },
+		});
+		composer.editor.onExit?.();
+		expect(exits).toEqual([0]);
+	});
+
+	it("wraps the editor border with a persisted status border colour", () => {
+		const terminal = new VirtualTerminal(80, 24);
+		const scheduler = new VirtualRenderScheduler();
+		const composer = new Composer({
+			terminal,
+			tuiOptions: { renderScheduler: scheduler },
+			status: { borderColor: { prefix: "<B>", suffix: "</B>" }, statusLine: { settings: {}, gitEnabled: false, autoThinking: false, fastMode: false, usingSubscription: false, autoCompactEnabled: false, compactionBoundaries: null } as never },
+			preferences: { spellingTypoDetection: false, spellingAutocomplete: "off", spellingAutocorrect: false },
+		});
+		expect(composer.editor.borderColor("x")).toBe("<B>x</B>");
+	});
+
+	it("toggles the welcome component with quiet preferences", async () => {
+		const { terminal, scheduler, composer } = makeComposer();
+		expect(composer.welcome).toBeDefined();
+		composer.start({ playWelcomeIntro: false });
+		try {
+			await scheduler.settle(terminal);
+			composer.setPreferences({ quiet: true });
+			expect(composer.welcome).toBeUndefined();
+			composer.setPreferences({ quiet: false });
+			expect(composer.welcome).toBeDefined();
+		} finally {
+			composer.stop();
+		}
+		// Preference and welcome updates after stop are no-ops.
+		composer.setPreferences({ quiet: true });
+		composer.updateWelcome({ version: "9.9.9" });
+		expect(composer.welcome).toBeDefined();
+	});
+
+	it("applies welcome updates and header extras, and replaces the editor", async () => {
+		const { terminal, scheduler, composer } = makeComposer();
+		const extra = new Text("extra-header", 0, 0);
+		composer.start({ playWelcomeIntro: false });
+		try {
+			await scheduler.settle(terminal);
+			composer.updateWelcome({ version: "1.2.3" });
+			composer.setHeaderExtras([extra], []);
+			const surface = composer.describeSurface();
+			expect(surface.main).toContain(extra);
+			const replacement = new CustomEditor(getEditorTheme());
+			composer.setEditor(replacement);
+			expect(composer.editor).toBe(replacement);
+		} finally {
+			composer.stop();
+		}
+		composer.setHeaderExtras([], []);
 	});
 
 	it("returns the cached surface after stop", async () => {
