@@ -118,14 +118,16 @@ describe("TUI native host (root-scope TSP)", () => {
 		expect(h.terminal.surface).toBeDefined();
 	});
 
-	it("repaints on terminal theme and motion events", async () => {
-		const { h, sf } = await open(true);
-		const framesBefore = h.frames.length;
+	it("keeps focus and key routing after terminal theme and motion events", async () => {
+		const { h, panel, sf } = await open(true);
 		h.event({ ev: "theme", dark: false });
 		h.event({ ev: "motion", reduce: true });
 		h.flush();
-		expect(h.frames.length).toBeGreaterThanOrEqual(framesBefore);
 		expect(h.terminal.docs.get(sf)).toBeDefined();
+		expect(h.tui.getFocused()).toBe(panel);
+		h.terminal.send("x");
+		h.flush();
+		expect(panel.keys).toEqual(["x"]);
 	});
 
 	it("repaints rows instead of going native when the TSP hello never arrives", async () => {

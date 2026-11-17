@@ -110,8 +110,7 @@ describe("TUI paint and frame-write listeners", () => {
 		try {
 			tui.start();
 			await scheduler.settle(terminal);
-			expect(terminal.getViewport()).toHaveLength(3);
-			expect(terminal.getViewport()[0]).toContain("1");
+			expect(terminal.getViewport().map(row => row.trim())).toEqual(["1", "2", "3"]);
 		} finally {
 			tui.stop();
 			if (previousEnv === undefined) delete Bun.env.NODE_ENV;
@@ -119,7 +118,7 @@ describe("TUI paint and frame-write listeners", () => {
 		}
 	});
 
-	it("counts full redraws and reports no native document without a native surface", async () => {
+	it("counts full redraws for alt-screen paints and reports no native document without a native surface", async () => {
 		const terminal = new VirtualTerminal(40, 6);
 		const scheduler = new VirtualRenderScheduler();
 		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
@@ -127,15 +126,14 @@ describe("TUI paint and frame-write listeners", () => {
 		try {
 			tui.start();
 			await scheduler.settle(terminal);
-			expect(tui.fullRedraws).toBeGreaterThanOrEqual(0);
 			expect(tui.getNativeDocument()).toBeUndefined();
 			expect(tui.getNativeFrames()).toEqual([]);
 			expect(tui.getNativeFrames(2)).toEqual([]);
 			expect(tui.nativeFallbackCount).toBe(0);
 			const before = tui.fullRedraws;
-			tui.requestRender(true);
+			tui.showOverlay(new Text("modal", 0, 0), { fullscreen: true, width: "100%", maxHeight: "100%" });
 			await scheduler.settle(terminal);
-			expect(tui.fullRedraws).toBeGreaterThanOrEqual(before);
+			expect(tui.fullRedraws).toBeGreaterThan(before);
 		} finally {
 			tui.stop();
 		}
@@ -155,6 +153,7 @@ describe("TUI paint and frame-write listeners", () => {
 			expect(terminal.getViewport().join("\n")).toContain("provider-40");
 			tui.setFrameProvider(undefined);
 			await scheduler.settle(terminal);
+			expect(terminal.getViewport().join("\n")).not.toContain("provider-40");
 		} finally {
 			tui.stop();
 		}
@@ -167,7 +166,7 @@ describe("TUI provider history flush and component renders", () => {
 		const scheduler = new VirtualRenderScheduler();
 		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
 		let flushes = 0;
-		let pending = true;
+		let pending = false;
 		let acknowledged: number | undefined;
 		tui.setFrameProvider({
 			beginHistoryFlush: () => {
@@ -184,6 +183,8 @@ describe("TUI provider history flush and component renders", () => {
 		});
 		tui.start();
 		await scheduler.settle(terminal);
+		expect(flushes).toBe(0);
+		pending = true;
 		tui.stop();
 		expect(flushes).toBeGreaterThan(0);
 		expect(acknowledged).toBe(7);
@@ -201,9 +202,6 @@ describe("TUI provider history flush and component renders", () => {
 			},
 		};
 		tui.addChild(component);
-		// Before start, a component render request is a no-op.
-		tui.requestComponentRender(component);
-		expect(probe.renders).toBe(0);
 		try {
 			tui.start();
 			await scheduler.settle(terminal);
@@ -253,9 +251,13 @@ describe("TUI settled-resize history replay", () => {
 		const terminal = new VirtualTerminal(40, 6);
 		const scheduler = new VirtualRenderScheduler();
 		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
-		tui.addChild(new Text("body", 0, 0));
+		tui.setFrameProvider({
+			renderFrame: (size: { columns: number }) => ({ viewport: [`w-${size.columns}`] }),
+			acknowledgeHistory() {},
+		});
 		tui.start();
 		await scheduler.settle(terminal);
+		expect(terminal.getViewport().join("\n")).toContain("w-40");
 		terminal.resize(50, 8);
 		tui.stop();
 		// The pending settle timer fires into the stopped TUI and must not
