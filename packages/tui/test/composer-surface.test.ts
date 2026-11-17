@@ -214,6 +214,96 @@ describe("Composer describeSurface", () => {
 		composer.setHeaderExtras([], []);
 	});
 
+	it("mounts a session status component, adopting git status from the startup line", async () => {
+		const terminal = new VirtualTerminal(80, 24);
+		const scheduler = new VirtualRenderScheduler();
+		const composer = new Composer({
+			terminal,
+			tuiOptions: { renderScheduler: scheduler },
+			status: {
+				borderColor: { prefix: "<B>", suffix: "</B>" },
+				statusLine: {
+					settings: {},
+					gitEnabled: true,
+					autoThinking: false,
+					fastMode: false,
+					usingSubscription: false,
+					autoCompactEnabled: false,
+					compactionBoundaries: null,
+				} as never,
+			},
+			preferences: { spellingTypoDetection: false, spellingAutocomplete: "off", spellingAutocorrect: false },
+		});
+		let adopted: unknown;
+		const component = {
+			render: () => ["session-status"],
+			adoptGitStatus: (from: unknown) => {
+				adopted = from;
+			},
+		};
+		composer.start({ playWelcomeIntro: false });
+		try {
+			await scheduler.settle(terminal);
+			composer.setStatusComponent(component as never);
+			expect(adopted).toBeDefined();
+			expect(composer.editor.composerFacts).toBe(component as never);
+		} finally {
+			composer.stop();
+		}
+	});
+
+	it("replaces runtime children and refuses runtime changes after stop", async () => {
+		const { terminal, scheduler, composer } = makeComposer();
+		const first = new Text("first", 0, 0);
+		const second = new Text("second", 0, 0);
+		composer.start({ playWelcomeIntro: false });
+		try {
+			await scheduler.settle(terminal);
+			composer.setRuntimeChildren([first]);
+			expect(composer.describeSurface().dock).toEqual([first]);
+			composer.setRuntimeChildren([second]);
+			expect(composer.describeSurface().dock).toEqual([second]);
+		} finally {
+			composer.stop();
+		}
+		composer.setRuntimeChildren([first]);
+		expect(composer.describeSurface().dock).toEqual([second]);
+	});
+
+	it("transfers ownership once and cannot transfer before start or after stop", async () => {
+		const { terminal, scheduler, composer } = makeComposer();
+		expect(() => composer.transfer()).toThrow("Composer is not available for transfer");
+		composer.start({ playWelcomeIntro: false });
+		try {
+			await scheduler.settle(terminal);
+			composer.transfer();
+			expect(() => composer.transfer()).toThrow("Composer is not available for transfer");
+			// Stop after transfer is a no-op: ownership moved to InteractiveMode.
+			composer.stop();
+			expect(composer.started).toBe(true);
+		} finally {
+			// The composer was transferred; stop the UI directly for cleanup.
+			composer.ui.stop();
+		}
+	});
+
+	it("does not exit again through the editor hook after stop", async () => {
+		const exits: number[] = [];
+		const terminal = new VirtualTerminal(80, 24);
+		const scheduler = new VirtualRenderScheduler();
+		const composer = new Composer({
+			terminal,
+			tuiOptions: { renderScheduler: scheduler },
+			exit: code => exits.push(code),
+			preferences: { spellingTypoDetection: false, spellingAutocomplete: "off", spellingAutocorrect: false },
+		});
+		composer.start({ playWelcomeIntro: false });
+		await scheduler.settle(terminal);
+		composer.stop();
+		composer.editor.onExit?.();
+		expect(exits).toEqual([]);
+	});
+
 	it("ignores history acknowledgements for unknown batches", () => {
 		const { composer } = makeComposer();
 		expect(() => composer.acknowledgeHistory(999)).not.toThrow();

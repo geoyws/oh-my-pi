@@ -1,4 +1,5 @@
 import { afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { Text } from "@oh-my-pi/pi-tui";
 import { Markdown } from "@oh-my-pi/pi-tui/components/markdown";
 import { TranscriptContainer } from "@oh-my-pi/pi-tui/chrome/transcript-container";
 import { Composer } from "@oh-my-pi/pi-tui/prompt/composer";
@@ -77,6 +78,57 @@ describe("Composer viewport links and link hints", () => {
 			composer.cancelLinkHints();
 			expect(composer.linkHintsActive).toBe(false);
 			expect(ends).toEqual([undefined, undefined]);
+		} finally {
+			composer.stop();
+		}
+	});
+
+	it("ends hint mode immediately when no link labels are drawn", async () => {
+		const terminal = new VirtualTerminal(80, 24);
+		const scheduler = new VirtualRenderScheduler();
+		const composer = new Composer({
+			terminal,
+			tuiOptions: { renderScheduler: scheduler },
+			preferences: { spellingTypoDetection: false, spellingAutocomplete: "off", spellingAutocorrect: false },
+		});
+		const ends: (string | undefined)[] = [];
+		composer.setRuntimeChildren([new Text("no links here", 0, 0)]);
+		composer.start({ playWelcomeIntro: false });
+		try {
+			await scheduler.settle(terminal);
+			composer.startLinkHints(reason => ends.push(reason));
+			expect(composer.typeLinkHint("a")).toBe(false);
+			expect(composer.linkHintsActive).toBe(false);
+			expect(ends).toEqual([undefined]);
+		} finally {
+			composer.stop();
+		}
+	});
+
+	it("narrows two-letter hint tags before picking among many links", async () => {
+		setExtensionLinks(["demo"]);
+		const terminal = new VirtualTerminal(80, 40);
+		const scheduler = new VirtualRenderScheduler();
+		const composer = new Composer({
+			terminal,
+			tuiOptions: { renderScheduler: scheduler },
+			preferences: { spellingTypoDetection: false, spellingAutocomplete: "off", spellingAutocorrect: false },
+		});
+		const transcript = new TranscriptContainer();
+		const text = Array.from({ length: 30 }, (_, i) => `[link-${i}](demo:open/${i})`).join("\n");
+		transcript.addChild(new Markdown(text, 0, 0, getMarkdownTheme()));
+		composer.setRuntimeChildren([transcript]);
+		composer.start({ playWelcomeIntro: false });
+		try {
+			await scheduler.settle(terminal);
+			expect(composer.viewportLinkCount()).toBeGreaterThan(26);
+			composer.startLinkHints(() => {});
+			// Tags past the alphabet are two letters: the first only narrows.
+			expect(composer.typeLinkHint("a")).toBe(true);
+			expect(composer.linkHintsActive).toBe(true);
+			const picked = composer.typeLinkHint("a");
+			expect(picked).toMatchObject({ url: "demo:open/0" });
+			expect(composer.linkHintsActive).toBe(false);
 		} finally {
 			composer.stop();
 		}
