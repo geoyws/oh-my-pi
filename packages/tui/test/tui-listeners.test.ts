@@ -97,6 +97,28 @@ describe("TUI paint and frame-write listeners", () => {
 		}
 	});
 
+	it("slices an oversized provider frame outside test environments instead of throwing", async () => {
+		const previousEnv = Bun.env.NODE_ENV;
+		Bun.env.NODE_ENV = "production";
+		const terminal = new VirtualTerminal(40, 3);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		tui.setFrameProvider({
+			renderFrame: () => ({ viewport: ["1", "2", "3", "4", "5"] }),
+			acknowledgeHistory() {},
+		});
+		try {
+			tui.start();
+			await scheduler.settle(terminal);
+			expect(terminal.getViewport()).toHaveLength(3);
+			expect(terminal.getViewport()[0]).toContain("1");
+		} finally {
+			tui.stop();
+			if (previousEnv === undefined) delete Bun.env.NODE_ENV;
+			else Bun.env.NODE_ENV = previousEnv;
+		}
+	});
+
 	it("counts full redraws and reports no native document without a native surface", async () => {
 		const terminal = new VirtualTerminal(40, 6);
 		const scheduler = new VirtualRenderScheduler();
