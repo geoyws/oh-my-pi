@@ -227,6 +227,43 @@ describe("TUI settled-resize history replay", () => {
 		}
 	});
 
+	it("ignores a resize settle that fires after stop", async () => {
+		const terminal = new VirtualTerminal(40, 6);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		tui.addChild(new Text("body", 0, 0));
+		tui.start();
+		await scheduler.settle(terminal);
+		terminal.resize(50, 8);
+		tui.stop();
+		// The pending settle timer fires into the stopped TUI and must not
+		// repaint or throw.
+		await scheduler.advance(terminal, 1000);
+		expect(terminal.getViewport().join("\n")).not.toContain("w-50");
+	});
+
+	it("handles a burst of resizes and paints only the final geometry", async () => {
+		const terminal = new VirtualTerminal(40, 6);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		tui.setFrameProvider({
+			renderFrame: (size: { columns: number }) => ({ viewport: [`w-${size.columns}`] }),
+			acknowledgeHistory() {},
+		});
+		try {
+			tui.start();
+			await scheduler.settle(terminal);
+			terminal.resize(50, 6);
+			terminal.resize(60, 7);
+			terminal.resize(55, 8);
+			await scheduler.advance(terminal, 1000);
+			await scheduler.settle(terminal);
+			expect(terminal.getViewport().join("\n")).toContain("w-55");
+		} finally {
+			tui.stop();
+		}
+	});
+
 	it("does not replay provider history for a height-only change in rebuild mode", async () => {
 		const terminal = new VirtualTerminal(40, 6);
 		const scheduler = new VirtualRenderScheduler();
