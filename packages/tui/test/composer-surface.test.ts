@@ -304,6 +304,41 @@ describe("Composer describeSurface", () => {
 		expect(exits).toEqual([]);
 	});
 
+	it("re-renders an offered history batch at a new width and replays after acknowledgement", async () => {
+		const { terminal, scheduler, composer } = makeComposer();
+		const entries = Array.from({ length: 60 }, (_, i) => `Changelog entry ${i}`);
+		composer.setHeaderExtras([], [new Text(entries.join("\n"), 0, 0)]);
+		composer.setRuntimeChildren([new TranscriptContainer(), new Text("EDITOR", 0, 0)]);
+		composer.start({ playWelcomeIntro: false });
+		try {
+			// Manual frames run before the TUI's own scheduled frame can
+			// acknowledge the offered batch, so the offer stays open.
+			const first = composer.renderFrame({ columns: 80, rows: 24 });
+			expect(first.history).toBeDefined();
+			const again = composer.renderFrame({ columns: 40, rows: 24 });
+			expect(again.history?.id).toBe(first.history!.id);
+			composer.beginHistoryReplay();
+			composer.acknowledgeHistory(first.history!.id);
+			const next = composer.renderFrame({ columns: 80, rows: 24 });
+			expect(next.viewport.join("\n")).toContain("EDITOR");
+		} finally {
+			composer.stop();
+		}
+	});
+
+	it("renders the resize tail from runtime roots without a transcript", async () => {
+		const { terminal, scheduler, composer } = makeComposer();
+		composer.setRuntimeChildren([new Text("root-row", 0, 0)]);
+		composer.start({ playWelcomeIntro: false });
+		try {
+			await scheduler.settle(terminal);
+			const tail = composer.renderResizeFrame({ columns: 80, rows: 10 });
+			expect(tail.join("\n")).toContain("root-row");
+		} finally {
+			composer.stop();
+		}
+	});
+
 	it("ignores history acknowledgements for unknown batches", () => {
 		const { composer } = makeComposer();
 		expect(() => composer.acknowledgeHistory(999)).not.toThrow();
