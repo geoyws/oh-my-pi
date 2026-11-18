@@ -186,7 +186,7 @@ describe("Editor kill ring, yank and undo", () => {
 		expect(emoji.getText()).toBe("ab");
 
 		const join = editorWith("aa\nbb");
-		join.moveToLineStart();
+		join.moveToMessageStart();
 		join.moveToLineEnd();
 		join.handleInput("\x1b[3~");
 		expect(join.getText()).toBe("aabb");
@@ -198,7 +198,7 @@ describe("Editor kill ring, yank and undo", () => {
 
 	it("deletes the line break forward at the end of a line and yanks it back", () => {
 		const editor = editorWith("aa\nbb");
-		editor.moveToLineStart();
+		editor.moveToMessageStart();
 		editor.moveToLineEnd();
 		editor.handleInput("\x1bd"); // Alt+D at end of line
 		expect(editor.getText()).toBe("aabb");
