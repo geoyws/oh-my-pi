@@ -1,5 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import { Editor } from "@oh-my-pi/pi-tui/components/editor";
+import type { DescribeContext } from "@oh-my-pi/pi-tui/native/node";
+
+const DESCRIBE_CX: DescribeContext = { cols: 80, reduceMotion: false, dark: true, supports: () => true, feature: () => true };
 import { defaultEditorTheme } from "./test-themes";
 
 async function untilShown(editor: Editor): Promise<void> {
@@ -97,6 +100,27 @@ describe("Editor spelling suggestions and ghost completion", () => {
 		await untilShown(moving);
 		moving.handleInput("\x1b[D");
 		expect(moving.isShowingAutocomplete()).toBe(false);
+	});
+
+	it("describes a placeholder only for an empty editor and a prediction only as a live suffix", () => {
+		const described = (editor: Editor) => JSON.stringify(editor.describe(DESCRIBE_CX));
+		const editor = new Editor(defaultEditorTheme);
+		editor.placeholder = () => "Type here";
+		expect(described(editor)).toContain("Type here");
+		editor.setText("x");
+		expect(described(editor)).not.toContain("Type here");
+
+		const predicted = new Editor(defaultEditorTheme);
+		predicted.prediction = () => "hello world";
+		predicted.setText("hel");
+		expect(described(predicted)).toContain("lo world");
+		// A prediction that does not extend the typed text shows nothing.
+		predicted.prediction = () => "other";
+		expect(described(predicted)).not.toContain("lo world");
+		// A cursor not at the end shows nothing either.
+		predicted.prediction = () => "hello world";
+		predicted.moveToLineStart();
+		expect(described(predicted)).not.toContain("lo world");
 	});
 
 	it("does not apply a spelling suggestion when the word changed underneath", async () => {
