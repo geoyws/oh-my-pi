@@ -1150,6 +1150,33 @@ describe("SessionFocusController", () => {
 		expect(starts).toHaveLength(1);
 	});
 
+	it("does not restore tool results when superseded during the restore update", async () => {
+		const h = makeHarness();
+		const worker = makeSessionStub();
+		const live = { role: "assistant", content: [{ type: "text", text: "live" }] };
+		(worker.session.agent.state as { streamMessage: unknown }).streamMessage = live;
+		let restored = 0;
+		(h.ctx.eventController as unknown as { restorePendingToolResults: () => void }).restorePendingToolResults = () => { restored++; };
+		let release: (() => void) | undefined;
+		let updated: (() => void) | undefined;
+		const updateSeen = new Promise<void>(r => { updated = r; });
+		const original = h.ctx.eventController.handleEvent.bind(h.ctx.eventController);
+		(h.ctx.eventController as unknown as { handleEvent: (e: unknown) => Promise<void> }).handleEvent = async e => {
+			if ((e as { type: string }).type === "message_update") {
+				updated?.();
+				await new Promise<void>(r => { release = r; });
+			}
+			return original(e as never);
+		};
+		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
+		const focus = h.controller.focusAgent("Worker");
+		await updateSeen;
+		await h.controller.unfocus();
+		release?.();
+		await focus;
+		expect(restored).toBe(0);
+	});
+
 describe("pickRecentFocusableAgentId", () => {
 	function ref(id: string, overrides: Partial<AgentRef> = {}): AgentRef {
 		return {
@@ -1199,6 +1226,8 @@ describe("pickRecentFocusableAgentId", () => {
 	it("breaks activity and creation ties by id, in both directions", () => {
 		const refs = [ref("Bravo"), ref("Alpha"), ref("Charlie")];
 		expect(pickRecentFocusableAgentId(refs)).toBe("Alpha");
+		expect(pickRecentFocusableAgentId([ref("Bravo"), ref("Alpha")])).toBe("Alpha");
+		expect(pickRecentFocusableAgentId([ref("Alpha"), ref("Bravo")])).toBe("Alpha");
 		for (const order of [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]]) {
 			const permuted = order.map(i => refs[i]!);
 			expect(pickRecentFocusableAgentId(permuted)).toBe("Alpha");
