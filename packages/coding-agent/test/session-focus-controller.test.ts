@@ -945,6 +945,67 @@ describe("SessionFocusController", () => {
 		expect(statuses.some(s => s.includes("Viewing agent Worker"))).toBe(true);
 	});
 
+	it("drops a live-stream restore superseded during its synthesized start", async () => {
+		const h = makeHarness();
+		const worker = makeSessionStub();
+		const live = { role: "assistant", content: [{ type: "text", text: "live" }] };
+		(worker.session.agent.state as { streamMessage: unknown }).streamMessage = live;
+		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
+		let release: (() => void) | undefined;
+		let started: (() => void) | undefined;
+		const startSeen = new Promise<void>(r => { started = r; });
+		const original = h.ctx.eventController.handleEvent.bind(h.ctx.eventController);
+		(h.ctx.eventController as unknown as { handleEvent: (e: unknown) => Promise<void> }).handleEvent = async e => {
+			if ((e as { type: string }).type === "message_start") {
+				started?.();
+				await new Promise<void>(r => { release = r; });
+			}
+			return original(e as never);
+		};
+		const focus = h.controller.focusAgent("Worker");
+		await startSeen;
+		await h.controller.unfocus();
+		release?.();
+		await focus;
+		expect(h.handledEvents.map(e => (e as { type: string }).type)).not.toContain("message_update");
+	});
+
+	it("handles a focused agent removed while its attach is in flight", async () => {
+		const h = makeHarness();
+		const statuses: string[] = [];
+		(h.ctx as unknown as { showStatus: (m: string) => void }).showStatus = m => statuses.push(m);
+		const worker = makeSessionStub();
+		let release: (() => void) | undefined;
+		(worker.session as unknown as { settleInFlightMessagePersistence: () => Promise<void> }).settleInFlightMessagePersistence =
+			() => new Promise<void>(resolve => { release = resolve; });
+		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
+		const focus = h.controller.focusAgent("Worker");
+		await flushAsync();
+		h.registry.unregister("Worker");
+		await flushAsync();
+		release?.();
+		await focus;
+		expect(h.controller.focusedAgentId).toBeUndefined();
+		expect(statuses.some(s => s.includes("Viewing agent Worker"))).toBe(false);
+	});
+
+	it("does not announce return to main when that detach is superseded by a refocus", async () => {
+		const h = makeHarness({
+			renderInitialMessages: async () => {},
+		});
+		const statuses: string[] = [];
+		(h.ctx as unknown as { showStatus: (m: string) => void }).showStatus = m => statuses.push(m);
+		const worker = makeSessionStub();
+		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
+		await h.controller.focusAgent("Worker");
+		statuses.length = 0;
+		const unfocus = h.controller.unfocus();
+		await h.controller.focusAgent("Worker");
+		await unfocus;
+		expect(statuses.some(s => s.includes("Returned to main session"))).toBe(false);
+		expect(h.controller.focusedAgentId).toBe("Worker");
+	});
+
 describe("pickRecentFocusableAgentId", () => {
 	function ref(id: string, overrides: Partial<AgentRef> = {}): AgentRef {
 		return {
