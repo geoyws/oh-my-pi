@@ -1,0 +1,102 @@
+import { describe, expect, it } from "bun:test";
+import { Editor } from "@oh-my-pi/pi-tui/components/editor";
+import { defaultEditorTheme } from "./test-themes";
+
+function edit(editor: Editor, from: number, to: number, text: string, cursor: number, len?: number): void {
+	editor.handleNativeEvent({
+		type: "edit",
+		key: "",
+		from,
+		to,
+		text,
+		cursor,
+		len: len ?? editor.getText().length,
+	});
+}
+
+describe("Editor host edits", () => {
+	it("replaces a range and places the caret, as one undo unit", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText("hello world");
+		edit(editor, 6, 11, "there", 11);
+		expect(editor.getText()).toBe("hello there");
+		expect(editor.getCursor()).toEqual({ line: 0, col: 11 });
+		editor.handleNativeEvent({ type: "undo", key: "" });
+		expect(editor.getText()).toBe("hello world");
+	});
+
+	it("moves only the caret for a pure caret move", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText("hello");
+		edit(editor, 0, 0, "", 2);
+		expect(editor.getText()).toBe("hello");
+		expect(editor.getCursor()).toEqual({ line: 0, col: 2 });
+	});
+
+	it("drops a stale edit whose length no longer matches", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText("hello");
+		edit(editor, 0, 5, "bye", 3, 999);
+		expect(editor.getText()).toBe("hello");
+	});
+
+	it("maps a caret offset across lines after a multi-line edit", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText("aa\nbb");
+		edit(editor, 0, 5, "x\nyy\nzzz", 8);
+		expect(editor.getText()).toBe("x\nyy\nzzz");
+		expect(editor.getCursor()).toEqual({ line: 2, col: 3 });
+	});
+
+	it("widens an edit range over an atomic paste marker", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.atomicTokenPattern = /\[(?:Image|Paste) #\d+(?:,[^\]\n]*)?\]/g;
+		editor.setText("");
+		editor.insertPaste("stored paste body");
+		const marker = editor.getText();
+		expect(marker).toContain("[Paste #");
+		// Replace a slice inside the marker: the whole marker is replaced.
+		edit(editor, 1, 3, "X", 1, marker.length);
+		expect(editor.getText()).toBe("X");
+	});
+});
+
+describe("Editor volatile preview and delete-before-cursor", () => {
+	it("shows, replaces, and clears a volatile preview without an undo step", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText("say: ");
+		editor.moveToLineEnd();
+		editor.setVolatileText("helo");
+		expect(editor.getText()).toBe("say: helo");
+		editor.setVolatileText("hello");
+		expect(editor.getText()).toBe("say: hello");
+		editor.clearVolatileText();
+		expect(editor.getText()).toBe("say: ");
+		editor.clearVolatileText();
+		expect(editor.getText()).toBe("say: ");
+	});
+
+	it("commits a volatile preview as a single undoable edit", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText("say: ");
+		editor.moveToLineEnd();
+		editor.setVolatileText("helo");
+		editor.commitVolatileText("hello");
+		expect(editor.getText()).toBe("say: hello");
+		editor.handleInput("\x1f");
+		expect(editor.getText()).toBe("say: ");
+	});
+
+	it("deletes before the cursor capped at the line start", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText("hello");
+		editor.deleteBeforeCursor(2);
+		expect(editor.getText()).toBe("hel");
+		editor.deleteBeforeCursor(99);
+		expect(editor.getText()).toBe("");
+		editor.deleteBeforeCursor(1);
+		expect(editor.getText()).toBe("");
+		editor.deleteBeforeCursor(0);
+		expect(editor.getText()).toBe("");
+	});
+});
