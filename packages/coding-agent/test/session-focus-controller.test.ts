@@ -935,7 +935,7 @@ describe("SessionFocusController", () => {
 		expect(h.controller.focusedAgentId).toBeUndefined();
 	});
 
-	it("does not show the viewing status when a completed attach is no longer focused", async () => {
+	it("shows the viewing status on a completed focus attach", async () => {
 		const h = makeHarness();
 		const statuses: string[] = [];
 		(h.ctx as unknown as { showStatus: (m: string) => void }).showStatus = m => statuses.push(m);
@@ -1018,8 +1018,8 @@ describe("SessionFocusController", () => {
 		await h.controller.focusAgent("Worker");
 		await h.controller.unfocus();
 		h.handledEvents.length = 0;
-		// The captured listener belongs to the dead generation: both a plain
-		// event and an orphaned message_end restore must be dropped.
+		// The captured listener belongs to the dead generation: a plain event
+		// is dropped at its early generation return, before any restore path.
 		await listener?.({ type: "message_end", message: { role: "user" } });
 		await listener?.({ type: "message_end", message: { role: "assistant", content: [] } });
 		expect(h.handledEvents).toEqual([]);
