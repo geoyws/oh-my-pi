@@ -12,6 +12,7 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import { InteractiveMode } from "../src/modes/interactive-mode";
 import { cfgStartupQuiet } from "@oh-my-pi/pi-coding-agent/modes/settings";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import type { DescribeContext } from "@oh-my-pi/pi-tui/native/node";
 
 const cx: DescribeContext = { cols: 80, reduceMotion: false, dark: true, supports: () => true, feature: () => true };
@@ -45,7 +46,7 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		resetSettingsForTest();
 	});
 
-	function createMode(): InteractiveMode {
+	function createMode(eventBus?: EventBus): InteractiveMode {
 		const registry = new ModelRegistry(authStorage, path.join(tempDir.path(), `models-${Bun.nanoseconds()}.yml`));
 		const model = registry.find("anthropic", "claude-sonnet-4-5") as Model<Api>;
 		const readTool: AgentTool = {
@@ -68,7 +69,7 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			toolRegistry: new Map([[readTool.name, readTool]]),
 			builtInToolNames: ["read"],
 		});
-		mode = new InteractiveMode(session, "test");
+		mode = new InteractiveMode(session, "test", undefined, () => {}, undefined, undefined, eventBus);
 		return mode;
 	}
 
@@ -90,6 +91,23 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		expect(m.editor.modelMentionSelector({} as never)).toBeUndefined();
 		expect(typeof m.editor.magicKeywordsEnabled()).toBe("boolean");
 		void m.editor.placeholder?.();
+	});
+
+	it("routes LSP and MCP startup events from the session event bus", () => {
+		const bus = new EventBus();
+		const m = createMode(bus);
+		// quiet startup: the LSP handler returns before touching the transcript
+		bus.emit("lsp:startup", { type: "failed", error: "no servers" });
+		cfgStartupQuiet.set(Settings.instance, false);
+		bus.emit("lsp:startup", { type: "failed", error: "no servers" });
+		bus.emit("lsp:startup", { type: "completed", servers: [] });
+		// malformed MCP payloads are logged and dropped
+		bus.emit("mcp:connection-status", { nope: true });
+		bus.emit("mcp:connection-status", { type: "connecting", serverNames: ["srv1"] });
+		bus.emit("mcp:connection-status", { type: "connected", serverName: "srv1" });
+		bus.emit("mcp:connection-status", { type: "failed", serverName: "srv1", error: "boom" });
+		bus.emit("mcp:connection-status", { type: "reconnecting", serverName: "srv1" });
+		expect(m).toBeDefined();
 	});
 
 	it("tracks displayable thinking content per visible session", () => {
