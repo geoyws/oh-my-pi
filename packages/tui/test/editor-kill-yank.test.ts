@@ -114,6 +114,65 @@ describe("Editor kill ring, yank and undo", () => {
 		expect(editor.getCursor()).toEqual({ line: 0, col: 0 });
 	});
 
+	it("undoes past a transient completion and ignores a transient that is not at the cursor", () => {
+		const editor = editorWith("hello world");
+		editor.undoPastTransientText("world");
+		expect(editor.getText()).toBe("hello ");
+
+		const other = editorWith("hello");
+		other.undoPastTransientText("xyz");
+		expect(other.getText()).toBe("hello");
+
+		const typed = editorWith("");
+		typed.handleInput("a");
+		typed.handleInput("b");
+		typed.undoPastTransientText("");
+		// The two typed characters form one undo unit.
+		expect(typed.getText()).toBe("");
+	});
+
+	it("submits through onSubmit unless submit is disabled", () => {
+		const editor = editorWith("prompt text");
+		const submitted: string[] = [];
+		editor.onSubmit = text => submitted.push(text);
+		editor.submit();
+		expect(submitted).toEqual(["prompt text"]);
+		editor.disableSubmit = true;
+		editor.submit();
+		expect(submitted).toEqual(["prompt text"]);
+	});
+
+	it("inserts multi-line text at the cursor", () => {
+		const editor = editorWith("XY");
+		editor.moveToLineStart();
+		right(editor, 1);
+		editor.insertText("a\nb");
+		expect(editor.getText()).toBe("Xa\nbY");
+		expect(editor.getCursor()).toEqual({ line: 1, col: 1 });
+	});
+
+	it("yanks and pops multi-line kills", () => {
+		function killTwoLines(editor: Editor): void {
+			editor.handleInput("\x0b"); // kill the first line's text
+			editor.handleInput("\x0b"); // kill the line break, accumulating
+		}
+		const editor = editorWith("aa\nbb");
+		editor.moveToMessageStart();
+		killTwoLines(editor);
+		editor.handleInput("x");
+		editor.handleInput("\x7f");
+		editor.setText("cc\ndd");
+		editor.moveToMessageStart();
+		killTwoLines(editor);
+		editor.setText("");
+		editor.handleInput("\x19");
+		const newest = editor.getText();
+		editor.handleInput("\x1by");
+		const older = editor.getText();
+		expect([newest, older]).toEqual(expect.arrayContaining(["aa\n", "cc\n"]));
+		expect(newest).not.toBe(older);
+	});
+
 	it("moves to line start and end", () => {
 		const editor = editorWith("hello");
 		editor.moveToLineStart();
