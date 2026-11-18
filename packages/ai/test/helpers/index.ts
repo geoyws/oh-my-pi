@@ -98,7 +98,7 @@ async function readAuthGatewayE2EStatus(): Promise<AuthGatewayE2EStatus> {
 	if (!Bun.env.E2E) return { ok: false, reason: "E2E env not set" };
 	const refusal = e2eHostRefusal("e2e", liveE2eHostProbe());
 	if (refusal !== null) {
-		const reason = `auth-gateway e2e refused on this host: ${refusal} (omp e2e runs only on @@hal, kb rule g-ca3365d2)`;
+		const reason = `auth-gateway e2e refused on this host: ${refusal} (omp e2e runs on Linux: a container on @@mbp first, @@hal as overflow; medic a-80d0010b)`;
 		console.warn(`[skip] ${reason}`);
 		return { ok: false, reason };
 	}
