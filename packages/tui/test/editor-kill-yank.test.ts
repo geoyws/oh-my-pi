@@ -206,6 +206,43 @@ describe("Editor kill ring, yank and undo", () => {
 		expect(editor.getText()).toBe("aa\nbb");
 	});
 
+	it("pops the per-keystroke snapshots under a transient completion", () => {
+		const editor = editorWith("hello ");
+		for (const ch of "world") editor.handleInput(ch);
+		expect(editor.getText()).toBe("hello world");
+		editor.undoPastTransientText("world");
+		expect(editor.getText()).toBe("hello ");
+		expect(editor.getCursor()).toEqual({ line: 0, col: 6 });
+		// The transient snapshots are gone: a plain undo does not resurrect them.
+		editor.handleInput("\x1f");
+		expect(editor.getText()).toBe("hello ");
+	});
+
+	it("does not yank-pop when the cursor moved away from the yanked text", () => {
+		const editor = editorWith("aaa\nbbb");
+		editor.moveToMessageStart();
+		editor.handleInput("\x0b");
+		editor.handleInput("x");
+		editor.handleInput("\x7f");
+		editor.handleInput("\x1b[B");
+		editor.moveToLineStart();
+		editor.handleInput("\x0b");
+		editor.setText("base");
+		editor.handleInput("\x19"); // yank newest kill
+		const yanked = editor.getText();
+		editor.insertText("\nzz");
+		editor.handleInput("\x1by"); // cursor no longer at the yank end
+		expect(editor.getText()).toBe(`${yanked}\nzz`);
+	});
+
+	it("merges with the previous line on word-backward at a line start", () => {
+		const editor = editorWith("aa\nbb");
+		editor.moveToMessageEnd();
+		editor.moveToLineStart();
+		editor.handleInput("\x17"); // Ctrl+W at start of "bb"
+		expect(editor.getText()).toBe("aabb");
+	});
+
 	it("moves to line start and end", () => {
 		const editor = editorWith("hello");
 		editor.moveToLineStart();
