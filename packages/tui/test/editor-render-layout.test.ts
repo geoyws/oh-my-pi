@@ -139,7 +139,7 @@ describe("Editor cursor and scroll rendering", () => {
 		const editor = new Editor(defaultEditorTheme);
 		editor.focused = true;
 		// Content width at 16 is 10 (border chrome): exactly fill it.
-		editor.setText("0123456789ABCDEFGHIJ");
+		editor.setText("0123456789ABCDEFGHIJKLMNOPQRSTUV");
 		const rows = editor.render(16);
 		expect(rows.join("\n")).toContain(CURSOR_MARKER);
 		expect(rows.join("")).toContain("\x1b[4m");
