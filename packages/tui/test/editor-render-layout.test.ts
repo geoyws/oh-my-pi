@@ -194,6 +194,57 @@ describe("Editor native describe", () => {
 	});
 });
 
+describe("Editor decorations, scrollbar and gutter edges", () => {
+	it("keeps decoration identity across describes with equal decorations", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText("draft");
+		const decor = [{ from: 0, to: 2, s: "accent" }];
+		(editor as unknown as { describeDecorations: unknown }).describeDecorations = () => decor;
+		const propsOf = () => {
+			const root = editor.describe(cx);
+			const found = (root.c ?? []).find(child => "k" in child && child.k === "editor") as
+				| { p?: { decor?: unknown } }
+				| undefined;
+			return found?.p?.decor;
+		};
+		expect(propsOf()).toBe(decor);
+		editor.invalidate();
+		// Equal decorations keep the previous array identity.
+		(editor as unknown as { describeDecorations: unknown }).describeDecorations = () => [{ from: 0, to: 2, s: "accent" }];
+		expect(propsOf()).toBe(decor);
+	});
+
+	it("bounds the debug preview when the first line alone exceeds it", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText(`${"x".repeat(200)}\nsecond`);
+		const state = editor.debugState();
+		expect(state.previewTruncated).toBe(true);
+		expect(state.lineCount).toBe(2);
+		expect((state.textPreview as string).length).toBeLessThanOrEqual(120);
+	});
+
+	it("paints a scrollbar thumb when content overflows with the scrollbar visible", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText(Array.from({ length: 20 }, (_, i) => `row-${i}`).join("\n"));
+		editor.setMaxHeight(3);
+		editor.setScrollbarVisible(true);
+		const rows = editor.render(40).map(row => Bun.stripANSI(row));
+		expect(rows.length).toBeGreaterThan(1);
+		// The cursor rests on the last row, so the viewport follows it there.
+		expect(rows.join("\n")).toContain("row-19");
+		expect(rows.join("\n")).not.toContain("row-0");
+	});
+
+	it("slices a prompt gutter wider than the terminal to the row width", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText("body");
+		editor.setBorderVisible(false);
+		editor.setPromptGutter(">>>>>>>>>>");
+		const rows = editor.render(8).map(row => Bun.stripANSI(row));
+		expect(rows[0]).toContain(">>>>>>>>");
+	});
+});
+
 describe("Editor wrap rendering", () => {
 	it("renders an empty editor as a blank row", () => {
 		const editor = new Editor(defaultEditorTheme);
