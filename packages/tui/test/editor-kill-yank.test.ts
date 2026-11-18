@@ -72,6 +72,48 @@ describe("Editor kill ring, yank and undo", () => {
 		expect(forward.getText()).toBe(" world");
 	});
 
+	it("cycles yank-pop between two separate kills", () => {
+		const editor = editorWith("aaa\nbbb");
+		editor.moveToMessageStart();
+		editor.handleInput("\x0b"); // kill "aaa"
+		editor.handleInput("x"); // intervening edit separates the kills
+		editor.handleInput("\x7f"); // remove the intervening edit
+		editor.handleInput("\x1b[B"); // down to "bbb"
+		editor.moveToLineStart();
+		editor.handleInput("\x0b"); // kill "bbb"
+		editor.setText("");
+		editor.handleInput("\x19"); // yank newest
+		const newest = editor.getText();
+		editor.handleInput("\x1by"); // pop to the older kill
+		const older = editor.getText();
+		expect([newest, older]).toEqual(expect.arrayContaining(["aaa", "bbb"]));
+		expect(newest).not.toBe(older);
+		editor.handleInput("\x1by"); // pop cycles back
+		expect(editor.getText()).toBe(newest);
+	});
+
+	it("deletes across line boundaries at line edges", () => {
+		const editor = editorWith("aa\nbb");
+		editor.moveToMessageEnd();
+		editor.handleInput("\x17"); // Ctrl+W deletes the last word
+		expect(editor.getText()).toBe("aa\n");
+		const atStart = editorWith("aa\nbb");
+		atStart.moveToMessageStart();
+		atStart.handleInput("\x15"); // Ctrl+U at line start: nothing to delete
+		expect(atStart.getText()).toBe("aa\nbb");
+		atStart.handleInput("\x0b"); // kill "aa"
+		atStart.handleInput("\x0b"); // kill at empty line start joins or clears
+		expect(atStart.getText()).not.toContain("aa");
+	});
+
+	it("moves to message start and end across lines", () => {
+		const editor = editorWith("one\ntwo\nthree");
+		editor.moveToMessageEnd();
+		expect(editor.getCursor()).toEqual({ line: 2, col: 5 });
+		editor.moveToMessageStart();
+		expect(editor.getCursor()).toEqual({ line: 0, col: 0 });
+	});
+
 	it("moves to line start and end", () => {
 		const editor = editorWith("hello");
 		editor.moveToLineStart();
