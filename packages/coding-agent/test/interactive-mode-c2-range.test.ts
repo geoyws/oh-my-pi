@@ -82,6 +82,16 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		expect(m.describeStatusHud([], cx)).toBe(status);
 	});
 
+	it("installs editor callbacks for mentions, hyperlinks, skills and hints", () => {
+		const m = createMode();
+		expect(m.editor.fileHyperlink("/tmp/a.ts", "a.ts")).toBe("a.ts"); // no OSC 8 in this terminal
+		expect(m.editor.skillFilePath("missing")).toBeUndefined();
+		expect(m.editor.modelMentionLabel("no-such-model-xyz")).toBeUndefined();
+		expect(m.editor.modelMentionSelector({} as never)).toBeUndefined();
+		expect(typeof m.editor.magicKeywordsEnabled()).toBe("boolean");
+		void m.editor.placeholder?.();
+	});
+
 	it("tracks displayable thinking content per visible session", () => {
 		const m = createMode();
 		expect(m.hasDisplayableThinkingContent).toBe(false);
