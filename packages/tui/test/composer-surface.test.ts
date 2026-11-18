@@ -437,6 +437,34 @@ describe("Composer describeSurface", () => {
 		}
 	});
 
+	it("keeps offered rows when the transcript batch is acknowledged before a re-render", async () => {
+		const terminal = new VirtualTerminal(80, 24);
+		const scheduler = new VirtualRenderScheduler();
+		const composer = new Composer({
+			terminal,
+			tuiOptions: { renderScheduler: scheduler },
+			preferences: { quiet: true, spellingTypoDetection: false, spellingAutocomplete: "off", spellingAutocorrect: false },
+		});
+		const transcript = new TranscriptContainer();
+		for (let i = 0; i < 30; i++) {
+			transcript.addChild(new Text(`transcript-${i}`, 0, 0));
+		}
+		composer.setRuntimeChildren([transcript]);
+		composer.start({ playWelcomeIntro: false });
+		try {
+			const first = composer.renderFrame({ columns: 80, rows: 5 });
+			expect(first.history).toBeDefined();
+			// The transcript-level batch is accepted elsewhere first, so the
+			// composer's re-render of its still-open offer has nothing new.
+			transcript.acknowledgeFinalizedBatch(first.history!.id);
+			const again = composer.renderFrame({ columns: 40, rows: 5 });
+			expect(again.history?.id).toBe(first.history!.id);
+			expect(again.history?.rows).toEqual(first.history!.rows);
+		} finally {
+			composer.stop();
+		}
+	});
+
 	it("renders the resize tail from runtime roots without a transcript", async () => {
 		const { terminal, scheduler, composer } = makeComposer();
 		composer.setRuntimeChildren([new Text("root-row", 0, 0)]);
