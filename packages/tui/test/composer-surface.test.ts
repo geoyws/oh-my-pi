@@ -17,7 +17,12 @@ function makeComposer() {
 	const composer = new Composer({
 		terminal,
 		tuiOptions: { renderScheduler: scheduler },
-		preferences: { quiet: false, spellingTypoDetection: false, spellingAutocomplete: "off", spellingAutocorrect: false },
+		preferences: {
+			quiet: false,
+			spellingTypoDetection: false,
+			spellingAutocomplete: "off",
+			spellingAutocorrect: false,
+		},
 	});
 	return { terminal, scheduler, composer };
 }
@@ -170,7 +175,18 @@ describe("Composer describeSurface", () => {
 		const composer = new Composer({
 			terminal,
 			tuiOptions: { renderScheduler: scheduler },
-			status: { borderColor: { prefix: "<B>", suffix: "</B>" }, statusLine: { settings: {}, gitEnabled: false, autoThinking: false, fastMode: false, usingSubscription: false, autoCompactEnabled: false, compactionBoundaries: null } as never },
+			status: {
+				borderColor: { prefix: "<B>", suffix: "</B>" },
+				statusLine: {
+					settings: {},
+					gitEnabled: false,
+					autoThinking: false,
+					fastMode: false,
+					usingSubscription: false,
+					autoCompactEnabled: false,
+					compactionBoundaries: null,
+				} as never,
+			},
 			preferences: { spellingTypoDetection: false, spellingAutocomplete: "off", spellingAutocorrect: false },
 		});
 		expect(composer.editor.borderColor("x")).toBe("<B>x</B>");
