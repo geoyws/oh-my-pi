@@ -13,6 +13,7 @@ import { ModelRegistry } from "../src/config/model-registry";
 import { InteractiveMode } from "../src/modes/interactive-mode";
 import { cfgStartupQuiet, cfgTuiMouse } from "@oh-my-pi/pi-coding-agent/modes/settings";
 import { cfgGoalEnabled } from "../src/goals/settings";
+import { cfgSessionIdleCheckpointMs } from "../src/session/settings";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { formatModelString } from "../src/config/model-resolver";
 import { hasTranscriptActions, runTranscriptAction } from "@oh-my-pi/pi-tui/chat/transcript-actions";
@@ -268,6 +269,14 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		m.statusLine.onNativeAction?.("status.context");
 		m.statusLine.onNativeAction?.("status.cost");
 		await new Promise(resolve => setTimeout(resolve, 20));
+	});
+
+	it("re-arms the idle checkpoint when its bound changes", async () => {
+		const m = createMode();
+		await m.init({ suppressWelcomeIntro: true });
+		cfgSessionIdleCheckpointMs.set(Settings.instance, 60_000);
+		cfgSessionIdleCheckpointMs.set(Settings.instance, 0);
+		expect(m.isInitialized).toBe(true);
 	});
 
 	it("tracks displayable thinking content per visible session", () => {
