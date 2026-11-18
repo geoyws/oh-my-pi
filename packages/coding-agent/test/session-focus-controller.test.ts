@@ -1006,6 +1006,150 @@ describe("SessionFocusController", () => {
 		expect(h.controller.focusedAgentId).toBe("Worker");
 	});
 
+	it("ignores a captured subscription and restore after the generation moves on", async () => {
+		const h = makeHarness();
+		const worker = makeSessionStub();
+		let listener: ((event: unknown) => Promise<void>) | undefined;
+		(worker.session as unknown as { subscribe: (fn: (e: unknown) => Promise<void>) => () => void }).subscribe = fn => {
+			listener = fn;
+			return () => {};
+		};
+		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
+		await h.controller.focusAgent("Worker");
+		await h.controller.unfocus();
+		h.handledEvents.length = 0;
+		// The captured listener belongs to the dead generation: both a plain
+		// event and an orphaned message_end restore must be dropped.
+		await listener?.({ type: "message_end", message: { role: "user" } });
+		await listener?.({ type: "message_end", message: { role: "assistant", content: [] } });
+		expect(h.handledEvents).toEqual([]);
+	});
+
+	it("drops an orphaned update superseded during its synthesized start", async () => {
+		const h = makeHarness();
+		const worker = makeSessionStub();
+		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
+		await h.controller.focusAgent("Worker");
+		h.handledEvents.length = 0;
+		let release: (() => void) | undefined;
+		let started: (() => void) | undefined;
+		const startSeen = new Promise<void>(r => { started = r; });
+		const original = h.ctx.eventController.handleEvent.bind(h.ctx.eventController);
+		(h.ctx.eventController as unknown as { handleEvent: (e: unknown) => Promise<void> }).handleEvent = async e => {
+			if ((e as { type: string }).type === "message_start") {
+				started?.();
+				await new Promise<void>(r => { release = r; });
+			}
+			return original(e as never);
+		};
+		const emit = worker.emit({ type: "message_update", message: { role: "assistant", content: [] } });
+		await startSeen;
+		await h.controller.unfocus();
+		release?.();
+		await emit;
+		expect(h.handledEvents.map(e => (e as { type: string }).type)).toEqual(["message_start"]);
+	});
+
+	it("drops a streaming attach superseded after agent_start", async () => {
+		const h = makeHarness();
+		const worker = makeSessionStub({ isStreaming: true });
+		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
+		let release: (() => void) | undefined;
+		let started: (() => void) | undefined;
+		const startSeen = new Promise<void>(r => { started = r; });
+		const original = h.ctx.eventController.handleEvent.bind(h.ctx.eventController);
+		(h.ctx.eventController as unknown as { handleEvent: (e: unknown) => Promise<void> }).handleEvent = async e => {
+			if ((e as { type: string }).type === "agent_start") {
+				started?.();
+				await new Promise<void>(r => { release = r; });
+			}
+			return original(e as never);
+		};
+		const focus = h.controller.focusAgent("Worker");
+		await startSeen;
+		await h.controller.unfocus();
+		const afterMain = h.counts.renderInitialMessages();
+		release?.();
+		await focus;
+		expect(h.counts.renderInitialMessages()).toBe(afterMain);
+		expect(h.controller.focusedAgentId).toBeUndefined();
+	});
+
+	it("stops replaying tool updates when superseded after the first", async () => {
+		const h = makeHarness();
+		const worker = makeSessionStub();
+		const updates = [{ type: "tool_execution_update", toolCallId: "a" }, { type: "tool_execution_update", toolCallId: "b" }];
+		(worker.session as unknown as { activeToolExecutionUpdates: () => unknown[] }).activeToolExecutionUpdates = () => updates;
+		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
+		let release: (() => void) | undefined;
+		let started: (() => void) | undefined;
+		const startSeen = new Promise<void>(r => { started = r; });
+		const original = h.ctx.eventController.handleEvent.bind(h.ctx.eventController);
+		let deferred = true;
+		(h.ctx.eventController as unknown as { handleEvent: (e: unknown) => Promise<void> }).handleEvent = async e => {
+			if (deferred && (e as { type: string }).type === "tool_execution_update") {
+				deferred = false;
+				started?.();
+				await new Promise<void>(r => { release = r; });
+			}
+			return original(e as never);
+		};
+		const focus = h.controller.focusAgent("Worker");
+		await startSeen;
+		await h.controller.unfocus();
+		release?.();
+		await focus;
+		const handled = h.handledEvents.filter(e => (e as { type: string }).type === "tool_execution_update");
+		expect(handled).toHaveLength(1);
+	});
+
+	it("does not repaint the pending block when the main attach is superseded during its model-switch flush", async () => {
+		const h = makeHarness();
+		const worker = makeSessionStub();
+		h.main.setQueue({ steering: ["main steer"] });
+		worker.setQueue({ steering: ["worker steer"] });
+		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
+		await h.controller.focusAgent("Worker");
+		let release: (() => void) | undefined;
+		let flushing: (() => void) | undefined;
+		const flushSeen = new Promise<void>(r => { flushing = r; });
+		(h.ctx as unknown as { flushPendingModelSwitch: () => Promise<void> }).flushPendingModelSwitch = async () => {
+			flushing?.();
+			await new Promise<void>(r => { release = r; });
+		};
+		const unfocus = h.controller.unfocus();
+		await flushSeen;
+		await h.controller.focusAgent("Worker");
+		release?.();
+		await unfocus;
+		expect(h.pendingMessagesContainer.render(80).join("\n")).toContain("worker steer");
+		expect(h.controller.focusedAgentId).toBe("Worker");
+	});
+
+	it("restores pending tool results after a live restore that was already synced", async () => {
+		const h = makeHarness();
+		const worker = makeSessionStub();
+		const live = { role: "assistant", content: [{ type: "text", text: "live" }] };
+		(worker.session.agent.state as { streamMessage: unknown }).streamMessage = live;
+		let restored = 0;
+		(h.ctx.eventController as unknown as { restorePendingToolResults: () => void }).restorePendingToolResults = () => { restored++; };
+		// Mark the stream synced by emitting a start through the subscription
+		// captured during attach, before the live restore runs: use a deferred
+		// persistence settle so the emit lands first.
+		let release: (() => void) | undefined;
+		(worker.session as unknown as { settleInFlightMessagePersistence: () => Promise<void> }).settleInFlightMessagePersistence =
+			() => new Promise<void>(r => { release = r; });
+		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
+		const focus = h.controller.focusAgent("Worker");
+		await flushAsync();
+		await worker.emit({ type: "message_start", message: live });
+		release?.();
+		await focus;
+		expect(restored).toBeGreaterThan(0);
+		const starts = h.handledEvents.filter(e => (e as { type: string }).type === "message_start");
+		expect(starts).toHaveLength(1);
+	});
+
 describe("pickRecentFocusableAgentId", () => {
 	function ref(id: string, overrides: Partial<AgentRef> = {}): AgentRef {
 		return {
@@ -1055,6 +1199,10 @@ describe("pickRecentFocusableAgentId", () => {
 	it("breaks activity and creation ties by id, in both directions", () => {
 		const refs = [ref("Bravo"), ref("Alpha"), ref("Charlie")];
 		expect(pickRecentFocusableAgentId(refs)).toBe("Alpha");
+		for (const order of [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]]) {
+			const permuted = order.map(i => refs[i]!);
+			expect(pickRecentFocusableAgentId(permuted)).toBe("Alpha");
+		}
 		expect(pickRecentFocusableAgentId(refs, "Alpha")).toBe("Bravo");
 		const later = [ref("Bravo", { createdAt: 2000 }), ref("Alpha", { createdAt: 1000 })];
 		expect(pickRecentFocusableAgentId(later)).toBe("Bravo");
