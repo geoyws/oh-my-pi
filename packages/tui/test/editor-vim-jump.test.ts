@@ -169,6 +169,57 @@ describe("Editor character jump and replace modes", () => {
 		expect(editor.getText()).toBe("three");
 	});
 
+	it("jumps backward with the ctrl+alt encoding", () => {
+		const editor = insertEditor("hello world");
+		editor.moveToMessageEnd();
+		editor.handleInput("\x1b[93;7u"); // Ctrl+Alt+]
+		editor.handleInput("o");
+		expect(editor.getCursor().col).toBe(7);
+	});
+
+	it("indents a tabbed line with a tab and dedents it back", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setVimMode(true);
+		editor.setText("one");
+		editor.handleInput(ESC);
+		editor.handleInput("g");
+		editor.handleInput("g");
+		// Make the line tab-indented first through a replace-free path: use >>
+		// on an already tabbed line instead.
+		editor.setText("\tone");
+		const original = editor.getText();
+		editor.handleInput("g");
+		editor.handleInput("g");
+		editor.handleInput(">");
+		editor.handleInput(">");
+		expect(editor.getText()).not.toBe(original);
+		editor.handleInput("<");
+		editor.handleInput("<");
+		expect(editor.getText()).toBe(original);
+	});
+
+	it("deleting the only empty line is a no-op", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setVimMode(true);
+		editor.setText("");
+		editor.handleInput(ESC);
+		editor.handleInput("d");
+		editor.handleInput("d");
+		expect(editor.getText()).toBe("");
+	});
+
+	it("declines an invalid motion after an operator without editing", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setVimMode(true);
+		editor.setText("abc");
+		editor.handleInput(ESC);
+		editor.handleInput("g");
+		editor.handleInput("g");
+		editor.handleInput("d");
+		editor.handleInput("!");
+		expect(editor.getText()).toBe("abc");
+	});
+
 	it("overwrites in replace mode and restores on backspace", () => {
 		const editor = new Editor(defaultEditorTheme);
 		editor.setVimMode(true);
