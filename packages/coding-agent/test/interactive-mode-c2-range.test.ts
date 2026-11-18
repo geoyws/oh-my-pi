@@ -143,6 +143,14 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		m.statusLine.onNativePullRequest?.(undefined as never);
 	});
 
+	it("initializes once and refreshes the title system prompt", async () => {
+		const m = createMode();
+		await m.init({ suppressWelcomeIntro: true });
+		expect(m.isInitialized).toBe(true);
+		await m.init({ suppressWelcomeIntro: true }); // second init is a no-op
+		await m.refreshTitleSystemPrompt(tempDir.path());
+	});
+
 	it("tracks displayable thinking content per visible session", () => {
 		const m = createMode();
 		expect(m.hasDisplayableThinkingContent).toBe(false);
