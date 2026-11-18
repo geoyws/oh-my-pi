@@ -314,7 +314,7 @@ describe("Editor kill ring, yank and undo", () => {
 		editor.setText("q");
 		editor.handleInput("\x19"); // yank "aa\n" (or the newest multi-line kill)
 		const yanked = editor.getText();
-		editor.moveToMessageStart();
+		editor.handleInput("\x1b[A"); // cursor to the first yanked line
 		editor.handleInput("\x1by");
 		expect(editor.getText()).toBe(yanked);
 	});
@@ -332,9 +332,19 @@ describe("Editor kill ring, yank and undo", () => {
 		editor.setText("base");
 		editor.handleInput("\x19");
 		const yanked = editor.getText();
-		editor.moveToLineStart();
+		editor.handleInput("\x1b[D"); // cursor back inside the yanked region
 		editor.handleInput("\x1by");
 		expect(editor.getText()).toBe(yanked);
+	});
+
+	it("anchors history navigation after a zero-width render", async () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.addToHistory("one\ntwo");
+		await editor.whenHistorySettled();
+		editor.render(16);
+		editor.render(0);
+		editor.handleInput("\x1b[A");
+		expect(editor.getText()).toBe("one\ntwo");
 	});
 
 	it("moves to line start and end", () => {
