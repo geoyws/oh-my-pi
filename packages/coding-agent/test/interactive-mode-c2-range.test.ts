@@ -242,6 +242,13 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		expect(await m.applyCwdChange("/nonexistent-c2-dir-xyz")).toBe(false);
 	});
 
+	it("retitles the terminal when the session is renamed", async () => {
+		const m = createMode();
+		await m.init({ suppressWelcomeIntro: true });
+		expect(await m.sessionManager.setSessionName("C2 Renamed Session", "user")).toBe(true);
+		expect(m.sessionManager.getSessionName()).toBe("C2 Renamed Session");
+	});
+
 	it("tracks displayable thinking content per visible session", () => {
 		const m = createMode();
 		expect(m.hasDisplayableThinkingContent).toBe(false);
