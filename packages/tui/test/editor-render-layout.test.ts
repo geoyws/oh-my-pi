@@ -297,6 +297,31 @@ describe("Editor software and terminal cursor shapes", () => {
 
 });
 
+describe("Editor gutter-only cursor rows", () => {
+	it("keeps the terminal cursor marker when the gutter consumes the whole row", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setBorderVisible(false);
+		editor.setPromptGutter(">> ");
+		editor.setUseTerminalCursor(true);
+		editor.focused = true;
+		editor.setText("body");
+		const rows = editor.render(3);
+		expect(rows.join("\n")).toContain(CURSOR_MARKER);
+	});
+
+	it("keeps the prompt glyph visible for a software cursor on a gutter-only row", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setBorderVisible(false);
+		editor.setPromptGutter(">> ");
+		editor.setUseTerminalCursor(false);
+		editor.focused = true;
+		editor.setText("body");
+		const rows = editor.render(3);
+		expect(rows.join("")).toContain(">");
+		expect(rows.join("\n")).toContain(CURSOR_MARKER);
+	});
+});
+
 describe("Editor wrap rendering", () => {
 	it("renders an empty editor as a blank row", () => {
 		const editor = new Editor(defaultEditorTheme);
