@@ -877,6 +877,74 @@ describe("SessionFocusController", () => {
 		expect(flushes).toBe(1);
 	});
 
+	it("focusing the main agent returns to the main session", async () => {
+		const h = makeHarness();
+		const worker = makeSessionStub();
+		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
+		await h.controller.focusAgent("Worker");
+		await h.controller.focusAgent(MAIN_AGENT_ID);
+		expect(h.controller.focusedAgentId).toBeUndefined();
+	});
+
+	it("reports a removed focused agent as gone", async () => {
+		const h = makeHarness();
+		const statuses: string[] = [];
+		(h.ctx as unknown as { showStatus: (m: string) => void }).showStatus = m => statuses.push(m);
+		const worker = makeSessionStub();
+		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
+		await h.controller.focusAgent("Worker");
+		statuses.length = 0;
+		h.registry.unregister("Worker");
+		await flushAsync();
+		await flushAsync();
+		expect(h.controller.focusedAgentId).toBeUndefined();
+		expect(statuses.some(s => s.includes("is gone"))).toBe(true);
+	});
+
+	it("drops an attach superseded while settling in-flight persistence", async () => {
+		const h = makeHarness();
+		const worker = makeSessionStub();
+		let release: (() => void) | undefined;
+		(worker.session as unknown as { settleInFlightMessagePersistence: () => Promise<void> }).settleInFlightMessagePersistence =
+			() => new Promise<void>(resolve => { release = resolve; });
+		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
+		const focus = h.controller.focusAgent("Worker");
+		await flushAsync();
+		await h.controller.unfocus();
+		release?.();
+		await focus;
+		expect(h.controller.focusedAgentId).toBeUndefined();
+		expect(h.setSessionCalls.filter(([, id]) => id === "Worker")).toEqual([]);
+	});
+
+	it("drops an attach superseded while reloading todos", async () => {
+		const h = makeHarness();
+		const worker = makeSessionStub();
+		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
+		let release: (() => void) | undefined;
+		const original = h.ctx.reloadTodos.bind(h.ctx);
+		(h.ctx as unknown as { reloadTodos: (s?: AgentSession) => Promise<void> }).reloadTodos = async s => {
+			if (s === worker.session) await new Promise<void>(resolve => { release = resolve; });
+			return original(s);
+		};
+		const focus = h.controller.focusAgent("Worker");
+		await flushAsync();
+		await h.controller.unfocus();
+		release?.();
+		await focus;
+		expect(h.controller.focusedAgentId).toBeUndefined();
+	});
+
+	it("does not show the viewing status when a completed attach is no longer focused", async () => {
+		const h = makeHarness();
+		const statuses: string[] = [];
+		(h.ctx as unknown as { showStatus: (m: string) => void }).showStatus = m => statuses.push(m);
+		const worker = makeSessionStub();
+		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
+		await h.controller.focusAgent("Worker");
+		expect(statuses.some(s => s.includes("Viewing agent Worker"))).toBe(true);
+	});
+
 describe("pickRecentFocusableAgentId", () => {
 	function ref(id: string, overrides: Partial<AgentRef> = {}): AgentRef {
 		return {
@@ -929,6 +997,7 @@ describe("pickRecentFocusableAgentId", () => {
 		expect(pickRecentFocusableAgentId(refs, "Alpha")).toBe("Bravo");
 		const later = [ref("Bravo", { createdAt: 2000 }), ref("Alpha", { createdAt: 1000 })];
 		expect(pickRecentFocusableAgentId(later)).toBe("Bravo");
+		expect(pickRecentFocusableAgentId([ref("Charlie"), ref("Bravo"), ref("Alpha")])).toBe("Alpha");
 	});
 
 	it("cycles to the next-most-recent agent from the focused one, wrapping at the end", () => {
