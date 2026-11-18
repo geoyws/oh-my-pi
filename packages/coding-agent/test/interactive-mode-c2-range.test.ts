@@ -14,6 +14,7 @@ import { InteractiveMode } from "../src/modes/interactive-mode";
 import { cfgStartupQuiet, cfgTuiMouse } from "@oh-my-pi/pi-coding-agent/modes/settings";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { formatModelString } from "../src/config/model-resolver";
+import { hasTranscriptActions, runTranscriptAction } from "@oh-my-pi/pi-tui/chat/transcript-actions";
 import type { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import type { DescribeContext } from "@oh-my-pi/pi-tui/native/node";
 
@@ -223,6 +224,22 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		m.armLoopAutoSubmit();
 		m.disableLoopMode();
 		expect(await m.handleLoopCommand("")).toBeUndefined();
+	});
+
+	it("dispatches native transcript actions to the mode commands", async () => {
+		const m = createMode();
+		await m.init({ suppressWelcomeIntro: true });
+		expect(hasTranscriptActions()).toBe(true);
+		expect(runTranscriptAction({ act: "copy", text: "hello" })).toBe(true);
+		expect(runTranscriptAction({ act: "retry" })).toBe(true);
+		expect(runTranscriptAction({ act: "resume", path: "/nonexistent/session.jsonl" })).toBe(true);
+		await new Promise(resolve => setTimeout(resolve, 50));
+	});
+
+	it("refuses a cwd change to a missing directory", async () => {
+		const m = createMode();
+		await m.init({ suppressWelcomeIntro: true });
+		expect(await m.applyCwdChange("/nonexistent-c2-dir-xyz")).toBe(false);
 	});
 
 	it("tracks displayable thinking content per visible session", () => {
