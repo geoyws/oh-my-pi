@@ -279,6 +279,21 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		expect(m.isInitialized).toBe(true);
 	});
 
+	it("auto-submits the loop prompt as the next user input", async () => {
+		const m = createMode();
+		await m.init({ suppressWelcomeIntro: true });
+		// enabling through the command hands the inline prompt back for the first iteration
+		expect(await m.handleLoopCommand("again please")).toBe("again please");
+		m.setLoopPrompt("again please");
+		m.armLoopAutoSubmit();
+		const input = await Promise.race([
+			m.getUserInput(),
+			new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), 2500)),
+		]);
+		expect(input?.text).toBe("again please");
+		m.disableLoopMode();
+	});
+
 	it("tracks displayable thinking content per visible session", () => {
 		const m = createMode();
 		expect(m.hasDisplayableThinkingContent).toBe(false);
