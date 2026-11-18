@@ -68,6 +68,48 @@ describe("Composer below-transcript click spans", () => {
 		}
 	});
 
+	it("resolves candidates through a custom-render container's children", () => {
+		const composer = startComposer();
+		try {
+			class CustomContainer extends Container {
+				override render(width: number): readonly string[] {
+					return super.render(width);
+				}
+			}
+			const container = new CustomContainer();
+			container.addChild(new (class implements Component {
+				render(): readonly string[] {
+					return ["plain-child"];
+				}
+			})());
+			container.addChild(new ClickableBlock(["custom-hit"], ["CustomAgent"]));
+			composer.setRuntimeChildren([new TranscriptContainer(), container]);
+			const frame = composer.renderFrame({ columns: 80, rows: 24 });
+			const hit = frame.viewport.findIndex(line => Bun.stripANSI(line).includes("custom-hit"));
+			expect(hit).toBeGreaterThanOrEqual(0);
+			expect(composer.viewportClickCandidates(hit)).toEqual(["CustomAgent"]);
+		} finally {
+			composer.stop();
+		}
+	});
+
+	it("does not click a span fully clipped above the viewport", () => {
+		const composer = startComposer();
+		try {
+			const transcript = new TranscriptContainer();
+			for (let i = 0; i < 30; i++) transcript.addChild(new ClickableBlock([`block-${i}`], [`Agent${i}`]));
+			composer.setRuntimeChildren([transcript]);
+			const frame = composer.renderFrame({ columns: 80, rows: 5 });
+			// Early blocks are clipped out of the 5-row viewport: no row in it
+			// resolves to their agents.
+			for (let row = 0; row < frame.viewport.length; row++) {
+				expect(composer.viewportClickCandidates(row)).not.toContain("Agent0");
+			}
+		} finally {
+			composer.stop();
+		}
+	});
+
 	it("tiles candidates for children of a plain container root", () => {
 		const composer = startComposer();
 		try {

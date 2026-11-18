@@ -393,6 +393,50 @@ describe("Composer describeSurface", () => {
 		}
 	});
 
+	it("empties an offered header batch when the header is emptied before re-render", async () => {
+		const { terminal, scheduler, composer } = makeComposer();
+		const entries = Array.from({ length: 60 }, (_, i) => `Changelog entry ${i}`);
+		composer.setHeaderExtras([], [new Text(entries.join("\n"), 0, 0)]);
+		composer.setRuntimeChildren([new TranscriptContainer(), new Text("EDITOR", 0, 0)]);
+		composer.start({ playWelcomeIntro: false });
+		try {
+			const first = composer.renderFrame({ columns: 80, rows: 24 });
+			expect(first.history).toBeDefined();
+			composer.setPreferences({ quiet: true });
+			composer.setHeaderExtras([], []);
+			const again = composer.renderFrame({ columns: 80, rows: 24 });
+			expect(again.history?.id).toBe(first.history!.id);
+			expect(again.history?.rows).toEqual([]);
+		} finally {
+			composer.stop();
+		}
+	});
+
+	it("falls back to reflowed retired rows when a replay is offered after the header empties", async () => {
+		const { terminal, scheduler, composer } = makeComposer();
+		const entries = Array.from({ length: 60 }, (_, i) => `Changelog entry ${i}`);
+		composer.setHeaderExtras([], [new Text(entries.join("\n"), 0, 0)]);
+		composer.setRuntimeChildren([new TranscriptContainer(), new Text("EDITOR", 0, 0)]);
+		composer.start({ playWelcomeIntro: false });
+		try {
+			const first = composer.renderFrame({ columns: 80, rows: 24 });
+			expect(first.history).toBeDefined();
+			composer.beginHistoryReplay();
+			composer.acknowledgeHistory(first.history!.id);
+			composer.setPreferences({ quiet: true });
+			composer.setHeaderExtras([], []);
+			const replay = composer.renderFrame({ columns: 80, rows: 24 });
+			expect(replay.history?.kind).toBe("replay");
+			expect(replay.history?.rows.join("\n")).toContain("Changelog entry 0");
+			// A re-render of the open replay offer reflows the same retired rows.
+			const again = composer.renderFrame({ columns: 80, rows: 24 });
+			expect(again.history?.id).toBe(replay.history!.id);
+			expect(again.history?.rows.join("\n")).toContain("Changelog entry 0");
+		} finally {
+			composer.stop();
+		}
+	});
+
 	it("renders the resize tail from runtime roots without a transcript", async () => {
 		const { terminal, scheduler, composer } = makeComposer();
 		composer.setRuntimeChildren([new Text("root-row", 0, 0)]);
