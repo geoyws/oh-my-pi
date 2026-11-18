@@ -243,6 +243,55 @@ describe("Editor kill ring, yank and undo", () => {
 		expect(editor.getText()).toBe("aabb");
 	});
 
+	it("merges with the previous line on Ctrl+U at a line start and yanks the break back", () => {
+		const editor = editorWith("aa\nbb");
+		editor.moveToMessageEnd();
+		editor.moveToLineStart();
+		editor.handleInput("\x15"); // Ctrl+U at start of "bb"
+		expect(editor.getText()).toBe("aabb");
+		editor.handleInput("\x19");
+		expect(editor.getText()).toBe("aa\nbb");
+	});
+
+	it("collapses a span to an atom, expands it on read, and clears atoms", () => {
+		const editor = editorWith("hello world");
+		editor.collapseToAtom(0, 6, 11, "[W]", "world");
+		expect(editor.getText()).toBe("hello [W]");
+		expect(editor.getExpandedText()).toBe("hello world");
+		editor.clearAtoms();
+		expect(editor.getExpandedText()).toBe("hello [W]");
+		// Invalid collapses are no-ops.
+		editor.collapseToAtom(9, 0, 1, "[X]", "x");
+		editor.collapseToAtom(0, 3, 3, "[X]", "x");
+		expect(editor.getText()).toBe("hello [W]");
+	});
+
+	it("keeps the cursor relative to a collapsed span", () => {
+		const inside = editorWith("hello world");
+		inside.moveToLineStart();
+		right(inside, 8);
+		inside.collapseToAtom(0, 6, 11, "[W]", "world");
+		expect(inside.getCursor()).toEqual({ line: 0, col: 9 });
+	});
+
+	it("undoes through a native undo event", () => {
+		const editor = editorWith("");
+		editor.handleInput("x");
+		expect(editor.getText()).toBe("x");
+		editor.handleNativeEvent({ type: "undo" } as never);
+		expect(editor.getText()).toBe("");
+	});
+
+	it("anchors the cursor at the start when navigating history before any render", async () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.addToHistory("one\ntwo");
+		await editor.whenHistorySettled();
+		editor.handleInput("\x1b[A");
+		expect(editor.getText()).toBe("one\ntwo");
+		// No layout width is known yet, so the history anchor falls back to start.
+		expect(editor.getCursor()).toEqual({ line: 0, col: 0 });
+	});
+
 	it("moves to line start and end", () => {
 		const editor = editorWith("hello");
 		editor.moveToLineStart();
