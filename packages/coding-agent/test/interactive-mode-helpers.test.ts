@@ -4,9 +4,16 @@ import {
 	computeEditorMaxHeight,
 	layoutPinnedHud,
 	nextSubagentPreviewTickMs,
+	renderSubagentHudLines,
 	shouldEnterPlanModeOnStartup,
 	SubagentHudComponent,
 } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
+import type { ObservableSession } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
+
+function render(sessions: readonly ObservableSession[], columns = 120): string {
+	return Bun.stripANSI(renderSubagentHudLines(sessions, columns).join("\n"));
+}
 import { PINNED_HUD_TOGGLE_ID } from "@oh-my-pi/pi-coding-agent/task/output-manager";
 
 describe("computeEditorMaxHeight edges", () => {
@@ -93,6 +100,42 @@ describe("SubagentHudComponent click map", () => {
 		expect(rows.length).toBeGreaterThan(3);
 		const owners = rows.map((_row, index) => hud.getClickAgentAtRow(index));
 		expect(owners.slice(2).every(owner => owner === "AgentLong")).toBe(true);
+	});
+});
+
+describe("renderSubagentHudLines", () => {
+	it("renders nothing when nothing is running", async () => {
+		await initTheme();
+		expect(renderSubagentHudLines([], 120)).toEqual([]);
+		expect(renderSubagentHudLines([{ kind: "subagent", id: "Idle", label: "Idle", status: "active", progress: { status: "idle" } } as ObservableSession], 120)).toEqual([]);
+	});
+
+	it("lists running agents with descriptions and previews raw assignments", async () => {
+		await initTheme();
+		const withDescription = render([
+			{ kind: "subagent", id: "Alpha", label: "Alpha", status: "active", detached: true, progress: { status: "running", description: "alpha work" } },
+		] as never);
+		expect(withDescription).toContain("Alpha: alpha work");
+		const withAssignment = render([
+			{ kind: "subagent", id: "Beta", label: "Beta", status: "active", detached: true, progress: { status: "running", assignment: "beta task text" } },
+		] as never);
+		expect(withAssignment).toContain("beta task text");
+	});
+
+	it("shows the expand line when collapsed past the limit and every row when expanded", async () => {
+		await initTheme();
+		const sessions = Array.from({ length: 5 }, (_, i) => ({
+			kind: "subagent",
+			id: `Agent${i}`,
+			label: `Agent${i}`,
+			status: "active",
+			detached: true,
+			progress: { status: "running", description: `work ${i}` },
+		})) as never;
+		const collapsed = renderSubagentHudLines(sessions, 120, false).join("\n");
+		expect(Bun.stripANSI(collapsed)).toContain("more");
+		const expanded = renderSubagentHudLines(sessions, 120, true).join("\n");
+		expect(Bun.stripANSI(expanded)).toContain("work 4");
 	});
 });
 
