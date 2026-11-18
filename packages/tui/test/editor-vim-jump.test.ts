@@ -54,6 +54,48 @@ describe("Editor character jump and replace modes", () => {
 		expect(editor.getText()).toBe(" ab");
 	});
 
+	it("routes Alt+Enter to its callback when set and to a new line otherwise", () => {
+		const editor = insertEditor("line");
+		const seen: string[] = [];
+		editor.onAltEnter = text => seen.push(text);
+		editor.handleInput("\x1b\r");
+		expect(seen).toEqual(["line"]);
+		expect(editor.getText()).toBe("line");
+
+		const plain = insertEditor("line");
+		plain.handleInput("\x1b\r");
+		expect(plain.getText()).toContain("\n");
+	});
+
+	it("inserts a new line for Shift+Enter encodings", () => {
+		for (const seq of ["\x1b[13;2~", "\x1b[13;2u"]) {
+			const editor = insertEditor("ab");
+			editor.handleInput(seq);
+			expect(editor.getText()).toContain("\n");
+		}
+	});
+
+	it("inserts a new line after a trailing backslash without a submit remap", () => {
+		const editor = insertEditor("cmd\\");
+		const submitted: string[] = [];
+		editor.onSubmit = text => submitted.push(text);
+		editor.handleInput("\x1b[13;2u");
+		expect(submitted).toEqual([]);
+		expect(editor.getText()).toBe("cmd\\\n");
+	});
+
+	it("declines an unmapped normal-mode key without editing", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setVimMode(true);
+		editor.setText("abc");
+		editor.handleInput(ESC);
+		editor.handleInput("g");
+		editor.handleInput("g");
+		editor.handleInput("!");
+		expect(editor.getText()).toBe("abc");
+		expect(editor.vimMode).toBe("normal");
+	});
+
 	it("overwrites in replace mode and restores on backspace", () => {
 		const editor = new Editor(defaultEditorTheme);
 		editor.setVimMode(true);
