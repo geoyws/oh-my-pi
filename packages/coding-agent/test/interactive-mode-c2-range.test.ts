@@ -12,6 +12,7 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import { InteractiveMode } from "../src/modes/interactive-mode";
 import { cfgStartupQuiet, cfgTuiMouse } from "@oh-my-pi/pi-coding-agent/modes/settings";
+import { cfgGoalEnabled } from "../src/goals/settings";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { formatModelString } from "../src/config/model-resolver";
 import { hasTranscriptActions, runTranscriptAction } from "@oh-my-pi/pi-tui/chat/transcript-actions";
@@ -247,6 +248,18 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		await m.init({ suppressWelcomeIntro: true });
 		expect(await m.sessionManager.setSessionName("C2 Renamed Session", "user")).toBe(true);
 		expect(m.sessionManager.getSessionName()).toBe("C2 Renamed Session");
+	});
+
+	it("starts a goal from an objective and schedules its continuation", async () => {
+		const m = createMode();
+		await m.init({ suppressWelcomeIntro: true });
+		cfgGoalEnabled.set(Settings.instance, true);
+		// waiting for input arms the schedulers; the goal objective then submits into it
+		void m.getUserInput();
+		expect(await m.handleGoalModeCommand("ship the coverage row")).toBe(true);
+		expect(m.goalModeEnabled).toBe(true);
+		m.disableGoalMode();
+		expect(m.goalModeEnabled).toBe(false);
 	});
 
 	it("tracks displayable thinking content per visible session", () => {
