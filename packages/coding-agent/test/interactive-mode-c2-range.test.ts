@@ -262,6 +262,14 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		expect(m.goalModeEnabled).toBe(false);
 	});
 
+	it("routes status-line native actions to their commands", async () => {
+		const m = createMode();
+		await m.init({ suppressWelcomeIntro: true });
+		m.statusLine.onNativeAction?.("status.context");
+		m.statusLine.onNativeAction?.("status.cost");
+		await new Promise(resolve => setTimeout(resolve, 20));
+	});
+
 	it("tracks displayable thinking content per visible session", () => {
 		const m = createMode();
 		expect(m.hasDisplayableThinkingContent).toBe(false);
