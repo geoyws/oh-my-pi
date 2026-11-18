@@ -97,6 +97,78 @@ describe("Editor character jump and replace modes", () => {
 		expect(editor.vimMode).toBe("normal");
 	});
 
+	it("joins lines with vim gap rules", () => {
+		const plain = new Editor(defaultEditorTheme);
+		plain.setVimMode(true);
+		plain.setText("one\ntwo");
+		plain.handleInput(ESC);
+		plain.handleInput("g");
+		plain.handleInput("g");
+		plain.handleInput("J");
+		expect(plain.getText()).toBe("one two");
+
+		const sentence = new Editor(defaultEditorTheme);
+		sentence.setVimMode(true);
+		sentence.setText("end.\nnext");
+		sentence.handleInput(ESC);
+		sentence.handleInput("g");
+		sentence.handleInput("g");
+		sentence.handleInput("J");
+		expect(sentence.getText()).toBe("end.  next");
+
+		const empty = new Editor(defaultEditorTheme);
+		empty.setVimMode(true);
+		empty.setText("one\n");
+		empty.handleInput(ESC);
+		empty.handleInput("g");
+		empty.handleInput("g");
+		empty.handleInput("J");
+		expect(empty.getText()).toBe("one");
+	});
+
+	it("indents and dedents lines, leaving empty lines empty", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setVimMode(true);
+		editor.setText("one\n\ntwo");
+		editor.handleInput(ESC);
+		editor.handleInput("g");
+		editor.handleInput("g");
+		editor.handleInput(">");
+		editor.handleInput(">");
+		expect(editor.getText()).toBe("  one\n\ntwo");
+		editor.handleInput("<");
+		editor.handleInput("<");
+		expect(editor.getText()).toBe("one\n\ntwo");
+	});
+
+	it("deletes a line and pastes it back linewise", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setVimMode(true);
+		editor.setText("one\ntwo");
+		editor.handleInput(ESC);
+		editor.handleInput("g");
+		editor.handleInput("g");
+		editor.handleInput("d");
+		editor.handleInput("d");
+		expect(editor.getText()).toBe("two");
+		editor.handleInput("p");
+		expect(editor.getText()).toBe("two\none");
+	});
+
+	it("repeats a word deletion with dot", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setVimMode(true);
+		editor.setText("one two three");
+		editor.handleInput(ESC);
+		editor.handleInput("g");
+		editor.handleInput("g");
+		editor.handleInput("d");
+		editor.handleInput("w");
+		expect(editor.getText()).toBe("two three");
+		editor.handleInput(".");
+		expect(editor.getText()).toBe("three");
+	});
+
 	it("overwrites in replace mode and restores on backspace", () => {
 		const editor = new Editor(defaultEditorTheme);
 		editor.setVimMode(true);
