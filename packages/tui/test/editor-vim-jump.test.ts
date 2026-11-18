@@ -79,6 +79,7 @@ describe("Editor character jump and replace modes", () => {
 		const editor = insertEditor("cmd\\");
 		const submitted: string[] = [];
 		editor.onSubmit = text => submitted.push(text);
+		editor.moveToMessageEnd();
 		editor.handleInput("\x1b[13;2u");
 		expect(submitted).toEqual([]);
 		expect(editor.getText()).toBe("cmd\\\n");
