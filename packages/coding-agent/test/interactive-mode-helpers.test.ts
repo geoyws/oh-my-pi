@@ -139,6 +139,58 @@ describe("renderSubagentHudLines", () => {
 	});
 });
 
+describe("Subagent HUD live previews and hit-map fallback", () => {
+	it("falls back to one owner row per line when tab expansion desyncs the wrap map", async () => {
+		await initTheme();
+		const hud = new SubagentHudComponent(["header", "sub", "a\tb item"], ["AgentTab"]);
+		hud.render(20);
+		expect(hud.getClickAgentAtRow(2)).toBe("AgentTab");
+	});
+
+	it("renders a live tool preview row with intent and an elapsed marker", async () => {
+		await initTheme();
+		const now = Date.now();
+		const sessions = [
+			{
+				kind: "subagent",
+				id: "Worker",
+				label: "Worker",
+				status: "active",
+				detached: true,
+				progress: {
+					status: "running",
+					description: "working",
+					currentTool: "read",
+					currentToolStartMs: now - 60_000,
+					currentToolIntent: "read the config",
+					recentTools: [],
+				},
+			},
+		] as never;
+		const out = renderSubagentHudLines(sessions, 120, false, true).join("\n");
+		expect(Bun.stripANSI(out)).toContain("read the config");
+		const recent = [
+			{
+				kind: "subagent",
+				id: "Worker",
+				label: "Worker",
+				status: "active",
+				detached: true,
+				progress: {
+					status: "running",
+					description: "working",
+					currentTool: "read",
+					currentToolStartMs: now,
+					currentToolIntent: "read the config",
+					recentTools: [],
+				},
+			},
+		] as never;
+		const fresh = renderSubagentHudLines(recent, 120, false, true).join("\n");
+		expect(Bun.stripANSI(fresh)).toContain("read the config");
+	});
+});
+
 describe("shouldEnterPlanModeOnStartup gates", () => {
 	const manager = (options: { conversation?: boolean; explicitMode?: boolean } = {}) =>
 		({
