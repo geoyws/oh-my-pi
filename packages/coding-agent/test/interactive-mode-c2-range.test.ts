@@ -212,6 +212,19 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		expect(m.isInitialized).toBe(true);
 	});
 
+	it("drives the loop-mode command lifecycle", async () => {
+		const m = createMode();
+		await m.init({ suppressWelcomeIntro: true });
+		// with no loop configured the handler reports through the UI, not a return value
+		expect(await m.handleLoopCommand("")).toBeUndefined();
+		m.setLoopPrompt("keep polishing");
+		expect(await m.handleLoopCommand("show")).toBeUndefined();
+		m.pauseLoop();
+		m.armLoopAutoSubmit();
+		m.disableLoopMode();
+		expect(await m.handleLoopCommand("")).toBeUndefined();
+	});
+
 	it("tracks displayable thinking content per visible session", () => {
 		const m = createMode();
 		expect(m.hasDisplayableThinkingContent).toBe(false);
