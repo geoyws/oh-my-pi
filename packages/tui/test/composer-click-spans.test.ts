@@ -103,12 +103,13 @@ describe("Composer below-transcript click spans", () => {
 					return Array.from({ length: 10 }, (_, i) => `below-${i}`);
 				}
 			})();
-			composer.setRuntimeChildren([transcript, below]);
+			composer.setRuntimeChildren([transcript, new ClickableBlock(["below-hit"], ["BelowAgent"]), below]);
 			const frame = composer.renderFrame({ columns: 80, rows: 5 });
 			// Early blocks are clipped out of the 5-row viewport: no row in it
 			// resolves to their agents.
 			for (let row = 0; row < frame.viewport.length; row++) {
 				expect(composer.viewportClickCandidates(row)).not.toContain("Agent0");
+				expect(composer.viewportClickCandidates(row)).not.toContain("BelowAgent");
 			}
 		} finally {
 			composer.stop();
