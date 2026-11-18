@@ -289,6 +289,71 @@ describe("Editor character jump and replace modes", () => {
 		expect(editor.getText()).toBe("base\nfoo\nfoo\nfoo");
 	});
 
+	it("does not overwrite an atomic token in replace mode", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setVimMode(true);
+		editor.setText("hello world");
+		editor.collapseToAtom(0, 6, 11, "[W]", "world");
+		editor.handleInput(ESC);
+		editor.handleInput("g");
+		editor.handleInput("g");
+		for (let i = 0; i < 6; i++) editor.handleInput("l");
+		editor.handleInput("R");
+		editor.handleInput("X");
+		expect(editor.getText()).toBe("hello [W]");
+	});
+
+	it("joins onto an atom-led line without eating the token", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setVimMode(true);
+		editor.setText("one\nworld");
+		editor.collapseToAtom(1, 0, 5, "[W]", "world");
+		editor.handleInput(ESC);
+		editor.handleInput("g");
+		editor.handleInput("g");
+		editor.handleInput("J");
+		expect(editor.getText()).toBe("one [W]");
+	});
+
+	it("deletes an empty first line linewise", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setVimMode(true);
+		editor.setText("\nabc");
+		editor.handleInput(ESC);
+		editor.handleInput("g");
+		editor.handleInput("g");
+		editor.handleInput("d");
+		editor.handleInput("d");
+		expect(editor.getText()).toBe("abc");
+	});
+
+	it("pastes nothing in normal mode when the register is empty", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setVimMode(true);
+		editor.setText("abc");
+		editor.handleInput(ESC);
+		editor.handleInput("g");
+		editor.handleInput("g");
+		editor.handleInput("p");
+		editor.handleInput("P");
+		expect(editor.getText()).toBe("abc");
+	});
+
+	it("highlights only the selected segment of a wrapped visual selection", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setVimMode(true);
+		editor.focused = true;
+		editor.setText("hello world");
+		editor.handleInput(ESC);
+		editor.handleInput("g");
+		editor.handleInput("g");
+		editor.handleInput("v");
+		editor.handleInput("l");
+		editor.handleInput("l");
+		const rows = editor.render(40);
+		expect(rows.join("")).toContain("\x1b[7mh");
+	});
+
 	it("overwrites in replace mode and restores on backspace", () => {
 		const editor = new Editor(defaultEditorTheme);
 		editor.setVimMode(true);
