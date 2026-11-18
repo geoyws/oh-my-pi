@@ -220,6 +220,75 @@ describe("Editor character jump and replace modes", () => {
 		expect(editor.getText()).toBe("abc");
 	});
 
+	it("pastes before the cursor line with P and repeats a paste with a count", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setVimMode(true);
+		editor.setText("one\ntwo");
+		editor.handleInput(ESC);
+		editor.handleInput("g");
+		editor.handleInput("g");
+		editor.handleInput("d");
+		editor.handleInput("d");
+		editor.handleInput("P");
+		expect(editor.getText()).toBe("one\ntwo");
+
+		const word = new Editor(defaultEditorTheme);
+		word.setVimMode(true);
+		word.setText("ab cd");
+		word.handleInput(ESC);
+		word.handleInput("g");
+		word.handleInput("g");
+		word.handleInput("v");
+		word.handleInput("l");
+		word.handleInput("y");
+		word.handleInput("$");
+		word.handleInput("2");
+		word.handleInput("p");
+		expect(word.getText()).toBe("ab cdabab");
+	});
+
+	it("deletes a characterwise and a linewise visual selection", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setVimMode(true);
+		editor.setText("hello world");
+		editor.handleInput(ESC);
+		editor.handleInput("g");
+		editor.handleInput("g");
+		editor.handleInput("v");
+		expect(editor.vimMode).toBe("visual");
+		editor.handleInput("l");
+		editor.handleInput("l");
+		editor.handleInput("d");
+		expect(editor.getText()).toBe("lo world");
+		expect(editor.vimMode).toBe("normal");
+
+		const lines = new Editor(defaultEditorTheme);
+		lines.setVimMode(true);
+		lines.setText("one\ntwo\nthree");
+		lines.handleInput(ESC);
+		lines.handleInput("g");
+		lines.handleInput("g");
+		lines.handleInput("V");
+		expect(lines.vimMode).toBe("visual-line");
+		lines.handleInput("d");
+		expect(lines.getText()).toBe("two\nthree");
+	});
+
+	it("retypes an opened-line insert session with a count", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setVimMode(true);
+		editor.setText("base");
+		editor.handleInput(ESC);
+		editor.handleInput("g");
+		editor.handleInput("g");
+		editor.handleInput("o");
+		editor.handleInput("foo");
+		editor.handleInput(ESC);
+		editor.handleInput("2");
+		editor.handleInput(".");
+		expect(editor.getText()).toBe("base\nfoo\nfoo\nfoo");
+	});
+
 	it("overwrites in replace mode and restores on backspace", () => {
 		const editor = new Editor(defaultEditorTheme);
 		editor.setVimMode(true);
