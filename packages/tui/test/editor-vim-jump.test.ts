@@ -293,6 +293,7 @@ describe("Editor character jump and replace modes", () => {
 		const editor = new Editor(defaultEditorTheme);
 		editor.setVimMode(true);
 		editor.setText("hello world");
+		(editor as unknown as { atomicTokenPattern: RegExp }).atomicTokenPattern = /\[W\]/g;
 		editor.collapseToAtom(0, 6, 11, "[W]", "world");
 		editor.handleInput(ESC);
 		editor.handleInput("g");
