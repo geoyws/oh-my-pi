@@ -123,6 +123,48 @@ describe("Editor spelling suggestions and ghost completion", () => {
 		expect(described(predicted)).not.toContain("lo world");
 	});
 
+	it("submits instead of accepting a slash argument that restates the typed text", async () => {
+		const editor = new Editor(defaultEditorTheme);
+		let applied = 0;
+		editor.setAutocompleteProvider({
+			getSuggestions: async (lines: string[]) =>
+				(lines[0] ?? "").startsWith("/mcp") ? { items: [{ value: "list", label: "list" }], prefix: "list" } : null,
+			applyCompletion: () => {
+				applied++;
+				return { lines: ["/mcp list"], cursorLine: 0, cursorCol: 9 };
+			},
+		});
+		const submitted: string[] = [];
+		editor.onSubmit = text => submitted.push(text);
+		for (const ch of "/mcp list") editor.handleInput(ch);
+		await untilShown(editor);
+		editor.handleInput("\r");
+		expect(submitted).toEqual(["/mcp list"]);
+		expect(applied).toBe(0);
+	});
+
+	it("accepts instead of submitting when the slash argument still requires an argument", async () => {
+		const editor = new Editor(defaultEditorTheme);
+		let applied = 0;
+		editor.setAutocompleteProvider({
+			getSuggestions: async (lines: string[]) =>
+				(lines[0] ?? "").startsWith("/mcp")
+					? { items: [{ value: "list", label: "list", hint: "list <name>" }], prefix: "list" }
+					: null,
+			applyCompletion: () => {
+				applied++;
+				return { lines: ["/mcp list "], cursorLine: 0, cursorCol: 10 };
+			},
+		});
+		const submitted: string[] = [];
+		editor.onSubmit = text => submitted.push(text);
+		for (const ch of "/mcp list") editor.handleInput(ch);
+		await untilShown(editor);
+		editor.handleInput("\r");
+		expect(applied).toBe(1);
+		expect(submitted).toEqual([]);
+	});
+
 	it("does not apply a spelling suggestion when the word changed underneath", async () => {
 		const editor = new Editor(defaultEditorTheme);
 		editor.setTextAssistProvider({
