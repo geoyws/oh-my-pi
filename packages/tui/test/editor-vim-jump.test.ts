@@ -444,6 +444,51 @@ describe("Editor character jump and replace modes", () => {
 		expect(rows.join("\n")).toContain("distinct-line-0");
 	});
 
+	it("joins without trimming a leading-space atom token", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setVimMode(true);
+		editor.setText("one\nworld");
+		(editor as unknown as { atomicTokenPattern: RegExp }).atomicTokenPattern = / \[W\]/g;
+		editor.collapseToAtom(1, 0, 5, " [W]", "world");
+		editor.handleInput(ESC);
+		editor.handleInput("g");
+		editor.handleInput("g");
+		editor.handleInput("J");
+		expect(editor.getText()).toBe("one  [W]");
+	});
+
+	it("expands a cross-line visual delete over a token on the second line", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setVimMode(true);
+		editor.setText("aa\nworld xx");
+		(editor as unknown as { atomicTokenPattern: RegExp }).atomicTokenPattern = /\[W\]/g;
+		editor.collapseToAtom(1, 0, 5, "[W]", "world");
+		editor.handleInput(ESC);
+		editor.handleInput("g");
+		editor.handleInput("g");
+		editor.handleInput("v");
+		editor.handleInput("j");
+		editor.handleInput("l");
+		editor.handleInput("d");
+		expect(editor.getText()).not.toContain("[W]");
+		expect(editor.getText()).not.toContain("W]");
+	});
+
+	it("renders the cursor marker at the end of a full-buffer visual selection", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setVimMode(true);
+		editor.focused = true;
+		editor.setText("one\ntwo");
+		editor.handleInput(ESC);
+		editor.handleInput("g");
+		editor.handleInput("g");
+		editor.handleInput("V");
+		editor.handleInput("G");
+		const rows = editor.render(40);
+		expect(rows.join("\n")).toContain("\x1b_pi:c");
+		expect(rows.join("")).toContain("\x1b[7m");
+	});
+
 	it("overwrites in replace mode and restores on backspace", () => {
 		const editor = new Editor(defaultEditorTheme);
 		editor.setVimMode(true);
