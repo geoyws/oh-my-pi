@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { Editor } from "@oh-my-pi/pi-tui/components/editor";
+import { KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "@oh-my-pi/pi-tui/keybindings";
 import { defaultEditorTheme } from "./test-themes";
 
 function edit(editor: Editor, from: number, to: number, text: string, cursor: number, len?: number): void {
@@ -145,6 +146,33 @@ describe("Editor volatile preview and delete-before-cursor", () => {
 		editor.onLargePaste = () => false;
 		editor.pasteText(Array.from({ length: 12 }, (_, i) => `line-${i}`).join("\n"));
 		expect(editor.getText()).toContain("[Paste #");
+	});
+
+	it("stops deleting a volatile preview at the buffer start", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText("");
+		editor.setVolatileText("abc");
+		editor.moveToMessageStart();
+		editor.setVolatileText("z");
+		// The stale preview cannot be deleted past the buffer start; the new
+		// single-character preview replaces what it can and stays consistent.
+		expect(editor.getText()).toContain("z");
+		editor.clearVolatileText();
+		expect(editor.getText()).not.toContain("z");
+	});
+
+	it("submits on backslash plus Shift+Enter when submit is remapped to it", () => {
+		setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS, { "tui.input.submit": "shift+enter" }));
+		try {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("cmd\\");
+			const submitted: string[] = [];
+			editor.onSubmit = text => submitted.push(text);
+			editor.handleInput("\x1b[13;5u"); // Ctrl+Enter: not the submit binding
+			expect(submitted).toEqual(["cmd"]);
+		} finally {
+			setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS));
+		}
 	});
 
 	it("deletes before the cursor capped at the line start", () => {
