@@ -160,6 +160,27 @@ describe("Editor volatile preview and delete-before-cursor", () => {
 		expect(editor.getText()).not.toContain("z");
 	});
 
+	it("tracks character-jump pending state", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText("hello world");
+		editor.moveToMessageStart();
+		expect(editor.isJumpPending).toBe(false);
+		editor.handleInput("\x1d"); // Ctrl+]
+		expect(editor.isJumpPending).toBe(true);
+		editor.handleInput("w");
+		expect(editor.isJumpPending).toBe(false);
+		expect(editor.getCursor().col).toBe(6);
+	});
+
+	it("types literal text through the character pipeline", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText("");
+		editor.typeCharacter("a");
+		editor.typeCharacter("b");
+		expect(editor.getText()).toBe("ab");
+		expect(editor.getCursor()).toEqual({ line: 0, col: 2 });
+	});
+
 	it("deletes before the cursor capped at the line start", () => {
 		const editor = new Editor(defaultEditorTheme);
 		editor.setText("hello");
