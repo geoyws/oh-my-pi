@@ -165,6 +165,28 @@ describe("Editor spelling suggestions and ghost completion", () => {
 		expect(submitted).toEqual([]);
 	});
 
+	it("dismisses the popup on cursor motion and submits on Enter", async () => {
+		const editor = new Editor(defaultEditorTheme);
+		let applied = 0;
+		editor.setAutocompleteProvider({
+			getSuggestions: async (lines: string[]) =>
+				(lines[0] ?? "").startsWith("/mcp") ? { items: [{ value: "list", label: "list" }], prefix: "list" } : null,
+			applyCompletion: () => {
+				applied++;
+				return { lines: ["/mcp list"], cursorLine: 0, cursorCol: 9 };
+			},
+		});
+		const submitted: string[] = [];
+		editor.onSubmit = text => submitted.push(text);
+		for (const ch of "/mcp list") editor.handleInput(ch);
+		await untilShown(editor);
+		editor.handleInput("\x1b[D");
+		expect(editor.isShowingAutocomplete()).toBe(false);
+		editor.handleInput("\r");
+		expect(applied).toBe(0);
+		expect(submitted).toEqual(["/mcp list"]);
+	});
+
 	it("does not apply a spelling suggestion when the word changed underneath", async () => {
 		const editor = new Editor(defaultEditorTheme);
 		editor.setTextAssistProvider({
