@@ -151,6 +151,29 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		await m.refreshTitleSystemPrompt(tempDir.path());
 	});
 
+	it("refreshes skill and slash-command state and accepts autocomplete providers", async () => {
+		const m = createMode();
+		await m.init({ suppressWelcomeIntro: true });
+		await m.refreshSkillState();
+		await m.refreshSlashCommandState(tempDir.path());
+		m.addAutocompleteProvider(current => current);
+		m.disableGoalMode();
+		m.disableLoopMode();
+		m.holdGoalContinuation();
+		expect(m.editor).toBeDefined();
+	});
+
+	it("applies a cwd change to a sibling directory", async () => {
+		const m = createMode();
+		await m.init({ suppressWelcomeIntro: true });
+		const other = new TempDir("pi-c2-other-");
+		try {
+			await m.applyCwdChange(other.path());
+		} finally {
+			other.removeSync();
+		}
+	});
+
 	it("tracks displayable thinking content per visible session", () => {
 		const m = createMode();
 		expect(m.hasDisplayableThinkingContent).toBe(false);
