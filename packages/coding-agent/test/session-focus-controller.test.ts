@@ -794,6 +794,89 @@ describe("SessionFocusController", () => {
 	});
 });
 
+	it("rejects focusing in a collab session", async () => {
+		const h = makeHarness();
+		const worker = makeSessionStub();
+		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
+		(h.ctx as { collabGuest?: unknown }).collabGuest = { id: "guest" };
+		await expect(h.controller.focusAgent("Worker")).rejects.toThrow("Viewing agents is unavailable in a collab session.");
+		expect(h.controller.focusedAgentId).toBeUndefined();
+	});
+
+	it("focusParent is a no-op when unfocused and falls back to main for main or missing parents", async () => {
+		const h = makeHarness();
+		await h.controller.focusParent();
+		expect(h.controller.focusedAgentId).toBeUndefined();
+
+		const worker = makeSessionStub();
+		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
+		await h.controller.focusAgent("Worker");
+		await h.controller.focusParent();
+		expect(h.controller.focusedAgentId).toBeUndefined();
+
+		const orphan = makeSessionStub();
+		registerSub(h.registry, "Orphan", orphan.session, "MissingParent");
+		await h.controller.focusAgent("Orphan");
+		await h.controller.focusParent();
+		expect(h.controller.focusedAgentId).toBeUndefined();
+	});
+
+	it("ignores registry events for other agents and for a focused agent staying alive", async () => {
+		const h = makeHarness();
+		const worker = makeSessionStub();
+		const other = makeSessionStub();
+		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
+		registerSub(h.registry, "Other", other.session, MAIN_AGENT_ID);
+		await h.controller.focusAgent("Worker");
+		h.registry.setStatus("Other", "aborted");
+		await flushAsync();
+		expect(h.controller.focusedAgentId).toBe("Worker");
+		h.registry.setStatus("Worker", "idle");
+		await flushAsync();
+		expect(h.controller.focusedAgentId).toBe("Worker");
+	});
+
+	it("restores a live assistant stream and tool updates when focusing mid-turn", async () => {
+		const h = makeHarness();
+		const worker = makeSessionStub();
+		const live = { role: "assistant", content: [{ type: "text", text: "live" }] };
+		(worker.session.agent.state as { streamMessage: unknown }).streamMessage = live;
+		const toolUpdate = { type: "tool_execution_update", toolCallId: "t1" };
+		(worker.session as unknown as { activeToolExecutionUpdates: () => unknown[] }).activeToolExecutionUpdates = () => [toolUpdate];
+		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
+		await h.controller.focusAgent("Worker");
+		const types = h.handledEvents.map(e => (e as { type: string }).type);
+		expect(types).toContain("message_start");
+		expect(types).toContain("message_update");
+		expect(h.handledEvents).toContain(toolUpdate);
+	});
+
+	it("synthesizes a start before an orphaned assistant message_end", async () => {
+		const h = makeHarness();
+		const worker = makeSessionStub();
+		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
+		await h.controller.focusAgent("Worker");
+		h.handledEvents.length = 0;
+		const message = { role: "assistant", content: [{ type: "text", text: "done" }] };
+		await worker.emit({ type: "message_end", message });
+		const types = h.handledEvents.map(e => (e as { type: string }).type);
+		expect(types).toEqual(["message_start", "message_update", "message_end"]);
+	});
+
+	it("flushes the main session's pending model switch when returning unfocused", async () => {
+		const h = makeHarness();
+		const worker = makeSessionStub();
+		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
+		let flushes = 0;
+		(h.ctx as unknown as { flushPendingModelSwitch: () => Promise<void> }).flushPendingModelSwitch = async () => {
+			flushes++;
+		};
+		await h.controller.focusAgent("Worker");
+		flushes = 0;
+		await h.controller.unfocus();
+		expect(flushes).toBe(1);
+	});
+
 describe("pickRecentFocusableAgentId", () => {
 	function ref(id: string, overrides: Partial<AgentRef> = {}): AgentRef {
 		return {
@@ -838,6 +921,14 @@ describe("pickRecentFocusableAgentId", () => {
 				ref("Dead", { status: "aborted" }),
 			]),
 		).toBeUndefined();
+	});
+
+	it("breaks activity and creation ties by id, in both directions", () => {
+		const refs = [ref("Bravo"), ref("Alpha"), ref("Charlie")];
+		expect(pickRecentFocusableAgentId(refs)).toBe("Alpha");
+		expect(pickRecentFocusableAgentId(refs, "Alpha")).toBe("Bravo");
+		const later = [ref("Bravo", { createdAt: 2000 }), ref("Alpha", { createdAt: 1000 })];
+		expect(pickRecentFocusableAgentId(later)).toBe("Bravo");
 	});
 
 	it("cycles to the next-most-recent agent from the focused one, wrapping at the end", () => {
