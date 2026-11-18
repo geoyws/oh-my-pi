@@ -294,6 +294,23 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		m.disableLoopMode();
 	});
 
+	it("restores a saved draft into the editor on init", async () => {
+		const m = createMode();
+		await m.sessionManager.saveDraft("unsent thought");
+		await m.init({ suppressWelcomeIntro: true });
+		expect(m.editor.getText()).toContain("unsent thought");
+	});
+
+	it("reacts to a model change on the live session", async () => {
+		const m = createMode();
+		await m.init({ suppressWelcomeIntro: true });
+		const registry = new ModelRegistry(authStorage, path.join(tempDir.path(), `models-alt-${Bun.nanoseconds()}.yml`));
+		const other = registry.find("anthropic", "claude-opus-4-5") as Model<Api>;
+		const result = await m.session.setModel(other);
+		expect(result.switched).toBe(true);
+		expect(m.session.model?.id).toBe("claude-opus-4-5");
+	});
+
 	it("tracks displayable thinking content per visible session", () => {
 		const m = createMode();
 		expect(m.hasDisplayableThinkingContent).toBe(false);
