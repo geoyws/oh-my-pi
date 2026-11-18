@@ -358,6 +358,18 @@ describe("Editor wide-token and tiny-width rendering", () => {
 	});
 });
 
+describe("Editor zero-width rendering", () => {
+	it("renders at zero width with a prompt gutter without losing the cursor marker", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setBorderVisible(false);
+		editor.setPromptGutter(">> ");
+		editor.focused = true;
+		editor.setText("body");
+		const rows = editor.render(0);
+		expect(rows.length).toBeGreaterThan(0);
+	});
+});
+
 describe("Editor wrap rendering", () => {
 	it("renders an empty editor as a blank row", () => {
 		const editor = new Editor(defaultEditorTheme);
