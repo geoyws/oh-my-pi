@@ -292,6 +292,51 @@ describe("Editor kill ring, yank and undo", () => {
 		expect(editor.getCursor()).toEqual({ line: 0, col: 0 });
 	});
 
+	it("anchors history navigation on visual rows after a render", async () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.addToHistory("alpha beta gamma delta");
+		await editor.whenHistorySettled();
+		editor.render(16);
+		editor.handleInput("\x1b[A");
+		expect(editor.getText()).toBe("alpha beta gamma delta");
+	});
+
+	it("does not yank-pop a multi-line yank when the cursor is on its first line", () => {
+		const editor = editorWith("aa\nbb");
+		editor.moveToMessageStart();
+		editor.handleInput("\x0b");
+		editor.handleInput("x");
+		editor.handleInput("\x7f");
+		editor.handleInput("\x1b[B");
+		editor.moveToLineStart();
+		editor.handleInput("\x0b");
+		editor.handleInput("\x0b");
+		editor.setText("q");
+		editor.handleInput("\x19"); // yank "aa\n" (or the newest multi-line kill)
+		const yanked = editor.getText();
+		editor.moveToMessageStart();
+		editor.handleInput("\x1by");
+		expect(editor.getText()).toBe(yanked);
+	});
+
+	it("does not yank-pop when the yanked region no longer matches", () => {
+		const editor = editorWith("hello world");
+		editor.moveToLineStart();
+		right(editor, 6);
+		editor.handleInput("\x0b");
+		editor.handleInput("z");
+		editor.handleInput("\x7f");
+		editor.moveToLineStart();
+		right(editor, 6);
+		editor.handleInput("\x0b");
+		editor.setText("base");
+		editor.handleInput("\x19");
+		const yanked = editor.getText();
+		editor.moveToLineStart();
+		editor.handleInput("\x1by");
+		expect(editor.getText()).toBe(yanked);
+	});
+
 	it("moves to line start and end", () => {
 		const editor = editorWith("hello");
 		editor.moveToLineStart();
