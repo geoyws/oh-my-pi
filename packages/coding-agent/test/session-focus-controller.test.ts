@@ -1246,6 +1246,8 @@ describe("pickRecentFocusableAgentId", () => {
 		expect(pickRecentFocusableAgentId([ref("Bravo"), ref("Alpha")])).toBe("Alpha");
 		expect(pickRecentFocusableAgentId([ref("Alpha"), ref("Bravo")])).toBe("Alpha");
 		expect(pickRecentFocusableAgentId([ref("Echo"), ref("Delta"), ref("Charlie"), ref("Bravo"), ref("Alpha")])).toBe("Alpha");
+		const many = Array.from({ length: 50 }, (_, i) => ref(`Agent-${String(49 - i).padStart(2, "0")}`));
+		expect(pickRecentFocusableAgentId(many)).toBe("Agent-00");
 		for (const order of [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]]) {
 			const permuted = order.map(i => refs[i]!);
 			expect(pickRecentFocusableAgentId(permuted)).toBe("Alpha");
