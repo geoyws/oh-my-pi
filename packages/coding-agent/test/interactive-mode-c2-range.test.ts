@@ -182,9 +182,24 @@ describe("InteractiveMode constructed surface (C2)", () => {
 	it("applies a cwd change to a sibling directory", async () => {
 		const m = createMode();
 		await m.init({ suppressWelcomeIntro: true });
-		const other = new TempDir("pi-c2-other-");
+		const other = TempDir.createSync("@pi-c2-other-");
 		try {
-			await m.applyCwdChange(other.path());
+			expect(await m.applyCwdChange(other.path())).toBe(true);
+		} finally {
+			other.removeSync();
+		}
+	});
+
+	it("commits a cwd change even when the project settings file is unreadable", async () => {
+		const m = createMode();
+		await m.init({ suppressWelcomeIntro: true });
+		const other = TempDir.createSync("@pi-c2-bad-");
+		try {
+			const fs = await import("node:fs");
+			fs.mkdirSync(path.join(other.path(), ".claude"), { recursive: true });
+			fs.mkdirSync(path.join(other.path(), ".claude", "settings.yml"), { recursive: true });
+			// the settings loader tolerates an unreadable project file; the switch commits
+			expect(await m.applyCwdChange(other.path())).toBe(true);
 		} finally {
 			other.removeSync();
 		}
