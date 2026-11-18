@@ -336,6 +336,28 @@ describe("Editor non-cursor line truncation", () => {
 	});
 });
 
+describe("Editor wide-token and tiny-width rendering", () => {
+	it("fills the remaining width with a wide-token prefix before wrapping", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText("aaaaa 日本語テスト日本語テスト");
+		const rows = editor.render(16).map(row => Bun.stripANSI(row));
+		const joined = rows.join("");
+		expect(joined).toContain("日本");
+		expect(joined).toContain("テスト");
+		for (const row of rows) expect(row.length).toBeLessThanOrEqual(20);
+	});
+
+	it("renders a software cursor at a near-zero width without losing the marker", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setBorderVisible(false);
+		editor.setUseTerminalCursor(false);
+		editor.focused = true;
+		editor.setText("x");
+		const rows = editor.render(2);
+		expect(rows.join("\n")).toContain(CURSOR_MARKER);
+	});
+});
+
 describe("Editor wrap rendering", () => {
 	it("renders an empty editor as a blank row", () => {
 		const editor = new Editor(defaultEditorTheme);
