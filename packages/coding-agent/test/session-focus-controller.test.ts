@@ -1174,7 +1174,9 @@ describe("SessionFocusController", () => {
 		await h.controller.unfocus();
 		release?.();
 		await focus;
-		expect(restored).toBe(0);
+		// Two unconditional restores (one per attach at the render step); the
+		// restore-specific one after the superseded update would make it 3.
+		expect(restored).toBe(2);
 	});
 
 describe("pickRecentFocusableAgentId", () => {
