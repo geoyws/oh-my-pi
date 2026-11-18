@@ -489,6 +489,56 @@ describe("Editor character jump and replace modes", () => {
 		expect(rows.join("")).toContain("\x1b[7m");
 	});
 
+	it("expands a cross-line visual delete starting inside a token", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setVimMode(true);
+		editor.setText("world aa\nbb");
+		(editor as unknown as { atomicTokenPattern: RegExp }).atomicTokenPattern = /\[W\]/g;
+		editor.collapseToAtom(0, 0, 5, "[W]", "world");
+		editor.handleInput(ESC);
+		editor.handleInput("g");
+		editor.handleInput("g");
+		editor.handleInput("l");
+		editor.handleInput("v");
+		editor.handleInput("j");
+		editor.handleInput("d");
+		expect(editor.getText()).not.toContain("[W]");
+		expect(editor.getText()).toBe("");
+	});
+
+	it("backspace in replace mode before any overwrite is a no-op", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setVimMode(true);
+		editor.setText("abc");
+		editor.handleInput(ESC);
+		editor.handleInput("g");
+		editor.handleInput("g");
+		editor.handleInput("R");
+		editor.handleInput("\x7f");
+		expect(editor.getText()).toBe("abc");
+		expect(editor.vimMode).toBe("replace");
+	});
+
+	it("does not restore an overwrite after a host caret move breaks the replace chain", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setVimMode(true);
+		editor.setText("abc");
+		editor.handleInput(ESC);
+		editor.handleInput("g");
+		editor.handleInput("g");
+		editor.handleInput("R");
+		editor.handleInput("X");
+		expect(editor.getText()).toBe("Xbc");
+		editor.insertText("q");
+		expect(editor.getText()).toBe("Xqbc");
+		editor.handleInput("\x7f");
+		// The entry is not at the cursor, so nothing is restored yet.
+		expect(editor.getText()).toBe("Xqbc");
+		editor.handleNativeEvent({ type: "edit", key: "", from: 2, to: 2, text: "", cursor: 1, len: 4 });
+		editor.handleInput("\x7f");
+		expect(editor.getText()).toBe("Xqbc");
+	});
+
 	it("overwrites in replace mode and restores on backspace", () => {
 		const editor = new Editor(defaultEditorTheme);
 		editor.setVimMode(true);
