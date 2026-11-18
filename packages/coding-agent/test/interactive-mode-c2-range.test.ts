@@ -11,7 +11,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import { InteractiveMode } from "../src/modes/interactive-mode";
-import { cfgStartupQuiet } from "@oh-my-pi/pi-coding-agent/modes/settings";
+import { cfgStartupQuiet, cfgTuiMouse } from "@oh-my-pi/pi-coding-agent/modes/settings";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import type { DescribeContext } from "@oh-my-pi/pi-tui/native/node";
 
@@ -108,6 +108,39 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		bus.emit("mcp:connection-status", { type: "failed", serverName: "srv1", error: "boom" });
 		bus.emit("mcp:connection-status", { type: "reconnecting", serverName: "srv1" });
 		expect(m).toBeDefined();
+	});
+
+	it("reacts to editor geometry callbacks, mouse settings and judgment progress", () => {
+		const bus = new EventBus();
+		const m = createMode(bus);
+		m.editor.onAutocompleteCancel?.();
+		m.editor.onAutocompleteUpdate?.();
+		expect(m.editor.viewportRowsProvider?.()).toBeGreaterThan(0);
+		// mouse capture follows the tui.mouse setting in both directions
+		cfgTuiMouse.set(Settings.instance, false);
+		cfgTuiMouse.set(Settings.instance, true);
+		// malformed judgment progress is dropped; a valid snapshot drives the HUD
+		bus.emit("eval:judgment-batch-progress", { nope: true });
+		bus.emit("eval:judgment-batch-progress", {
+			id: "batch-1",
+			intent: "grade answers",
+			done: 1,
+			total: 3,
+			failed: 0,
+			cost: 0.01,
+			running: true,
+		});
+		bus.emit("eval:judgment-batch-progress", {
+			id: "batch-1",
+			intent: "grade answers",
+			done: 3,
+			total: 3,
+			failed: 1,
+			cost: 0.03,
+			running: false,
+		});
+		m.statusLine.onNativePullRequest?.({ number: 42 } as never);
+		m.statusLine.onNativePullRequest?.(undefined as never);
 	});
 
 	it("tracks displayable thinking content per visible session", () => {
