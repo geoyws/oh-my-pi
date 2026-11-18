@@ -214,6 +214,33 @@ describe("Editor decorations, scrollbar and gutter edges", () => {
 		expect(propsOf()).toBe(decor);
 	});
 
+	it("replaces decorations when their length or fields change", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText("draft");
+		const propsOf = () => {
+			const root = editor.describe(cx);
+			const found = (root.c ?? []).find(child => "k" in child && child.k === "editor") as
+				| { p?: { decor?: unknown } }
+				| undefined;
+			return found?.p?.decor;
+		};
+		(editor as unknown as { describeDecorations: unknown }).describeDecorations = () => [{ from: 0, to: 2, s: "accent" }];
+		expect(propsOf()).toEqual([{ from: 0, to: 2, s: "accent" }]);
+		editor.invalidate();
+		(editor as unknown as { describeDecorations: unknown }).describeDecorations = () => [
+			{ from: 0, to: 2, s: "accent" },
+			{ from: 3, to: 5, s: "muted" },
+		];
+		expect(propsOf()).toHaveLength(2);
+		editor.invalidate();
+		(editor as unknown as { describeDecorations: unknown }).describeDecorations = () => [{ from: 1, to: 2, s: "accent" }];
+		expect(propsOf()).toEqual([{ from: 1, to: 2, s: "accent" }]);
+		// Clearing decorations removes them from the description.
+		editor.invalidate();
+		(editor as unknown as { describeDecorations: unknown }).describeDecorations = () => [];
+		expect(propsOf()).toBeUndefined();
+	});
+
 	it("bounds the debug preview when the first line alone exceeds it", () => {
 		const editor = new Editor(defaultEditorTheme);
 		editor.setText(`${"x".repeat(200)}\nsecond`);
@@ -293,6 +320,16 @@ describe("Editor wrap rendering", () => {
 		const rows = editor.render(16).map(row => Bun.stripANSI(row));
 		expect(rows.length).toBeGreaterThan(1);
 		expect(rows.join(" ")).toContain("indented");
+	});
+
+	it("collapses trailing whitespace at a wrap boundary without losing words", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText("alpha     beta gamma delta epsilon");
+		const rows = editor.render(16).map(row => Bun.stripANSI(row));
+		const joined = rows.join(" ");
+		expect(joined).toContain("alpha");
+		expect(joined).toContain("beta");
+		expect(joined).toContain("epsilon");
 	});
 
 	it("describes the editor as a native editor node", () => {
