@@ -403,6 +403,47 @@ describe("Editor character jump and replace modes", () => {
 		expect(editor.getText()).toBe("hello wo");
 	});
 
+	it("deletes every line with a full linewise visual selection", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setVimMode(true);
+		editor.setText("one\ntwo\nthree");
+		editor.handleInput(ESC);
+		editor.handleInput("g");
+		editor.handleInput("g");
+		editor.handleInput("V");
+		editor.handleInput("G");
+		editor.handleInput("d");
+		expect(editor.getText()).toBe("");
+		expect(editor.render(40).length).toBeGreaterThan(0);
+	});
+
+	it("does not highlight the second visual row of a wrapped line outside the selection", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setVimMode(true);
+		editor.focused = true;
+		editor.setText("0123456789ABCDEFGHIJ");
+		editor.handleInput(ESC);
+		editor.handleInput("g");
+		editor.handleInput("g");
+		editor.handleInput("v");
+		editor.handleInput("l");
+		editor.handleInput("l");
+		const rows = editor.render(16);
+		const highlighted = rows.filter(row => row.includes("\x1b[7m"));
+		expect(highlighted.length).toBeGreaterThan(0);
+		expect(rows.join("")).toContain("ABCDEFGHIJ");
+		const secondRow = rows.find(row => row.includes("ABCDEFGHIJ"))!;
+		expect(secondRow).not.toContain("\x1b[7m");
+	});
+
+	it("renders a wrapped editor with more lines than the wrap cache holds", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText(Array.from({ length: 260 }, (_, i) => `distinct-line-${i}`).join("\n"));
+		const rows = editor.render(60);
+		expect(rows.join("\n")).toContain("distinct-line-259");
+		expect(rows.join("\n")).toContain("distinct-line-0");
+	});
+
 	it("overwrites in replace mode and restores on backspace", () => {
 		const editor = new Editor(defaultEditorTheme);
 		editor.setVimMode(true);
