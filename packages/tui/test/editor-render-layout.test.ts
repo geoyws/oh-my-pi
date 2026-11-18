@@ -80,6 +80,51 @@ describe("Editor debug state and simple setters", () => {
 	});
 });
 
+describe("Editor border, gutter and invalidation", () => {
+	it("hides the border chrome when border visibility is off and restores it when on", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText("body");
+		const bordered = editor.render(40).map(row => Bun.stripANSI(row));
+		expect(bordered.join("\n")).toContain("+");
+		editor.setBorderVisible(false);
+		editor.setBorderVisible(false);
+		const plain = editor.render(40).map(row => Bun.stripANSI(row));
+		expect(plain.join("\n")).not.toContain("+");
+		expect(plain.join("\n")).toContain("body");
+		editor.setBorderVisible(true);
+		expect(editor.render(40).map(row => Bun.stripANSI(row)).join("\n")).toContain("+");
+	});
+
+	it("keeps the same top-border provider without re-registering it", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText("body");
+		let calls = 0;
+		const provider = (availableWidth: number) => {
+			calls++;
+			return { content: `w=${availableWidth}`, width: 6 };
+		};
+		editor.setTopBorderProvider(provider);
+		editor.setTopBorderProvider(provider);
+		editor.render(80);
+		expect(calls).toBe(1);
+		editor.setTopBorderProvider(undefined);
+		editor.render(80);
+		expect(calls).toBe(1);
+	});
+
+	it("shows a prompt gutter only in borderless contexts", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText("body");
+		editor.setPromptGutter(">> ");
+		const bordered = editor.render(40).map(row => Bun.stripANSI(row));
+		expect(bordered.join("\n")).not.toContain(">>");
+		editor.setBorderVisible(false);
+		const borderless = editor.render(40).map(row => Bun.stripANSI(row));
+		expect(borderless.join("\n")).toContain(">>");
+	});
+
+});
+
 describe("Editor wrap rendering", () => {
 	it("renders an empty editor as a blank row", () => {
 		const editor = new Editor(defaultEditorTheme);
