@@ -107,7 +107,7 @@ describe("renderSubagentHudLines", () => {
 	it("renders nothing when nothing is running", async () => {
 		await initTheme();
 		expect(renderSubagentHudLines([], 120)).toEqual([]);
-		expect(renderSubagentHudLines([{ kind: "subagent", id: "Idle", label: "Idle", status: "active", progress: { status: "idle" } } as ObservableSession], 120)).toEqual([]);
+		expect(renderSubagentHudLines([{ kind: "subagent", id: "Idle", label: "Idle", status: "completed", progress: { status: "idle" } } as ObservableSession], 120)).toEqual([]);
 	});
 
 	it("lists running agents with descriptions and previews raw assignments", async () => {
