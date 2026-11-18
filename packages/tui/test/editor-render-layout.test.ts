@@ -235,6 +235,9 @@ describe("Editor decorations, scrollbar and gutter edges", () => {
 		editor.invalidate();
 		(editor as unknown as { describeDecorations: unknown }).describeDecorations = () => [{ from: 1, to: 2, s: "accent" }];
 		expect(propsOf()).toEqual([{ from: 1, to: 2, s: "accent" }]);
+		editor.invalidate();
+		(editor as unknown as { describeDecorations: unknown }).describeDecorations = () => [{ from: 0, to: 2, s: "accent", fx: "glow" }];
+		expect(propsOf()).toEqual([{ from: 0, to: 2, s: "accent", fx: "glow" }]);
 		// Clearing decorations removes them from the description.
 		editor.invalidate();
 		(editor as unknown as { describeDecorations: unknown }).describeDecorations = () => [];
@@ -319,6 +322,17 @@ describe("Editor gutter-only cursor rows", () => {
 		const rows = editor.render(3);
 		expect(rows.join("")).toContain(">");
 		expect(rows.join("\n")).toContain(CURSOR_MARKER);
+	});
+});
+
+describe("Editor non-cursor line truncation", () => {
+	it("truncates an over-wide line that does not hold the cursor", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText("short\n0123456789abcdefghijklmnopqrstuvwxyz");
+		editor.handleInput("\x1b[A");
+		const rows = editor.render(16).map(row => Bun.stripANSI(row).replaceAll(CURSOR_MARKER, ""));
+		expect(rows.join("\n")).toContain("short");
+		expect(rows.join("\n")).not.toContain("abcdefghijklmnopqrstuvwxyz");
 	});
 });
 
