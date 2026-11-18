@@ -158,6 +158,42 @@ describe("Editor cursor and scroll rendering", () => {
 	});
 });
 
+describe("Editor native describe", () => {
+	it("memoizes the described root until the text changes", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText("draft");
+		const first = editor.describe(cx);
+		expect(editor.describe(cx)).toBe(first);
+		editor.setText("draft v2");
+		const second = editor.describe(cx);
+		expect(second).not.toBe(first);
+		expect(JSON.stringify(second)).toContain("draft v2");
+	});
+
+	it("describes text, end cursor and max lines", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText("one\ntwo");
+		editor.setMaxHeight(4);
+		const root = editor.describe(cx);
+		const editorNode = (root.c ?? []).find(child => "k" in child && child.k === "editor") as
+			| { p?: { text?: string; cursor?: number; maxLines?: number } }
+			| undefined;
+		expect(editorNode?.p?.text).toBe("one\ntwo");
+		expect(editorNode?.p?.cursor).toBe("one\ntwo".length);
+		expect(editorNode?.p?.maxLines).toBe(4);
+	});
+
+	it("describes an empty editor with no text and cursor at zero", () => {
+		const editor = new Editor(defaultEditorTheme);
+		const root = editor.describe(cx);
+		const editorNode = (root.c ?? []).find(child => "k" in child && child.k === "editor") as
+			| { p?: { text?: string; cursor?: number } }
+			| undefined;
+		expect(editorNode?.p?.text).toBe("");
+		expect(editorNode?.p?.cursor).toBe(0);
+	});
+});
+
 describe("Editor wrap rendering", () => {
 	it("renders an empty editor as a blank row", () => {
 		const editor = new Editor(defaultEditorTheme);
