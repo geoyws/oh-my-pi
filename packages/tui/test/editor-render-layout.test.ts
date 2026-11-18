@@ -1,4 +1,5 @@
 import { beforeAll, describe, expect, it } from "bun:test";
+import { CURSOR_MARKER } from "@oh-my-pi/pi-tui";
 import { Editor } from "@oh-my-pi/pi-tui/components/editor";
 import type { DescribeContext } from "@oh-my-pi/pi-tui/native/node";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
@@ -123,6 +124,39 @@ describe("Editor border, gutter and invalidation", () => {
 		expect(borderless.join("\n")).toContain(">>");
 	});
 
+});
+
+describe("Editor cursor and scroll rendering", () => {
+	it("marks the cursor in a focused editor and omits it unfocused", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText("hello");
+		expect(editor.render(40).join("\n")).not.toContain(CURSOR_MARKER);
+		editor.focused = true;
+		expect(editor.render(40).join("\n")).toContain(CURSOR_MARKER);
+	});
+
+	it("renders an end-of-line cursor on an exactly full row", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.focused = true;
+		// Content width at 16 is 10 (border chrome): exactly fill it.
+		editor.setText("0123456789ABCDEFGHIJ");
+		const rows = editor.render(16);
+		expect(rows.join("\n")).toContain(CURSOR_MARKER);
+		expect(rows.join("")).toContain("\x1b[4m");
+	});
+
+	it("scrolls to keep the cursor visible under a max height", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText(Array.from({ length: 10 }, (_, i) => `line-${i}`).join("\n"));
+		editor.setMaxHeight(3);
+		const atEnd = editor.render(40).map(row => Bun.stripANSI(row).replaceAll(CURSOR_MARKER, ""));
+		expect(atEnd.join("\n")).toContain("line-9");
+		expect(atEnd.join("\n")).not.toContain("line-0");
+		editor.moveToMessageStart();
+		const atStart = editor.render(40).map(row => Bun.stripANSI(row).replaceAll(CURSOR_MARKER, ""));
+		expect(atStart.join("\n")).toContain("line-0");
+		expect(atStart.join("\n")).not.toContain("line-9");
+	});
 });
 
 describe("Editor wrap rendering", () => {
