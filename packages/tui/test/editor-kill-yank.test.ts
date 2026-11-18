@@ -173,6 +173,39 @@ describe("Editor kill ring, yank and undo", () => {
 		expect(newest).not.toBe(older);
 	});
 
+	it("deletes forward by grapheme, joins lines at the end, and stops at the buffer end", () => {
+		const editor = editorWith("abc");
+		editor.moveToLineStart();
+		editor.handleInput("\x1b[3~"); // Delete
+		expect(editor.getText()).toBe("bc");
+
+		const emoji = editorWith("a😀b");
+		emoji.moveToLineStart();
+		emoji.handleInput("\x1b[C");
+		emoji.handleInput("\x1b[3~");
+		expect(emoji.getText()).toBe("ab");
+
+		const join = editorWith("aa\nbb");
+		join.moveToLineStart();
+		join.moveToLineEnd();
+		join.handleInput("\x1b[3~");
+		expect(join.getText()).toBe("aabb");
+
+		const atEnd = editorWith("aa");
+		atEnd.handleInput("\x1b[3~");
+		expect(atEnd.getText()).toBe("aa");
+	});
+
+	it("deletes the line break forward at the end of a line and yanks it back", () => {
+		const editor = editorWith("aa\nbb");
+		editor.moveToLineStart();
+		editor.moveToLineEnd();
+		editor.handleInput("\x1bd"); // Alt+D at end of line
+		expect(editor.getText()).toBe("aabb");
+		editor.handleInput("\x19"); // yank the killed break
+		expect(editor.getText()).toBe("aa\nbb");
+	});
+
 	it("moves to line start and end", () => {
 		const editor = editorWith("hello");
 		editor.moveToLineStart();
