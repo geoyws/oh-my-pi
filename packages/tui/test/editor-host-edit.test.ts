@@ -87,6 +87,66 @@ describe("Editor volatile preview and delete-before-cursor", () => {
 		expect(editor.getText()).toBe("say: ");
 	});
 
+	it("clears a volatile preview with an empty set and an empty commit", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText("say: ");
+		editor.moveToLineEnd();
+		editor.setVolatileText("helo");
+		editor.setVolatileText("");
+		expect(editor.getText()).toBe("say: ");
+		editor.setVolatileText("helo");
+		editor.commitVolatileText("");
+		expect(editor.getText()).toBe("say: ");
+	});
+
+	it("replaces a multi-line volatile preview across the line break", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText("ab\ncd");
+		editor.setVolatileText("X\nYZ");
+		expect(editor.getText()).toBe("ab\ncdX\nYZ");
+		editor.setVolatileText("q");
+		expect(editor.getText()).toBe("ab\ncdq");
+		editor.clearVolatileText();
+		expect(editor.getText()).toBe("ab\ncd");
+	});
+
+	it("prepends a space when pasting a file path after a word character", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText("file");
+		editor.pasteText("/tmp/x");
+		expect(editor.getText()).toBe("file /tmp/x");
+		const atStart = new Editor(defaultEditorTheme);
+		atStart.setText("");
+		atStart.pasteText("/tmp/x");
+		expect(atStart.getText()).toBe("/tmp/x");
+	});
+
+	it("collapses a marker-sized paste and expands it on read", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText("");
+		const big = Array.from({ length: 12 }, (_, i) => `line-${i}`).join("\n");
+		editor.pasteText(big);
+		expect(editor.getText()).toContain("[Paste #");
+		expect(editor.getExpandedText()).toBe(big);
+	});
+
+	it("inserts nothing when the host intercepts a marker-sized paste", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setText("keep");
+		const seen: string[] = [];
+		editor.onLargePaste = text => {
+			seen.push(text);
+			return true;
+		};
+		editor.pasteText(Array.from({ length: 12 }, (_, i) => `line-${i}`).join("\n"));
+		expect(editor.getText()).toBe("keep");
+		expect(seen).toHaveLength(1);
+		// A host that declines lets the editor collapse it to a marker.
+		editor.onLargePaste = () => false;
+		editor.pasteText(Array.from({ length: 12 }, (_, i) => `line-${i}`).join("\n"));
+		expect(editor.getText()).toContain("[Paste #");
+	});
+
 	it("deletes before the cursor capped at the line start", () => {
 		const editor = new Editor(defaultEditorTheme);
 		editor.setText("hello");
