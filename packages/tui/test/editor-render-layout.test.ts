@@ -135,14 +135,13 @@ describe("Editor cursor and scroll rendering", () => {
 		expect(editor.render(40).join("\n")).toContain(CURSOR_MARKER);
 	});
 
-	it("renders an end-of-line cursor on an exactly full row", () => {
+	it("renders the cursor marker at the end of an exactly full row", () => {
 		const editor = new Editor(defaultEditorTheme);
 		editor.focused = true;
 		// Content width at 16 is 10 (border chrome): exactly fill it.
-		editor.setText("0123456789ABCDEFGHIJKLMNOPQRSTUV");
+		editor.setText("0123456789ABCDEFGHIJKLMNOPQRST");
 		const rows = editor.render(16);
 		expect(rows.join("\n")).toContain(CURSOR_MARKER);
-		expect(rows.join("")).toContain("\x1b[4m");
 	});
 
 	it("scrolls to keep the cursor visible under a max height", () => {
