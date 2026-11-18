@@ -245,6 +245,31 @@ describe("Editor decorations, scrollbar and gutter edges", () => {
 	});
 });
 
+describe("Editor software and terminal cursor shapes", () => {
+	it("highlights the grapheme under a software cursor mid-text", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setUseTerminalCursor(false);
+		editor.focused = true;
+		editor.setText("hello");
+		editor.handleInput("\x1b[D");
+		editor.handleInput("\x1b[D");
+		const rows = editor.render(40);
+		expect(rows.join("")).toContain("\x1b[7ml\x1b[0m");
+	});
+
+	it("renders a cursor override at the end of the text", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setUseTerminalCursor(false);
+		editor.focused = true;
+		editor.setText("hi");
+		editor.cursorOverride = "X";
+		const rows = editor.render(40);
+		expect(rows.join("")).toContain(`${CURSOR_MARKER}X`);
+	});
+
+
+});
+
 describe("Editor wrap rendering", () => {
 	it("renders an empty editor as a blank row", () => {
 		const editor = new Editor(defaultEditorTheme);
