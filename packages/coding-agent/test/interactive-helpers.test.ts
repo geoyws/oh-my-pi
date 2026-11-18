@@ -5,7 +5,9 @@ import {
 	layoutPinnedHud,
 	nextSubagentPreviewTickMs,
 	shouldEnterPlanModeOnStartup,
+	SubagentHudComponent,
 } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
+import { PINNED_HUD_TOGGLE_ID } from "@oh-my-pi/pi-coding-agent/task/output-manager";
 
 describe("computeEditorMaxHeight edges", () => {
 	it("falls back for non-positive and non-finite row counts", () => {
@@ -60,6 +62,37 @@ describe("nextSubagentPreviewTickMs", () => {
 				10000,
 			),
 		).toBe(1000);
+	});
+});
+
+describe("SubagentHudComponent click map", () => {
+	it("maps rendered rows to agents only after a render", () => {
+		const hud = new SubagentHudComponent(["header", "sub", "itemA", "itemB"], ["AgentA", "AgentB"]);
+		expect(hud.getClickAgentAtRow(2)).toBeUndefined();
+		hud.render(60);
+		expect(hud.getClickAgentAtRow(-1)).toBeUndefined();
+		expect(hud.getClickAgentAtRow(0)).toBeUndefined();
+		expect(hud.getClickAgentAtRow(2)).toBe("AgentA");
+		expect(hud.getClickAgentAtRow(3)).toBe("AgentB");
+		expect(hud.getClickAgentAtRow(99)).toBeUndefined();
+	});
+
+	it("routes the toggle row to the pinned toggle id and remaps after update", () => {
+		const hud = new SubagentHudComponent(["header", "sub", "itemA", "more"], ["AgentA"], 3);
+		hud.render(60);
+		expect(hud.getClickAgentAtRow(3)).toBe(PINNED_HUD_TOGGLE_ID);
+		hud.update(["header", "sub", "itemZ"], ["AgentZ"], undefined);
+		hud.render(60);
+		expect(hud.getClickAgentAtRow(2)).toBe("AgentZ");
+		expect(hud.getClickAgentAtRow(3)).toBeUndefined();
+	});
+
+	it("maps every wrapped physical row of a long item to its agent", () => {
+		const hud = new SubagentHudComponent(["header", "sub", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa item"], ["AgentLong"]);
+		const rows = hud.render(20);
+		expect(rows.length).toBeGreaterThan(3);
+		const owners = rows.map((_row, index) => hud.getClickAgentAtRow(index));
+		expect(owners.slice(2).every(owner => owner === "AgentLong")).toBe(true);
 	});
 });
 
