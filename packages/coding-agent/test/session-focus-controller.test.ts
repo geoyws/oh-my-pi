@@ -1179,6 +1179,21 @@ describe("SessionFocusController", () => {
 		expect(restored).toBe(2);
 	});
 
+	it("does not restore the live stream when the render step reentrantly unfocuses", async () => {
+		const h = makeHarness();
+		const worker = makeSessionStub();
+		const live = { role: "assistant", content: [{ type: "text", text: "live" }] };
+		(worker.session.agent.state as { streamMessage: unknown }).streamMessage = live;
+		(h.ctx.eventController as unknown as { restorePendingToolResults: () => void }).restorePendingToolResults = () => {
+			void h.controller.unfocus();
+		};
+		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
+		await h.controller.focusAgent("Worker");
+		await flushAsync();
+		expect(h.handledEvents.map(e => (e as { type: string }).type)).not.toContain("message_start");
+		expect(h.controller.focusedAgentId).toBeUndefined();
+	});
+
 describe("pickRecentFocusableAgentId", () => {
 	function ref(id: string, overrides: Partial<AgentRef> = {}): AgentRef {
 		return {
@@ -1230,6 +1245,7 @@ describe("pickRecentFocusableAgentId", () => {
 		expect(pickRecentFocusableAgentId(refs)).toBe("Alpha");
 		expect(pickRecentFocusableAgentId([ref("Bravo"), ref("Alpha")])).toBe("Alpha");
 		expect(pickRecentFocusableAgentId([ref("Alpha"), ref("Bravo")])).toBe("Alpha");
+		expect(pickRecentFocusableAgentId([ref("Echo"), ref("Delta"), ref("Charlie"), ref("Bravo"), ref("Alpha")])).toBe("Alpha");
 		for (const order of [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]]) {
 			const permuted = order.map(i => refs[i]!);
 			expect(pickRecentFocusableAgentId(permuted)).toBe("Alpha");
