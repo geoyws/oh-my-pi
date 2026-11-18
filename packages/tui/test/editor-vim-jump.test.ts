@@ -308,6 +308,7 @@ describe("Editor character jump and replace modes", () => {
 		const editor = new Editor(defaultEditorTheme);
 		editor.setVimMode(true);
 		editor.setText("one\nworld");
+		(editor as unknown as { atomicTokenPattern: RegExp }).atomicTokenPattern = /\[W\]/g;
 		editor.collapseToAtom(1, 0, 5, "[W]", "world");
 		editor.handleInput(ESC);
 		editor.handleInput("g");
@@ -353,6 +354,53 @@ describe("Editor character jump and replace modes", () => {
 		editor.handleInput("l");
 		const rows = editor.render(40);
 		expect(rows.join("")).toContain("\x1b[7mh");
+	});
+
+	it("indents and dedents a genuinely tabbed line", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setVimMode(true);
+		editor.setText("one");
+		editor.moveToLineStart();
+		editor.insertText("\t");
+		expect(editor.getText()).toBe("\tone");
+		editor.handleInput(ESC);
+		editor.handleInput("g");
+		editor.handleInput("g");
+		editor.handleInput(">");
+		editor.handleInput(">");
+		expect(editor.getText()).toBe("\t\tone");
+		editor.handleInput("<");
+		editor.handleInput("<");
+		expect(editor.getText()).toBe("\tone");
+	});
+
+	it("retypes nothing for an insert session that typed nothing", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setVimMode(true);
+		editor.setText("abc");
+		editor.handleInput(ESC);
+		editor.handleInput("g");
+		editor.handleInput("g");
+		editor.handleInput("i");
+		editor.handleInput(ESC);
+		editor.handleInput(".");
+		expect(editor.getText()).toBe("abc");
+	});
+
+	it("deletes a backward visual selection", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setVimMode(true);
+		editor.focused = true;
+		editor.setText("hello world");
+		editor.handleInput(ESC);
+		editor.handleInput("$");
+		editor.handleInput("v");
+		editor.handleInput("h");
+		editor.handleInput("h");
+		const rows = editor.render(40);
+		expect(rows.join("")).toContain("\x1b[7m");
+		editor.handleInput("d");
+		expect(editor.getText()).toBe("hello wo");
 	});
 
 	it("overwrites in replace mode and restores on backspace", () => {
