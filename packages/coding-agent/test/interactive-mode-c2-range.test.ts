@@ -13,6 +13,8 @@ import { ModelRegistry } from "../src/config/model-registry";
 import { InteractiveMode } from "../src/modes/interactive-mode";
 import { cfgStartupQuiet, cfgTuiMouse } from "@oh-my-pi/pi-coding-agent/modes/settings";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { formatModelString } from "../src/config/model-resolver";
+import type { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import type { DescribeContext } from "@oh-my-pi/pi-tui/native/node";
 
 const cx: DescribeContext = { cols: 80, reduceMotion: false, dark: true, supports: () => true, feature: () => true };
@@ -46,7 +48,10 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		resetSettingsForTest();
 	});
 
-	function createMode(eventBus?: EventBus): InteractiveMode {
+	function createMode(
+		eventBus?: EventBus,
+		extra?: { lspServers?: Array<{ name: string; status: "ready"; fileTypes: string[] }>; mcpManager?: MCPManager },
+	): InteractiveMode {
 		const registry = new ModelRegistry(authStorage, path.join(tempDir.path(), `models-${Bun.nanoseconds()}.yml`));
 		const model = registry.find("anthropic", "claude-sonnet-4-5") as Model<Api>;
 		const readTool: AgentTool = {
@@ -69,7 +74,15 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			toolRegistry: new Map([[readTool.name, readTool]]),
 			builtInToolNames: ["read"],
 		});
-		mode = new InteractiveMode(session, "test", undefined, () => {}, undefined, undefined, eventBus);
+		mode = new InteractiveMode(
+			session,
+			"test",
+			undefined,
+			() => {},
+			extra?.lspServers,
+			extra?.mcpManager,
+			eventBus,
+		);
 		return mode;
 	}
 
@@ -172,6 +185,31 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		} finally {
 			other.removeSync();
 		}
+	});
+
+	it("labels a mentionable model and registers the MCP auth handler", () => {
+		let authHandler: unknown;
+		const mcpManager = {
+			setAuthHandler: (handler: unknown) => {
+				authHandler = handler;
+			},
+		} as unknown as MCPManager;
+		const m = createMode(undefined, {
+			lspServers: [{ name: "tsserver", status: "ready", fileTypes: [".ts"] }],
+			mcpManager,
+		});
+		expect(m.lspServers).toHaveLength(1);
+		expect(typeof authHandler).toBe("function");
+		const selector = formatModelString(m.session.model!);
+		const label = m.editor.modelMentionLabel(selector);
+		expect(typeof label).toBe("string");
+		expect(label!.length).toBeGreaterThan(0);
+	});
+
+	it("plays the welcome intro on an unsuppressed init", async () => {
+		const m = createMode();
+		await m.init({ clearInitialTerminalHistory: true });
+		expect(m.isInitialized).toBe(true);
 	});
 
 	it("tracks displayable thinking content per visible session", () => {
