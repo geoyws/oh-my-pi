@@ -56,6 +56,49 @@ describe("Editor spelling suggestions and ghost completion", () => {
 		expect(feedback).toContain(true);
 	});
 
+	it("does not apply a spelling suggestion after the word itself is edited", async () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setTextAssistProvider({
+			getWordReplacements: () => ({ line: 0, startCol: 0, endCol: 4, items: ["good"] }),
+		});
+		editor.setText("badw");
+		const submitted: string[] = [];
+		editor.onSubmit = text => submitted.push(text);
+		editor.handleInput("\x1b[46;5u");
+		await untilShown(editor);
+		editor.handleInput("\x7f");
+		editor.handleInput("\r");
+		expect(submitted).toEqual(["bad"]);
+		expect(editor.isShowingAutocomplete()).toBe(false);
+	});
+
+	it("cancels the popup when the provider fails and when the cursor leaves its token", async () => {
+		const failing = new Editor(defaultEditorTheme);
+		failing.setAutocompleteProvider({
+			getSuggestions: async () => {
+				throw new Error("provider down");
+			},
+			applyCompletion: () => {},
+		});
+		failing.setText("");
+		failing.handleInput("@");
+		await new Promise(resolve => setTimeout(resolve, 10));
+		expect(failing.isShowingAutocomplete()).toBe(false);
+		failing.handleInput("x");
+		expect(failing.getText()).toBe("@x");
+
+		const moving = new Editor(defaultEditorTheme);
+		moving.setAutocompleteProvider({
+			getSuggestions: async () => ({ items: [{ value: "@alpha.ts", label: "alpha.ts" }], prefix: "@" }),
+			applyCompletion: () => {},
+		});
+		moving.setText("");
+		moving.handleInput("@");
+		await untilShown(moving);
+		moving.handleInput("\x1b[D");
+		expect(moving.isShowingAutocomplete()).toBe(false);
+	});
+
 	it("does not apply a spelling suggestion when the word changed underneath", async () => {
 		const editor = new Editor(defaultEditorTheme);
 		editor.setTextAssistProvider({
