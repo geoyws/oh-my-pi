@@ -77,6 +77,7 @@ interface FakeAcpBuiltinSession {
 	modelRegistry: {
 		getAll(): Array<{ provider: string; id: string; contextWindow?: number }>;
 		getAvailable(): Array<{ provider: string; id: string; contextWindow?: number }>;
+		refresh(strategy?: string): Promise<void>;
 	};
 	setModel(model: unknown): Promise<void>;
 	setModelTemporary(model: unknown, thinkingLevel?: string): Promise<void>;
@@ -185,6 +186,7 @@ function createRuntime() {
 		modelRegistry: {
 			getAll: () => session.getAvailableModels(),
 			getAvailable: () => session.getAvailableModels(),
+			refresh: async (_strategy?: string) => {},
 		},
 		async setModel(_model: unknown) {},
 		async setModelTemporary(_model: unknown, _thinkingLevel?: string) {},
@@ -836,6 +838,25 @@ describe("ACP builtin slash commands", () => {
 
 		expect(temporarySpy).not.toHaveBeenCalled();
 		expect(output[0]).toContain("Unknown model: gpt-fake-9000");
+	});
+
+	it("switch after discovery: reloads the stale catalog once and switches to the newly published model", async () => {
+		const { output, runtime, session } = createRuntime();
+		const available: Array<{ provider: string; id: string; contextWindow?: number }> = [
+			{ provider: "anthropic", id: "claude-opus-4-5" },
+		];
+		const discovered = { provider: "openai", id: "gpt-6.2-astra", contextWindow: 1_100_000 };
+		session.getAvailableModels = () => available;
+		const refreshSpy = spyOn(session.modelRegistry, "refresh").mockImplementation(async () => {
+			available.push(discovered);
+		});
+		const temporarySpy = spyOn(session, "setModelTemporary").mockResolvedValue(undefined);
+
+		await executeAcpBuiltinSlashCommand("/switch openai/gpt-6.2-astra:medium", runtime);
+
+		expect(refreshSpy).toHaveBeenCalledTimes(1);
+		expect(temporarySpy).toHaveBeenCalledWith(discovered, "medium");
+		expect(output[0]).toContain("Session-only model: openai/gpt-6.2-astra");
 	});
 
 	// Removed TUI-only and dropped commands fall through as false

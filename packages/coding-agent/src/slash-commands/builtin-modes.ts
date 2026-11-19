@@ -2,7 +2,7 @@ import { admitTuiSlashText, clearSubmittedText, runWithDetachedDraft } from "./h
 import * as path from "node:path";
 import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
 import { formatKeyHint } from "@oh-my-pi/pi-tui/app-keybindings";
-import { prompt } from "@oh-my-pi/pi-utils";
+import { logger, prompt } from "@oh-my-pi/pi-utils";
 import {
 	formatModelString,
 	getModelMatchPreferences,
@@ -70,6 +70,34 @@ function resolveSessionModelSelector(
 		settings,
 		preferences: getModelMatchPreferences(settings),
 	});
+}
+
+/**
+ * {@link resolveSessionModelSelector} for an explicit `/model <sel>` or
+ * `/switch <sel>`: on a miss, reload the catalog once and retry. A running
+ * session loads discovery-backed catalogs at startup only, so a model another
+ * omp process discovered since (now in models.db) or that the provider has
+ * published since would otherwise stay "Unknown model" until a restart.
+ * `online-if-uncached` reads fresh cache rows and fetches only stale ones.
+ * A `--models` scope is registry-independent, so it never refreshes.
+ */
+async function resolveSessionModelSelectorFresh(
+	selector: string,
+	session: AgentSession,
+	settings: Settings,
+): Promise<ResolveCliModelResult> {
+	const resolved = resolveSessionModelSelector(selector, session, settings);
+	if (resolved.model || session.scopedModels.length > 0) return resolved;
+	try {
+		await session.modelRegistry.refresh("online-if-uncached");
+	} catch (error) {
+		logger.warn("model catalog refresh before selector retry failed", {
+			selector,
+			error: errorMessage(error),
+		});
+		return resolved;
+	}
+	return resolveSessionModelSelector(selector, session, settings);
 }
 
 /** `/fast status` label for the active model: "ultra" for the Ultrafast tier, "on" for priority, else "off". */
@@ -424,7 +452,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		handle: async (command, runtime) => {
 			if (command.args) {
 				const selector = command.args.trim();
-				const resolved = resolveSessionModelSelector(selector, runtime.session, runtime.settings);
+				const resolved = await resolveSessionModelSelectorFresh(selector, runtime.session, runtime.settings);
 				const match = resolved.model;
 				if (!match) {
 					return usage(
@@ -458,7 +486,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				return;
 			}
 			const ctx = runtime.ctx;
-			const resolved = resolveSessionModelSelector(selector, ctx.session, ctx.settings);
+			const resolved = await resolveSessionModelSelectorFresh(selector, ctx.session, ctx.settings);
 			const match = resolved.model;
 			if (!match) {
 				ctx.showError(`Unknown model: ${selector}`);
@@ -505,7 +533,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				);
 				return commandConsumed();
 			}
-			const resolved = resolveSessionModelSelector(selector, runtime.session, runtime.settings);
+			const resolved = await resolveSessionModelSelectorFresh(selector, runtime.session, runtime.settings);
 			if (!resolved.model) return usage(`Unknown model: ${selector}`, runtime);
 			try {
 				await runtime.session.setModelTemporary(resolved.model, resolved.thinkingLevel);
@@ -524,7 +552,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				runtime.ctx.showModelSelector({ temporaryOnly: true });
 				return;
 			}
-			const resolved = resolveSessionModelSelector(selector, runtime.ctx.session, runtime.ctx.settings);
+			const resolved = await resolveSessionModelSelectorFresh(selector, runtime.ctx.session, runtime.ctx.settings);
 			if (!resolved.model) {
 				runtime.ctx.showError(`Unknown model: ${selector}`);
 				return;
