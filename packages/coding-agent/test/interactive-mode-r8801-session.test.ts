@@ -1,0 +1,614 @@
+/**
+ * InteractiveMode behaviour from line 8801 to the end that is more than a
+ * hand-off: vibe-mode guards on session transitions, worktree auto-creation,
+ * push-to-talk dictation, screen recording, live-mode gating, /btw branching,
+ * Ctrl+L appearance refresh, report sizing and the TODO HUD reveal.
+ */
+import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn, vi } from "bun:test";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { Agent } from "@oh-my-pi/pi-agent-core";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { cfgGoalEnabled } from "@oh-my-pi/pi-coding-agent/goals/settings";
+import { CommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/command-controller";
+import { LiveCommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/live-command-controller";
+import { MCPCommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/mcp-command-controller";
+import { SSHCommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/ssh-command-controller";
+import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
+import * as providerSetup from "@oh-my-pi/pi-coding-agent/modes/setup";
+import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { SessionRecorder } from "@oh-my-pi/pi-coding-agent/stream/recording";
+import { StreamRedactor } from "@oh-my-pi/pi-coding-agent/stream/redactor";
+import { STTController } from "@oh-my-pi/pi-coding-agent/stt";
+import { cfgSttEnabled } from "@oh-my-pi/pi-coding-agent/stt/settings";
+import { cfgWorktreeOnStart } from "@oh-my-pi/pi-coding-agent/task/settings";
+import { vocalizer } from "@oh-my-pi/pi-coding-agent/tts/vocalizer";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
+import { logger, TempDir } from "@oh-my-pi/pi-utils";
+
+const assistant = {
+	role: "assistant",
+	content: [{ type: "text", text: "answer" }],
+	api: "anthropic-messages",
+	provider: "anthropic",
+	model: "claude-sonnet-4-5",
+	usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+	stopReason: "stop",
+	timestamp: 1,
+} as never;
+
+describe("InteractiveMode session commands and capture surfaces (lines 8801-end)", () => {
+	let tempDir: TempDir;
+	let authStorage: AuthStorage;
+	let modelRegistry: ModelRegistry;
+	let session: AgentSession;
+	let mode: InteractiveMode;
+	let warnings: string[];
+	let statuses: string[];
+	let errors: string[];
+
+	async function freshMode(): Promise<void> {
+		if (mode) {
+			mode.stop();
+			await session.dispose();
+		}
+		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 to exist in registry");
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings: Settings.isolated(),
+			modelRegistry,
+		});
+		mode = new InteractiveMode(session, "test", undefined, undefined, undefined, undefined, new EventBus());
+	}
+
+	function captureMessages(): void {
+		warnings = [];
+		statuses = [];
+		errors = [];
+		spyOn(mode, "showWarning").mockImplementation(message => void warnings.push(message));
+		spyOn(mode, "showStatus").mockImplementation(message => void statuses.push(message));
+		spyOn(mode, "showError").mockImplementation(message => void errors.push(message));
+	}
+
+	beforeAll(async () => {
+		await initTheme();
+		resetSettingsForTest();
+		tempDir = TempDir.createSync("@pi-im-r8801-session-");
+		await Settings.init({ inMemory: true, cwd: tempDir.path() });
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
+		modelRegistry = new ModelRegistry(authStorage);
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+		vi.useRealTimers();
+		cfgSttEnabled.set(settings, false);
+	});
+
+	afterAll(async () => {
+		mode?.stop();
+		await session?.dispose();
+		authStorage?.close();
+		tempDir?.removeSync();
+		resetSettingsForTest();
+	});
+
+	describe("vibe mode blocks session transitions", () => {
+		it.each([
+			["handleClearCommand", "handleClearCommand", []],
+			["handleDeleteCommand", "handleDeleteCommand", []],
+			["handleForkCommand", "handleForkCommand", []],
+			["handleMoveCommand", "handleMoveCommand", ["/elsewhere"]],
+			["handleWorktreeCommand", "handleWorktreeCommand", ["wt/x"]],
+		] as const)("%s warns and leaves the session alone", async (method, via, args) => {
+			await freshMode();
+			captureMessages();
+			const target = spyOn(CommandController.prototype, via).mockResolvedValue(undefined as never);
+			mode.vibeModeEnabled = true;
+
+			await (mode[method] as (...a: unknown[]) => Promise<void>)(...args);
+
+			expect(warnings).toEqual(["Exit vibe mode first."]);
+			expect(target).not.toHaveBeenCalled();
+			mode.vibeModeEnabled = false;
+		});
+
+		it("/delete outside vibe mode tears down side conversations first, then deletes", async () => {
+			await freshMode();
+			const order: string[] = [];
+			spyOn(mode, "prepareSessionSwitch").mockImplementation(async () => void order.push("prepare"));
+			spyOn(CommandController.prototype, "handleDeleteCommand").mockImplementation(async () => void order.push("delete"));
+
+			await mode.handleDeleteCommand();
+
+			expect(order).toEqual(["prepare", "delete"]);
+		});
+
+		it("/move outside vibe mode moves to the requested path", async () => {
+			await freshMode();
+			const move = spyOn(CommandController.prototype, "handleMoveCommand").mockResolvedValue();
+
+			await mode.handleMoveCommand("/srv/project");
+
+			expect(move).toHaveBeenCalledWith("/srv/project");
+		});
+
+		it("/new keeps the plan-mode default untouched when the clear did not start a new session", async () => {
+			await freshMode();
+			const clear = spyOn(CommandController.prototype, "handleClearCommand").mockResolvedValue();
+			const before = mode.sessionManager.getSessionId();
+
+			await mode.handleNewCommand();
+
+			expect(clear).toHaveBeenCalledTimes(1);
+			expect(mode.sessionManager.getSessionId()).toBe(before);
+			expect(mode.planModeEnabled).toBe(false);
+		});
+	});
+
+	describe("worktrees", () => {
+		it("records a worktree /wt created so exit can offer to clean it up, and ignores a declined one", async () => {
+			await freshMode();
+			const worktree = { path: "/tmp/wt-a", branch: "wt/a" } as never;
+			const created = spyOn(CommandController.prototype, "handleWorktreeCommand")
+				.mockResolvedValueOnce(undefined as never)
+				.mockResolvedValueOnce(worktree);
+
+			await mode.handleWorktreeCommand("wt/none");
+			await mode.handleWorktreeCommand("wt/a", { keepChanges: true });
+
+			expect(created.mock.calls).toEqual([
+				["wt/none", undefined],
+				["wt/a", { keepChanges: true }],
+			]);
+		});
+
+		it("does nothing at launch when worktree.onStart is off", async () => {
+			await freshMode();
+			cfgWorktreeOnStart.set(mode.settings, "off");
+			const wt = spyOn(mode, "handleWorktreeCommand");
+
+			await mode.maybeAutoCreateWorktree();
+
+			expect(wt).not.toHaveBeenCalled();
+		});
+
+		it("does nothing outside a git checkout", async () => {
+			await freshMode();
+			cfgWorktreeOnStart.set(mode.settings, "create");
+			const wt = spyOn(mode, "handleWorktreeCommand");
+
+			await mode.maybeAutoCreateWorktree();
+
+			expect(wt).not.toHaveBeenCalled();
+		});
+
+		describe("inside a git checkout with a commit", () => {
+			let repo: string;
+			beforeAll(async () => {
+				repo = path.join(tempDir.path(), "repo");
+				fs.mkdirSync(repo, { recursive: true });
+				const git = (...args: string[]) =>
+					Bun.spawnSync(["git", "-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: repo });
+				git("init", "-q");
+				fs.writeFileSync(path.join(repo, "a.txt"), "a");
+				git("add", "a.txt");
+				git("commit", "-q", "-m", "init");
+			});
+
+			it("asks first under 'ask' and creates nothing when declined", async () => {
+				await freshMode();
+				spyOn(mode.sessionManager, "getCwd").mockReturnValue(repo);
+				cfgWorktreeOnStart.set(mode.settings, "ask");
+				const confirm = spyOn(mode, "showHookConfirm").mockResolvedValue(false);
+				const wt = spyOn(mode, "handleWorktreeCommand").mockResolvedValue();
+
+				await mode.maybeAutoCreateWorktree();
+
+				expect(confirm).toHaveBeenCalledWith(
+					"Create a worktree for this session?",
+					"Work happens on a new wt/* branch; this checkout stays untouched.",
+				);
+				expect(wt).not.toHaveBeenCalled();
+			});
+
+			it("creates a clean worktree once 'ask' is accepted, and without asking under 'create'", async () => {
+				await freshMode();
+				spyOn(mode.sessionManager, "getCwd").mockReturnValue(repo);
+				const confirm = spyOn(mode, "showHookConfirm").mockResolvedValue(true);
+				const wt = spyOn(mode, "handleWorktreeCommand").mockResolvedValue();
+
+				cfgWorktreeOnStart.set(mode.settings, "ask");
+				await mode.maybeAutoCreateWorktree();
+				cfgWorktreeOnStart.set(mode.settings, "create");
+				await mode.maybeAutoCreateWorktree();
+
+				expect(confirm).toHaveBeenCalledTimes(1);
+				expect(wt.mock.calls).toEqual([
+					[undefined, { keepChanges: false }],
+					[undefined, { keepChanges: false }],
+				]);
+			});
+
+			it("turns a failure into a warning so startup continues", async () => {
+				await freshMode();
+				captureMessages();
+				spyOn(mode.sessionManager, "getCwd").mockReturnValue(repo);
+				cfgWorktreeOnStart.set(mode.settings, "create");
+				spyOn(mode, "handleWorktreeCommand")
+					.mockRejectedValueOnce(new Error("branch exists"))
+					.mockRejectedValueOnce("disk full");
+
+				await mode.maybeAutoCreateWorktree();
+				await mode.maybeAutoCreateWorktree();
+
+				expect(warnings).toEqual(["Worktree not created: branch exists", "Worktree not created: disk full"]);
+			});
+		});
+	});
+
+	describe("push-to-talk dictation", () => {
+		it("refuses while speech-to-text is disabled", async () => {
+			await freshMode();
+			captureMessages();
+			const toggle = spyOn(STTController.prototype, "toggle");
+
+			await mode.handleSTTToggle();
+
+			expect(warnings).toEqual(["Speech-to-text is disabled. Enable it in settings: stt.enabled"]);
+			expect(toggle).not.toHaveBeenCalled();
+		});
+
+		it("refuses while live mode owns the microphone", async () => {
+			await freshMode();
+			captureMessages();
+			cfgSttEnabled.set(settings, true);
+			spyOn(LiveCommandController.prototype, "active", "get").mockReturnValue(true);
+			const toggle = spyOn(STTController.prototype, "toggle");
+
+			await mode.handleSTTToggle();
+
+			expect(warnings).toEqual(["End live mode before using push-to-talk speech input."]);
+			expect(toggle).not.toHaveBeenCalled();
+		});
+
+		it("toggles dictation into the editor, ducking speech and swapping the cursor through the capture", async () => {
+			await freshMode();
+			captureMessages();
+			cfgSttEnabled.set(settings, true);
+			const duck = spyOn(vocalizer, "duck").mockImplementation(() => {});
+			const unduck = spyOn(vocalizer, "unduck").mockImplementation(() => {});
+			let callbacks: Parameters<STTController["toggle"]>[1] | undefined;
+			const toggle = spyOn(STTController.prototype, "toggle").mockImplementation(async (target, options) => {
+				expect(target).toBe(mode.editor);
+				callbacks = options;
+			});
+
+			await mode.handleSTTToggle();
+			expect(toggle).toHaveBeenCalledTimes(1);
+			const cb = callbacks!;
+
+			cb.showWarning("mic busy");
+			cb.showStatus("listening");
+			cb.onStateChange("recording");
+			expect(mode.editor.getUseTerminalCursor()).toBe(false);
+			cb.onStateChange("recording");
+			cb.onStateChange("transcribing");
+			cb.onStateChange("idle");
+
+			expect(warnings).toEqual(["mic busy"]);
+			expect(statuses).toEqual(["listening"]);
+			expect(duck).toHaveBeenCalledTimes(2);
+			expect(unduck).toHaveBeenCalledTimes(2);
+		});
+
+		it("space-hold dictation follows the stt.enabled setting and starts/stops a capture into its target", async () => {
+			await freshMode();
+			const start = spyOn(STTController.prototype, "start").mockResolvedValue();
+			const stop = spyOn(STTController.prototype, "stop").mockResolvedValue();
+			const hold = mode.dictationSpaceHold(mode.editor);
+
+			expect(hold.enabled()).toBe(false);
+			cfgSttEnabled.set(settings, true);
+			expect(hold.enabled()).toBe(true);
+
+			hold.onStart();
+			hold.onEnd();
+
+			expect(start).toHaveBeenCalledTimes(1);
+			expect(start.mock.calls[0]![0]).toBe(mode.editor);
+			expect(stop).toHaveBeenCalledTimes(1);
+		});
+
+		it("the composer mic stops a running capture, ignores clicks while transcribing and starts when idle", async () => {
+			await freshMode();
+			cfgSttEnabled.set(settings, true);
+			let state: "idle" | "recording" | "transcribing" = "idle";
+			spyOn(STTController.prototype, "state", "get").mockImplementation(() => state);
+			const start = spyOn(STTController.prototype, "start").mockResolvedValue();
+			const stop = spyOn(STTController.prototype, "stop").mockResolvedValue();
+			// The mic re-renders once when the start begins and once when it settles.
+			const settled = Promise.withResolvers<void>();
+			let renders = 0;
+			spyOn(mode.ui, "requestRender").mockImplementation(() => {
+				if (++renders === 2) settled.resolve();
+			});
+
+			mode.editor.onToggleDictation?.();
+			await settled.promise;
+			expect(start).toHaveBeenCalledTimes(1);
+			expect(start.mock.calls[0]![1]).toMatchObject({ manualSubmit: true });
+
+			state = "recording";
+			mode.editor.onToggleDictation?.();
+			expect(stop).toHaveBeenCalledTimes(1);
+
+			state = "transcribing";
+			mode.editor.onToggleDictation?.();
+			expect(start).toHaveBeenCalledTimes(1);
+			expect(stop).toHaveBeenCalledTimes(1);
+		});
+
+		it("a second mic click while the capture is still starting cancels the start", async () => {
+			await freshMode();
+			cfgSttEnabled.set(settings, true);
+			const begun = Promise.withResolvers<void>();
+			spyOn(STTController.prototype, "start").mockReturnValue(begun.promise);
+			const stop = spyOn(STTController.prototype, "stop").mockResolvedValue();
+
+			mode.editor.onToggleDictation?.();
+			mode.editor.onToggleDictation?.();
+			begun.resolve();
+
+			expect(stop).toHaveBeenCalledTimes(1);
+		});
+
+		it("the composer mic does nothing when no controller can be made", async () => {
+			await freshMode();
+			captureMessages();
+			const start = spyOn(STTController.prototype, "start");
+
+			mode.editor.onToggleDictation?.();
+
+			expect(start).not.toHaveBeenCalled();
+			expect(warnings).toEqual(["Speech-to-text is disabled. Enable it in settings: stt.enabled"]);
+		});
+	});
+
+	describe("live mode gating", () => {
+		it("refuses to start live mode, local or remote, while a dictation capture is active", async () => {
+			await freshMode();
+			captureMessages();
+			cfgSttEnabled.set(settings, true);
+			spyOn(STTController.prototype, "toggle").mockResolvedValue();
+			await mode.handleSTTToggle();
+			spyOn(STTController.prototype, "state", "get").mockReturnValue("recording");
+			const local = spyOn(LiveCommandController.prototype, "handleCommand").mockResolvedValue();
+			const remote = spyOn(LiveCommandController.prototype, "startRemote");
+			const blocker = "Finish the current speech-to-text capture before starting live mode.";
+
+			await mode.handleLiveCommand();
+			await expect(mode.startRemoteLive({} as never)).rejects.toThrow(blocker);
+
+			expect(warnings).toEqual([blocker]);
+			expect(local).not.toHaveBeenCalled();
+			expect(remote).not.toHaveBeenCalled();
+		});
+
+		it("starts a remote live session once an idle dictation controller is out of the way", async () => {
+			await freshMode();
+			cfgSttEnabled.set(settings, true);
+			spyOn(STTController.prototype, "toggle").mockResolvedValue();
+			await mode.handleSTTToggle();
+			spyOn(STTController.prototype, "state", "get").mockReturnValue("idle");
+			const live = { id: "live-1" } as never;
+			const options = { label: "peer" } as never;
+			const remote = spyOn(LiveCommandController.prototype, "startRemote").mockResolvedValue(live);
+
+			expect(await mode.startRemoteLive(options)).toBe(live);
+			expect(remote).toHaveBeenCalledWith(options);
+		});
+	});
+
+	describe("/record", () => {
+		function fakeRecorder(elapsedMs = 65_000) {
+			return { path: "/tmp/rec/session.omprec", elapsedMs, stop: vi.fn(async () => {}) } as unknown as SessionRecorder;
+		}
+
+		it("starts a recording titled by the session, then stops it and reports where it was saved", async () => {
+			await freshMode();
+			captureMessages();
+			await mode.sessionManager.setSessionName("Demo run", "user");
+			spyOn(StreamRedactor, "load").mockResolvedValue({} as never);
+			const recorder = fakeRecorder();
+			const start = spyOn(SessionRecorder, "start").mockResolvedValue(recorder);
+			const setRecording = spyOn(mode.statusLine, "setRecording");
+
+			await mode.toggleRecording();
+			expect(start.mock.calls[0]![0]).toMatchObject({ title: "Demo run", tui: mode.ui });
+			expect(statuses).toEqual(["Recording to /tmp/rec/session.omprec · /record again to stop"]);
+
+			await mode.toggleRecording();
+
+			expect(recorder.stop).toHaveBeenCalledTimes(1);
+			expect(setRecording.mock.calls).toEqual([[true], [false]]);
+			expect(statuses[1]).toStartWith("Saved ");
+			expect(statuses[1]).toContain("recording to /tmp/rec/session.omprec · replay: omp play · share: omp clip");
+		});
+
+		it("titles an unnamed session by its directory and ignores a second /record while starting", async () => {
+			await freshMode();
+			spyOn(mode.sessionManager, "getSessionName").mockReturnValue(undefined);
+			spyOn(StreamRedactor, "load").mockResolvedValue({} as never);
+			const { promise, resolve } = Promise.withResolvers<SessionRecorder>();
+			const start = spyOn(SessionRecorder, "start").mockReturnValue(promise);
+
+			// The start flag is raised synchronously, so a second /record arriving during the start is a no-op.
+			const first = mode.toggleRecording();
+			await mode.toggleRecording();
+			resolve(fakeRecorder());
+			await first;
+
+			expect(start).toHaveBeenCalledTimes(1);
+			expect(start.mock.calls[0]![0]).toMatchObject({ title: path.basename(mode.sessionManager.getCwd()) });
+			await mode.toggleRecording();
+		});
+
+		it("reports a recording that cannot start", async () => {
+			await freshMode();
+			captureMessages();
+			spyOn(StreamRedactor, "load").mockResolvedValue({} as never);
+			spyOn(SessionRecorder, "start").mockRejectedValueOnce(new Error("no tty")).mockRejectedValueOnce("denied");
+
+			await mode.toggleRecording();
+			await mode.toggleRecording();
+
+			expect(errors).toEqual(["Could not start recording: no tty", "Could not start recording: denied"]);
+		});
+	});
+
+	describe("/btw branch", () => {
+		it.each([
+			[{ cancelled: true }, { status: "/btw branch cancelled" }],
+			[{ cancelled: false, sessionFile: "/s/2026-branch.jsonl" }, { status: "Branched /btw to 2026-branch.jsonl" }],
+			[{ cancelled: false }, { status: "Branched /btw" }],
+		])("branchFromBtw %o reports %o", async (result, expected) => {
+			await freshMode();
+			captureMessages();
+			const branch = spyOn(session, "branchFromBtw").mockResolvedValue(result as never);
+			const render = spyOn(mode, "renderInitialMessages").mockResolvedValue();
+
+			await mode.handleBtwBranch("why?", assistant, "leaf-1", "sess-1");
+
+			expect(branch).toHaveBeenCalledWith("why?", assistant, "leaf-1", "sess-1", undefined);
+			expect(statuses).toEqual([expected.status]);
+			expect(render).toHaveBeenCalledTimes(result.cancelled ? 0 : 1);
+		});
+
+		it("surfaces a branch failure", async () => {
+			await freshMode();
+			captureMessages();
+			spyOn(session, "branchFromBtw").mockRejectedValueOnce(new Error("no leaf")).mockRejectedValueOnce("gone");
+
+			await mode.handleBtwBranch("q", assistant, "l", "s");
+			await mode.handleBtwBranch("q", assistant, "l", "s");
+
+			expect(errors).toEqual(["Cannot branch /btw: no leaf", "Cannot branch /btw: gone"]);
+		});
+	});
+
+	describe("guided goal interview flag", () => {
+		it("is active during the interview and yields once a goal is running or paused", async () => {
+			await freshMode();
+			cfgGoalEnabled.set(session.settings, true);
+			spyOn(session, "prompt").mockResolvedValue(undefined as never);
+			spyOn(session, "setActiveToolsByName").mockResolvedValue(undefined as never);
+			expect(mode.isGuidedGoalInterviewActive()).toBe(false);
+
+			expect(await mode.handleGuidedGoalCommand("ship it")).toBe(true);
+			expect(mode.isGuidedGoalInterviewActive()).toBe(true);
+
+			mode.goalModeEnabled = true;
+			expect(mode.isGuidedGoalInterviewActive()).toBe(false);
+			mode.goalModeEnabled = false;
+			mode.goalModePaused = true;
+			expect(mode.isGuidedGoalInterviewActive()).toBe(false);
+			mode.goalModePaused = false;
+		});
+	});
+
+	describe("display", () => {
+		it("Ctrl+L replays the display immediately and keeps an appearance probe the terminal accepted", async () => {
+			await freshMode();
+			const reset = spyOn(mode.ui, "resetDisplay").mockImplementation(() => {});
+			const probe = vi.fn((token?: unknown) => token);
+			Object.defineProperty(mode.ui.terminal, "refreshAppearance", { value: probe, configurable: true });
+
+			mode.resetDisplayAfterAppearanceRefresh();
+			expect(probe).toHaveBeenCalledTimes(1);
+			expect(probe.mock.calls[0]![0]).toBeDefined();
+
+			probe.mockImplementation(() => undefined);
+			mode.resetDisplayAfterAppearanceRefresh();
+
+			Object.defineProperty(mode.ui.terminal, "refreshAppearance", { value: undefined, configurable: true });
+			mode.resetDisplayAfterAppearanceRefresh();
+
+			expect(reset).toHaveBeenCalledTimes(3);
+		});
+
+		it("sizes the command report to the rows above the chrome below it", async () => {
+			await freshMode();
+			Object.defineProperty(mode.ui.terminal, "rows", { get: () => 40, configurable: true });
+			const below = spyOn(mode.composer, "rowsBelow").mockReturnValueOnce(undefined).mockReturnValueOnce(6);
+
+			expect(mode.commandReportRows()).toBeUndefined();
+			expect(mode.commandReportRows()).toBe(34);
+			expect(below).toHaveBeenCalledWith(mode.reportContainer);
+		});
+
+		it("resetObserverRegistry tolerates an in-memory session with no file", async () => {
+			await freshMode();
+			spyOn(mode.sessionManager, "getSessionFile").mockReturnValue(undefined);
+
+			expect(() => mode.resetObserverRegistry()).not.toThrow();
+		});
+	});
+
+	describe("command controllers created per call", () => {
+		it("/mcp and /ssh each run a fresh controller on the full command text", async () => {
+			await freshMode();
+			const mcp = spyOn(MCPCommandController.prototype, "handle").mockResolvedValue();
+			const ssh = spyOn(SSHCommandController.prototype, "handle").mockResolvedValue();
+
+			await mode.handleMCPCommand("/mcp list");
+			await mode.handleSSHCommand("/ssh add box");
+
+			expect(mcp).toHaveBeenCalledWith("/mcp list");
+			expect(ssh).toHaveBeenCalledWith("/ssh add box");
+		});
+
+		it("/setup runs the provider wizard against this mode", async () => {
+			await freshMode();
+			const wizard = spyOn(providerSetup, "runProviderSetupWizard").mockResolvedValue();
+
+			await mode.showProviderSetup();
+
+			expect(wizard).toHaveBeenCalledWith(mode);
+		});
+	});
+
+	describe("TODO HUD reveal", () => {
+		it("logs instead of throwing when persisting the reveal fails", async () => {
+			await freshMode();
+			mode.setTodos([{ content: "a", status: "completed" }] as never);
+			spyOn(mode.sessionManager, "appendCustomEntry").mockImplementation(() => {
+				throw new Error("disk full");
+			});
+			const warn = spyOn(logger, "warn").mockImplementation(() => {});
+
+			mode.setTodoExpanded(true);
+
+			expect(warn).toHaveBeenCalledWith("Failed to persist TODO HUD reveal", expect.anything());
+			expect(mode.todoExpanded).toBe(true);
+		});
+
+		it("logs when settling in-flight persistence fails before a deferred reveal", async () => {
+			await freshMode();
+			spyOn(session, "settleInFlightMessagePersistence").mockRejectedValue(new Error("io"));
+			const warned = Promise.withResolvers<void>();
+			const warn = spyOn(logger, "warn").mockImplementation(() => warned.resolve());
+
+			mode.setTodoExpanded(true);
+			await warned.promise;
+
+			expect(warn).toHaveBeenCalledWith("Failed to persist TODO HUD reveal", expect.anything());
+		});
+	});
+});
