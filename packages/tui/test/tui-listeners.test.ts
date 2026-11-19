@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { Text, TUI } from "@oh-my-pi/pi-tui";
 import * as postmortem from "@oh-my-pi/pi-utils/postmortem";
 import { VirtualRenderScheduler } from "./virtual-render-scheduler";
@@ -91,7 +91,9 @@ describe("TUI paint and frame-write listeners", () => {
 		});
 		try {
 			tui.start();
-			await expect(scheduler.settle(terminal)).rejects.toThrow("Frame provider returned 5 rows for a 3-row viewport");
+			await expect(scheduler.settle(terminal)).rejects.toThrow(
+				"Frame provider returned 5 rows for a 3-row viewport",
+			);
 		} finally {
 			tui.stop();
 		}
@@ -192,12 +194,20 @@ describe("TUI provider history flush and component renders", () => {
 
 	it("schedules a render for a component render request and reports frame cost", async () => {
 		const terminal = new VirtualTerminal(40, 6);
-		const scheduler = new VirtualRenderScheduler();
+		// Each component render costs 7 ms on the virtual clock.
+		let renderCost = 0;
+		class CostedScheduler extends VirtualRenderScheduler {
+			override now(): number {
+				return super.now() + renderCost;
+			}
+		}
+		const scheduler = new CostedScheduler();
 		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
 		const probe = { renders: 0 };
 		const component = {
 			render: () => {
 				probe.renders++;
+				renderCost += 7;
 				return ["body"];
 			},
 		};
@@ -205,14 +215,54 @@ describe("TUI provider history flush and component renders", () => {
 		try {
 			tui.start();
 			await scheduler.settle(terminal);
-			expect(tui.lastFrameCostMs).toBeGreaterThanOrEqual(0);
+			expect(tui.lastFrameCostMs).toBe(7);
 			const settled = probe.renders;
 			tui.requestComponentRender(component);
 			await scheduler.settle(terminal);
-			expect(probe.renders).toBeGreaterThan(settled);
+			expect(probe.renders).toBe(settled + 1);
+			expect(tui.lastFrameCostMs).toBe(7);
 		} finally {
 			tui.stop();
 		}
+	});
+
+	it("repaints the whole viewport after a fullscreen overlay closes on a resized screen", async () => {
+		async function rowsRewrittenOnClose(resize: boolean): Promise<string> {
+			const terminal = new VirtualTerminal(40, 6);
+			const scheduler = new VirtualRenderScheduler();
+			const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+			tui.addChild(new Text("base-body", 0, 0));
+			const writes: string[] = [];
+			try {
+				tui.start();
+				await scheduler.settle(terminal);
+				const handle = tui.showOverlay(new Text("modal", 0, 0), {
+					fullscreen: true,
+					width: "100%",
+					maxHeight: "100%",
+				});
+				await scheduler.settle(terminal);
+				if (resize) {
+					terminal.resize(40, 8);
+					await scheduler.advance(terminal, 1000);
+				}
+				const write = terminal.write.bind(terminal);
+				terminal.write = (data: string) => {
+					writes.push(data);
+					write(data);
+				};
+				handle.hide();
+				await scheduler.settle(terminal);
+				expect(terminal.getViewport().join("\n")).toContain("base-body");
+			} finally {
+				tui.stop();
+			}
+			return writes.join("");
+		}
+		// Same geometry: the restored normal buffer is trusted, rows are not rewritten.
+		expect(await rowsRewrittenOnClose(false)).not.toContain("base-body");
+		// Resized while covered: the restored buffer moved, so every row is repainted.
+		expect(await rowsRewrittenOnClose(true)).toContain("base-body");
 	});
 });
 
@@ -251,8 +301,12 @@ describe("TUI settled-resize history replay", () => {
 		const terminal = new VirtualTerminal(40, 6);
 		const scheduler = new VirtualRenderScheduler();
 		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		let frames = 0;
 		tui.setFrameProvider({
-			renderFrame: (size: { columns: number }) => ({ viewport: [`w-${size.columns}`] }),
+			renderFrame: (size: { columns: number }) => {
+				frames++;
+				return { viewport: [`w-${size.columns}`] };
+			},
 			acknowledgeHistory() {},
 		});
 		tui.start();
@@ -260,10 +314,55 @@ describe("TUI settled-resize history replay", () => {
 		expect(terminal.getViewport().join("\n")).toContain("w-40");
 		terminal.resize(50, 8);
 		tui.stop();
-		// The pending settle timer fires into the stopped TUI and must not
-		// repaint or throw.
+		const framesAtStop = frames;
+		const writes: string[] = [];
+		const write = terminal.write.bind(terminal);
+		terminal.write = (data: string) => {
+			writes.push(data);
+			write(data);
+		};
+		// The pending settle window elapses after stop: no frame is composed
+		// and nothing reaches the terminal.
 		await scheduler.advance(terminal, 1000);
+		expect(frames).toBe(framesAtStop);
+		expect(writes).toEqual([]);
 		expect(terminal.getViewport().join("\n")).not.toContain("w-50");
+	});
+
+	it("settles a rebuild-mode width change without a destructive reset when the provider cannot replay", async () => {
+		async function settledResizeWrites(canReplay: boolean): Promise<string> {
+			const terminal = new VirtualTerminal(40, 6);
+			const scheduler = new VirtualRenderScheduler();
+			const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+			const replays = { count: 0 };
+			const base = provider(replays);
+			tui.setFrameProvider(
+				canReplay ? base : { renderFrame: base.renderFrame, acknowledgeHistory: base.acknowledgeHistory },
+			);
+			tui.setResizeScrollback("rebuild");
+			const writes: string[] = [];
+			try {
+				tui.start();
+				await scheduler.settle(terminal);
+				const write = terminal.write.bind(terminal);
+				terminal.write = (data: string) => {
+					writes.push(data);
+					write(data);
+				};
+				terminal.resize(50, 6);
+				await scheduler.advance(terminal, 1000);
+				await scheduler.settle(terminal);
+				expect(terminal.getViewport().join("\n")).toContain("w-50");
+				expect(replays.count).toBe(canReplay ? 1 : 0);
+			} finally {
+				tui.stop();
+			}
+			return writes.join("");
+		}
+		// A replaying provider gets the scrollback-clearing rebuild ...
+		expect(await settledResizeWrites(true)).toContain("\x1b[3J");
+		// ... one that cannot replay keeps its scrollback: no ED3.
+		expect(await settledResizeWrites(false)).not.toContain("\x1b[3J");
 	});
 
 	it("handles a burst of resizes and paints only the final geometry", async () => {
@@ -329,12 +428,21 @@ describe("TUI in-place resize CPR probe", () => {
 		}
 	}
 
+	/**
+	 * Resize in place and step past the 120 ms settle (which sends the DSR
+	 * probe), then report whether the settled width painted before the 200 ms
+	 * probe timeout and after it, plus any keys the focused component saw.
+	 */
 	async function resizeWithReply(tagged: boolean) {
 		const previous = Bun.env.PI_TUI_RESIZE_IN_PLACE;
 		Bun.env.PI_TUI_RESIZE_IN_PLACE = "1";
 		const terminal = new CprTerminal(40, 6, tagged);
 		const scheduler = new VirtualRenderScheduler();
 		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		const keys: string[] = [];
+		const focus = { render: () => [], invalidate() {}, handleInput: (data: string) => keys.push(data) };
+		tui.addChild(focus);
+		tui.setFocus(focus);
 		tui.setFrameProvider({
 			renderFrame: (size: { columns: number }) => ({ viewport: [`w-${size.columns}`] }),
 			acknowledgeHistory() {},
@@ -344,9 +452,13 @@ describe("TUI in-place resize CPR probe", () => {
 			await scheduler.settle(terminal);
 			terminal.writes.length = 0;
 			terminal.resize(50, 8);
-			await scheduler.advance(terminal, 2000);
-			await scheduler.settle(terminal);
-			return terminal;
+			// Settle fires at 120 ms; the follow-up settle runs to ~170 ms, short of the 320 ms timeout.
+			await scheduler.advance(terminal, 130);
+			const probed = terminal.writes.join("").includes("\x1b[6n");
+			const beforeTimeout = terminal.getViewport().join("\n").includes("w-50");
+			await scheduler.advance(terminal, 300);
+			const afterTimeout = terminal.getViewport().join("\n").includes("w-50");
+			return { probed, beforeTimeout, afterTimeout, keys };
 		} finally {
 			tui.stop();
 			if (previous === undefined) delete Bun.env.PI_TUI_RESIZE_IN_PLACE;
@@ -354,16 +466,21 @@ describe("TUI in-place resize CPR probe", () => {
 		}
 	}
 
-	it("anchors the settled repaint on a tagged CPR reply", async () => {
-		const terminal = await resizeWithReply(true);
-		expect(terminal.writes.join("")).toContain("\x1b[6n");
-		expect(terminal.getViewport().join("\n")).toContain("w-50");
+	it("anchors the settled repaint as soon as a tagged CPR reply arrives", async () => {
+		const result = await resizeWithReply(true);
+		expect(result.probed).toBe(true);
+		expect(result.beforeTimeout).toBe(true);
+		expect(result.afterTimeout).toBe(true);
+		expect(result.keys).toEqual([]);
 	});
 
-	it("ignores an untagged CPR reply and anchors on the probe timeout", async () => {
-		const terminal = await resizeWithReply(false);
-		expect(terminal.writes.join("")).toContain("\x1b[6n");
-		expect(terminal.getViewport().join("\n")).toContain("w-50");
+	it("discards an untagged CPR reply and anchors only on the probe timeout", async () => {
+		const result = await resizeWithReply(false);
+		expect(result.probed).toBe(true);
+		expect(result.beforeTimeout).toBe(false);
+		expect(result.afterTimeout).toBe(true);
+		// The stripped reply never reaches the focused component as a key.
+		expect(result.keys).toEqual([]);
 	});
 });
 
@@ -461,12 +578,11 @@ describe("TUI degenerate geometry and history re-offers", () => {
 		const terminal = new WriteCapture(40, 6);
 		const scheduler = new VirtualRenderScheduler();
 		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
-		let offer = true;
 		const acks: number[] = [];
 		tui.setFrameProvider({
 			renderFrame: () => ({
 				viewport: ["live"],
-				history: offer ? { id: 7, rows: ["hist-row"], kind: "append" as const } : undefined,
+				history: { id: 7, rows: ["hist-row"], kind: "append" as const },
 			}),
 			acknowledgeHistory: (id: number) => {
 				acks.push(id);
@@ -549,7 +665,7 @@ describe("TUI synchronous and reset renders", () => {
 });
 
 describe("TUI postmortem restore", () => {
-	it("stops the TUI when the postmortem cleanup pass runs", async () => {
+	it("registers a postmortem restore that stops the TUI and releases its registration", async () => {
 		const terminal = new VirtualTerminal(40, 6);
 		const scheduler = new VirtualRenderScheduler();
 		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
@@ -560,14 +676,30 @@ describe("TUI postmortem restore", () => {
 				return ["body"];
 			},
 		});
-		tui.start();
-		await scheduler.settle(terminal);
-		await postmortem.cleanup();
-		await scheduler.settle(terminal);
-		const settled = probe.renders;
-		tui.requestRender(true);
-		await scheduler.settle(terminal);
-		expect(probe.renders).toBe(settled);
+		// Capture only the TUI's own registration instead of running every
+		// process-wide cleanup callback.
+		let restore: ((reason: postmortem.Reason) => void | Promise<void>) | undefined;
+		let cancelled = 0;
+		const register = spyOn(postmortem, "register").mockImplementation((id, callback) => {
+			expect(id).toBe("tui-restore");
+			restore = callback;
+			return () => {
+				cancelled++;
+			};
+		});
+		try {
+			tui.start();
+			await scheduler.settle(terminal);
+			expect(restore).toBeDefined();
+			await restore?.(postmortem.Reason.MANUAL);
+			expect(cancelled).toBe(1);
+			const settled = probe.renders;
+			tui.requestRender(true);
+			await scheduler.settle(terminal);
+			expect(probe.renders).toBe(settled);
+		} finally {
+			register.mockRestore();
+		}
 	});
 });
 

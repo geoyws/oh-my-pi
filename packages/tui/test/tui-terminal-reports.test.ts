@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { TUI } from "@oh-my-pi/pi-tui";
+import type { RenderTimer } from "@oh-my-pi/pi-tui/tui";
 import { ImageProtocol, setTerminalImageProtocol, TERMINAL } from "@oh-my-pi/pi-tui/terminal-capabilities";
 import { VirtualRenderScheduler } from "./virtual-render-scheduler";
 import { VirtualTerminal } from "./virtual-terminal";
@@ -37,6 +38,32 @@ class Probe implements Component {
 	render(): string[] {
 		this.renders++;
 		return ["probe"];
+	}
+}
+
+/** Records every timer the engine arms and which of them it cancels, by arming order. */
+class TrackingScheduler extends VirtualRenderScheduler {
+	readonly cancelled: number[] = [];
+	#armed = 0;
+	#live = new Set<number>();
+
+	override scheduleRender(callback: () => void, delayMs: number): RenderTimer {
+		const id = this.#armed++;
+		this.#live.add(id);
+		const timer = super.scheduleRender(() => {
+			this.#live.delete(id);
+			callback();
+		}, delayMs);
+		return {
+			cancel: () => {
+				if (this.#live.delete(id)) this.cancelled.push(id);
+				timer.cancel();
+			},
+		};
+	}
+
+	pending(): number[] {
+		return [...this.#live];
 	}
 }
 
@@ -104,11 +131,46 @@ describe("TUI terminal report callbacks", () => {
 		try {
 			tui.start();
 			await scheduler.settle(terminal);
-			expect(terminal.writes.join("")).not.toContain("\x1b_Ga=T");
+			// No Kitty graphics APC of any action (transmit is `a=t`, placement `a=p`) before the timer.
+			expect(terminal.writes.join("")).not.toContain("\x1b_G");
 			await scheduler.advance(terminal, 150);
 			expect(terminal.writes.join("")).toContain("\x1b_G");
 		} finally {
 			tui.stop();
+			mutable.id = originalId;
+		}
+	});
+
+	it("cancels the pending Ghostty initial-image timer when stopped during the delay", async () => {
+		const mutable = TERMINAL as unknown as { id: string; imageProtocol: ImageProtocol | null };
+		const originalId = mutable.id;
+		mutable.id = "ghostty";
+		setTerminalImageProtocol(ImageProtocol.Kitty);
+		const terminal = new ReportTerminal(40, 12);
+		const scheduler = new TrackingScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		const { Image } = await import("@oh-my-pi/pi-tui/components/image");
+		tui.addChild(
+			new Image(
+				"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGNgAAAAAgABSK+kcQAAAABJRU5ErkJggg==",
+				"image/png",
+				{ fallbackColor: (text: string) => text },
+				{ maxWidthCells: 4, maxHeightCells: 4, budget: tui.imageBudget, imageKey: "ghostty-stop" },
+				{ widthPx: 40, heightPx: 40 },
+			),
+		);
+		try {
+			tui.start();
+			await scheduler.settle(terminal);
+			// The deferred first image frame is the only timer still owed.
+			const owed = scheduler.pending();
+			expect(owed).toHaveLength(1);
+			tui.stop();
+			expect(scheduler.pending()).toEqual([]);
+			expect(scheduler.cancelled).toEqual(owed);
+			await scheduler.advance(terminal, 1_000);
+			expect(terminal.writes.join("")).not.toContain("\x1b_G");
+		} finally {
 			mutable.id = originalId;
 		}
 	});

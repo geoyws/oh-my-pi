@@ -40,9 +40,10 @@ describe("TUI provider line fitting", () => {
 	});
 
 	it("renders combining and zero-width characters without widening the row", async () => {
-		const viewport = await renderLines(["éx", "a‍b"]);
-		expect(viewport[0]).toContain("e");
-		expect(viewport[1]!.replace(/\u200d/g, "")).toContain("ab");
+		const viewport = await renderLines(["e\u0301x", "a\u200db"]);
+		// The combining accent shares its base cell: "x" stays in the second column.
+		expect(viewport[0]!.trimEnd().normalize("NFC")).toBe("\u00e9x");
+		expect(viewport[1]!.replace(/\u200d/g, "").trimEnd()).toBe("ab");
 	});
 
 	it("renders an emoji surrogate pair as one glyph at the boundary", async () => {
@@ -52,11 +53,37 @@ describe("TUI provider line fitting", () => {
 
 	it("passes a line with an unterminated ANSI sequence through fitting", async () => {
 		const viewport = await renderLines(["abc\x1b[31"]);
-		expect(viewport[0]).toContain("abc");
+		expect(viewport[0]!.trimEnd()).toBe("abc");
 	});
 
 	it("renders an OSC 8 hyperlink line's visible text", async () => {
 		const viewport = await renderLines(["\x1b]8;;https://example.com\x07link\x1b]8;;\x07"]);
 		expect(viewport[0]).toContain("link");
+	});
+
+	// Lines longer than the fit source budget (4096 code units at this width) take the
+	// giant-line path, which copies only the visible prefix.
+	const GIANT_TAIL = 70_000;
+
+	it("stops a giant line at a wide character that would cross the width", async () => {
+		const viewport = await renderLines([`${"a".repeat(9)}\u754c${"b".repeat(GIANT_TAIL)}`]);
+		expect(viewport[0]!.trimEnd()).toBe("a".repeat(9));
+	});
+
+	it("cuts a giant line at an unterminated CSI sequence", async () => {
+		const viewport = await renderLines([`abc\x1b[${"1;".repeat(GIANT_TAIL / 2)}`]);
+		expect(viewport[0]!.trimEnd()).toBe("abc");
+	});
+
+	it("cuts a giant line at an unterminated OSC sequence", async () => {
+		const viewport = await renderLines([`abc\x1b]8;;${"u".repeat(GIANT_TAIL)}`]);
+		expect(viewport[0]!.trimEnd()).toBe("abc");
+	});
+
+	it("cuts a giant line at a trailing lone ESC", async () => {
+		// Zero-width joiners past the source budget are skipped without filling the row,
+		// so the scan reaches the final ESC, which has no sequence byte after it.
+		const viewport = await renderLines([`ab${"\u200d".repeat(GIANT_TAIL)}\x1b`]);
+		expect(viewport[0]!.replace(/\u200d/g, "").trimEnd()).toBe("ab");
 	});
 });

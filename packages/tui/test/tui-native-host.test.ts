@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { Editor } from "@oh-my-pi/pi-tui/components/editor";
 import { node } from "@oh-my-pi/pi-tui/native/describe";
 import type { NativeNode } from "@oh-my-pi/pi-tui/native/node";
+import type { Terminal } from "@oh-my-pi/pi-tui/terminal";
 import { type Component, TUI } from "@oh-my-pi/pi-tui/tui";
 import { ManualScheduler, TspHarness, TspTestTerminal } from "./native/tsp-harness";
 import { defaultEditorTheme } from "./test-themes";
@@ -9,6 +10,7 @@ import { defaultEditorTheme } from "./test-themes";
 /** A settings page that docks beside the transcript or, with `sheet` off, a modal panel. */
 class Panel implements Component {
 	readonly keys: string[] = [];
+	invalidations = 0;
 	constructor(readonly sheet: boolean) {}
 	render(): string[] {
 		return ["panel"];
@@ -16,7 +18,9 @@ class Panel implements Component {
 	handleInput(data: string): void {
 		this.keys.push(data);
 	}
-	invalidate(): void {}
+	invalidate(): void {
+		this.invalidations++;
+	}
 	nativeSheet(): boolean {
 		return this.sheet;
 	}
@@ -80,10 +84,18 @@ describe("TUI native host (root-scope TSP)", () => {
 	});
 
 	it("flushes a requested render before closing the native surface", async () => {
-		const { h } = await open(true);
+		const { h, editor } = await open(true);
+		const logStart = h.terminal.log.length;
+		editor.setText("draft");
 		h.tui.requestRender();
 		h.tui.closeNative();
 		expect(h.terminal.surface).toBeUndefined();
+		const verbs = h.terminal.log.slice(logStart).map(entry => entry.verb);
+		// The pending frame goes out first, then the close.
+		expect(verbs).toContain("f");
+		expect(verbs).toContain("x");
+		expect(verbs.lastIndexOf("f")).toBeLessThan(verbs.indexOf("x"));
+		expect(JSON.stringify(h.terminal.frames.at(-1))).toContain("draft");
 	});
 
 	it("re-arms the native confirm deadline after a stalled event loop, then revokes", async () => {
@@ -118,26 +130,54 @@ describe("TUI native host (root-scope TSP)", () => {
 		expect(h.terminal.surface).toBeDefined();
 	});
 
-	it("keeps focus and key routing after terminal theme and motion events", async () => {
-		const { h, panel, sf } = await open(true);
+	it("refreshes appearance on a theme event and re-renders on a motion event, keeping focus", async () => {
+		const { h, panel } = await open(true);
+		let refreshes = 0;
+		const terminal: Terminal = h.terminal;
+		terminal.refreshAppearance = () => {
+			refreshes++;
+		};
 		h.event({ ev: "theme", dark: false });
+		h.flush();
+		expect(refreshes).toBe(1);
+		const invalidations = panel.invalidations;
+		const frames = h.terminal.frames.length;
 		h.event({ ev: "motion", reduce: true });
 		h.flush();
-		expect(h.terminal.docs.get(sf)).toBeDefined();
+		expect(panel.invalidations).toBeGreaterThan(invalidations);
+		expect(h.terminal.frames.length).toBeGreaterThan(frames);
 		expect(h.tui.getFocused()).toBe(panel);
 		h.terminal.send("x");
 		h.flush();
 		expect(panel.keys).toEqual(["x"]);
 	});
 
-	it("repaints rows instead of going native when the TSP hello never arrives", async () => {
+	it("holds row painting for the TSP probe, then repaints rows when no hello arrives", async () => {
 		const terminal = new TspTestTerminal({ reply: false, manualProbe: true });
 		const hold = new TspHarness(terminal, new ManualScheduler());
 		harness = hold;
 		hold.tui.addChild(new Panel(true));
 		hold.tui.start();
+		hold.flush(0);
+		expect(terminal.rowBytes).not.toContain("panel");
 		hold.flush(1000);
 		expect(hold.tui.nativeRendering).toBe(false);
+		expect(terminal.rowBytes).toContain("panel");
+	});
+
+	it("repaints rows at once when a no-hello reply ends the probe hold early", async () => {
+		const terminal = new TspTestTerminal({ reply: false, manualProbe: true });
+		const hold = new TspHarness(terminal, new ManualScheduler());
+		harness = hold;
+		hold.tui.addChild(new Panel(true));
+		hold.tui.start();
+		hold.flush(0);
+		expect(terminal.rowBytes).not.toContain("panel");
+		// The terminal answers the probe without a hello before the hold timer fires.
+		expect(terminal.answerProbe()).toBe(true);
+		hold.flush(0);
+		expect(hold.tui.nativeRendering).toBe(false);
+		expect(terminal.rowBytes).toContain("panel");
 	});
 
 	it("leaves the keys with a modal panel when the composer is clicked", async () => {

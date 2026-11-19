@@ -593,24 +593,78 @@ describe("TUI overlay focus", () => {
 		}
 	});
 
-	it("keeps focus on the editor when a non-focused overlay is hidden and shown", () => {
+	it("leaves focus where it is when an overlay that does not hold it is hidden and shown", () => {
 		const terminal = new MinimalTerminal();
 		const tui = new TUI(terminal);
 		const editor = new FocusRecorder("editor");
+		const other = new FocusRecorder("other");
 		const overlay = new FocusRecorder("overlay");
+		tui.addChild(editor);
+		tui.addChild(other);
+		tui.setFocus(editor);
+
+		try {
+			tui.start();
+			// Invisible overlays hold no keys, so focus can leave preFocus (the editor).
+			const handle = tui.showOverlay(overlay, { visible: () => false });
+			tui.setFocus(other);
+
+			handle.setHidden(true);
+			expect(handle.isHidden()).toBe(true);
+			// Not restored to preFocus: the hidden overlay never had the keys.
+			expect(tui.getFocused()).toBe(other);
+			handle.setHidden(false);
+			expect(handle.isHidden()).toBe(false);
+			// Shown but still invisible: it does not take focus either.
+			expect(tui.getFocused()).toBe(other);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("leaves focus where it is when an overlay that does not hold it is removed", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		const other = new FocusRecorder("other");
+		const overlay = new FocusRecorder("overlay");
+		tui.addChild(editor);
+		tui.addChild(other);
+		tui.setFocus(editor);
+
+		try {
+			tui.start();
+			const handle = tui.showOverlay(overlay, { visible: () => false });
+			tui.setFocus(other);
+			handle.hide();
+			expect(tui.hasOverlay()).toBe(false);
+			expect(tui.getFocused()).toBe(other);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("hideOverlay keeps the cursor state while another overlay remains", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		const lower = new FocusRecorder("lower");
+		const upper = new FocusRecorder("upper");
 		tui.addChild(editor);
 		tui.setFocus(editor);
 
 		try {
 			tui.start();
-			const handle = tui.showOverlay(overlay);
-			tui.setFocus(editor);
+			tui.showOverlay(lower);
+			tui.showOverlay(upper);
+			terminal.showCursor();
+			const transitions = terminal.cursorTransitions;
 
-			handle.setHidden(true);
-			expect(tui.getFocused()).toBe(editor);
-			handle.setHidden(false);
-			// Showing a visible overlay restores focus to it per the handle contract.
-			expect(tui.getFocused()).toBe(overlay);
+			tui.hideOverlay();
+			expect(tui.getFocused()).toBe(lower);
+			// The lower overlay is still up: no cursor hide on its behalf.
+			expect(terminal.cursorTransitions).toBe(transitions);
+			expect(terminal.cursorHidden).toBe(false);
 		} finally {
 			tui.stop();
 		}
@@ -709,11 +763,7 @@ describe("TUI overlay focus", () => {
 
 	it("aborts start when the terminal disconnects during start", () => {
 		class DisconnectTerminal extends MinimalTerminal {
-			override start(
-				onInput: (data: string) => void,
-				onResize: () => void,
-				onDisconnect?: () => void,
-			): void {
+			override start(onInput: (data: string) => void, onResize: () => void, onDisconnect?: () => void): void {
 				super.start(onInput, onResize);
 				onDisconnect?.();
 			}
@@ -884,6 +934,8 @@ describe("TUI overlay focus", () => {
 			tui.showOverlay(overlay);
 			expect(tui.getFocused()).toBe(overlay);
 
+			// Showing the overlay already hid the cursor; reveal it so the hide below is observable.
+			terminal.showCursor();
 			tui.hideOverlay();
 			expect(tui.getFocused()).toBe(editor);
 			expect(terminal.cursorHidden).toBe(true);

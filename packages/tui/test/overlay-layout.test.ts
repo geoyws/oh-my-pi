@@ -91,11 +91,14 @@ describe("TUI overlay layout options", () => {
 		tui.start();
 		try {
 			await scheduler.settle(terminal);
-			tui.showOverlay({ render: () => ["line-1", "line-2", "line-3", "line-4"] }, {
-				width: 8,
-				maxHeight: 2,
-				anchor: "bottom-left",
-			});
+			tui.showOverlay(
+				{ render: () => ["line-1", "line-2", "line-3", "line-4"] },
+				{
+					width: 8,
+					maxHeight: 2,
+					anchor: "bottom-left",
+				},
+			);
 			await scheduler.settle(terminal);
 			const viewport = terminal.getViewport().join("\n");
 			expect(viewport).toContain("line-3");
@@ -114,11 +117,14 @@ describe("TUI overlay layout options", () => {
 		tui.start();
 		try {
 			await scheduler.settle(terminal);
-			tui.showOverlay({ render: () => ["line-1", "line-2", "line-3", "line-4"] }, {
-				width: 8,
-				maxHeight: 2,
-				anchor: "top-left",
-			});
+			tui.showOverlay(
+				{ render: () => ["line-1", "line-2", "line-3", "line-4"] },
+				{
+					width: 8,
+					maxHeight: 2,
+					anchor: "top-left",
+				},
+			);
 			await scheduler.settle(terminal);
 			const viewport = terminal.getViewport().join("\n");
 			expect(viewport).toContain("line-1");
