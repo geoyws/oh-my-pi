@@ -643,6 +643,49 @@ describe("InteractiveMode constructed surface (C3)", () => {
 			expect(append).not.toHaveBeenCalled();
 		});
 
+		it("reconciles and auto-dismisses into the session that owned the todos at init", async () => {
+			const plan = [{ name: "Build", tasks: [{ content: "ship docs", status: "pending" as const }] }];
+			const { sessions, notify } = observe();
+			const m = createMode(undefined, {
+				beforeMode: session => {
+					session.sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases: plan });
+					session.setTodoPhases(plan);
+				},
+			});
+			await m.init({ suppressWelcomeIntro: true });
+			// init alone loaded the plan; nothing rebound the owner since
+			expect(m.todoPhases).toEqual(plan);
+			cfgTasksTodoClearDelay.override(m.session.settings, 0);
+			const append = vi.spyOn(m.session.sessionManager, "appendCustomEntry");
+			vi.useFakeTimers();
+			sessions.push(subagent({ id: "Done", status: "completed", description: "ship docs" }));
+			notify("lifecycle");
+			vi.advanceTimersByTime(100);
+			const done = [{ name: "Build", tasks: [{ content: "ship docs", status: "completed" }] }];
+			expect(append).toHaveBeenCalledWith(USER_TODO_EDIT_CUSTOM_TYPE, { phases: done });
+			expect(m.session.getTodoPhases()).toEqual(done);
+			// the flush re-syncs the HUD against that same owner, which dismisses the settled plan
+			vi.advanceTimersByTime(0);
+			await m.session.settleInFlightMessagePersistence();
+			await m.session.sessionManager.flush();
+			expect(append).toHaveBeenCalledWith(TODO_HUD_STATE_CUSTOM_TYPE, expect.objectContaining({ visibility: "dismissed" }));
+			expect(todoText(m)).toBe("");
+		});
+
+		it("persists a todo HUD reveal to the main session before init", () => {
+			const plan = [{ name: "Build", tasks: [{ content: "ship docs", status: "pending" as const }] }];
+			const m = createMode(undefined, {
+				beforeMode: session => {
+					session.sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases: plan });
+					session.setTodoPhases(plan);
+				},
+			});
+			m.todoPhases = m.session.getTodoPhases();
+			const append = vi.spyOn(m.session.sessionManager, "appendCustomEntry");
+			m.setTodoExpanded(true);
+			expect(append).toHaveBeenCalledWith(TODO_HUD_STATE_CUSTOM_TYPE, expect.objectContaining({ visibility: "revealed" }));
+		});
+
 		it("keeps the HUD when auto-clear finds no snapshot, when the plan changes mid-flush, and logs a failed dismissal", async () => {
 			const m = await initialized();
 			cfgTasksTodoClearDelay.override(m.session.settings, 0);
