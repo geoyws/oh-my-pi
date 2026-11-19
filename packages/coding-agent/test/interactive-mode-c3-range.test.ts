@@ -430,6 +430,106 @@ describe("InteractiveMode constructed surface (C3)", () => {
 		});
 	});
 
+	describe("rebuilding the transcript", () => {
+		const toolResult = (toolCallId: string, details?: unknown) =>
+			({ role: "toolResult", toolCallId, toolName: "read", content: [], isError: false, details, timestamp: 1 }) as never;
+
+		it("keeps in-flight rows across a streaming rebuild, handing settled results to the replay", async () => {
+			const m = await initialized();
+			const row = (label: string) => new piTui.Text(label, 0, 0);
+			const [streaming, segment, reply, offscreen, done, background, shared, live, stale] = [
+				"streaming",
+				"segment",
+				"reply",
+				"offscreen",
+				"done",
+				"background",
+				"shared",
+				"live",
+				"stale",
+			].map(row);
+			m.chatContainer.clear();
+			for (const child of [stale, done, streaming, background, segment, shared, reply, live]) m.chatContainer.addChild(child);
+			m.streamingComponent = streaming as never;
+			vi.spyOn(EventController.prototype, "liveAssistantSegments").mockReturnValue([segment, offscreen] as never);
+			vi.spyOn(EventController.prototype, "liveToolReplies").mockReturnValue([reply] as never);
+			m.pendingTools.clear();
+			m.pendingTools.set("done", done as never);
+			m.pendingTools.set("bg", background as never);
+			m.pendingTools.set("r1", shared as never);
+			m.pendingTools.set("r2", shared as never);
+			m.pendingTools.set("live", live as never);
+			Object.defineProperty(m.session, "isStreaming", { configurable: true, get: () => true });
+			const kept = { role: "user", content: [], timestamp: 1 } as never;
+			const dropped = { role: "user", content: [], timestamp: 2 } as never;
+			m.transcriptMessageComponents.set(kept, row("kept"));
+			m.transcriptMessageComponents.set(dropped, row("dropped"));
+			const context = {
+				messages: [
+					kept,
+					toolResult("unrelated"),
+					toolResult("done", { async: { state: "completed" } }),
+					toolResult("bg", { async: { state: "running" } }),
+					toolResult("r1"),
+				],
+			};
+			vi.spyOn(m.session, "buildTranscriptSessionContext").mockReturnValue(context as never);
+			const render = vi.spyOn(m, "renderSessionContext").mockImplementation(() => {
+				m.pendingTools.clear();
+			});
+			m.rebuildChatFromMessages({ reuseSettledComponents: true });
+			expect(render).toHaveBeenCalledWith(context, {
+				reuseSettledComponents: true,
+				preservedLiveToolCallIds: new Set(["bg", "r1"]),
+			});
+			// live rows return in their original order; the settled tool and stale rows go
+			expect(m.chatContainer.children).toEqual([streaming, background, segment, shared, reply, live]);
+			// the settled shared member stops routing; its pending sibling still owns the group
+			expect([...m.pendingTools]).toEqual([
+				["bg", background],
+				["r2", shared],
+				["live", live],
+			]);
+			expect(m.transcriptMessageComponents.has(kept)).toBe(true);
+			expect(m.transcriptMessageComponents.has(dropped)).toBe(false);
+		});
+
+		it("preserves nothing when a streaming rebuild has no live rows", async () => {
+			const m = await initialized();
+			const stale = new piTui.Text("stale", 0, 0);
+			m.chatContainer.addChild(stale);
+			m.streamingComponent = undefined;
+			m.pendingTools.clear();
+			Object.defineProperty(m.session, "isStreaming", { configurable: true, get: () => true });
+			vi.spyOn(m.session, "buildTranscriptSessionContext").mockReturnValue({ messages: [] } as never);
+			const render = vi.spyOn(m, "renderSessionContext").mockImplementation(() => {});
+			m.rebuildChatFromMessages();
+			expect(render).toHaveBeenCalledWith({ messages: [] }, { reuseSettledComponents: undefined, preservedLiveToolCallIds: new Set() });
+			expect(m.chatContainer.children).toEqual([]);
+		});
+
+		it("replays the optimistic user row only for a live, uncancelled user submission", async () => {
+			const m = await initialized();
+			const userRows = () =>
+				m.chatContainer.children.filter(child => Bun.stripANSI(child.render(80).join("\n")).includes("pending ask"));
+			const pending = m.startPendingSubmission({ text: "pending ask" });
+			m.rebuildChatFromMessages();
+			expect(userRows()).toHaveLength(1);
+			pending.cancelled = true;
+			m.rebuildChatFromMessages();
+			expect(userRows()).toHaveLength(0);
+			// a signature without a matching user submission replays nothing
+			pending.cancelled = false;
+			pending.customType = "goal-continuation";
+			m.rebuildChatFromMessages();
+			expect(userRows()).toHaveLength(0);
+			m.cancelPendingSubmission();
+			m.optimisticUserMessageSignature = "pending ask\u00000";
+			m.rebuildChatFromMessages();
+			expect(userRows()).toHaveLength(0);
+		});
+	});
+
 	describe("native composer state", () => {
 		it("reports the draft's shell mode and whether its prefix excludes it from context", () => {
 			const m = createMode();
