@@ -9,6 +9,7 @@ import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-messa
 import * as svgFigure from "@oh-my-pi/pi-tui/chat/svg-figure";
 import * as tableChart from "@oh-my-pi/pi-tui/chat/table-chart";
 import { ToolExecutionComponent } from "@oh-my-pi/pi-tui/chat/tool-execution";
+import * as composerCache from "@oh-my-pi/pi-tui/prompt/composer-cache";
 import * as tuiTheme from "@oh-my-pi/pi-tui/theme";
 import { cfgAdvisorEnabled } from "../src/advisor/settings";
 import * as autoGraphPlanner from "../src/auto-graph/planner";
@@ -16,7 +17,7 @@ import { cfgExtensionAssistantTextRenderers } from "../src/extensibility/setting
 import * as judgment from "../src/judgment";
 import { ComposerPredictionController } from "../src/modes/controllers/composer-prediction-controller";
 import { EventController } from "../src/modes/controllers/event-controller";
-import type { InteractiveMode } from "../src/modes/interactive-mode";
+import { InteractiveMode } from "../src/modes/interactive-mode";
 import { UiHelpers } from "../src/modes/utils/ui-helpers";
 import {
 	cfgComposerPredictions,
@@ -42,6 +43,10 @@ import {
 import { cfgCompactionEnabled } from "../src/session/context-settings";
 import { cfgExpandThinkingBlocks, cfgHideThinkingBlock, cfgProseOnlyThinking } from "../src/session/settings";
 import { cfgGoalEnabled } from "../src/goals/settings";
+import { AgentRegistry, MAIN_AGENT_ID } from "../src/registry/agent-registry";
+import * as persistedAgents from "../src/registry/persisted-agents";
+import { STTController } from "../src/stt";
+import { cfgSttEnabled } from "../src/stt/settings";
 import * as runStatus from "../src/utils/run-status";
 import * as titleGenerator from "../src/utils/title-generator";
 import { useConstructedInteractiveMode } from "./helpers/constructed-interactive-mode";
@@ -253,6 +258,209 @@ describe("InteractiveMode constructed surface (C3)", () => {
 			const cancel = vi.spyOn(m.composer, "cancelLinkHints");
 			m.cancelLinkHints();
 			expect(cancel).toHaveBeenCalledTimes(1);
+		});
+	});
+
+	describe("native composer state", () => {
+		it("reports the draft's shell mode and whether its prefix excludes it from context", () => {
+			const m = createMode();
+			m.isBashMode = true;
+			m.editor.setText("!!ls -la");
+			expect(m.editor.composerState?.().shell).toEqual({ kind: "bash", excluded: true });
+			m.editor.setText("ls");
+			expect(m.editor.composerState?.().shell).toEqual({ kind: "bash", excluded: false });
+			m.isBashMode = false;
+			m.isPythonMode = true;
+			m.editor.setText("$$print(1)");
+			expect(m.editor.composerState?.().shell).toEqual({ kind: "python", excluded: true });
+			m.isPythonMode = false;
+			expect(m.editor.composerState?.().shell).toBeUndefined();
+		});
+
+		it("shows the dictation state only while speech input is enabled or a capture is live", async () => {
+			const m = createMode();
+			expect(m.editor.composerState?.().dictation).toBeUndefined();
+			await change(cfgSttEnabled, true);
+			expect(m.editor.composerState?.().dictation).toBe("idle");
+			const started = Promise.withResolvers<void>();
+			vi.spyOn(STTController.prototype, "start").mockReturnValue(started.promise as never);
+			m.editor.onToggleDictation?.();
+			// the mic reads "starting" until the capture is up
+			expect(m.editor.composerState?.().dictation).toBe("starting");
+			started.resolve();
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(m.editor.composerState?.().dictation).toBe("idle");
+			// a capture still recording shows even after the setting turns off
+			const state = Object.getOwnPropertyDescriptor(STTController.prototype, "state")!;
+			Object.defineProperty(STTController.prototype, "state", { configurable: true, get: () => "recording" });
+			try {
+				await change(cfgSttEnabled, false);
+				expect(m.editor.composerState?.().dictation).toBe("recording");
+			} finally {
+				Object.defineProperty(STTController.prototype, "state", state);
+			}
+		});
+
+		it("lists the focused subagent's live ancestors below main, outermost first", () => {
+			const m = createMode();
+			expect(m.editor.composerState?.().viewing).toBeUndefined();
+			const parents: Record<string, string | undefined> = {
+				grandchild: "child",
+				child: "root-task",
+				"root-task": MAIN_AGENT_ID,
+				looped: "looper",
+				looper: "looped",
+				orphan: "gone",
+			};
+			vi.spyOn(AgentRegistry.global(), "get").mockImplementation(
+				(id: string) => (id in parents ? { id, parentId: parents[id] } : undefined) as never,
+			);
+			let focused = "grandchild";
+			Object.defineProperty(m, "focusedAgentId", { configurable: true, get: () => focused });
+			expect(m.editor.composerState?.().viewing).toEqual(["root-task", "child", "grandchild"]);
+			// a parent cycle stops at the first repeat; a parent no longer registered ends the chain
+			focused = "looped";
+			expect(m.editor.composerState?.().viewing).toEqual(["looper", "looped"]);
+			focused = "orphan";
+			expect(m.editor.composerState?.().viewing).toEqual(["orphan"]);
+		});
+	});
+
+	describe("editor border colour", () => {
+		it("colours the border for bash, python and each vim mode", () => {
+			const m = createMode();
+			const border = () => m.editor.borderColor("x");
+			m.isBashMode = true;
+			m.updateEditorBorderColor();
+			expect(border()).toBe(tuiTheme.theme.getBashModeBorderColor()("x"));
+			m.isBashMode = false;
+			m.isPythonMode = true;
+			m.updateEditorBorderColor();
+			expect(border()).toBe(tuiTheme.theme.getPythonModeBorderColor()("x"));
+			m.isPythonMode = false;
+			let vimMode = "insert";
+			Object.defineProperty(m.editor, "vimEnabled", { configurable: true, get: () => true });
+			Object.defineProperty(m.editor, "vimMode", { configurable: true, get: () => vimMode });
+			for (const [mode, color] of [
+				["visual", "warning"],
+				["visual-line", "warning"],
+				["normal", "accent"],
+				["replace", "accent"],
+				["insert", "success"],
+			] as const) {
+				vimMode = mode;
+				m.updateEditorBorderColor();
+				expect(border()).toBe(tuiTheme.theme.fg(color, "x"));
+			}
+		});
+	});
+
+	describe("composer status cache", () => {
+		it("persists the settled status bar once per burst, recovering the border's ANSI wrapper", async () => {
+			vi.useFakeTimers();
+			const writeStatus = vi.fn();
+			vi.spyOn(composerCache, "sharedComposerCache").mockReturnValue({ writeStatus } as never);
+			const m = createMode();
+			vi.spyOn(m.sessionManager, "getSessionFile").mockReturnValue("/tmp/c3-session.jsonl");
+			m.syncComposerShape();
+			m.syncComposerShape();
+			// the timer reads whatever border the mode last applied
+			m.editor.borderColor = (text: string) => `<${text}>`;
+			expect(writeStatus).not.toHaveBeenCalled();
+			vi.advanceTimersByTime(1_000);
+			expect(writeStatus).toHaveBeenCalledTimes(1);
+			const [cwd, status] = writeStatus.mock.calls[0]!;
+			expect(cwd).toBe(m.sessionManager.getCwd());
+			expect(status.borderColor).toEqual({ prefix: "<", suffix: ">" });
+			expect(status.statusLine.model).toBe(m.session.model);
+			expect(status.statusLine.compactionBoundaries).not.toBeNull();
+		});
+
+		it("caches no border wrapper or model-derived tiers when neither can be recovered", () => {
+			vi.useFakeTimers();
+			const writeStatus = vi.fn();
+			vi.spyOn(composerCache, "sharedComposerCache").mockReturnValue({ writeStatus } as never);
+			const m = createMode(undefined, {
+				beforeMode: session => Object.defineProperty(session, "model", { configurable: true, get: () => undefined }),
+			});
+			vi.spyOn(m.sessionManager, "getSessionFile").mockReturnValue("/tmp/c3-session.jsonl");
+			// a default role that resolves to nothing falls back to the launch model (none here)
+			vi.spyOn(m.settings, "getModelRole").mockReturnValue("anthropic/missing" as never);
+			vi.spyOn(m.session, "resolveRoleModelWithThinking").mockReturnValue({ model: undefined } as never);
+			m.syncComposerShape();
+			m.editor.borderColor = () => "plain";
+			vi.advanceTimersByTime(1_000);
+			const [, status] = writeStatus.mock.calls[0]!;
+			expect(status.borderColor).toBeUndefined();
+			expect(status.statusLine).toMatchObject({
+				model: undefined,
+				fastMode: false,
+				usingSubscription: false,
+				compactionBoundaries: null,
+			});
+		});
+
+		it("caches a role model without a context window with no compaction boundaries", () => {
+			vi.useFakeTimers();
+			const writeStatus = vi.fn();
+			vi.spyOn(composerCache, "sharedComposerCache").mockReturnValue({ writeStatus } as never);
+			const m = createMode();
+			vi.spyOn(m.sessionManager, "getSessionFile").mockReturnValue("/tmp/c3-session.jsonl");
+			const roleModel = { ...m.session.model!, contextWindow: 0 };
+			vi.spyOn(m.settings, "getModelRole").mockReturnValue("anthropic/role" as never);
+			vi.spyOn(m.session, "resolveRoleModelWithThinking").mockReturnValue({ model: roleModel } as never);
+			m.syncComposerShape();
+			vi.advanceTimersByTime(1_000);
+			const [, status] = writeStatus.mock.calls[0]!;
+			expect(status.statusLine.model).toBe(roleModel);
+			expect(status.statusLine.compactionBoundaries).toBeNull();
+		});
+	});
+
+	describe("running-subagent badge", () => {
+		it("repaints only on a change and when the caller allows it", () => {
+			const m = createMode();
+			const render = vi.spyOn(m.ui, "requestRender");
+			const running = vi.spyOn(m.statusLine, "setRunningSubagents").mockReturnValue(true);
+			expect(m.syncRunningSubagentBadge()).toBe(true);
+			expect(render).toHaveBeenCalledTimes(1);
+			expect(m.syncRunningSubagentBadge({ requestRender: false })).toBe(true);
+			expect(render).toHaveBeenCalledTimes(1);
+			running.mockReturnValue(false);
+			vi.spyOn(m.statusLine, "setSubagentTreeCost").mockReturnValue(false);
+			expect(m.syncRunningSubagentBadge()).toBe(false);
+			expect(render).toHaveBeenCalledTimes(1);
+		});
+
+		it("skips the subagent tree cost for a collab guest", () => {
+			const m = createMode();
+			m.collabGuest = {} as never;
+			const cost = vi.spyOn(m.statusLine, "setSubagentTreeCost");
+			const hydrate = vi.spyOn(persistedAgents, "registerPersistedSubagents");
+			m.syncRunningSubagentBadge();
+			expect(cost).toHaveBeenLastCalledWith(0);
+			expect(hydrate).not.toHaveBeenCalled();
+			m.collabGuest = undefined;
+		});
+
+		it("hydrates a resumed session's subagent costs once and logs a failed hydration", async () => {
+			const m = createMode();
+			vi.spyOn(m.sessionManager, "getSessionFile").mockReturnValue("/tmp/c3-root.jsonl");
+			vi.spyOn(m.sessionManager, "isSessionOnDisk").mockReturnValue(true);
+			const hydrate = vi
+				.spyOn(persistedAgents, "registerPersistedSubagents")
+				.mockRejectedValue(new Error("unreadable transcript"));
+			const warn = vi.spyOn(piUtils.logger, "warn");
+			m.syncRunningSubagentBadge();
+			m.syncRunningSubagentBadge();
+			expect(hydrate).toHaveBeenCalledTimes(1);
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(warn).toHaveBeenCalledWith("Persisted subagent cost hydration failed", {
+				rootSessionFile: "/tmp/c3-root.jsonl",
+				error: "Error: unreadable transcript",
+			});
 		});
 	});
 
