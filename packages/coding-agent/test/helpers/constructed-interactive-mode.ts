@@ -44,6 +44,8 @@ export interface ConstructedModeOptions {
 	beforeMode?: (session: AgentSession) => void;
 	/** Builds the session's extension runner over its manager and registry. */
 	extensionRunner?: (manager: SessionManager, registry: ModelRegistry) => ExtensionRunner;
+	/** Supplies the session's vibe tool set (vibe mode refuses to enter without one). */
+	createVibeTools?: () => AgentTool[];
 }
 
 export interface ConstructedModeHarness {
@@ -121,6 +123,7 @@ export function useConstructedInteractiveMode(tempPrefix: string): ConstructedMo
 			toolRegistry: new Map([[readTool.name, readTool]]),
 			builtInToolNames: ["read"],
 			extensionRunner: extra?.extensionRunner?.(manager, registry),
+			createVibeTools: extra?.createVibeTools,
 		});
 		extra?.beforeMode?.(session);
 		mode = new InteractiveMode(

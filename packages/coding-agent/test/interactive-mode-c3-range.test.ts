@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "bun:test";
-import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { type } from "@oh-my-pi/omptype";
+import type { AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as piTui from "@oh-my-pi/pi-tui";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
@@ -35,6 +36,7 @@ import {
 } from "../src/modes/settings";
 import { cfgCompactionEnabled } from "../src/session/context-settings";
 import { cfgExpandThinkingBlocks, cfgHideThinkingBlock, cfgProseOnlyThinking } from "../src/session/settings";
+import { cfgGoalEnabled } from "../src/goals/settings";
 import * as runStatus from "../src/utils/run-status";
 import * as titleGenerator from "../src/utils/title-generator";
 import { useConstructedInteractiveMode } from "./helpers/constructed-interactive-mode";
@@ -94,6 +96,95 @@ describe("InteractiveMode constructed surface (C3)", () => {
 		if (transcript.length > 0) await m.renderInitialMessages();
 		return m;
 	}
+
+	describe("session-mode transition gates (sessionModes.set)", () => {
+		it("disables a paused plan on exit and refuses plan entry while vibe holds", async () => {
+			const m = await initialized();
+			m.planModePaused = true;
+			const exited = await m.sessionModes.set({ mode: "plan", action: "exit" });
+			expect(exited).toMatchObject({ ok: true, changed: true });
+			expect(m.planModePaused).toBe(false);
+			m.vibeModeEnabled = true;
+			expect(await m.sessionModes.set({ mode: "plan", action: "enter" })).toMatchObject({
+				ok: false,
+				code: "conflict",
+				message: "Exit vibe mode first.",
+			});
+		});
+
+		it("enters and exits vibe mode, treating a repeat enter as unchanged", async () => {
+			const vibeTool: AgentTool = {
+				name: "vibe_spawn",
+				label: "vibe_spawn",
+				description: "Fake vibe spawn",
+				parameters: type({}),
+				async execute() {
+					return { content: [{ type: "text" as const, text: "spawned" }] };
+				},
+			};
+			const m = createMode(undefined, { createVibeTools: () => [vibeTool] });
+			await m.init({ suppressWelcomeIntro: true });
+			const entered = await m.sessionModes.set({ mode: "vibe", action: "enter" });
+			expect(entered).toMatchObject({ ok: true, changed: true });
+			expect(m.vibeModeEnabled).toBe(true);
+			expect(m.session.getActiveToolNames()).toContain("vibe_spawn");
+			expect(await m.sessionModes.set({ mode: "vibe", action: "enter" })).toMatchObject({ ok: true, changed: false });
+			const exited = await m.sessionModes.set({ mode: "vibe", action: "exit" });
+			expect(exited).toMatchObject({ ok: true, changed: true });
+			expect(m.vibeModeEnabled).toBe(false);
+		});
+
+		it("refuses vibe entry while plan or goal holds, and goal entry while vibe holds", async () => {
+			const m = await initialized();
+			m.planModePaused = true;
+			expect(await m.sessionModes.set({ mode: "vibe", action: "enter" })).toMatchObject({
+				code: "conflict",
+				message: "Exit plan mode first.",
+			});
+			m.planModePaused = false;
+			m.goalModePaused = true;
+			expect(await m.sessionModes.set({ mode: "vibe", action: "enter" })).toMatchObject({
+				code: "conflict",
+				message: "Exit goal mode first.",
+			});
+			m.goalModePaused = false;
+			m.vibeModeEnabled = true;
+			expect(await m.sessionModes.set({ mode: "goal", action: "enter", objective: "ship" })).toMatchObject({
+				code: "conflict",
+				message: "Exit vibe mode first.",
+			});
+			expect(m.goalModeEnabled).toBe(false);
+		});
+
+		it("refuses resuming a paused goal while goal mode is disabled in settings", async () => {
+			const m = await initialized();
+			vi.spyOn(m.session, "getGoalModeState").mockReturnValue({
+				enabled: false,
+				goal: { objective: "parked", status: "paused" },
+			} as never);
+			await change(cfgGoalEnabled, false);
+			expect(await m.sessionModes.set({ mode: "goal", action: "resume" })).toMatchObject({
+				ok: false,
+				code: "disabled",
+				message: "Goal mode is disabled in settings (goal.enabled).",
+			});
+		});
+
+		it("rejects a non-string goal objective and unknown goal, loop or vibe actions", async () => {
+			const m = await initialized();
+			const cases: Array<[unknown, string]> = [
+				[{ mode: "goal", action: "enter", objective: 42 }, "non-empty string"],
+				[{ mode: "goal", action: "stretch" }, "Unknown mode"],
+				[{ mode: "loop", action: "stretch" }, "Unknown mode"],
+				[{ mode: "vibe", action: "stretch" }, "Unknown mode"],
+			];
+			for (const [request, message] of cases) {
+				const result = await m.sessionModes.set(request as never);
+				expect(result).toMatchObject({ ok: false, code: "invalid_request" });
+				expect(result.ok ? "" : result.message).toContain(message);
+			}
+		});
+	});
 
 	describe("live UI setting changes", () => {
 		it("rebuilds the transcript once for render-time display options and retires committed rows", async () => {
