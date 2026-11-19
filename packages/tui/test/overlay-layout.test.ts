@@ -59,7 +59,7 @@ describe("TUI overlay layout options", () => {
 
 	it("falls back to centred placement for invalid percentage row and column", async () => {
 		const centred = await showOverlay({ width: 6 });
-		const invalid = await showOverlay({ width: 6, row: "bogus", col: "bogus" });
+		const invalid = await showOverlay({ width: 6, row: "bogus" as never, col: "bogus" as never });
 		expect(invalid.row).toBe(centred.row);
 		expect(invalid.col).toBe(centred.col);
 		expect(invalid.row).toBeGreaterThan(0);
