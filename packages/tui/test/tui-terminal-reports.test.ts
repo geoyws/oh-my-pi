@@ -179,13 +179,13 @@ describe("TUI terminal report callbacks", () => {
 	it("clearInlineImages deletes each transmitted Kitty image while running and nothing once stopped", async () => {
 		const mutable = TERMINAL as unknown as { id: string };
 		const originalId = mutable.id;
-		mutable.id = "kitty";
-		setTerminalImageProtocol(ImageProtocol.Kitty);
-		const { Image } = await import("@oh-my-pi/pi-tui/components/image");
+		const started: TUI[] = [];
 		async function paintedImage(): Promise<{ tui: TUI; terminal: ReportTerminal }> {
+			const { Image } = await import("@oh-my-pi/pi-tui/components/image");
 			const terminal = new ReportTerminal(40, 12);
 			const scheduler = new VirtualRenderScheduler();
 			const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+			started.push(tui);
 			tui.addChild(
 				new Image(
 					"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGNgAAAAAgABSK+kcQAAAABJRU5ErkJggg==",
@@ -201,10 +201,13 @@ describe("TUI terminal report callbacks", () => {
 			terminal.writes.length = 0;
 			return { tui, terminal };
 		}
-		const running = await paintedImage();
-		const stopped = await paintedImage();
-		const switched = await paintedImage();
 		try {
+			mutable.id = "kitty";
+			setTerminalImageProtocol(ImageProtocol.Kitty);
+			const running = await paintedImage();
+			const stopped = await paintedImage();
+			const switched = await paintedImage();
+
 			running.tui.clearInlineImages();
 			expect(running.terminal.writes.join("")).toMatch(/\x1b_Ga=d,d=I,i=\d+,q=2\x1b\\/);
 			// The purge consumed the tracked ids: a second call has nothing to delete.
@@ -225,9 +228,7 @@ describe("TUI terminal report callbacks", () => {
 			switched.tui.clearInlineImages();
 			expect(switched.terminal.writes).toEqual([]);
 		} finally {
-			running.tui.stop();
-			stopped.tui.stop();
-			switched.tui.stop();
+			for (const tui of started) tui.stop();
 			mutable.id = originalId;
 		}
 	});

@@ -677,6 +677,8 @@ describe("TUI synchronous and reset renders", () => {
 		const eagerTui = new TUI(eager, undefined, { renderScheduler: new VirtualRenderScheduler() });
 		const deferred = new InputTerminal(40, 6);
 		const deferredTui = new TUI(deferred, undefined, { renderScheduler: new VirtualRenderScheduler() });
+		const late = new InputTerminal(40, 6);
+		const lateTui = new TUI(late, undefined, { renderScheduler: new VirtualRenderScheduler() });
 		try {
 			eagerTui.start();
 			eagerTui.enableInput();
@@ -686,17 +688,17 @@ describe("TUI synchronous and reset renders", () => {
 			deferredTui.enableInput();
 			deferredTui.enableInput();
 			expect(deferred.enables).toBe(1);
+
+			// A deferred start that is stopped before input is enabled never takes stdin.
+			lateTui.start({ deferInput: true });
+			lateTui.stop();
+			lateTui.enableInput();
+			expect(late.enables).toBe(0);
 		} finally {
 			eagerTui.stop();
 			deferredTui.stop();
+			lateTui.stop();
 		}
-		// A deferred start that is stopped before input is enabled never takes stdin.
-		const late = new InputTerminal(40, 6);
-		const lateTui = new TUI(late, undefined, { renderScheduler: new VirtualRenderScheduler() });
-		lateTui.start({ deferInput: true });
-		lateTui.stop();
-		lateTui.enableInput();
-		expect(late.enables).toBe(0);
 	});
 
 	it("resetDisplay repaints while running and is a no-op after stop", async () => {
