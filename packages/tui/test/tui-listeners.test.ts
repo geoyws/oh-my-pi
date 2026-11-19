@@ -419,8 +419,11 @@ describe("TUI in-place resize CPR probe", () => {
 		}
 		override write(data: string): void {
 			this.writes.push(data);
-			super.write(data);
 			const probe = data.match(/\x1b\[(\d+)G\x1b\[6n/);
+			// Keep the emulator from answering the DSR itself: this terminal's
+			// reply (tagged column, or a column-1 reply that cannot be
+			// attributed) is the only one the TUI sees.
+			super.write(probe ? data.replace("\x1b[6n", "") : data);
 			if (probe) {
 				const column = this.tagged ? probe[1] : "1";
 				queueMicrotask(() => this.sendInput(`\x1b[2;${column}R`));
@@ -431,7 +434,8 @@ describe("TUI in-place resize CPR probe", () => {
 	/**
 	 * Resize in place and step past the 120 ms settle (which sends the DSR
 	 * probe), then report whether the settled width painted before the 200 ms
-	 * probe timeout and after it, plus any keys the focused component saw.
+	 * probe timeout and once every timeout (including the grow's one retry)
+	 * has run, plus any keys the focused component saw.
 	 */
 	async function resizeWithReply(tagged: boolean) {
 		const previous = Bun.env.PI_TUI_RESIZE_IN_PLACE;
@@ -456,7 +460,7 @@ describe("TUI in-place resize CPR probe", () => {
 			await scheduler.advance(terminal, 130);
 			const probed = terminal.writes.join("").includes("\x1b[6n");
 			const beforeTimeout = terminal.getViewport().join("\n").includes("w-50");
-			await scheduler.advance(terminal, 300);
+			await scheduler.advance(terminal, 1000);
 			const afterTimeout = terminal.getViewport().join("\n").includes("w-50");
 			return { probed, beforeTimeout, afterTimeout, keys };
 		} finally {

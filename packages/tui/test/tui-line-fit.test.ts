@@ -51,9 +51,27 @@ describe("TUI provider line fitting", () => {
 		expect(viewport[0]).toContain("😀");
 	});
 
-	it("passes a line with an unterminated ANSI sequence through fitting", async () => {
-		const viewport = await renderLines(["abc\x1b[31"]);
-		expect(viewport[0]!.trimEnd()).toBe("abc");
+	it("passes a short line with an unterminated ANSI sequence through fitting verbatim", async () => {
+		const terminal = new VirtualTerminal(10, 6);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		tui.setFrameProvider({
+			renderFrame: () => ({ viewport: ["abc\x1b[31"] }),
+			acknowledgeHistory() {},
+		});
+		const frames: string[] = [];
+		tui.addFrameWriteListener(data => {
+			frames.push(data);
+		});
+		try {
+			tui.start();
+			await scheduler.settle(terminal);
+		} finally {
+			tui.stop();
+		}
+		// Within the width the line is not cut: the unterminated CSI reaches the terminal as written.
+		expect(frames.join("")).toContain("abc\x1b[31");
+		expect(terminal.getViewport()[0]).toStartWith("abc");
 	});
 
 	it("renders an OSC 8 hyperlink line's visible text", async () => {

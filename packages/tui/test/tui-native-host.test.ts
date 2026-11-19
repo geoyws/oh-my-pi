@@ -130,7 +130,7 @@ describe("TUI native host (root-scope TSP)", () => {
 		expect(h.terminal.surface).toBeDefined();
 	});
 
-	it("refreshes appearance on a theme event and re-renders on a motion event, keeping focus", async () => {
+	it("refreshes appearance on a theme event and invalidates components on a motion event, keeping focus", async () => {
 		const { h, panel } = await open(true);
 		let refreshes = 0;
 		const terminal: Terminal = h.terminal;
@@ -141,11 +141,9 @@ describe("TUI native host (root-scope TSP)", () => {
 		h.flush();
 		expect(refreshes).toBe(1);
 		const invalidations = panel.invalidations;
-		const frames = h.terminal.frames.length;
 		h.event({ ev: "motion", reduce: true });
 		h.flush();
 		expect(panel.invalidations).toBeGreaterThan(invalidations);
-		expect(h.terminal.frames.length).toBeGreaterThan(frames);
 		expect(h.tui.getFocused()).toBe(panel);
 		h.terminal.send("x");
 		h.flush();
