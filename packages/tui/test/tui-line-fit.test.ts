@@ -52,12 +52,20 @@ describe("TUI provider line fitting", () => {
 		expect(viewport[0]).toContain("😀");
 	});
 
-	it("passes a short line with an unterminated ANSI sequence through fitting verbatim", async () => {
+	// A sequence left open at the end of a line would swallow the row's SGR reset
+	// and leak "[0m" as text (t-54b2ea43); the short-line path cuts it as the
+	// giant-line path does.
+	it.each([
+		["an unterminated CSI", "abc\x1b[31", "abc"],
+		["an unterminated OSC 8", "abc\x1b]8;;https://example.com", "abc"],
+		["a lone trailing ESC", "abc\x1b", "abc"],
+		["a dangling CSI after a styled span", "a\x1b[31mb\x1b[0mc\x1b[", "abc"],
+	])("cuts %s from a short line before the row reset", async (_name, line, visible) => {
 		const terminal = new VirtualTerminal(10, 6);
 		const scheduler = new VirtualRenderScheduler();
 		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
 		tui.setFrameProvider({
-			renderFrame: () => ({ viewport: ["abc\x1b[31"] }),
+			renderFrame: () => ({ viewport: [line] }),
 			acknowledgeHistory() {},
 		});
 		const frames: string[] = [];
@@ -70,11 +78,10 @@ describe("TUI provider line fitting", () => {
 		} finally {
 			tui.stop();
 		}
-		// Characterization of known defect t-54b2ea43: within the budget the line is not
-		// cut, so the dangling CSI reaches the terminal as written and swallows the
-		// row's SGR reset, leaving "[0m" visible. Update when that row lands.
-		expect(frames.join("")).toContain("abc\x1b[31");
-		expect(terminal.getViewport()[0]!.trimEnd()).toBe("abc[0m");
+		expect(terminal.getViewport()[0]!.trimEnd()).toBe(visible);
+		// Everything before the dangling sequence reaches the terminal, followed
+		// directly by the row reset: the open sequence's bytes are gone.
+		expect(frames.join("")).toContain(`${line.slice(0, line.lastIndexOf("\x1b"))}\x1b[0m`);
 	});
 
 	it("renders an OSC 8 hyperlink line's visible text", async () => {
