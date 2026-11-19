@@ -22,6 +22,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { SessionRecorder } from "@oh-my-pi/pi-coding-agent/stream/recording";
 import { StreamRedactor } from "@oh-my-pi/pi-coding-agent/stream/redactor";
+import * as stt from "@oh-my-pi/pi-coding-agent/stt";
 import { STTController } from "@oh-my-pi/pi-coding-agent/stt";
 import { cfgSttEnabled } from "@oh-my-pi/pi-coding-agent/stt/settings";
 import { cfgWorktreeOnStart } from "@oh-my-pi/pi-coding-agent/task/settings";
@@ -391,6 +392,34 @@ describe("InteractiveMode session commands and capture surfaces (lines 8801-end)
 
 			expect(start).not.toHaveBeenCalled();
 			expect(warnings).toEqual(["Speech-to-text is disabled. Enable it in settings: stt.enabled"]);
+		});
+
+		it("builds one dictation controller per mode, bound to this session's settings, models and live session id", async () => {
+			await freshMode();
+			cfgSttEnabled.set(settings, true);
+			const built: Array<ConstructorParameters<typeof STTController>[0]> = [];
+			const fake = {
+				toggle: vi.fn(async () => {}),
+				start: vi.fn(async () => {}),
+				dispose: vi.fn(),
+				state: "idle",
+			};
+			spyOn(stt, "STTController").mockImplementation(function (deps: ConstructorParameters<typeof STTController>[0]) {
+				built.push(deps);
+				return fake;
+			} as never);
+
+			await mode.handleSTTToggle();
+			mode.dictationSpaceHold(mode.editor).onStart();
+
+			expect(built).toHaveLength(1);
+			expect(fake.toggle).toHaveBeenCalledTimes(1);
+			expect(fake.start).toHaveBeenCalledTimes(1);
+			const deps = built[0];
+			if (!deps || typeof deps === "function") throw new Error("expected dependency object");
+			expect(deps.settings).toBe(mode.settings);
+			expect(deps.registry).toBe(session.modelRegistry);
+			expect(deps.getSessionId?.()).toBe(session.sessionId);
 		});
 	});
 

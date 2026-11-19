@@ -4092,9 +4092,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.clearOptimisticUserMessage();
 		this.#pendingWorkingMessage = undefined;
 		if (submission.customType === "goal-continuation") this.#releaseGoalContinuationTurn();
-		if (this.loadingAnimation) {
-			this.#stopLoadingAnimation(true);
-		}
+		this.#stopLoadingAnimation(true);
 		if (!submission.customType && !preserveDraft) {
 			// Enter clears the submitted draft before this cancellation can run.
 			// Keep anything typed or attached since then, after the recovered input.
@@ -4128,9 +4126,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	restoreRefusedPrompt(prompt: DroppedPrompt): void {
 		this.clearOptimisticUserMessage();
 		this.#pendingWorkingMessage = undefined;
-		if (this.loadingAnimation) {
-			this.#stopLoadingAnimation(true);
-		}
+		this.#stopLoadingAnimation(true);
 		this.rebuildChatFromMessages();
 		restoreRefusedDraft(this.editor, prompt.text, prompt.images, prompt.imageLinks);
 		this.ui.requestRender();
@@ -4145,9 +4141,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#restoreDroppedPrompt(prompt: DroppedPrompt): void {
 		this.clearOptimisticUserMessage();
 		this.#pendingWorkingMessage = undefined;
-		if (this.loadingAnimation) {
-			this.#stopLoadingAnimation(true);
-		}
+		this.#stopLoadingAnimation(true);
 		this.rebuildChatFromMessages();
 		// The rebuild drops transient notices, including the one that refused this prompt.
 		if (prompt.reason) this.showError(prompt.reason);
@@ -8162,9 +8156,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		clearTimeout(this.#composerStatusPersistTimer);
 		this.#composerStatusPersistTimer = undefined;
 		this.#persistComposerStatus();
-		if (this.loadingAnimation) {
-			this.#stopLoadingAnimation(false);
-		}
+		this.#stopLoadingAnimation(false);
 		this.#micCursor?.dispose();
 		this.#micCursor = undefined;
 		// Stop the shared tool-spinner ticker: a live block missed by per-component
@@ -8745,9 +8737,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#pendingSubmissionPreservesDraft = false;
 		this.clearOptimisticUserMessage();
 		this.#pendingWorkingMessage = undefined;
-		if (this.loadingAnimation) {
-			this.#stopLoadingAnimation(true);
-		}
+		this.#stopLoadingAnimation(true);
 		this.#uiHelpers.showError(message);
 	}
 
