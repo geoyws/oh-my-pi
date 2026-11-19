@@ -16,6 +16,8 @@ import { cfgGoalContinuationModes, cfgGoalEnabled } from "../src/goals/settings"
 import type { SubmittedUserInput } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { cfgPlanEnabled } from "../src/plan-mode/settings";
 import { cfgSessionIdleCheckpointMs } from "../src/session/settings";
+import { cfgLoopMode } from "@oh-my-pi/pi-coding-agent/modes/settings";
+import { getProjectDir, setProjectDir } from "@oh-my-pi/pi-utils";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { cfgExtensionHandlersModeControl } from "../src/extensibility/settings";
 import { formatModelString } from "../src/config/model-resolver";
@@ -30,12 +32,15 @@ describe("InteractiveMode constructed surface (C2)", () => {
 	let authStorage: AuthStorage;
 	let mode: InteractiveMode | undefined;
 	let session: AgentSession | undefined;
+	// cwd-change tests move the process project dir into temp dirs they then remove
+	let projectDir: string;
 
 	beforeAll(() => {
 		initTheme();
 	});
 
 	beforeEach(async () => {
+		projectDir = getProjectDir();
 		resetSettingsForTest();
 		tempDir = TempDir.createSync("@pi-c2-range-");
 		await Settings.init({ inMemory: true, cwd: tempDir.path() });
@@ -54,6 +59,7 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		mode = undefined;
 		session = undefined;
 		resetSettingsForTest();
+		setProjectDir(projectDir);
 	});
 
 	function createMode(
@@ -626,6 +632,264 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			vi.useFakeTimers();
 			expect(await inputAfterTick(m, () => m.holdGoalContinuation())).toBe("none");
 			expect(hold).toHaveBeenCalledTimes(1);
+		});
+	});
+
+	describe("cwd change rollback", () => {
+		it("restores the source project and reports false when the rescope fails", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const source = getProjectDir();
+			const other = TempDir.createSync("@pi-c2-rescope-");
+			const showError = vi.spyOn(m, "showError").mockImplementation(() => {});
+			const refresh = vi.spyOn(m.session, "refreshSkillsAndCommands");
+			refresh.mockRejectedValueOnce(new Error("skills exploded"));
+			try {
+				expect(await m.applyCwdChange(other.path())).toBe(false);
+				expect(getProjectDir()).toBe(source);
+				expect(m.sessionManager.getCwd()).toBe(source);
+				expect(showError).toHaveBeenCalledWith(`Cannot change working directory to ${other.path()}: skills exploded`);
+				// the source project was re-scoped after the failure
+				expect(refresh).toHaveBeenCalledTimes(2);
+			} finally {
+				other.removeSync();
+			}
+		});
+
+		it("reports non-Error rescope failures verbatim", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const other = TempDir.createSync("@pi-c2-rescope-");
+			const showError = vi.spyOn(m, "showError").mockImplementation(() => {});
+			vi.spyOn(m.session, "refreshSkillsAndCommands").mockRejectedValueOnce("plain failure");
+			try {
+				expect(await m.applyCwdChange(other.path())).toBe(false);
+				expect(showError).toHaveBeenCalledWith(`Cannot change working directory to ${other.path()}: plain failure`);
+			} finally {
+				other.removeSync();
+			}
+		});
+
+		it("throws with both causes when restoring the source project also fails", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const other = TempDir.createSync("@pi-c2-rescope-");
+			const showError = vi.spyOn(m, "showError").mockImplementation(() => {});
+			vi.spyOn(m.session, "refreshSkillsAndCommands")
+				.mockRejectedValueOnce(new Error("switch broke"))
+				.mockRejectedValueOnce(new Error("restore broke"));
+			try {
+				await expect(m.applyCwdChange(other.path())).rejects.toThrow(
+					`Failed to restore workspace after failed switch to ${other.path()}: restore broke`,
+				);
+				expect(showError).toHaveBeenCalledWith(
+					`Failed to switch to ${other.path()} (switch broke), and restoring the previous workspace failed: restore broke`,
+				);
+			} finally {
+				other.removeSync();
+			}
+		});
+
+		it("quotes non-Error causes when the restore also fails", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const other = TempDir.createSync("@pi-c2-rescope-");
+			const showError = vi.spyOn(m, "showError").mockImplementation(() => {});
+			vi.spyOn(m.session, "refreshSkillsAndCommands").mockRejectedValueOnce("first").mockRejectedValueOnce("second");
+			try {
+				await expect(m.applyCwdChange(other.path())).rejects.toThrow("second");
+				expect(showError).toHaveBeenCalledWith(
+					`Failed to switch to ${other.path()} (first), and restoring the previous workspace failed: second`,
+				);
+			} finally {
+				other.removeSync();
+			}
+		});
+	});
+
+	describe("loop iterations", () => {
+		const flush = async () => {
+			for (let i = 0; i < 10; i++) await Promise.resolve();
+		};
+
+		it("stops an iteration-limited loop once its budget is spent", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			await m.sessionModes.set({
+				mode: "loop",
+				action: "enter",
+				prompt: "again",
+				limit: { kind: "iterations", iterations: 1 },
+			});
+			const showStatus = vi.spyOn(m, "showStatus");
+			vi.useFakeTimers();
+			const first = m.getUserInput();
+			vi.advanceTimersByTime(800);
+			await flush();
+			expect((await first).text).toBe("again");
+			void m.getUserInput();
+			vi.advanceTimersByTime(800);
+			await flush();
+			expect(showStatus).toHaveBeenCalledWith("Loop limit reached. Loop mode disabled.");
+			expect(m.loopModeEnabled).toBe(false);
+		});
+
+		it("does nothing when the auto-submit tick fires with no input waiting", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			await m.sessionModes.set({ mode: "loop", action: "enter", prompt: "again" });
+			const submit = vi.spyOn(m, "startPendingSubmission");
+			vi.useFakeTimers();
+			m.armLoopAutoSubmit();
+			vi.advanceTimersByTime(800);
+			await flush();
+			expect(submit).not.toHaveBeenCalled();
+			expect(m.loopModeEnabled).toBe(true);
+		});
+
+		it("clears the session before resubmitting in reset mode", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			cfgLoopMode.set(Settings.instance, "reset");
+			await m.sessionModes.set({ mode: "loop", action: "enter", prompt: "fresh start" });
+			const clear = vi.spyOn(m, "handleClearCommand").mockResolvedValue(undefined as never);
+			vi.useFakeTimers();
+			const input = m.getUserInput();
+			vi.advanceTimersByTime(800);
+			await flush();
+			expect((await input).text).toBe("fresh start");
+			expect(clear).toHaveBeenCalledTimes(1);
+		});
+
+		it("ignores a condition run aborted by a resubmitted prompt", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			await m.sessionModes.set({
+				mode: "loop",
+				action: "enter",
+				prompt: "poll",
+				condition: { command: "sleep 30", until: true },
+			});
+			const showStatus = vi.spyOn(m, "showStatus");
+			const submit = vi.spyOn(m, "startPendingSubmission");
+			// the iteration's `finally` reports through syncIdleMaintenanceView once the gate settles
+			const settled = Promise.withResolvers<void>();
+			let armed = false;
+			const realSync = m.syncIdleMaintenanceView.bind(m);
+			vi.spyOn(m, "syncIdleMaintenanceView").mockImplementation(() => {
+				realSync();
+				if (armed) settled.resolve();
+			});
+			vi.useFakeTimers();
+			void m.getUserInput();
+			vi.advanceTimersByTime(800);
+			vi.useRealTimers();
+			armed = true;
+			// resubmitting the same text supersedes the running gate without leaving loop mode
+			m.setLoopPrompt("poll");
+			await settled.promise;
+			expect(submit).not.toHaveBeenCalled();
+			expect(m.loopModeEnabled).toBe(true);
+			expect(showStatus).not.toHaveBeenCalledWith(expect.stringContaining("Loop mode disabled"));
+		});
+
+		it("ignores a loop prompt while loop mode is off and reports malformed /loop arguments", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			m.setLoopPrompt("ignored");
+			expect(m.loopPrompt).toBeUndefined();
+			const showError = vi.spyOn(m, "showError").mockImplementation(() => {});
+			expect(await m.handleLoopCommand("0 times")).toBeUndefined();
+			expect(showError).toHaveBeenCalledTimes(1);
+			expect(m.loopModeEnabled).toBe(false);
+		});
+
+		it("announces the continuation condition when enabling a conditional loop", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const showStatus = vi.spyOn(m, "showStatus");
+			await m.sessionModes.set({ mode: "loop", action: "enter", condition: { command: "test -f done", until: true } });
+			expect(showStatus).toHaveBeenCalledWith(expect.stringContaining("Continuing until"));
+			expect(showStatus).toHaveBeenCalledWith(expect.stringContaining("test -f done"));
+		});
+	});
+
+	describe("idle owner checkpoint", () => {
+		const flush = async () => {
+			for (let i = 0; i < 20; i++) await Promise.resolve();
+		};
+
+		/** Moves the wall clock `ms` past the last activity and fires the idle-checkpoint timer. */
+		function idleFor(ms: number): void {
+			const later = Date.now() + ms;
+			vi.spyOn(Date, "now").mockReturnValue(later);
+			vi.advanceTimersByTime(ms);
+		}
+
+		it("re-arms instead of checkpointing while the composer holds a draft", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const shutdown = vi.spyOn(m, "shutdown").mockResolvedValue(undefined as never);
+			const flushSpy = vi.spyOn(m.sessionManager, "flush");
+			m.editor.setText("still typing");
+			vi.useFakeTimers();
+			cfgSessionIdleCheckpointMs.set(Settings.instance, 1000);
+			idleFor(1500);
+			await flush();
+			expect(flushSpy).not.toHaveBeenCalled();
+			expect(shutdown).not.toHaveBeenCalled();
+		});
+
+		it("checkpoints an idle owner and closes it unattended", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const closed = Promise.withResolvers<void>();
+			const shutdown = vi.spyOn(m, "shutdown").mockImplementation(async () => closed.resolve());
+			vi.useFakeTimers();
+			cfgSessionIdleCheckpointMs.set(Settings.instance, 1000);
+			idleFor(1500);
+			vi.useRealTimers();
+			await closed.promise;
+			expect(shutdown).toHaveBeenCalledWith({ unattended: true });
+			expect(m.sessionManager.isSessionOnDisk()).toBe(true);
+		});
+
+		it("stays live when input arrives while the transcript flushes", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const shutdown = vi.spyOn(m, "shutdown").mockResolvedValue(undefined as never);
+			const flushed = Promise.withResolvers<void>();
+			const realFlush = m.sessionManager.flush.bind(m.sessionManager);
+			vi.spyOn(m.sessionManager, "flush").mockImplementation(async () => {
+				m.editor.setText("typed mid-checkpoint");
+				await realFlush();
+				flushed.resolve();
+			});
+			vi.useFakeTimers();
+			cfgSessionIdleCheckpointMs.set(Settings.instance, 1000);
+			idleFor(1500);
+			vi.useRealTimers();
+			await flushed.promise;
+			await flush();
+			expect(shutdown).not.toHaveBeenCalled();
+		});
+
+		it("stays live when the session still has work running", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const shutdown = vi.spyOn(m, "shutdown").mockResolvedValue(undefined as never);
+			const flushSpy = vi.spyOn(m.sessionManager, "flush");
+			Object.defineProperty(m.session, "isStreaming", { configurable: true, get: () => true });
+			try {
+				vi.useFakeTimers();
+				cfgSessionIdleCheckpointMs.set(Settings.instance, 1000);
+				idleFor(1500);
+				await flush();
+				expect(flushSpy).not.toHaveBeenCalled();
+				expect(shutdown).not.toHaveBeenCalled();
+			} finally {
+				Reflect.deleteProperty(m.session, "isStreaming");
+			}
 		});
 	});
 });
