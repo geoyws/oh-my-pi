@@ -30,6 +30,9 @@ import * as clipboard from "../src/utils/clipboard";
 import { trackDownload } from "../src/downloads/activity";
 import { HistoryStorage } from "../src/session/history-storage";
 import { StreamPublisher } from "../src/stream/publisher";
+import { StreamRedactor } from "../src/stream/redactor";
+import { ExtensionRuntime, loadExtensionFromFactory } from "../src/extensibility/extensions/loader";
+import { ExtensionRunner } from "../src/extensibility/extensions/runner";
 import { cfgStreamRedactPatterns } from "../src/stream/settings";
 import type { StartupChangelogSelection } from "../src/utils/changelog";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
@@ -105,6 +108,8 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			messages?: AgentMessage[];
 			/** Runs on the session before InteractiveMode is constructed around it. */
 			beforeMode?: (session: AgentSession) => void;
+			/** Builds the session's extension runner over its manager and registry. */
+			extensionRunner?: (manager: SessionManager, registry: ModelRegistry) => ExtensionRunner;
 		},
 	): InteractiveMode {
 		const registry = new ModelRegistry(authStorage, path.join(tempDir.path(), `models-${Bun.nanoseconds()}.yml`));
@@ -134,6 +139,7 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			modelRegistry: registry,
 			toolRegistry: new Map([[readTool.name, readTool]]),
 			builtInToolNames: ["read"],
+			extensionRunner: extra?.extensionRunner?.(manager, registry),
 		});
 		extra?.beforeMode?.(session);
 		mode = new InteractiveMode(
@@ -1465,9 +1471,10 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			await m.init({ suppressWelcomeIntro: true });
 			const host = hostSpy.mock.calls.at(-1)?.[0];
 			if (!host) throw new Error("init registered no cfg approval host");
-			const wait = vi.spyOn(m.session, "waitForUser").mockResolvedValue("once" as never);
+			const wait = vi.spyOn(m.session, "waitForUser").mockImplementation(async run => run());
 			const request = { path: "tui.mouse", previous: "true", value: "false", save: false } as never;
-			expect(await host.approve(request)).toBe("once");
+			// an aborted turn dismisses the prompt the user wait opened
+			expect(await host.approve(request, { signal: AbortSignal.abort() })).toBe("deny");
 			expect(wait).toHaveBeenCalledTimes(1);
 			// a bounded prompt settles on its own, so it stays agent time; an aborted turn dismisses it
 			cfgAskTimeout.set(Settings.instance, 5);
@@ -1776,14 +1783,45 @@ describe("InteractiveMode constructed surface (C2)", () => {
 				close: () => {},
 				dispose: () => {},
 			} as never);
+			const loads = [Promise.withResolvers<never>(), Promise.withResolvers<never>()];
+			const realLoad = StreamRedactor.load.bind(StreamRedactor);
 			const m = createMode();
 			await m.init({ suppressWelcomeIntro: true });
+			let call = 0;
+			vi.spyOn(StreamRedactor, "load").mockImplementation(() => loads[call++]!.promise);
 			cfgStreamRedactPatterns.set(Settings.instance, ["first-\\d+"]);
+			await flush();
 			cfgStreamRedactPatterns.set(Settings.instance, ["second-\\d+"]);
-			for (let i = 0; i < 50 && setRedactor.mock.calls.length === 0; i++) await Bun.sleep(5); // real fs loads
-			await Bun.sleep(50);
+			await flush();
+			expect(call).toBe(2);
+			const [first, second] = [await realLoad(tempDir.path(), ["first-\\d+"]), await realLoad(tempDir.path(), ["second-\\d+"])];
+			// the newer load settles first and applies; the older one settles late and is dropped
+			loads[1]!.resolve(second as never);
+			await flush();
+			loads[0]!.resolve(first as never);
+			await flush();
 			expect(setRedactor).toHaveBeenCalledTimes(1);
+			expect(setRedactor).toHaveBeenCalledWith(second);
 			expect(m.isInitialized).toBe(true);
+		});
+
+		it("redraws extension links when an extension is suspended or resumed", async () => {
+			const runtime = new ExtensionRuntime();
+			const extension = await loadExtensionFromFactory(() => {}, tempDir.path(), new EventBus(), runtime, "c2-suspendable");
+			let runner: ExtensionRunner | undefined;
+			const m = createMode(undefined, {
+				extensionRunner: (manager, registry) => {
+					runner = new ExtensionRunner([extension], runtime, tempDir.path(), manager, registry);
+					return runner;
+				},
+			});
+			await m.init({ suppressWelcomeIntro: true });
+			const reapply = vi.spyOn(EventController.prototype, "applyAssistantTextRenderers");
+			// a live `disabledExtensions` edit suspends the extension, then resumes it
+			runner!.setSuspendedExtensions(() => true);
+			expect(reapply).toHaveBeenCalledTimes(1);
+			runner!.setSuspendedExtensions(() => false);
+			expect(reapply).toHaveBeenCalledTimes(2);
 		});
 
 		it("shows an empty expanded changelog entry when the selection carries no markdown", async () => {
