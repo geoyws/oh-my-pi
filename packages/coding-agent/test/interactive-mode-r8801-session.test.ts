@@ -16,10 +16,21 @@ import { LiveCommandController } from "@oh-my-pi/pi-coding-agent/modes/controlle
 import { MCPCommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/mcp-command-controller";
 import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/selector-controller";
 import { SSHCommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/ssh-command-controller";
-import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
+import { InteractiveMode, shouldEnterPlanModeOnStartup } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
+import {
+	cfgMarketplaceAutoUpdate,
+	cfgStartupChangelogMode,
+	cfgStartupCheckUpdate,
+	cfgStartupSetupWizard,
+	cfgStartupShowSplash,
+} from "@oh-my-pi/pi-coding-agent/modes/settings";
+import { cfgPlanDefaultOnStartup, cfgPlanEnabled } from "@oh-my-pi/pi-coding-agent/plan-mode/settings";
 import * as providerSetup from "@oh-my-pi/pi-coding-agent/modes/setup";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { HistoryStorage } from "@oh-my-pi/pi-coding-agent/session/history-storage";
+import { closeSessionIndex } from "@oh-my-pi/pi-coding-agent/session/session-index";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as sessionWorktree from "@oh-my-pi/pi-coding-agent/session/session-worktree";
 import { SessionRecorder } from "@oh-my-pi/pi-coding-agent/stream/recording";
@@ -31,8 +42,12 @@ import { cfgWorktreeOnExit, cfgWorktreeOnStart } from "@oh-my-pi/pi-coding-agent
 import { TODO_HUD_STATE_CUSTOM_TYPE, USER_TODO_EDIT_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/tools/todo";
 import { vocalizer } from "@oh-my-pi/pi-coding-agent/tts/vocalizer";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { Composer } from "@oh-my-pi/pi-tui/prompt/composer";
+import * as themeModule from "@oh-my-pi/pi-tui/theme";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { logger, postmortem, TempDir } from "@oh-my-pi/pi-utils";
+import * as utils from "@oh-my-pi/pi-utils";
+import { VirtualTerminal } from "../../tui/test/virtual-terminal";
 
 const assistant = {
 	role: "assistant",
@@ -166,6 +181,11 @@ describe("InteractiveMode session commands and capture surfaces (lines 8801-end)
 
 		it("/new keeps the plan-mode default untouched when the clear did not start a new session", async () => {
 			await freshMode();
+			cfgPlanEnabled.set(session.settings, true);
+			cfgPlanDefaultOnStartup.set(session.settings, true);
+			// Precondition: a launch into this empty session would enter plan mode, so only the
+			// unchanged-session guard keeps /new from doing so here.
+			expect(shouldEnterPlanModeOnStartup(mode.sessionManager, session.settings)).toBe(true);
 			const clear = spyOn(CommandController.prototype, "handleClearCommand").mockResolvedValue();
 			const before = mode.sessionManager.getSessionId();
 
@@ -597,23 +617,74 @@ describe("InteractiveMode session commands and capture surfaces (lines 8801-end)
 	});
 
 	describe("display", () => {
-		it("Ctrl+L replays the display immediately and keeps an appearance probe the terminal accepted", async () => {
-			await freshMode();
-			const reset = spyOn(mode.ui, "resetDisplay").mockImplementation(() => {});
-			const probe = vi.fn((token?: unknown) => token);
-			Object.defineProperty(mode.ui.terminal, "refreshAppearance", { value: probe, configurable: true });
+		it("Ctrl+L replays the display at once and keeps only an appearance probe the terminal accepted", async () => {
+			// The probe is observed through init's appearance listener: a kept request turns the next
+			// appearance change into a committed theme replay ({}), a cleared one does not (undefined).
+			const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected claude-sonnet-4-5 to exist in registry");
+			const local = Settings.isolated();
+			spyOn(utils, "getConfigRootDir").mockReturnValue(tempDir.path());
+			cfgStartupCheckUpdate.override(local, false);
+			cfgStartupChangelogMode.override(local, "hidden");
+			cfgStartupSetupWizard.override(local, false);
+			cfgStartupShowSplash.override(local, false);
+			cfgMarketplaceAutoUpdate.override(local, "off");
+			const initSession = new AgentSession({
+				agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
+				sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+				settings: local,
+				modelRegistry,
+			});
+			const inited = new InteractiveMode(
+				initSession,
+				"test",
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				new Composer({ terminal: new VirtualTerminal(200, 60) }),
+			);
+			try {
+				spyOn(inited.statusLine, "watchBranch").mockImplementation(() => {});
+				let onAppearance: ((appearance: string, token?: unknown) => void) | undefined;
+				spyOn(inited.ui.terminal, "onAppearanceChange").mockImplementation(callback => {
+					onAppearance = callback as typeof onAppearance;
+				});
+				await inited.init({ suppressWelcomeIntro: true });
+				if (!onAppearance) throw new Error("init did not subscribe to appearance changes");
+				const committed = spyOn(themeModule, "onTerminalAppearanceChange").mockImplementation(() => {});
+				const reset = spyOn(inited.ui, "resetDisplay").mockImplementation(() => {});
+				const probe = vi.fn((token?: unknown): unknown => token);
+				Object.defineProperty(inited.ui.terminal, "refreshAppearance", { value: probe, configurable: true });
 
-			mode.resetDisplayAfterAppearanceRefresh();
-			expect(probe).toHaveBeenCalledTimes(1);
-			expect(probe.mock.calls[0]![0]).toBeDefined();
+				// Accepted: the request is kept, so its reply commits a replay.
+				inited.resetDisplayAfterAppearanceRefresh();
+				onAppearance("dark", probe.mock.calls[0]?.[0]);
+				// Rejected: the request is dropped, so even its own token commits nothing.
+				probe.mockImplementation(() => undefined);
+				inited.resetDisplayAfterAppearanceRefresh();
+				onAppearance("dark", probe.mock.calls[1]?.[0]);
+				// Unsupported probe: a request left pending from an accepted probe is dropped too.
+				probe.mockImplementation((token?: unknown) => token);
+				inited.resetDisplayAfterAppearanceRefresh();
+				Object.defineProperty(inited.ui.terminal, "refreshAppearance", { value: undefined, configurable: true });
+				inited.resetDisplayAfterAppearanceRefresh();
+				onAppearance("light", undefined);
 
-			probe.mockImplementation(() => undefined);
-			mode.resetDisplayAfterAppearanceRefresh();
-
-			Object.defineProperty(mode.ui.terminal, "refreshAppearance", { value: undefined, configurable: true });
-			mode.resetDisplayAfterAppearanceRefresh();
-
-			expect(reset).toHaveBeenCalledTimes(3);
+				expect(committed.mock.calls).toEqual([
+					["dark", {}],
+					["dark", undefined],
+					["light", undefined],
+				]);
+				expect(reset).toHaveBeenCalledTimes(4);
+			} finally {
+				inited.stop();
+				await initSession.dispose();
+				AgentStorage.close();
+				HistoryStorage.close();
+				closeSessionIndex();
+			}
 		});
 
 		it("sizes the command report to the rows above the chrome below it", async () => {

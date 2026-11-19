@@ -111,12 +111,18 @@ describe("InteractiveMode working row and retry hint (lines 8801-9064)", () => {
 			expect(render).toHaveBeenCalled();
 		});
 
-		it("keeps a static message unanimated when shimmer is disabled", () => {
-			setShimmerMode("disabled");
+		it.each([
+			["disabled", undefined],
+			["classic", true],
+		] as const)("with shimmer %s the working message colorizer's animated flag is %s", (shimmer, animated) => {
+			setShimmerMode(shimmer);
 			mode.ensureLoadingAnimation();
 			mode.setWorkingMessage("Thinking about it");
 
 			expect(statusText(mode)).toContain("Thinking about it");
+			// `animated` selects the loader's 30fps shimmer cadence over the spinner-only one.
+			const loader = mode.loadingAnimation as unknown as { messageColorFn: { animated?: true } };
+			expect(loader.messageColorFn.animated).toBe(animated);
 		});
 
 		it("routes a click on the working row's stop control to the interrupt (Escape) handler", () => {
