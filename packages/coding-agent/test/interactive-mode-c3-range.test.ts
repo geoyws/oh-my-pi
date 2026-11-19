@@ -520,7 +520,7 @@ describe("InteractiveMode constructed surface (C3)", () => {
 			// live rows return in their original order; the settled tool and stale rows go
 			expect(m.chatContainer.children).toEqual([streaming, background, segment, shared, reply, live]);
 			// the settled shared member stops routing; its pending sibling still owns the group
-			expect([...m.pendingTools]).toEqual([
+			expect([...m.pendingTools] as unknown[]).toEqual([
 				["bg", background],
 				["r2", shared],
 				["live", live],
