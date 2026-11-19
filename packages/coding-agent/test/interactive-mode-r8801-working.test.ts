@@ -4,7 +4,7 @@
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as path from "node:path";
-import { Agent } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
@@ -77,7 +77,12 @@ describe("InteractiveMode working row and retry hint (lines 8801-9064)", () => {
 
 	describe("loader lifecycle", () => {
 		it("does not mount a working row while an auto-retry loader owns the status area", () => {
-			const retry = new Loader(mode.ui, s => s, m => m, "Retrying…");
+			const retry = new Loader(
+				mode.ui,
+				s => s,
+				m => m,
+				"Retrying…",
+			);
 			mode.retryLoader = retry;
 			mode.statusContainer.addChild(retry);
 
@@ -266,14 +271,15 @@ describe("InteractiveMode working row and retry hint (lines 8801-9064)", () => {
 			const messages = [
 				{ role: "user", content: "hi", timestamp: 1 },
 				{ role: "assistant", content: [{ type: "thinking", thinking: "hmm" }], timestamp: 2 },
-			];
+			] as unknown as AgentMessage[];
 			const context = { messages } as never;
 			const chunk = vi.fn();
+			const options = {} as Parameters<InteractiveMode["renderSessionContextIncrementally"]>[1];
 
-			await mode.renderSessionContextIncrementally(context, {} as never, chunk);
+			await mode.renderSessionContextIncrementally(context, options, chunk);
 
 			expect(note.mock.calls.map(call => call[0])).toEqual(messages);
-			expect(replay).toHaveBeenCalledWith(context, {}, chunk);
+			expect(replay).toHaveBeenCalledWith(context, options, chunk);
 		});
 	});
 });

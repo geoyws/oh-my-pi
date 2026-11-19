@@ -23,7 +23,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { SessionRecorder } from "@oh-my-pi/pi-coding-agent/stream/recording";
 import { StreamRedactor } from "@oh-my-pi/pi-coding-agent/stream/redactor";
 import * as stt from "@oh-my-pi/pi-coding-agent/stt";
-import { STTController } from "@oh-my-pi/pi-coding-agent/stt";
+import { STTController, type STTControllerDependencies } from "@oh-my-pi/pi-coding-agent/stt";
 import { cfgSttEnabled } from "@oh-my-pi/pi-coding-agent/stt/settings";
 import { cfgWorktreeOnStart } from "@oh-my-pi/pi-coding-agent/task/settings";
 import { TODO_HUD_STATE_CUSTOM_TYPE, USER_TODO_EDIT_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/tools/todo";
@@ -38,7 +38,14 @@ const assistant = {
 	api: "anthropic-messages",
 	provider: "anthropic",
 	model: "claude-sonnet-4-5",
-	usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+	usage: {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	},
 	stopReason: "stop",
 	timestamp: 1,
 } as never;
@@ -137,7 +144,9 @@ describe("InteractiveMode session commands and capture surfaces (lines 8801-end)
 			await freshMode();
 			const order: string[] = [];
 			spyOn(mode, "prepareSessionSwitch").mockImplementation(async () => void order.push("prepare"));
-			spyOn(CommandController.prototype, "handleDeleteCommand").mockImplementation(async () => void order.push("delete"));
+			spyOn(CommandController.prototype, "handleDeleteCommand").mockImplementation(
+				async () => void order.push("delete"),
+			);
 
 			await mode.handleDeleteCommand();
 
@@ -397,14 +406,14 @@ describe("InteractiveMode session commands and capture surfaces (lines 8801-end)
 		it("builds one dictation controller per mode, bound to this session's settings, models and live session id", async () => {
 			await freshMode();
 			cfgSttEnabled.set(settings, true);
-			const built: Array<ConstructorParameters<typeof STTController>[0]> = [];
+			const built: STTControllerDependencies[] = [];
 			const fake = {
 				toggle: vi.fn(async () => {}),
 				start: vi.fn(async () => {}),
 				dispose: vi.fn(),
 				state: "idle",
 			};
-			spyOn(stt, "STTController").mockImplementation(function (deps: ConstructorParameters<typeof STTController>[0]) {
+			spyOn(stt, "STTController").mockImplementation(function (deps: STTControllerDependencies) {
 				built.push(deps);
 				return fake;
 			} as never);
@@ -416,7 +425,7 @@ describe("InteractiveMode session commands and capture surfaces (lines 8801-end)
 			expect(fake.toggle).toHaveBeenCalledTimes(1);
 			expect(fake.start).toHaveBeenCalledTimes(1);
 			const deps = built[0];
-			if (!deps || typeof deps === "function") throw new Error("expected dependency object");
+			if (!deps) throw new Error("expected dependency object");
 			expect(deps.settings).toBe(mode.settings);
 			expect(deps.registry).toBe(session.modelRegistry);
 			expect(deps.getSessionId?.()).toBe(session.sessionId);
@@ -460,7 +469,11 @@ describe("InteractiveMode session commands and capture surfaces (lines 8801-end)
 
 	describe("/record", () => {
 		function fakeRecorder(elapsedMs = 65_000) {
-			return { path: "/tmp/rec/session.omprec", elapsedMs, stop: vi.fn(async () => {}) } as unknown as SessionRecorder;
+			return {
+				path: "/tmp/rec/session.omprec",
+				elapsedMs,
+				stop: vi.fn(async () => {}),
+			} as unknown as SessionRecorder;
 		}
 
 		it("starts a recording titled by the session, then stops it and reports where it was saved", async () => {
