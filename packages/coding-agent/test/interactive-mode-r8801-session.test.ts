@@ -14,23 +14,25 @@ import { cfgGoalEnabled } from "@oh-my-pi/pi-coding-agent/goals/settings";
 import { CommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/command-controller";
 import { LiveCommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/live-command-controller";
 import { MCPCommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/mcp-command-controller";
+import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/selector-controller";
 import { SSHCommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/ssh-command-controller";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import * as providerSetup from "@oh-my-pi/pi-coding-agent/modes/setup";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import * as sessionWorktree from "@oh-my-pi/pi-coding-agent/session/session-worktree";
 import { SessionRecorder } from "@oh-my-pi/pi-coding-agent/stream/recording";
 import { StreamRedactor } from "@oh-my-pi/pi-coding-agent/stream/redactor";
 import * as stt from "@oh-my-pi/pi-coding-agent/stt";
 import { STTController, type STTControllerDependencies } from "@oh-my-pi/pi-coding-agent/stt";
 import { cfgSttEnabled } from "@oh-my-pi/pi-coding-agent/stt/settings";
-import { cfgWorktreeOnStart } from "@oh-my-pi/pi-coding-agent/task/settings";
+import { cfgWorktreeOnExit, cfgWorktreeOnStart } from "@oh-my-pi/pi-coding-agent/task/settings";
 import { TODO_HUD_STATE_CUSTOM_TYPE, USER_TODO_EDIT_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/tools/todo";
 import { vocalizer } from "@oh-my-pi/pi-coding-agent/tts/vocalizer";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
-import { logger, TempDir } from "@oh-my-pi/pi-utils";
+import { logger, postmortem, TempDir } from "@oh-my-pi/pi-utils";
 
 const assistant = {
 	role: "assistant",
@@ -176,7 +178,7 @@ describe("InteractiveMode session commands and capture surfaces (lines 8801-end)
 	});
 
 	describe("worktrees", () => {
-		it("records a worktree /wt created so exit can offer to clean it up, and ignores a declined one", async () => {
+		it("records a worktree /wt created so exit offers to clean it up, and ignores a declined one", async () => {
 			await freshMode();
 			const worktree = { path: "/tmp/wt-a", branch: "wt/a" } as never;
 			const created = spyOn(CommandController.prototype, "handleWorktreeCommand")
@@ -190,6 +192,22 @@ describe("InteractiveMode session commands and capture surfaces (lines 8801-end)
 				["wt/none", undefined],
 				["wt/a", { keepChanges: true }],
 			]);
+
+			// Exit plans cleanup over exactly the worktrees this launch recorded.
+			cfgWorktreeOnExit.set(mode.settings, "remove");
+			const plan = spyOn(sessionWorktree, "planWorktreeExit").mockResolvedValue([]);
+			spyOn(sessionWorktree, "removeExitWorktrees").mockResolvedValue([]);
+			spyOn(session, "abort").mockResolvedValue();
+			spyOn(session, "dispose").mockResolvedValue();
+			spyOn(mode.ui.terminal, "drainInput").mockResolvedValue();
+			const quit = spyOn(postmortem, "quit").mockResolvedValue(undefined as never);
+
+			await mode.shutdown();
+
+			expect(plan).toHaveBeenCalledTimes(1);
+			expect(plan.mock.calls[0]?.[0]).toEqual([worktree]);
+			expect(plan.mock.calls[0]?.[1]).toBe("remove");
+			expect(quit).toHaveBeenCalledWith(0);
 		});
 
 		it("does nothing at launch when worktree.onStart is off", async () => {
@@ -608,11 +626,24 @@ describe("InteractiveMode session commands and capture surfaces (lines 8801-end)
 			expect(below).toHaveBeenCalledWith(mode.reportContainer);
 		});
 
-		it("resetObserverRegistry tolerates an in-memory session with no file", async () => {
+		it("resetObserverRegistry clears the registry and re-binds the main session file, or none in memory", async () => {
 			await freshMode();
-			spyOn(mode.sessionManager, "getSessionFile").mockReturnValue(undefined);
+			const hub = spyOn(SelectorController.prototype, "showAgentHub").mockImplementation(() => {});
+			mode.showAgentHub();
+			const registry = hub.mock.calls[0]?.[0] as unknown as {
+				resetSessions(): void;
+				setMainSession(file: string | undefined): void;
+			};
+			const reset = spyOn(registry, "resetSessions");
+			const setMain = spyOn(registry, "setMainSession");
+			const file = spyOn(mode.sessionManager, "getSessionFile").mockReturnValueOnce(undefined);
+			file.mockReturnValueOnce("/s/main.jsonl");
 
-			expect(() => mode.resetObserverRegistry()).not.toThrow();
+			mode.resetObserverRegistry();
+			mode.resetObserverRegistry();
+
+			expect(reset).toHaveBeenCalledTimes(2);
+			expect(setMain.mock.calls).toEqual([[undefined], ["/s/main.jsonl"]]);
 		});
 	});
 
