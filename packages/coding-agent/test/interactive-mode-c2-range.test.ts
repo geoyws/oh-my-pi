@@ -16,8 +16,22 @@ import { cfgGoalContinuationModes, cfgGoalEnabled } from "../src/goals/settings"
 import type { SubmittedUserInput } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { cfgPlanEnabled } from "../src/plan-mode/settings";
 import { cfgSessionIdleCheckpointMs } from "../src/session/settings";
-import { cfgLoopMode } from "@oh-my-pi/pi-coding-agent/modes/settings";
-import { getProjectDir, setProjectDir } from "@oh-my-pi/pi-utils";
+import { cfgLoopMode, cfgStartupChangelogMode } from "@oh-my-pi/pi-coding-agent/modes/settings";
+import { getProjectDir, postmortem, setProjectDir } from "@oh-my-pi/pi-utils";
+import { type AgentMessage } from "@oh-my-pi/pi-agent-core";
+import * as imageReferences from "@oh-my-pi/pi-tui/prompt/image-references";
+import * as tuiTodo from "@oh-my-pi/pi-tui/tools/todo";
+import { StatusLineComponent } from "@oh-my-pi/pi-tui/status-line";
+import { CodexResetFireworksController } from "@oh-my-pi/pi-tui/overlays/codex-reset-fireworks";
+import * as cfgProtocol from "../src/internal-urls/cfg-protocol";
+import * as titleGenerator from "../src/utils/title-generator";
+import * as openModule from "../src/utils/open";
+import * as clipboard from "../src/utils/clipboard";
+import { trackDownload } from "../src/downloads/activity";
+import { HistoryStorage } from "../src/session/history-storage";
+import { StreamPublisher } from "../src/stream/publisher";
+import { cfgStreamRedactPatterns } from "../src/stream/settings";
+import type { StartupChangelogSelection } from "../src/utils/changelog";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { cfgExtensionHandlersModeControl } from "../src/extensibility/settings";
 import { formatModelString } from "../src/config/model-resolver";
@@ -64,7 +78,14 @@ describe("InteractiveMode constructed surface (C2)", () => {
 
 	function createMode(
 		eventBus?: EventBus,
-		extra?: { lspServers?: Array<{ name: string; status: "ready"; fileTypes: string[] }>; mcpManager?: MCPManager },
+		extra?: {
+			lspServers?: Array<{ name: string; status: "ready"; fileTypes: string[] }>;
+			mcpManager?: MCPManager;
+			startupChangelog?: StartupChangelogSelection;
+			messages?: AgentMessage[];
+			/** Runs on the session before InteractiveMode is constructed around it. */
+			beforeMode?: (session: AgentSession) => void;
+		},
 	): InteractiveMode {
 		const registry = new ModelRegistry(authStorage, path.join(tempDir.path(), `models-${Bun.nanoseconds()}.yml`));
 		const model = registry.find("anthropic", "claude-sonnet-4-5") as Model<Api>;
@@ -80,7 +101,13 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		const manager = SessionManager.create(tempDir.path(), path.join(tempDir.path(), `active-${Bun.nanoseconds()}`));
 		session = new AgentSession({
 			agent: new Agent({
-				initialState: { model, systemPrompt: ["Test"], tools: [readTool], messages: [], thinkingLevel: Effort.Medium },
+				initialState: {
+					model,
+					systemPrompt: ["Test"],
+					tools: [readTool],
+					messages: extra?.messages ?? [],
+					thinkingLevel: Effort.Medium,
+				},
 			}),
 			sessionManager: manager,
 			settings: Settings.instance,
@@ -88,10 +115,11 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			toolRegistry: new Map([[readTool.name, readTool]]),
 			builtInToolNames: ["read"],
 		});
+		extra?.beforeMode?.(session);
 		mode = new InteractiveMode(
 			session,
 			"test",
-			undefined,
+			extra?.startupChangelog,
 			() => {},
 			extra?.lspServers,
 			extra?.mcpManager,
@@ -890,6 +918,275 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			} finally {
 				Reflect.deleteProperty(m.session, "isStreaming");
 			}
+		});
+	});
+
+	describe("constructor and init wiring", () => {
+		const flush = async () => {
+			for (let i = 0; i < 10; i++) await Promise.resolve();
+		};
+		const renderText = (component: { render(width: number): string[] }) => component.render(100).join("\n");
+
+		it("routes cfg:// applied changes for this session only", async () => {
+			const hostSpy = vi.spyOn(cfgProtocol, "setCfgApprovalHost");
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const host = hostSpy.mock.calls.at(-1)?.[0];
+			if (!host) throw new Error("init registered no cfg approval host");
+			expect(host.persistentSettings).toBe(Settings.instance);
+			const level = vi.spyOn(m.session, "setThinkingLevel");
+			// another settings instance's change is not this session's to apply
+			host.applied({ settings: {} as never, path: "defaultThinkingLevel", value: "high" } as never);
+			expect(level).not.toHaveBeenCalled();
+			host.applied({ settings: m.session.settings, path: "defaultThinkingLevel", value: "high" } as never);
+			expect(level).toHaveBeenCalledWith("high");
+		});
+
+		it("persists the draft and disposes the session on a signal teardown", async () => {
+			const registerSpy = vi.spyOn(postmortem, "register");
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const teardown = registerSpy.mock.calls.find(([name]) => name === "session-teardown")?.[1];
+			if (!teardown) throw new Error("init registered no session teardown");
+			m.editor.setText("words worth keeping");
+			const saveDraft = vi.spyOn(m.sessionManager, "saveDraft");
+			const dispose = vi.spyOn(m.session, "dispose");
+			await teardown("SIGTERM" as never);
+			expect(saveDraft).toHaveBeenCalledWith("words worth keeping");
+			expect(dispose).toHaveBeenCalledWith(expect.objectContaining({ reason: "SIGTERM" }));
+		});
+
+		it("publishes the live session file, cwd, todo descriptions and image blobs to process-global readers", async () => {
+			const sourceSpy = vi.spyOn(titleGenerator, "setTerminalSessionSource");
+			const todoSpy = vi.spyOn(tuiTodo, "setActiveTodoDescriptionsProvider");
+			const blobSpy = vi.spyOn(imageReferences, "setImageBlobWriter");
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const source = sourceSpy.mock.calls.at(-1)?.[0];
+			expect(source?.cwd()).toBe(m.sessionManager.getCwd());
+			expect(source?.file()).toBe(m.sessionManager.getSessionFile());
+			expect(todoSpy.mock.calls.at(-1)?.[0]()).toEqual([]);
+			const writer = blobSpy.mock.calls.at(-1)?.[0];
+			const putBlob = vi.spyOn(m.sessionManager, "putBlobSync");
+			writer?.(new Uint8Array([1, 2, 3]), { mimeType: "image/png" } as never);
+			expect(putBlob).toHaveBeenCalledTimes(1);
+		});
+
+		it("reveals tracked downloads in the progress HUD after the reveal delay", () => {
+			vi.useFakeTimers();
+			const m = createMode();
+			const tracker = trackDownload("weights.safetensors");
+			vi.advanceTimersByTime(200);
+			expect(renderText(m.progressHudContainer)).toContain("weights.safetensors");
+			tracker.done();
+		});
+
+		it("retains a finished judgment batch briefly and clears it after the retain window", () => {
+			vi.useFakeTimers();
+			const bus = new EventBus();
+			const m = createMode(bus);
+			const progress = { id: "b1", intent: "grade essays", done: 2, total: 2, failed: 0, cost: 0, running: false };
+			bus.emit("eval:judgment-batch-progress", progress);
+			vi.advanceTimersByTime(500);
+			// a repeated final snapshot restarts the retain window
+			bus.emit("eval:judgment-batch-progress", progress);
+			vi.advanceTimersByTime(600);
+			expect(renderText(m.progressHudContainer)).toContain("grade essays");
+			vi.advanceTimersByTime(500);
+			expect(renderText(m.progressHudContainer)).not.toContain("grade essays");
+		});
+
+		it("drops the hover band when mouse capture turns off", async () => {
+			const m = createMode();
+			cfgTuiMouse.set(Settings.instance, true);
+			await flush();
+			const hover = vi.spyOn(m.composer, "setHoveredClickId");
+			cfgTuiMouse.set(Settings.instance, false);
+			await flush();
+			expect(hover).toHaveBeenCalledWith(undefined);
+		});
+
+		it("warns when a prompt cannot be saved to history and survives an unavailable history store", () => {
+			const errorListenerSpy = vi.spyOn(HistoryStorage.prototype, "setErrorListener");
+			const m = createMode();
+			const onError = errorListenerSpy.mock.calls.at(-1)?.[0];
+			const showWarning = vi.spyOn(m, "showWarning").mockImplementation(() => {});
+			onError?.(new Error("disk full") as never);
+			expect(showWarning).toHaveBeenCalledWith(
+				"Prompt history could not be saved; this prompt may be unavailable after restart.",
+			);
+			mode?.stop();
+			vi.spyOn(HistoryStorage, "open").mockImplementation(() => {
+				throw new Error("locked");
+			});
+			const noHistory = createMode();
+			expect(noHistory.historyStorage).toBeUndefined();
+		});
+
+		it("routes status-line reset notices and native segment clicks", async () => {
+			const noticeSpy = vi.spyOn(StatusLineComponent.prototype, "setResetExpiryNoticeHandler");
+			const fireworksSpy = vi.spyOn(StatusLineComponent.prototype, "setCodexResetFireworksHandler");
+			const show = vi.spyOn(CodexResetFireworksController.prototype, "show").mockReturnValue(true);
+			const open = vi.spyOn(openModule, "openPath").mockImplementation(() => {});
+			const m = createMode();
+			const showWarning = vi.spyOn(m, "showWarning").mockImplementation(() => {});
+			noticeSpy.mock.calls.at(-1)?.[0]("Codex limits reset in 5m");
+			expect(showWarning).toHaveBeenCalledWith("Codex limits reset in 5m");
+			const event = { kind: "reset" } as never;
+			fireworksSpy.mock.calls.at(-1)?.[0](event);
+			expect(show).toHaveBeenCalledWith(event);
+			const modelSelector = vi.spyOn(m, "showModelSelector").mockImplementation(() => {});
+			const gitUi = vi.spyOn(m, "showGitUi").mockImplementation(() => {});
+			m.statusLine.onNativeAction?.("status.model");
+			m.statusLine.onNativeAction?.("status.git");
+			m.statusLine.onNativeAction?.("status.path");
+			expect(modelSelector).toHaveBeenCalledWith({ temporaryOnly: true });
+			expect(gitUi).toHaveBeenCalledTimes(1);
+			expect(open).toHaveBeenCalledWith(m.sessionManager.getCwd());
+		});
+
+		it("runs native transcript actions and reports their failures", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const modelSelector = vi.spyOn(m, "showModelSelector").mockImplementation(() => {});
+			const rewind = vi.spyOn(m, "showUserMessageSelector").mockImplementation(() => {});
+			const showError = vi.spyOn(m, "showError").mockImplementation(() => {});
+			const showWarning = vi.spyOn(m, "showWarning").mockImplementation(() => {});
+			runTranscriptAction({ act: "switch-model" });
+			runTranscriptAction({ act: "rewind" });
+			expect(modelSelector).toHaveBeenCalledWith({ temporaryOnly: true });
+			expect(rewind).toHaveBeenCalledTimes(1);
+			vi.spyOn(m, "handleResumeSession").mockRejectedValueOnce(new Error("gone")).mockRejectedValueOnce("vanished");
+			runTranscriptAction({ act: "resume", path: "/x.jsonl" });
+			runTranscriptAction({ act: "resume", path: "/y.jsonl" });
+			vi.spyOn(clipboard, "copyToClipboard").mockRejectedValueOnce(new Error("no display")).mockRejectedValueOnce("denied");
+			runTranscriptAction({ act: "copy", text: "a" });
+			runTranscriptAction({ act: "copy", text: "b" });
+			await flush();
+			expect(showError).toHaveBeenCalledWith("gone");
+			expect(showError).toHaveBeenCalledWith("vanished");
+			expect(showWarning).toHaveBeenCalledWith("Copy failed: no display");
+			expect(showWarning).toHaveBeenCalledWith("Copy failed: denied");
+		});
+
+		it("restores a prompt the session dropped", () => {
+			let dropped: ((prompt: never) => void) | undefined;
+			const m = createMode(undefined, {
+				beforeMode: s => {
+					vi.spyOn(s, "setPromptDropped").mockImplementation(cb => {
+						dropped = cb as never;
+					});
+				},
+			});
+			dropped?.({ text: "lost words", images: [] } as never);
+			expect(m.editor.getText()).toContain("lost words");
+		});
+
+		it("replays the welcome intro and paints the editor gap, draft links and resize geometry", async () => {
+			const m = createMode();
+			const intro = vi.spyOn(m.composer, "playWelcomeIntro").mockImplementation(() => {});
+			m.playWelcomeIntro();
+			expect(intro).toHaveBeenCalledTimes(1);
+			expect(Array.isArray(m.hookWidgetContainerAbove.render(80))).toBe(true);
+			expect(await m.editor.draftImageLinkMaterializer?.([])).toEqual([]);
+			const maxHeight = vi.spyOn(m.editor, "setMaxHeight");
+			process.stdout.emit("resize");
+			expect(maxHeight).toHaveBeenCalled();
+		});
+
+		it("shows the full startup changelog as markdown when configured", async () => {
+			cfgStartupQuiet.set(Settings.instance, false);
+			cfgStartupChangelogMode.set(Settings.instance, "expanded");
+			const m = createMode(undefined, {
+				startupChangelog: {
+					markdown: "## 9.9.9\n- brand new widget",
+					persistCurrentVersion: true,
+					truncated: false,
+					selectedEntries: 1,
+					totalUnseenEntries: 1,
+					latestVersion: "9.9.9",
+				},
+			});
+			const extras = vi.spyOn(m.composer, "setHeaderExtras");
+			await m.init({ suppressWelcomeIntro: true });
+			const after = extras.mock.calls.at(-1)?.[1] ?? [];
+			expect(after.map(component => component.render(100).join("\n")).join("\n")).toContain("brand new widget");
+		});
+
+		it("wires the stream publisher's status, chat and redaction reloads", async () => {
+			let options: Parameters<typeof StreamPublisher.connectLazy>[0] | undefined;
+			const setRedactor = vi.fn();
+			vi.spyOn(StreamPublisher, "connectLazy").mockImplementation(async opts => {
+				options = opts;
+				return { setRedactor, close: () => {}, dispose: () => {} } as never;
+			});
+			const m = createMode();
+			const showStatus = vi.spyOn(m, "showStatus").mockImplementation(() => {});
+			const streamStatus = vi.spyOn(m.statusLine, "setStreamStatus");
+			await m.init({ suppressWelcomeIntro: true });
+			if (!options) throw new Error("init did not connect the stream publisher");
+			options.onStatus?.({ state: "live" } as never);
+			expect(streamStatus).toHaveBeenCalledWith({ state: "live" });
+			options.onChat?.({ name: "viewer", text: "hello\nthere" } as never);
+			expect(showStatus).toHaveBeenCalledWith("viewer: hello there");
+			expect(await options.loadRedactor()).toBeDefined();
+			cfgStreamRedactPatterns.set(Settings.instance, ["secret-\\d+"]);
+			for (let i = 0; i < 50 && setRedactor.mock.calls.length === 0; i++) await Bun.sleep(5); // real fs load
+			expect(setRedactor).toHaveBeenCalledTimes(1);
+		});
+
+		it("auto-starts collaboration when asked and keeps going when the draft cannot be read", async () => {
+			const m = createMode();
+			const autoStart = vi.spyOn(m.collabController, "autoStart").mockImplementation(() => {});
+			vi.spyOn(m.sessionManager, "consumeDraft").mockRejectedValue(new Error("corrupt draft"));
+			await m.init({ suppressWelcomeIntro: true, autoStartCollab: true });
+			expect(autoStart).toHaveBeenCalledTimes(1);
+			expect(m.isInitialized).toBe(true);
+			expect(m.editor.getText()).toBe("");
+		});
+
+		it("re-arms the loop when a turn the TUI did not submit ends while input is pending", async () => {
+			const m = createMode();
+			const subscribe = vi.spyOn(m.session, "subscribe");
+			await m.init({ suppressWelcomeIntro: true });
+			await m.sessionModes.set({ mode: "loop", action: "enter", prompt: "again" });
+			vi.useFakeTimers();
+			const input = m.getUserInput();
+			vi.advanceTimersByTime(400);
+			for (const [listener] of subscribe.mock.calls) listener({ type: "agent_end", messages: [] } as never);
+			// the agent_end re-armed the 800ms timer: nothing at the original deadline
+			let resolved = false;
+			void input.then(() => {
+				resolved = true;
+			});
+			vi.advanceTimersByTime(400);
+			await flush();
+			expect(resolved).toBe(false);
+			vi.advanceTimersByTime(400);
+			await flush();
+			expect((await input).text).toBe("again");
+		});
+
+		it("skips broken extension autocomplete factories and waits for the base provider", async () => {
+			const m = createMode();
+			const setProvider = vi.spyOn(m.editor, "setAutocompleteProvider");
+			m.addAutocompleteProvider(current => current);
+			// before init there is no base provider to wrap
+			expect(setProvider).not.toHaveBeenCalled();
+			await m.init({ suppressWelcomeIntro: true });
+			const base = setProvider.mock.calls.at(-1)?.[0];
+			m.addAutocompleteProvider(() => ({}) as never);
+			m.addAutocompleteProvider(() => {
+				throw new Error("factory bug");
+			});
+			expect(setProvider.mock.calls.at(-1)?.[0]).toBe(base);
+		});
+
+		it("reloads the title system prompt from the session cwd by default", async () => {
+			const m = createMode();
+			const setTitle = vi.spyOn(m.session, "setTitleSystemPrompt");
+			await m.refreshTitleSystemPrompt();
+			expect(setTitle).toHaveBeenCalledTimes(1);
 		});
 	});
 });
