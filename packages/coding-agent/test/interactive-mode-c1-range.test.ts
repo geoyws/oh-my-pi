@@ -52,7 +52,8 @@ describe("InteractiveMode constructed surface (C1)", () => {
 
 			const hub = vi.spyOn(m, "showAgentHub").mockImplementation(() => {});
 			const jobs = vi.spyOn(m, "showJobsSheet").mockImplementation(() => {});
-			pills.handleNativeEvent({ type: "hover", id: "agents" } as never);
+			// only a click action routes, even when another event names the same act
+			pills.handleNativeEvent({ type: "hover", act: "agents.open" } as never);
 			pills.handleNativeEvent({ type: "action", act: "pill.unknown" } as never);
 			expect(hub).not.toHaveBeenCalled();
 			expect(jobs).not.toHaveBeenCalled();
@@ -197,16 +198,19 @@ describe("InteractiveMode constructed surface (C1)", () => {
 			expect(rateOnly[0]).toBe("");
 			expect(visibleWidth(rateOnly[1]!)).toBe(60);
 			expect(Bun.stripANSI(rateOnly[1]!).trim()).toEndWith("100.0 tok/s");
-
-			await change(cfgComposerShape, "band");
-			// band mode without a session name adds nothing
-			expect(Bun.stripANSI(m.renderIdleStatusHud(60)![1]!).trim()).toEndWith("100.0 tok/s");
+			// the status band is what hides the title, so other shapes never dock it here
 			await m.sessionManager.setSessionName("Release prep", "user");
 			expect(m.sessionName).toBe("Release prep");
+			expect(Bun.stripANSI(m.renderIdleStatusHud(60)![1]!).trim()).toMatch(/^\S+ 100\.0 tok\/s$/);
+
+			await change(cfgComposerShape, "band");
 			expect(Bun.stripANSI(m.renderIdleStatusHud(60)![1]!).trim()).toMatch(/100\.0 tok\/s {2}Release prep$/);
 
 			m.session.tokenRate.reset();
 			expect(Bun.stripANSI(m.renderIdleStatusHud(60)![1]!).trim()).toBe("Release prep");
+			// an unnamed session in band mode has nothing to dock
+			vi.spyOn(m.sessionManager, "getSessionName").mockReturnValue(undefined);
+			expect(m.renderIdleStatusHud(60)).toBeUndefined();
 		});
 	});
 
@@ -323,6 +327,22 @@ describe("InteractiveMode constructed surface (C1)", () => {
 				expect(targets.get("local://plan.md")).toEndWith("/plan.md");
 				expect(targets.get("notes.md#top")).toEndWith("/notes.md#top");
 				expect(targets.has("missing.md")).toBe(false);
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		});
+
+		it("resolves local:// links under the session-id root when the session has no artifacts dir", async () => {
+			const m = createMode();
+			const manager = m.session.sessionManager;
+			vi.spyOn(manager, "getArtifactsDir").mockReturnValue(null);
+			const root = resolveLocalRoot({ getSessionId: () => manager.getSessionId() });
+			expect(root).toContain(manager.getSessionId());
+			fs.mkdirSync(root, { recursive: true });
+			try {
+				fs.writeFileSync(path.join(root, "scratch.md"), "scratch\n");
+				const targets = await m.resolveAssistantMessageLinkHrefs(["local://scratch.md"]);
+				expect(targets.get("local://scratch.md")).toEndWith(`/${path.basename(root)}/scratch.md`);
 			} finally {
 				fs.rmSync(root, { recursive: true, force: true });
 			}
