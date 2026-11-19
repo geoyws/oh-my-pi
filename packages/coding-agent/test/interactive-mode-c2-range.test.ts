@@ -38,6 +38,20 @@ import { formatModelString } from "../src/config/model-resolver";
 import { hasTranscriptActions, runTranscriptAction } from "@oh-my-pi/pi-tui/chat/transcript-actions";
 import type { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import type { DescribeContext } from "@oh-my-pi/pi-tui/native/node";
+import * as tuiTheme from "@oh-my-pi/pi-tui/theme";
+import { agentPauseGate } from "@oh-my-pi/pi-agent-core";
+import { setNativeRendering } from "@oh-my-pi/pi-tui/native/state";
+import * as extensionLinks from "@oh-my-pi/pi-tui/render/extension-links";
+import { TERMINAL } from "@oh-my-pi/pi-tui";
+import { MCPCommandController } from "../src/modes/controllers/mcp-command-controller";
+import { EventController } from "../src/modes/controllers/event-controller";
+import { InputController } from "../src/modes/controllers/input-controller";
+import {
+	cfgAskTimeout,
+	cfgDisplaySubagentLivePreview,
+	cfgShowHardwareCursor,
+	cfgSymbolPreset,
+} from "@oh-my-pi/pi-coding-agent/modes/settings";
 
 const cx: DescribeContext = { cols: 80, reduceMotion: false, dark: true, supports: () => true, feature: () => true };
 
@@ -1187,6 +1201,382 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			const setTitle = vi.spyOn(m.session, "setTitleSystemPrompt");
 			await m.refreshTitleSystemPrompt();
 			expect(setTitle).toHaveBeenCalledTimes(1);
+		});
+	});
+
+	describe("init event wiring", () => {
+		const flush = async () => {
+			for (let i = 0; i < 20; i++) await Promise.resolve();
+		};
+		const renderAll = (components: ReadonlyArray<{ render(width: number): string[] }>) =>
+			components.map(component => component.render(100).join("\n")).join("\n");
+		const nextImmediate = () => {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setImmediate(resolve);
+			return promise;
+		};
+
+		it("presents the idle recap delivered for the viewed session", async () => {
+			const m = createMode();
+			const enable = vi.spyOn(m.session, "enableIdleMaintenance");
+			await m.init({ suppressWelcomeIntro: true });
+			const onRecap = enable.mock.calls.at(-1)?.[0]?.onRecap;
+			if (!onRecap) throw new Error("init enabled no idle maintenance recap");
+			const present = vi.spyOn(m, "present").mockImplementation(() => {});
+			onRecap("Refactored the parser; tests are green.");
+			expect(present).toHaveBeenCalledTimes(1);
+		});
+
+		it("asks for cfg:// approval as a user wait unless ask.timeout bounds the prompt", async () => {
+			const hostSpy = vi.spyOn(cfgProtocol, "setCfgApprovalHost");
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const host = hostSpy.mock.calls.at(-1)?.[0];
+			if (!host) throw new Error("init registered no cfg approval host");
+			const wait = vi.spyOn(m.session, "waitForUser").mockResolvedValue("once" as never);
+			const request = { path: "tui.mouse", previous: "true", value: "false", save: false } as never;
+			expect(await host.approve(request)).toBe("once");
+			expect(wait).toHaveBeenCalledTimes(1);
+			// a bounded prompt settles on its own, so it stays agent time; an aborted turn dismisses it
+			cfgAskTimeout.set(Settings.instance, 5);
+			expect(await host.approve(request, { signal: AbortSignal.abort() })).toBe("deny");
+			expect(wait).toHaveBeenCalledTimes(1);
+		});
+
+		it("repaints after a resume only while subagent live previews are on", async () => {
+			const onChange = vi.spyOn(agentPauseGate, "onChange");
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const listener = onChange.mock.calls.at(-1)?.[0];
+			if (!listener) throw new Error("init subscribed no pause listener");
+			const render = vi.spyOn(m.ui, "requestRender");
+			cfgDisplaySubagentLivePreview.set(Settings.instance, false);
+			render.mockClear();
+			listener(false);
+			expect(render).not.toHaveBeenCalled();
+			cfgDisplaySubagentLivePreview.set(Settings.instance, true);
+			render.mockClear();
+			listener(true);
+			expect(render).not.toHaveBeenCalled();
+			listener(false);
+			expect(render).toHaveBeenCalled();
+		});
+
+		it("warns when the session saves to a new file after a persistence conflict", async () => {
+			const m = createMode();
+			const onNotice = vi.spyOn(m.sessionManager, "onPersistenceNotice");
+			await m.init({ suppressWelcomeIntro: true });
+			const listener = onNotice.mock.calls.at(-1)?.[0];
+			if (!listener) throw new Error("init subscribed no persistence notice listener");
+			const showWarning = vi.spyOn(m, "showWarning").mockImplementation(() => {});
+			listener({ reason: "replaced", from: "/tmp/a.jsonl", to: "/tmp/b.jsonl" } as never);
+			expect(showWarning).toHaveBeenCalledWith(expect.stringContaining("no longer reads as this session"));
+		});
+
+		it("rebuilds the config warning header when the session's warnings change", async () => {
+			const m = createMode();
+			const subscribe = vi.spyOn(m.session, "subscribe");
+			await m.init({ suppressWelcomeIntro: true });
+			Object.defineProperty(m.session, "configWarnings", { configurable: true, get: () => ["unknown key foo"] });
+			try {
+				const extras = vi.spyOn(m.composer, "setHeaderExtras");
+				for (const [listener] of subscribe.mock.calls) listener({ type: "config_warnings_changed" } as never);
+				expect(renderAll(extras.mock.calls.at(-1)?.[0] ?? [])).toContain("Warning: unknown key foo");
+			} finally {
+				Reflect.deleteProperty(m.session, "configWarnings");
+			}
+		});
+
+		it("re-applies composer preferences on a live UI setting edit", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const preferences = vi.spyOn(m.composer, "setPreferences");
+			cfgShowHardwareCursor.set(Settings.instance, !cfgShowHardwareCursor.get(Settings.instance));
+			await flush();
+			expect(preferences).toHaveBeenCalled();
+		});
+
+		it("treats terminal input as activity that postpones the idle checkpoint", async () => {
+			const m = createMode();
+			const addInput = vi.spyOn(m.ui, "addInputListener");
+			await m.init({ suppressWelcomeIntro: true });
+			const flushSpy = vi.spyOn(m.sessionManager, "flush");
+			vi.useFakeTimers();
+			const start = Date.now();
+			cfgSessionIdleCheckpointMs.set(Settings.instance, 1000);
+			const now = vi.spyOn(Date, "now").mockReturnValue(start + 900);
+			for (const [listener] of addInput.mock.calls) expect(listener("x" as never)).toBeUndefined();
+			// the timer fires at the original deadline, finds only 600ms of quiet and re-arms
+			now.mockReturnValue(start + 1500);
+			vi.advanceTimersByTime(1000);
+			await flush();
+			expect(flushSpy).not.toHaveBeenCalled();
+		});
+
+		it("does not checkpoint once shutdown has begun", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const flushSpy = vi.spyOn(m.sessionManager, "flush");
+			vi.useFakeTimers();
+			cfgSessionIdleCheckpointMs.set(Settings.instance, 1000);
+			Object.defineProperty(m, "isShuttingDown", { configurable: true, get: () => true });
+			vi.spyOn(Date, "now").mockReturnValue(Date.now() + 1500);
+			vi.advanceTimersByTime(1500);
+			await flush();
+			expect(flushSpy).not.toHaveBeenCalled();
+		});
+
+		it("repaints in place for theme previews and rebuilds history for a committed theme", async () => {
+			const themeSpy = vi.spyOn(tuiTheme, "onThemeChange");
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const listener = themeSpy.mock.calls.at(-1)?.[0];
+			if (!listener) throw new Error("init subscribed no theme listener");
+			const render = vi.spyOn(m.ui, "requestRender");
+			listener({ ephemeral: true });
+			expect(render).toHaveBeenLastCalledWith();
+			// a preset switch since the picker was built rebuilds the slash-command icons
+			const createProvider = vi.spyOn(InputController.prototype, "createAutocompleteProvider");
+			const current = tuiTheme.theme.getSymbolPreset();
+			vi.spyOn(tuiTheme.theme, "getSymbolPreset").mockReturnValue(current === "nerd" ? "unicode" : "nerd");
+			listener({});
+			expect(render).toHaveBeenLastCalledWith(true, { clearScrollback: true });
+			expect(createProvider).toHaveBeenCalled();
+		});
+
+		it("upgrades the default unicode preset to nerd only on a confirmed glyph handshake", async () => {
+			const m = createMode();
+			let report: ((supported: boolean) => void) | undefined;
+			m.ui.terminal.onGlyphProtocolReport = callback => {
+				report = callback;
+			};
+			await m.init({ suppressWelcomeIntro: true });
+			if (!report) throw new Error("init subscribed no glyph report");
+			const setPreset = vi.spyOn(tuiTheme, "setSymbolPreset").mockResolvedValue(undefined);
+			const preset = vi.spyOn(tuiTheme.theme, "getSymbolPreset").mockReturnValue("nerd");
+			report(false);
+			report(true); // already nerd
+			expect(setPreset).not.toHaveBeenCalled();
+			preset.mockReturnValue("unicode");
+			const invalidate = vi.spyOn(m.ui, "invalidate");
+			report(true);
+			expect(setPreset).toHaveBeenCalledWith("nerd");
+			await flush();
+			expect(invalidate).toHaveBeenCalled();
+			// an explicit preset choice is never overridden
+			cfgSymbolPreset.set(Settings.instance, "unicode");
+			report(true);
+			expect(setPreset).toHaveBeenCalledTimes(1);
+		});
+
+		it("commits a Ctrl+L appearance probe's theme change only for its own timely report", async () => {
+			const m = createMode();
+			let report: ((mode: "dark" | "light", token?: unknown) => void) | undefined;
+			let change: ((mode: "dark" | "light", token?: unknown) => void) | undefined;
+			let issued: unknown;
+			const terminal = m.ui.terminal as unknown as Record<string, unknown>;
+			terminal.onAppearanceReport = (callback: typeof report) => {
+				report = callback;
+				return () => {};
+			};
+			terminal.onAppearanceChange = (callback: typeof change) => {
+				change = callback;
+			};
+			terminal.refreshAppearance = (token: unknown) => {
+				issued = token;
+				return token;
+			};
+			await m.init({ suppressWelcomeIntro: true });
+			if (!report || !change) throw new Error("init subscribed no appearance listeners");
+			vi.spyOn(m.ui, "resetDisplay").mockImplementation(() => {});
+			const apply = vi.spyOn(tuiTheme, "onTerminalAppearanceChange").mockImplementation(() => {});
+			// no probe pending: reports are ignored and automatic changes stay ephemeral
+			report("dark", undefined);
+			change("dark", undefined);
+			expect(apply).toHaveBeenLastCalledWith("dark", undefined);
+			// an unchanged report for the probe consumes it on the next microtask
+			m.resetDisplayAfterAppearanceRefresh();
+			report("dark", Symbol("other probe"));
+			report("dark", issued);
+			await flush();
+			change("light", issued);
+			expect(apply).toHaveBeenLastCalledWith("light", undefined);
+			// a changed report: the change callback commits and consumes before the microtask runs
+			m.resetDisplayAfterAppearanceRefresh();
+			report("dark", issued);
+			change("dark", issued);
+			expect(apply).toHaveBeenLastCalledWith("dark", {});
+			await flush();
+			// an automatic query (no token) ahead of the probe's response also commits
+			m.resetDisplayAfterAppearanceRefresh();
+			change("light", undefined);
+			expect(apply).toHaveBeenLastCalledWith("light", {});
+			// another probe's token does not, nor does any report past the deadline
+			change("dark", Symbol("stale probe"));
+			expect(apply).toHaveBeenLastCalledWith("dark", undefined);
+			vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60_000);
+			change("light", issued);
+			expect(apply).toHaveBeenLastCalledWith("light", undefined);
+		});
+
+		it("redraws extension links when native rendering toggles only if links are registered", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const reapply = vi.spyOn(EventController.prototype, "applyAssistantTextRenderers");
+			try {
+				setNativeRendering(true);
+				expect(reapply).not.toHaveBeenCalled();
+				setNativeRendering(false);
+				Object.defineProperty(m.session, "extensionRunner", {
+					configurable: true,
+					get: () => ({ getLinkSchemes: () => ["acme"] }),
+				});
+				setNativeRendering(true);
+				expect(reapply).toHaveBeenCalledTimes(1);
+			} finally {
+				setNativeRendering(false);
+				Reflect.deleteProperty(m.session, "extensionRunner");
+			}
+		});
+
+		it("redraws extension links when the mouse setting changes whether they can be clicked", async () => {
+			const m = createMode();
+			const reapply = vi.spyOn(EventController.prototype, "applyAssistantTextRenderers");
+			vi.spyOn(extensionLinks, "extensionLinkClicksAvailable").mockReturnValueOnce(false).mockReturnValueOnce(true);
+			cfgTuiMouse.set(Settings.instance, !cfgTuiMouse.get(Settings.instance));
+			await flush();
+			expect(reapply).toHaveBeenCalledTimes(1);
+			expect(m).toBeDefined();
+		});
+
+		it("routes an MCP sign-in challenge through a user wait", () => {
+			let authHandler: ((serverName: string, challenge: unknown) => Promise<unknown>) | undefined;
+			const mcpManager = {
+				setAuthHandler: (handler: typeof authHandler) => {
+					authHandler = handler;
+				},
+			} as unknown as MCPManager;
+			const m = createMode(undefined, { mcpManager });
+			const handle = vi
+				.spyOn(MCPCommandController.prototype, "handleMCPAuthChallenge")
+				.mockResolvedValue("signed-in" as never);
+			const wait = vi.spyOn(m.session, "waitForUser").mockImplementation(async run => run());
+			const challenge = { url: "https://auth.example/login" };
+			return authHandler!("srv1", challenge).then(result => {
+				expect(result).toBe("signed-in");
+				expect(wait).toHaveBeenCalledTimes(1);
+				expect(handle).toHaveBeenCalledWith("srv1", challenge);
+			});
+		});
+
+		it("resolves an agent's model mention to its selector", () => {
+			const m = createMode();
+			const agent = { name: "reviewer" };
+			Object.defineProperty(m.session, "modelMentions", {
+				configurable: true,
+				get: () => [
+					{ agent: { name: "other" }, selector: "openai/gpt-5" },
+					{ agent, selector: "anthropic/claude-opus-4-5" },
+				],
+			});
+			try {
+				expect(m.editor.modelMentionSelector(agent as never)).toBe("anthropic/claude-opus-4-5");
+			} finally {
+				Reflect.deleteProperty(m.session, "modelMentions");
+			}
+		});
+
+		it("warms the syntax highlighter after init only for a resumed transcript", async () => {
+			const warm = vi.spyOn(tuiTheme, "warmHighlighter").mockImplementation(async () => {});
+			const fresh = createMode();
+			await fresh.init({ suppressWelcomeIntro: true });
+			await nextImmediate();
+			expect(warm).not.toHaveBeenCalled();
+			fresh.stop();
+			await session?.dispose();
+			const resumed = createMode(undefined, {
+				messages: [{ role: "user", content: "earlier question", timestamp: Date.now() } as AgentMessage],
+			});
+			await resumed.init({ suppressWelcomeIntro: true });
+			await nextImmediate();
+			expect(warm).toHaveBeenCalledTimes(1);
+		});
+
+		it("observes a session with no file yet and reuses a composer that is already running", async () => {
+			const prepaint = createMode();
+			const composer = prepaint.composer;
+			const start = vi.spyOn(composer, "start");
+			Object.defineProperty(composer, "started", { configurable: true, get: () => true });
+			const m = new InteractiveMode(session!, "test", undefined, () => {}, undefined, undefined, undefined, composer);
+			mode = m;
+			vi.spyOn(m.sessionManager, "getSessionFile").mockReturnValue(undefined as never);
+			await m.init({ suppressWelcomeIntro: true });
+			expect(start).not.toHaveBeenCalled();
+			expect(m.isInitialized).toBe(true);
+			// the prepaint mode shares this session; stop both so neither leaks listeners
+			m.stop();
+			mode = prepaint;
+		});
+
+		it("applies only the newest stream redaction pattern load", async () => {
+			const setRedactor = vi.fn();
+			vi.spyOn(StreamPublisher, "connectLazy").mockResolvedValue({
+				setRedactor,
+				close: () => {},
+				dispose: () => {},
+			} as never);
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			cfgStreamRedactPatterns.set(Settings.instance, ["first-\\d+"]);
+			cfgStreamRedactPatterns.set(Settings.instance, ["second-\\d+"]);
+			for (let i = 0; i < 50 && setRedactor.mock.calls.length === 0; i++) await Bun.sleep(5); // real fs loads
+			await Bun.sleep(50);
+			expect(setRedactor).toHaveBeenCalledTimes(1);
+			expect(m.isInitialized).toBe(true);
+		});
+
+		it("shows an empty expanded changelog entry when the selection carries no markdown", async () => {
+			cfgStartupQuiet.set(Settings.instance, false);
+			cfgStartupChangelogMode.set(Settings.instance, "expanded");
+			const m = createMode(undefined, {
+				startupChangelog: {
+					persistCurrentVersion: true,
+					truncated: false,
+					selectedEntries: 0,
+					totalUnseenEntries: 0,
+					latestVersion: "9.9.9",
+				} as never,
+			});
+			const extras = vi.spyOn(m.composer, "setHeaderExtras");
+			await m.init({ suppressWelcomeIntro: true });
+			expect(extras).toHaveBeenCalled();
+		});
+
+		it("posts no MCP status line when a connecting round names no servers", () => {
+			const bus = new EventBus();
+			const m = createMode(bus);
+			cfgStartupQuiet.set(Settings.instance, false);
+			const showStatus = vi.spyOn(m, "showStatus").mockImplementation(() => {});
+			bus.emit("mcp:connection-status", { type: "connecting", serverNames: [] });
+			expect(showStatus).not.toHaveBeenCalled();
+			bus.emit("mcp:connection-status", { type: "connecting", serverNames: ["srv1"] });
+			expect(showStatus).toHaveBeenCalledTimes(1);
+		});
+
+		it("starts the macOS appearance re-probe fallback for WezTerm outside a multiplexer", async () => {
+			const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+			const terminalId = Object.getOwnPropertyDescriptor(TERMINAL, "id")!;
+			const reprobe = vi.spyOn(tuiTheme, "startMacOSAppearanceReprobeFallback").mockReturnValue(() => {});
+			const m = createMode();
+			Object.defineProperty(process, "platform", { configurable: true, value: "darwin" });
+			Object.defineProperty(TERMINAL, "id", { configurable: true, value: "wezterm" });
+			try {
+				await m.init({ suppressWelcomeIntro: true });
+			} finally {
+				Object.defineProperty(process, "platform", platform);
+				Object.defineProperty(TERMINAL, "id", terminalId);
+			}
+			expect(reprobe).toHaveBeenCalledWith(m.ui.terminal);
 		});
 	});
 });
