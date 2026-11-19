@@ -416,8 +416,6 @@ describe("extension exec ownership", () => {
 
 	it("file write fallback handlers own pi.exec", async () => {
 		if (process.platform === "win32") return;
-		// The fallback only runs on a real kernel EACCES, which never fires for root.
-		if (process.getuid?.() === 0) return;
 		const tag = `${process.pid}_${Math.random().toString(36).slice(2, 8)}`;
 		const markerW = `EXTEXEC_FBW_${tag}`;
 		let pendingW: Promise<ExecResult> | undefined;
@@ -441,12 +439,12 @@ describe("extension exec ownership", () => {
 		fallbackRunners.push(runner);
 		initializeRunnerForTest(runner);
 		const sid = runner.sessionId;
-		const lockedDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "ext-exec-fb-"));
+		const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "ext-exec-fb-"));
 		try {
-			// No write bit: creating a file here raises a real EACCES, which
-			// diverts into the registered fallback.
-			await fs.promises.chmod(lockedDir, 0o500);
-			await writeFileWithFallback(path.join(lockedDir, "owned.txt"), "bytes");
+			// A write denied with EACCES diverts into the registered fallback. The
+			// denial is injected rather than raised by mode bits, which root ignores,
+			// so the ownership assertions below run for every user.
+			await writeFileWithFallback(path.join(dir, "owned.txt"), "bytes", denyingFile("write") as never);
 			expect(pendingW).toBeDefined();
 			await waitLive(markerW);
 			expect(live(markerW).length).toBeGreaterThan(0);
@@ -461,15 +459,12 @@ describe("extension exec ownership", () => {
 			runner.disposeFileFallbacks();
 			await shutdownExecCommands();
 			killSweep(markerW);
-			await fs.promises.chmod(lockedDir, 0o700).catch(() => {});
-			await fs.promises.rm(lockedDir, { recursive: true, force: true });
+			await fs.promises.rm(dir, { recursive: true, force: true });
 		}
 	}, 120_000);
 
 	it("file delete fallback handlers own pi.exec", async () => {
 		if (process.platform === "win32") return;
-		// Same EACCES precondition as the write path above.
-		if (process.getuid?.() === 0) return;
 		const tag = `${process.pid}_${Math.random().toString(36).slice(2, 8)}`;
 		const markerD = `EXTEXEC_FBD_${tag}`;
 		let pendingD: Promise<ExecResult> | undefined;
@@ -493,14 +488,13 @@ describe("extension exec ownership", () => {
 		fallbackRunners.push(runner);
 		initializeRunnerForTest(runner);
 		const sid = runner.sessionId;
-		const lockedDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "ext-exec-fb-"));
-		const victim = path.join(lockedDir, "victim.txt");
+		const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "ext-exec-fb-"));
+		const victim = path.join(dir, "victim.txt");
 		try {
 			await fs.promises.writeFile(victim, "bytes");
-			// No write bit: unlinking raises a real EACCES, which diverts into
-			// the registered delete fallback.
-			await fs.promises.chmod(lockedDir, 0o500);
-			await deleteFileWithFallback(victim);
+			// An unlink denied with EACCES diverts into the registered delete
+			// fallback; injected for the same reason as the write path above.
+			await deleteFileWithFallback(victim, denyingFile("unlink") as never);
 			expect(pendingD).toBeDefined();
 			await waitLive(markerD);
 			expect(live(markerD).length).toBeGreaterThan(0);
@@ -515,8 +509,16 @@ describe("extension exec ownership", () => {
 			runner.disposeFileFallbacks();
 			await shutdownExecCommands();
 			killSweep(markerD);
-			await fs.promises.chmod(lockedDir, 0o700).catch(() => {});
-			await fs.promises.rm(lockedDir, { recursive: true, force: true });
+			await fs.promises.rm(dir, { recursive: true, force: true });
 		}
 	}, 120_000);
 });
+
+/** A file handle whose `method` fails the way a permission boundary does. */
+function denyingFile(method: "write" | "unlink"): Record<string, () => Promise<never>> {
+	return {
+		[method]: async () => {
+			throw Object.assign(new Error("EACCES: permission denied (simulated)"), { code: "EACCES" });
+		},
+	};
+}

@@ -1458,9 +1458,10 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * Session that owns the plan currently in {@link todoPhases}. Subagent
 	 * reconciliation persists to this session, not blindly to `viewSession`,
 	 * which flips to the destination before `reloadTodos` refreshes during
-	 * focus attach.
+	 * focus attach. Starts as the main session, which is also `viewSession`
+	 * until a focus attach.
 	 */
-	#todoPhasesOwner?: AgentSession;
+	#todoPhasesOwner: AgentSession;
 	#todoHudHidden = false;
 	hideThinkingBlock = false;
 	#sessionsWithDisplayableThinkingContent = new WeakSet<AgentSession>();
@@ -1822,7 +1823,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	#pendingPlanReview:
 		| {
 				request: PlanReviewRequestedEvent;
-				remote?: { choice: PlanReviewChoice; feedback?: string };
+				/** `feedback` is the non-blank refine text for a `refine` answer, empty for any other choice. */
+				remote?: { choice: PlanReviewChoice; feedback: string };
 				/** Applies a remote tier pick to the review's slider selection; undefined when the slider is hidden. */
 				selectTier?: (role: string) => boolean;
 		  }
@@ -2066,6 +2068,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	) {
 		this.refreshScopedModelsAfterLogin = refreshScopedModelsAfterLogin;
 		this.session = session;
+		this.#todoPhasesOwner = session;
 		this.sessionManager = session.sessionManager;
 		this.settings = session.settings;
 		this.#initialComposerModel = session.model;
@@ -3105,7 +3108,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		for (const command of fileSlashCommands) {
 			reservedNames.add(command.name);
-			for (const alias of command.aliases ?? []) reservedNames.add(alias);
 		}
 		const promptTemplateCommands: SlashCommand[] = this.session.promptTemplates
 			.filter(template => !reservedNames.has(template.name))
@@ -3295,7 +3297,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.#goalOpenWorkAllBlocked()) return;
 		if (this.#pendingSubmittedInput) return;
 		if (this.editor.getText().trim().length > 0) return;
-		if ((this.editor.pendingImages?.length ?? 0) > 0) return;
+		if (this.editor.pendingImages.length > 0) return;
 		if (!this.session.goalRuntime.buildContinuationPrompt()) return;
 		this.#goalContinuationTimer = setTimeout(() => {
 			this.#goalContinuationTimer = undefined;
@@ -3312,7 +3314,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				if (this.#isAutoSubmitBlocked()) return;
 				if (this.#pendingSubmittedInput) return;
 				if (this.editor.getText().trim().length > 0) return;
-				if ((this.editor.pendingImages?.length ?? 0) > 0) return;
+				if (this.editor.pendingImages.length > 0) return;
 				const latestState = this.session.getGoalModeState();
 				if (!latestState?.enabled || latestState.goal.status !== "active") return;
 				// An interrupt during the 800ms window holds continuation without pausing the goal,
@@ -3420,7 +3422,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			!this.ui.hasOverlay() &&
 			this.ui.getFocused() === this.editor &&
 			this.editor.getText().trim().length === 0 &&
-			(this.editor.pendingImages?.length ?? 0) === 0
+			this.editor.pendingImages.length === 0
 		);
 	}
 
@@ -3491,7 +3493,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		// The gate sits before the budget consume so a halt never burns an
 		// iteration that did not run, and after the blocked-check/defer above so
 		// a streaming turn cannot re-run the command on every retry tick.
-		if (this.loopCondition && !(await this.#passesLoopCondition(prompt))) return;
+		const condition = this.loopCondition;
+		if (condition && !(await this.#passesLoopCondition(condition, prompt))) return;
 
 		// The gate awaited a child process: a turn may have started meanwhile
 		// (async job, idle flush), so re-check before spending budget or
@@ -3534,10 +3537,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * to stop (already reported through {@link disableLoopMode}) or the loop was
 	 * paused/disabled while the command was still running.
 	 */
-	async #passesLoopCondition(prompt: string): Promise<boolean> {
-		const condition = this.loopCondition;
-		if (!condition) return true;
-
+	async #passesLoopCondition(condition: LoopConditionConfig, prompt: string): Promise<boolean> {
 		const controller = new AbortController();
 		// A prior evaluation can still be in flight when the next iteration
 		// starts (the user submitted mid-command); drop it instead of leaking a
@@ -4092,9 +4092,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.clearOptimisticUserMessage();
 		this.#pendingWorkingMessage = undefined;
 		if (submission.customType === "goal-continuation") this.#releaseGoalContinuationTurn();
-		if (this.loadingAnimation) {
-			this.#stopLoadingAnimation(true);
-		}
+		this.#stopLoadingAnimation(true);
 		if (!submission.customType && !preserveDraft) {
 			// Enter clears the submitted draft before this cancellation can run.
 			// Keep anything typed or attached since then, after the recovered input.
@@ -4128,9 +4126,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	restoreRefusedPrompt(prompt: DroppedPrompt): void {
 		this.clearOptimisticUserMessage();
 		this.#pendingWorkingMessage = undefined;
-		if (this.loadingAnimation) {
-			this.#stopLoadingAnimation(true);
-		}
+		this.#stopLoadingAnimation(true);
 		this.rebuildChatFromMessages();
 		restoreRefusedDraft(this.editor, prompt.text, prompt.images, prompt.imageLinks);
 		this.ui.requestRender();
@@ -4145,9 +4141,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#restoreDroppedPrompt(prompt: DroppedPrompt): void {
 		this.clearOptimisticUserMessage();
 		this.#pendingWorkingMessage = undefined;
-		if (this.loadingAnimation) {
-			this.#stopLoadingAnimation(true);
-		}
+		this.#stopLoadingAnimation(true);
 		this.rebuildChatFromMessages();
 		// The rebuild drops transient notices, including the one that refused this prompt.
 		if (prompt.reason) this.showError(prompt.reason);
@@ -4985,7 +4979,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// destination there would clobber its canonical plan. Leaving the owner
 		// bound (rather than routing through `setTodos`, which rebinds it to
 		// `viewSession`) keeps a follow-up reconcile in the same window correct.
-		const owner = this.#todoPhasesOwner ?? this.session;
+		const owner = this.#todoPhasesOwner;
 		owner.sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, {
 			phases: next,
 		});
@@ -5085,12 +5079,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#modelCycleClearTimer.unref?.();
 	}
 
-	#getActivePhase(phases: TodoPhase[]): TodoPhase | undefined {
-		const nonEmpty = phases.filter(phase => phase.tasks.length > 0);
-		const active = nonEmpty.find(phase =>
+	/** Index of the first stage with open work, else the last stage; `phases` holds only non-empty stages. */
+	#getActivePhaseIndex(phases: readonly TodoPhase[]): number {
+		const active = phases.findIndex(phase =>
 			phase.tasks.some(task => task.status === "pending" || task.status === "in_progress"),
 		);
-		return active ?? nonEmpty[nonEmpty.length - 1];
+		return active >= 0 ? active : phases.length - 1;
 	}
 
 	#scheduleObserverUiSync(kind: SessionObserverChangeKind): void {
@@ -5115,7 +5109,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			if (this.#observerUiSyncNeedsTodoReconcile) {
 				this.#observerUiSyncNeedsTodoReconcile = false;
 				this.#reconcileTodosWithSubagents();
-				this.#syncTodoHudState(this.#todoPhasesOwner ?? this.session);
+				this.#syncTodoHudState(this.#todoPhasesOwner);
 			}
 			// Progress-only ticks (10 Hz while subagents run) cannot change the
 			// todo phases or their persisted visibility — re-syncing would also
@@ -5148,7 +5142,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (phases.length === 0) return;
 		const expanded = this.todoExpanded;
 		const multiPhase = phases.length > 1;
-		const activeIdx = phases.indexOf(this.#getActivePhase(phases) ?? phases[0]);
+		const activeIdx = this.#getActivePhaseIndex(phases);
 		// Fixed budgets keep the HUD bounded regardless of plan size / progress.
 		const subsequentStageCap = 4; // stages shown after the active one (a trailing summary row covers the rest)
 		const activeTaskCap = 5; // open tasks previewed for the active stage
@@ -5217,7 +5211,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		const contentLines: string[] = [];
 		const pushBlock = (block: string | string[]): void => {
 			const rows = Array.isArray(block) ? block : [block];
-			if (rows.length === 0) return;
 			spineGlyphs.push(`${theme.tree.branch} `);
 			contentLines.push(replaceTabs(rows[0]!));
 			for (let i = 1; i < rows.length; i++) {
@@ -6536,7 +6529,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			const approves = choice === "execute" || choice === "compact" || choice === "keep";
 			if (!approves || !pending.selectTier?.(input.role)) return false;
 		}
-		pending.remote = { choice, feedback };
+		pending.remote = { choice, feedback: feedback ?? "" };
 		if (pick(option.label)) return true;
 		pending.remote = undefined;
 		return false;
@@ -8017,7 +8010,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 
 		if (choice === "Refine plan") {
-			const refinement = remote?.choice === "refine" ? (remote.feedback ?? "") : feedback;
+			const refinement = remote?.choice === "refine" ? remote.feedback : feedback;
 			try {
 				if (refinement.trim()) {
 					if (this.onInputCallback) {
@@ -8162,9 +8155,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		clearTimeout(this.#composerStatusPersistTimer);
 		this.#composerStatusPersistTimer = undefined;
 		this.#persistComposerStatus();
-		if (this.loadingAnimation) {
-			this.#stopLoadingAnimation(false);
-		}
+		this.#stopLoadingAnimation(false);
 		this.#micCursor?.dispose();
 		this.#micCursor = undefined;
 		// Stop the shared tool-spinner ticker: a live block missed by per-component
@@ -8745,9 +8736,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#pendingSubmissionPreservesDraft = false;
 		this.clearOptimisticUserMessage();
 		this.#pendingWorkingMessage = undefined;
-		if (this.loadingAnimation) {
-			this.#stopLoadingAnimation(true);
-		}
+		this.#stopLoadingAnimation(true);
 		this.#uiHelpers.showError(message);
 	}
 
@@ -9720,7 +9709,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	setTodoExpanded(expanded: boolean): void {
 		this.todoExpanded = expanded;
 		if (expanded) {
-			const owner = this.#todoPhasesOwner ?? this.viewSession;
+			const owner = this.#todoPhasesOwner;
 			this.#cancelTodoAutoClearTimer();
 			this.#todoHudHidden = false;
 			const appendReveal = (data: TodoHudStateEntryData): void => {
