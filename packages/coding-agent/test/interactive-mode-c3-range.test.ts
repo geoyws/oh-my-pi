@@ -261,6 +261,175 @@ describe("InteractiveMode constructed surface (C3)", () => {
 		});
 	});
 
+	describe("local and optimistic submissions", () => {
+		it("records a local submission's signature once and never for a known slash command", () => {
+			const m = createMode();
+			const dispose = m.recordLocalSubmission("hello there");
+			expect(m.locallySubmittedUserSignatures.has("hello there\u00000")).toBe(true);
+			dispose();
+			expect(m.locallySubmittedUserSignatures.has("hello there\u00000")).toBe(false);
+			// a second dispose cannot remove a later submission of the same text
+			m.recordLocalSubmission("hello there");
+			dispose();
+			expect(m.locallySubmittedUserSignatures.has("hello there\u00000")).toBe(true);
+			vi.spyOn(m, "isKnownSlashCommand").mockReturnValue(true);
+			const before = new Set(m.locallySubmittedUserSignatures);
+			m.recordLocalSubmission("/model")();
+			expect(m.locallySubmittedUserSignatures).toEqual(before);
+		});
+
+		it("drops a local submission's signature when its dispatch throws", async () => {
+			const m = createMode();
+			await expect(
+				m.withLocalSubmission("doomed", async () => {
+					expect(m.locallySubmittedUserSignatures.has("doomed\u00000")).toBe(true);
+					throw new Error("dispatch failed");
+				}),
+			).rejects.toThrow("dispatch failed");
+			expect(m.locallySubmittedUserSignatures.has("doomed\u00000")).toBe(false);
+		});
+
+		it("swaps the optimistic user row for the canonical message", async () => {
+			const m = await initialized();
+			m.startPendingSubmission({ text: "draft question" });
+			const optimistic = [...m.chatContainer.children];
+			expect(optimistic.length).toBeGreaterThan(0);
+			expect(m.optimisticUserMessageSignature).toBe("draft question\u00000");
+			m.replaceOptimisticUserMessage({
+				role: "user",
+				content: [{ type: "text", text: "draft question" }],
+				timestamp: Date.now(),
+			} as never);
+			expect(m.optimisticUserMessageSignature).toBeUndefined();
+			expect(m.locallySubmittedUserSignatures.has("draft question\u00000")).toBe(false);
+			for (const row of optimistic) expect(m.chatContainer.children).not.toContain(row);
+			expect(m.chatContainer.children.length).toBe(optimistic.length);
+		});
+
+		it("adopts an optimistic row that already retired to scrollback, and drops one a dispatch abandons", async () => {
+			const m = await initialized();
+			const row = { role: "user", content: [{ type: "text", text: "/skill:x" }], timestamp: 1 } as never;
+			m.renderOptimisticSkillMessage(row);
+			const rendered = [...m.chatContainer.children];
+			expect(m.optimisticSkillMessagePending).toBe(true);
+			vi.spyOn(m.chatContainer, "canRemoveBlock").mockReturnValue(false);
+			const add = vi.spyOn(m, "addMessageToChat");
+			m.reconcileOptimisticSkillMessage(row);
+			// retired rows stay where they are and no duplicate is appended
+			expect(add).not.toHaveBeenCalled();
+			expect(m.chatContainer.children).toEqual(rendered);
+			m.renderOptimisticSkillMessage(row);
+			const second = m.chatContainer.children.slice(rendered.length);
+			expect(second.length).toBeGreaterThan(0);
+			m.clearOptimisticSkillMessage();
+			expect(m.optimisticSkillMessagePending).toBe(false);
+			for (const component of second) expect(m.chatContainer.children).not.toContain(component);
+		});
+
+		it("cancels a goal continuation without restoring a draft, releasing its reserved turn", async () => {
+			const m = await initialized();
+			const sync = vi.spyOn(m, "syncIdleMaintenanceView");
+			m.startPendingSubmission({ text: "continue the goal", customType: "goal-continuation" });
+			sync.mockClear();
+			m.editor.setText("typed meanwhile");
+			expect(m.cancelPendingSubmission()).toBe(true);
+			expect(sync).toHaveBeenCalled();
+			expect(m.editor.getText()).toBe("typed meanwhile");
+		});
+
+		it("puts a cancelled prompt back ahead of text typed since", async () => {
+			const m = await initialized();
+			m.startPendingSubmission({ text: "first thought" });
+			m.editor.setText("second thought");
+			expect(m.cancelPendingSubmission()).toBe(true);
+			expect(m.editor.getExpandedText()).toBe("first thought\nsecond thought");
+			// nothing pending any more
+			expect(m.cancelPendingSubmission()).toBe(false);
+		});
+
+		it("hands a refused prompt back ahead of the newer draft and stops the working row", async () => {
+			const m = await initialized();
+			m.startPendingSubmission({ text: "refused text" });
+			expect(m.loadingAnimation).toBeDefined();
+			m.editor.setText("newer");
+			m.restoreRefusedPrompt({ text: "refused text" } as never);
+			expect(m.loadingAnimation).toBeUndefined();
+			expect(m.optimisticUserMessageSignature).toBeUndefined();
+			expect(m.editor.getExpandedText()).toBe("refused text\nnewer");
+			// without a working row the refusal still restores
+			m.editor.setText("");
+			m.restoreRefusedPrompt({ text: "again" } as never);
+			expect(m.editor.getExpandedText()).toBe("again");
+		});
+
+		it("restores a dropped prompt with its reason, never clobbering a newer draft or tray", () => {
+			let dropped: ((prompt: never) => void) | undefined;
+			const m = createMode(undefined, {
+				beforeMode: session => {
+					vi.spyOn(session, "setPromptDropped").mockImplementation(callback => {
+						dropped = callback as never;
+					});
+				},
+			});
+			const showError = vi.spyOn(m, "showError").mockImplementation(() => {});
+			m.startPendingSubmission({ text: "dropped words" });
+			expect(m.loadingAnimation).toBeDefined();
+			dropped!({ text: "dropped words", reason: "Usage limit reached" } as never);
+			expect(m.loadingAnimation).toBeUndefined();
+			expect(showError).toHaveBeenCalledWith("Usage limit reached");
+			expect(m.editor.getText()).toBe("dropped words");
+			expect(m.editor.pendingImages).toEqual([]);
+			// a draft typed since stays put
+			m.editor.setText("newer draft");
+			dropped!({ text: "older words" } as never);
+			expect(m.editor.getText()).toBe("newer draft");
+			// an attachment added since is kept; the text still comes back
+			const kept = { type: "image", data: "aGk=", mimeType: "image/png" } as never;
+			m.editor.setText("");
+			m.editor.pendingImages = [kept];
+			dropped!({ text: "with images", images: [{ type: "image", data: "eA==", mimeType: "image/png" }] } as never);
+			expect(m.editor.pendingImages).toEqual([kept]);
+			expect(m.editor.getText()).toBe("with images");
+		});
+
+		it("starts only the pending, uncancelled submission", async () => {
+			const m = await initialized();
+			const pending = m.startPendingSubmission({ text: "go" });
+			expect(m.markPendingSubmissionStarted({ ...pending })).toBe(false);
+			expect(m.markPendingSubmissionStarted(pending)).toBe(true);
+			expect(pending.started).toBe(true);
+			const cancelled = m.startPendingSubmission({ text: "stop" });
+			cancelled.cancelled = true;
+			expect(m.markPendingSubmissionStarted(cancelled)).toBe(false);
+		});
+
+		it("finishes a submission: releasing a refused continuation, keeping a streaming or async-waiting row", async () => {
+			const m = await initialized();
+			const sync = vi.spyOn(m, "syncIdleMaintenanceView");
+			const continuation = m.startPendingSubmission({ text: "next step", customType: "goal-continuation" });
+			continuation.started = true;
+			sync.mockClear();
+			m.finishPendingSubmission(continuation);
+			// a started continuation that never dispatched gives back its turn
+			expect(sync).toHaveBeenCalled();
+			// finishing a submission that is no longer pending leaves the current one alone
+			const current = m.startPendingSubmission({ text: "current" });
+			m.finishPendingSubmission(continuation);
+			expect(m.optimisticUserMessageSignature).toBe("current\u00000");
+			// while the session streams, the optimistic row and working row stay
+			Object.defineProperty(m.session, "isStreaming", { configurable: true, get: () => true });
+			m.finishPendingSubmission(current);
+			expect(m.optimisticUserMessageSignature).toBe("current\u00000");
+			Reflect.deleteProperty(m.session, "isStreaming");
+			// a run waiting only on background jobs keeps its working row
+			vi.spyOn(EventController.prototype, "isAwaitingAsyncWork").mockReturnValue(true);
+			const waiting = m.startPendingSubmission({ text: "waits on jobs" });
+			m.finishPendingSubmission(waiting);
+			expect(m.optimisticUserMessageSignature).toBeUndefined();
+			expect(m.loadingAnimation).toBeDefined();
+		});
+	});
+
 	describe("native composer state", () => {
 		it("reports the draft's shell mode and whether its prefix excludes it from context", () => {
 			const m = createMode();
