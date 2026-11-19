@@ -1,6 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import { type Component, Container, type Focusable, type OverlayFocusOwner, TUI } from "@oh-my-pi/pi-tui";
 import type { Terminal, TerminalAppearance } from "@oh-my-pi/pi-tui/terminal";
+import { getCellDimensions, setCellDimensions } from "@oh-my-pi/pi-tui/terminal-capabilities";
+import { setKittyProtocolActive } from "@oh-my-pi/pi-tui/keys";
 
 class MinimalTerminal implements Terminal {
 	columns = 80;
@@ -360,6 +362,590 @@ describe("TUI overlay focus", () => {
 			expect(tui.getFocused()).toBe(editor);
 			expect(editor.inputs).toEqual(["\x1b[B"]);
 			expect(approvalPrompt.inputs).toEqual([]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("does not focus an overlay that is invisible when shown", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		const overlay = new FocusRecorder("overlay");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start();
+			const handle = tui.showOverlay(overlay, { visible: () => false });
+			expect(handle.isHidden()).toBe(false);
+			expect(tui.getFocused()).toBe(editor);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("hiding the top of two overlays returns focus to the lower overlay", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		const lower = new FocusRecorder("lower");
+		const upper = new FocusRecorder("upper");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start();
+			tui.showOverlay(lower);
+			const upperHandle = tui.showOverlay(upper);
+			expect(tui.getFocused()).toBe(upper);
+			upperHandle.hide();
+			expect(tui.getFocused()).toBe(lower);
+			// Hiding again is a no-op for the already-removed overlay.
+			upperHandle.hide();
+			expect(tui.getFocused()).toBe(lower);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("does not focus an overlay shown again while its visible callback is false", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		const overlay = new FocusRecorder("overlay");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start();
+			const handle = tui.showOverlay(overlay, { visible: () => false });
+			handle.setHidden(true);
+			handle.setHidden(false);
+			expect(tui.getFocused()).toBe(editor);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("keeps focus on a key-holder overlay when focus is cleared to null", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		const overlay = new FocusRecorder("overlay");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start();
+			tui.showOverlay(overlay);
+			tui.setFocus(null);
+			expect(tui.getFocused()).toBe(overlay);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("consumes a live cell-size reply instead of delivering it to the editor", () => {
+		const previous = { ...getCellDimensions() };
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start();
+			terminal.sendInput("\x1b[6;20;10t");
+			expect(getCellDimensions()).toEqual({ widthPx: 10, heightPx: 20 });
+			expect(editor.inputs).toEqual([]);
+		} finally {
+			tui.stop();
+			setCellDimensions(previous);
+		}
+	});
+
+	it("redirects input to preFocus when the focused overlay becomes invisible", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		const overlay = new FocusRecorder("overlay");
+		let visible = true;
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start();
+			tui.showOverlay(overlay, { visible: () => visible });
+			expect(tui.getFocused()).toBe(overlay);
+			visible = false;
+			terminal.sendInput("k");
+			expect(tui.getFocused()).toBe(editor);
+			expect(editor.inputs).toEqual(["k"]);
+			expect(overlay.inputs).toEqual([]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("redirects input to the topmost visible overlay when the focused overlay becomes invisible", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		const lower = new FocusRecorder("lower");
+		const upper = new FocusRecorder("upper");
+		let upperVisible = true;
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start();
+			tui.showOverlay(lower);
+			tui.showOverlay(upper, { visible: () => upperVisible });
+			expect(tui.getFocused()).toBe(upper);
+			upperVisible = false;
+			terminal.sendInput("k");
+			expect(tui.getFocused()).toBe(lower);
+			expect(lower.inputs).toEqual(["k"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("delivers listener-transformed input and swallows input emptied by a listener", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+		tui.addInputListener(data => (data === "a" ? { data: "A" } : data === "z" ? { data: "" } : undefined));
+
+		try {
+			tui.start();
+			terminal.sendInput("a");
+			terminal.sendInput("z");
+			terminal.sendInput("b");
+			expect(editor.inputs).toEqual(["A", "b"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("runs prepended input listeners first and stops notifying removed listeners", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+		const order: string[] = [];
+		const removed = (data: string) => {
+			order.push(`removed:${data}`);
+			return undefined;
+		};
+		tui.addInputListener(removed);
+		tui.addInputListener(
+			data => {
+				order.push(`first:${data}`);
+				return undefined;
+			},
+			{ prepend: true },
+		);
+
+		try {
+			tui.start();
+			terminal.sendInput("x");
+			expect(order).toEqual(["first:x", "removed:x"]);
+			tui.removeInputListener(removed);
+			terminal.sendInput("y");
+			expect(order).toEqual(["first:x", "removed:x", "first:y"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("moves focus to preFocus when the focused overlay is hidden and back when shown again", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		const overlay = new FocusRecorder("overlay");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start();
+			const handle = tui.showOverlay(overlay);
+			expect(tui.getFocused()).toBe(overlay);
+			expect(handle.isHidden()).toBe(false);
+
+			handle.setHidden(true);
+			expect(handle.isHidden()).toBe(true);
+			expect(tui.getFocused()).toBe(editor);
+
+			// Repeating the same hidden state is a no-op.
+			handle.setHidden(true);
+			expect(tui.getFocused()).toBe(editor);
+
+			handle.setHidden(false);
+			expect(handle.isHidden()).toBe(false);
+			expect(tui.getFocused()).toBe(overlay);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("leaves focus where it is when an overlay that does not hold it is hidden and shown", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		const other = new FocusRecorder("other");
+		const overlay = new FocusRecorder("overlay");
+		tui.addChild(editor);
+		tui.addChild(other);
+		tui.setFocus(editor);
+
+		try {
+			tui.start();
+			// Invisible overlays hold no keys, so focus can leave preFocus (the editor).
+			const handle = tui.showOverlay(overlay, { visible: () => false });
+			tui.setFocus(other);
+
+			handle.setHidden(true);
+			expect(handle.isHidden()).toBe(true);
+			// Not restored to preFocus: the hidden overlay never had the keys.
+			expect(tui.getFocused()).toBe(other);
+			handle.setHidden(false);
+			expect(handle.isHidden()).toBe(false);
+			// Shown but still invisible: it does not take focus either.
+			expect(tui.getFocused()).toBe(other);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("leaves focus where it is when an overlay that does not hold it is removed", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		const other = new FocusRecorder("other");
+		const overlay = new FocusRecorder("overlay");
+		tui.addChild(editor);
+		tui.addChild(other);
+		tui.setFocus(editor);
+
+		try {
+			tui.start();
+			const handle = tui.showOverlay(overlay, { visible: () => false });
+			tui.setFocus(other);
+			// On the stack but invisible: it does not count as a shown overlay.
+			expect(tui.hasOverlay()).toBe(false);
+			handle.hide();
+			expect(tui.hasOverlay()).toBe(false);
+			expect(tui.getFocused()).toBe(other);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("hideOverlay keeps the cursor state while another overlay remains", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		const lower = new FocusRecorder("lower");
+		const upper = new FocusRecorder("upper");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start();
+			tui.showOverlay(lower);
+			tui.showOverlay(upper);
+			terminal.showCursor();
+			const transitions = terminal.cursorTransitions;
+
+			tui.hideOverlay();
+			expect(tui.getFocused()).toBe(lower);
+			expect(tui.hasOverlay()).toBe(true);
+			// The lower overlay is still up: no cursor hide on its behalf.
+			expect(terminal.cursorTransitions).toBe(transitions);
+			expect(terminal.cursorHidden).toBe(false);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("fires onDebug for shift+ctrl+d and delivers the key normally without a handler", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+		let debugCalls = 0;
+		tui.onDebug = () => {
+			debugCalls++;
+		};
+
+		try {
+			tui.start();
+			terminal.sendInput("\x1b[100;6u");
+			expect(debugCalls).toBe(1);
+			expect(editor.inputs).toEqual([]);
+			tui.onDebug = undefined;
+			terminal.sendInput("\x1b[100;6u");
+			expect(debugCalls).toBe(1);
+			expect(editor.inputs).toEqual(["\x1b[100;6u"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("filters key-release events unless the focus target opts in", () => {
+		const terminal = new MinimalTerminal();
+		setKittyProtocolActive(true);
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start();
+			terminal.sendInput("\x1b[97;1:3u");
+			expect(editor.inputs).toEqual([]);
+			terminal.sendInput("a");
+			expect(editor.inputs).toEqual(["a"]);
+		} finally {
+			tui.stop();
+			setKittyProtocolActive(false);
+		}
+	});
+
+	it("releases the deferred-start hold when Ctrl+C arrives", () => {
+		const terminal = new MinimalTerminal();
+		(terminal as { tspExpected?: boolean }).tspExpected = true;
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start({ deferInput: true });
+			terminal.sendInput("\x1b[B");
+			expect(editor.inputs).toEqual([]);
+			terminal.sendInput("\x03");
+			expect(editor.inputs).toEqual(["\x1b[B", "\x03"]);
+			// The hold is released: the next shortcut is delivered live.
+			terminal.sendInput("\x1b[A");
+			expect(editor.inputs).toEqual(["\x1b[B", "\x03", "\x1b[A"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("drops held keys when releaseHeldInput runs while stopped", () => {
+		const terminal = new MinimalTerminal();
+		(terminal as { tspExpected?: boolean }).tspExpected = true;
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		tui.start({ deferInput: true });
+		terminal.sendInput("\x1b[B");
+		expect(editor.inputs).toEqual([]);
+		tui.stop();
+		tui.releaseHeldInput();
+		expect(editor.inputs).toEqual([]);
+		// A later live start does not replay the dropped hold.
+		tui.start();
+		try {
+			terminal.sendInput("\x1b[A");
+			expect(editor.inputs).toEqual(["\x1b[A"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("aborts start when the terminal disconnects during start", () => {
+		class DisconnectTerminal extends MinimalTerminal {
+			override start(onInput: (data: string) => void, onResize: () => void, onDisconnect?: () => void): void {
+				super.start(onInput, onResize);
+				onDisconnect?.();
+			}
+		}
+		const terminal = new DisconnectTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+		let starts = 0;
+		tui.addStartListener(() => {
+			starts++;
+		});
+
+		tui.start();
+		// The disconnect stopped the TUI mid-start: no start hooks ran.
+		expect(starts).toBe(0);
+		expect(editor.inputs).toEqual([]);
+	});
+
+	it("holds shortcut keys during a deferred start and replays them in order on release", () => {
+		const terminal = new MinimalTerminal();
+		// The startup hold only arms for a TSP-expected terminal.
+		(terminal as { tspExpected?: boolean }).tspExpected = true;
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start({ deferInput: true });
+			terminal.sendInput("\x1b[B");
+			terminal.sendInput("\x1b[A");
+			expect(editor.inputs).toEqual([]);
+
+			tui.releaseHeldInput();
+			expect(editor.inputs).toEqual(["\x1b[B", "\x1b[A"]);
+
+			// Releasing again is a no-op; later keys are delivered live.
+			tui.releaseHeldInput();
+			terminal.sendInput("\x1b[B");
+			expect(editor.inputs).toEqual(["\x1b[B", "\x1b[A", "\x1b[B"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("consumes a cell-size reply during the hold instead of delivering or queueing it", () => {
+		const previous = { ...getCellDimensions() };
+		const terminal = new MinimalTerminal();
+		(terminal as { tspExpected?: boolean }).tspExpected = true;
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start({ deferInput: true });
+			terminal.sendInput("\x1b[6;20;10t");
+			expect(getCellDimensions()).toEqual({ widthPx: 10, heightPx: 20 });
+			expect(editor.inputs).toEqual([]);
+			tui.releaseHeldInput();
+			expect(editor.inputs).toEqual([]);
+		} finally {
+			tui.stop();
+			setCellDimensions(previous);
+		}
+	});
+
+	it("consumes a scaled iTerm2 cell-size reply during the hold", () => {
+		const previous = { ...getCellDimensions() };
+		const terminal = new MinimalTerminal();
+		(terminal as { tspExpected?: boolean }).tspExpected = true;
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start({ deferInput: true });
+			terminal.sendInput("\x1b]1337;ReportCellSize=20;10;2\x07");
+			expect(getCellDimensions()).toEqual({ widthPx: 20, heightPx: 40 });
+			tui.releaseHeldInput();
+			expect(editor.inputs).toEqual([]);
+		} finally {
+			tui.stop();
+			setCellDimensions(previous);
+		}
+	});
+
+	it("consumes an unscaled iTerm2 cell-size reply during the hold", () => {
+		const previous = { ...getCellDimensions() };
+		const terminal = new MinimalTerminal();
+		(terminal as { tspExpected?: boolean }).tspExpected = true;
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start({ deferInput: true });
+			terminal.sendInput("\x1b]1337;ReportCellSize=20;10\x07");
+			expect(getCellDimensions()).toEqual({ widthPx: 10, heightPx: 20 });
+			tui.releaseHeldInput();
+			expect(editor.inputs).toEqual([]);
+		} finally {
+			tui.stop();
+			setCellDimensions(previous);
+		}
+	});
+
+	it("ignores a zero cell-size reply during the hold", () => {
+		const previous = { ...getCellDimensions() };
+		const terminal = new MinimalTerminal();
+		(terminal as { tspExpected?: boolean }).tspExpected = true;
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start({ deferInput: true });
+			terminal.sendInput("\x1b[6;0;0t");
+			expect(getCellDimensions()).toEqual(previous);
+			tui.releaseHeldInput();
+			expect(editor.inputs).toEqual([]);
+		} finally {
+			tui.stop();
+			setCellDimensions(previous);
+		}
+	});
+
+	it("transfers the held-input hold to a replacement focus owner", () => {
+		const terminal = new MinimalTerminal();
+		(terminal as { tspExpected?: boolean }).tspExpected = true;
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		const replacement = new FocusRecorder("replacement");
+		tui.addChild(editor);
+		tui.addChild(replacement);
+		tui.setFocus(editor);
+
+		try {
+			tui.start({ deferInput: true });
+			tui.replaceHeldFocus(editor, replacement);
+			tui.setFocus(replacement);
+			terminal.sendInput("\x1b[B");
+			expect(replacement.inputs).toEqual([]);
+			expect(editor.inputs).toEqual([]);
+
+			tui.releaseHeldInput();
+			expect(replacement.inputs).toEqual(["\x1b[B"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("hideOverlay pops the topmost overlay, restores focus and hides the cursor when none remain", () => {
+		const terminal = new MinimalTerminal();
+		const tui = new TUI(terminal);
+		const editor = new FocusRecorder("editor");
+		const overlay = new FocusRecorder("overlay");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+
+		try {
+			tui.start();
+			tui.showOverlay(overlay);
+			expect(tui.getFocused()).toBe(overlay);
+
+			// Showing the overlay already hid the cursor; reveal it so the hide below is observable.
+			terminal.showCursor();
+			tui.hideOverlay();
+			expect(tui.getFocused()).toBe(editor);
+			expect(terminal.cursorHidden).toBe(true);
+
+			// Hiding with an empty stack is a no-op.
+			tui.hideOverlay();
+			expect(tui.getFocused()).toBe(editor);
 		} finally {
 			tui.stop();
 		}
