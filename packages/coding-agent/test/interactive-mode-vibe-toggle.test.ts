@@ -584,6 +584,66 @@ describe("InteractiveMode vibe mode toggle", () => {
 		}
 	});
 
+	it("distrusts a hand-edited pre-vibe snapshot that is not a list of tool names", async () => {
+		const model = session.model;
+		if (!model) throw new Error("Expected active model");
+		const openFixture = () => {
+			const opened = new AgentSession({
+				agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
+				sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+				settings: Settings.isolated({}),
+				modelRegistry,
+				toolRegistry: new Map(["read", "todo", "bash"].map(name => [name, stubTool(name)])),
+				builtInToolNames: ["read", "todo", "bash"],
+				createVibeTools: () => VIBE_TOOL_NAMES.map(stubTool),
+			});
+			return {
+				session: opened,
+				mode: new InteractiveMode(opened, "test", undefined, undefined, undefined, undefined, new EventBus()),
+			};
+		};
+
+		const { session: targetSession, mode: targetMode } = openFixture();
+		let targetFile: string;
+		try {
+			await targetMode.init({ suppressWelcomeIntro: true });
+			await targetSession.setActiveToolsByName(["read", "todo", "bash"]);
+			await targetMode.handleVibeModeCommand();
+			await targetSession.sessionManager.ensureOnDisk();
+			const file = targetSession.sessionFile;
+			if (!file) throw new Error("Expected persisted session file");
+			targetFile = file;
+		} finally {
+			targetMode.stop();
+			await targetSession.dispose();
+		}
+		// Session files are user-editable: a snapshot holding a non-name must not be applied.
+		const lines = (await Bun.file(targetFile).text()).split("\n").map(line => {
+			if (!line) return line;
+			const entry = JSON.parse(line);
+			if (entry.type !== "mode_change" || entry.mode !== "vibe") return line;
+			return JSON.stringify({ ...entry, data: { ...entry.data, previousTools: [42, "bash"] } });
+		});
+		await Bun.write(targetFile, lines.join("\n"));
+
+		const { session: sourceSession, mode: sourceMode } = openFixture();
+		try {
+			await sourceMode.init({ suppressWelcomeIntro: true });
+			await sourceSession.setActiveToolsByName(["read", "todo", "bash"]);
+			await sourceMode.handleVibeModeCommand();
+			expect(await sourceSession.switchSession(targetFile)).toBe(true);
+			expect(sourceMode.vibeModeEnabled).toBe(true);
+
+			// Re-entry snapshots the live (reduced) set instead, so exit cannot restore `bash` from the file.
+			await sourceMode.handleVibeModeCommand();
+			expect(sourceMode.vibeModeEnabled).toBe(false);
+			expect(sourceSession.getActiveToolNames()).not.toContain("bash");
+		} finally {
+			sourceMode.stop();
+			await sourceSession.dispose();
+		}
+	});
+
 	it("keeps the freshly built toolset when resuming a vibe session from outside vibe mode", async () => {
 		const model = session.model;
 		if (!model) throw new Error("Expected active model");
