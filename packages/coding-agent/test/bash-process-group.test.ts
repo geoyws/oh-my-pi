@@ -8,6 +8,7 @@ import {
 	releaseShellSessions,
 	setInFlightLeakBoundForTest,
 } from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
+import { Shell } from "@oh-my-pi/pi-natives";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 
 /**
@@ -319,6 +320,40 @@ describe("bash process-group kill", () => {
 		expect(result.cancelled).toBe(false);
 		expect(await pollUntilLive(marker, 10_000)).not.toEqual([]);
 		await releaseShellSessions(sessionId);
+		expect(await pollWhileLive(marker, 10_000)).toEqual([]);
+	}, 60_000);
+
+	it("normal completion kills a nohup operand too (it keeps the job's process group)", async () => {
+		if (process.platform === "win32") return;
+		const marker = uniqueMarker("NOHUP");
+		strayMarkers.push(marker);
+		// The builtin `nohup` double-forks its operand into a new session, but the
+		// operand stays in the job's process group, so the end-of-call background
+		// reap still reaches it. The call waits until the operand is running, and
+		// the trap forces the KILL wave.
+		const started = path.join(tempDir, "nohup-started");
+		const result = await executeBash(
+			`nohup sh -c 'touch ${started}; trap "" TERM; while :; do sleep 0.2; done' ${marker} >/dev/null 2>&1 & ` +
+				`while [ ! -f ${started} ]; do sleep 0.05; done`,
+			{ cwd: tempDir, timeout: 5000, sessionKey: `pgkill-nohup-${marker}` },
+		);
+		expect(result.cancelled).toBe(false);
+		expect(fs.existsSync(started)).toBe(true);
+		expect(await pollWhileLive(marker, 10_000)).toEqual([]);
+	}, 60_000);
+
+	it("Shell.shutdown kills a nohup operand left by an earlier run", async () => {
+		if (process.platform === "win32") return;
+		const marker = uniqueMarker("NOHUPSHUT");
+		strayMarkers.push(marker);
+		const shell = new Shell();
+		await shell.run(
+			{ command: `nohup sh -c 'trap "" TERM; while :; do sleep 0.2; done' ${marker} >/dev/null 2>&1 &`, cwd: tempDir },
+			() => {},
+		);
+		// The run left the operand behind: only the reap below may remove it.
+		expect(await pollUntilLive(marker, 10_000)).not.toEqual([]);
+		await shell.shutdown();
 		expect(await pollWhileLive(marker, 10_000)).toEqual([]);
 	}, 60_000);
 });
