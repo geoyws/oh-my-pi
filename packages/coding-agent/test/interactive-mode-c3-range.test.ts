@@ -1,0 +1,293 @@
+import { describe, expect, it, vi } from "bun:test";
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import * as piTui from "@oh-my-pi/pi-tui";
+import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
+import * as svgFigure from "@oh-my-pi/pi-tui/chat/svg-figure";
+import * as tableChart from "@oh-my-pi/pi-tui/chat/table-chart";
+import { ToolExecutionComponent } from "@oh-my-pi/pi-tui/chat/tool-execution";
+import * as tuiTheme from "@oh-my-pi/pi-tui/theme";
+import { cfgAdvisorEnabled } from "../src/advisor/settings";
+import * as autoGraphPlanner from "../src/auto-graph/planner";
+import { cfgExtensionAssistantTextRenderers } from "../src/extensibility/settings";
+import * as judgment from "../src/judgment";
+import { ComposerPredictionController } from "../src/modes/controllers/composer-prediction-controller";
+import { EventController } from "../src/modes/controllers/event-controller";
+import {
+	cfgComposerPredictions,
+	cfgComposerShape,
+	cfgDisplayHideToolActivity,
+	cfgDisplayPinnedAgents,
+	cfgDisplayShowTurnTime,
+	cfgStatusLinePreset,
+	cfgStatusLineSessionAccent,
+	cfgTerminalProgramStatus,
+	cfgTerminalShowImages,
+	cfgTuiAutoGraph,
+	cfgTuiHyperlinks,
+	cfgTuiRenderMermaid,
+	cfgTuiRenderSvg,
+	cfgTuiTextSizing,
+	cfgTuiTight,
+	cfgTuiTitleSpinner,
+	cfgTuiTitleState,
+	cfgTuiVimMode,
+} from "../src/modes/settings";
+import { cfgCompactionEnabled } from "../src/session/context-settings";
+import { cfgExpandThinkingBlocks, cfgHideThinkingBlock, cfgProseOnlyThinking } from "../src/session/settings";
+import * as runStatus from "../src/utils/run-status";
+import * as titleGenerator from "../src/utils/title-generator";
+import { useConstructedInteractiveMode } from "./helpers/constructed-interactive-mode";
+
+/** A finished read call and its result: replay renders an assistant reply plus one tool block. */
+const readTurn = (): AgentMessage[] =>
+	[
+		{ role: "user", content: [{ type: "text", text: "read it" }], timestamp: 1 },
+		{
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: "looking" },
+				{ type: "toolCall", id: "call-1", name: "read", arguments: {} },
+			],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: 2,
+		},
+		{
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "read",
+			content: [{ type: "text", text: "ok" }],
+			isError: false,
+			timestamp: 3,
+		},
+	] as never;
+
+/** Changes a setting and lets its coalesced listener (one microtask later) apply it. */
+async function change<T>(setting: { set(settings: Settings, value: T): unknown }, value: T): Promise<void> {
+	setting.set(Settings.instance, value);
+	await Promise.resolve();
+}
+
+describe("InteractiveMode constructed surface (C3)", () => {
+	const harness = useConstructedInteractiveMode("@pi-c3-range-");
+	const { createMode } = harness;
+
+	/** Seeds `transcript` as session entries and renders it the way startup does after init. */
+	async function initialized(transcript: AgentMessage[] = []) {
+		const m = createMode(undefined, {
+			beforeMode: session => {
+				for (const message of transcript) session.sessionManager.appendMessage(message as never);
+			},
+		});
+		await m.init({ suppressWelcomeIntro: true });
+		if (transcript.length > 0) await m.renderInitialMessages();
+		return m;
+	}
+
+	describe("live UI setting changes", () => {
+		it("rebuilds the transcript once for render-time display options and retires committed rows", async () => {
+			const m = await initialized();
+			const rebuild = vi.spyOn(m, "rebuildChatFromMessages");
+			const resetDisplay = vi.spyOn(m.ui, "resetDisplay");
+			const mermaid = vi.spyOn(tuiTheme, "setMarkdownMermaidRendering");
+			const svg = vi.spyOn(svgFigure, "setSvgFigureRendering");
+			await change(cfgDisplayShowTurnTime, true);
+			expect(rebuild).toHaveBeenCalledTimes(1);
+			expect(resetDisplay).toHaveBeenCalledTimes(1);
+			await change(cfgTuiRenderMermaid, !cfgTuiRenderMermaid.get(Settings.instance));
+			expect(mermaid).toHaveBeenLastCalledWith(cfgTuiRenderMermaid.get(Settings.instance));
+			await change(cfgTuiRenderSvg, !cfgTuiRenderSvg.get(Settings.instance));
+			expect(svg).toHaveBeenLastCalledWith(cfgTuiRenderSvg.get(Settings.instance));
+			expect(rebuild).toHaveBeenCalledTimes(3);
+			expect(resetDisplay).toHaveBeenCalledTimes(3);
+		});
+
+		it("hands extension assistant-text renderers to the live reply and rebuilds", async () => {
+			const m = await initialized();
+			const apply = vi.spyOn(EventController.prototype, "applyAssistantTextRenderers");
+			const rebuild = vi.spyOn(m, "rebuildChatFromMessages");
+			await change(cfgExtensionAssistantTextRenderers, true);
+			expect(apply).toHaveBeenCalledTimes(1);
+			expect(rebuild).toHaveBeenCalledTimes(1);
+		});
+
+		it("routes table charts per tui.autoGraph, consulting the judge only when allowed", async () => {
+			const m = await initialized();
+			const setCharts = vi.spyOn(tableChart, "setTableCharts");
+			const pick = vi.spyOn(autoGraphPlanner, "pickTableChart").mockReturnValue("picked" as never);
+			const nativeJudge = vi.spyOn(judgment, "hasNativeJudge").mockReturnValue(false);
+			await change(cfgTuiAutoGraph, "off");
+			expect(setCharts).toHaveBeenLastCalledWith("off");
+			await change(cfgTuiAutoGraph, "always");
+			expect(setCharts).toHaveBeenLastCalledWith("always");
+			const request = { rows: [] } as never;
+			await change(cfgTuiAutoGraph, "smart");
+			const smart = setCharts.mock.calls.at(-1) as unknown as [string, (request: never) => unknown];
+			expect(smart[0]).toBe("smart");
+			// smart always asks the judge
+			expect(smart[1](request)).toBe("picked");
+			await change(cfgTuiAutoGraph, "auto");
+			const auto = setCharts.mock.calls.at(-1) as unknown as [string, (request: never) => unknown];
+			// auto falls back to the local guess without a native judge, and asks once one resolves
+			expect(auto[1](request)).toBeUndefined();
+			nativeJudge.mockReturnValue(true);
+			expect(auto[1](request)).toBe("picked");
+			expect(pick).toHaveBeenCalledTimes(2);
+			expect(m.isInitialized).toBe(true);
+		});
+
+		it("applies text sizing only where the terminal supports it and resets the display without a rebuild", async () => {
+			const m = await initialized();
+			const sizing = vi.spyOn(piTui, "setTerminalTextSizing");
+			const rebuild = vi.spyOn(m, "rebuildChatFromMessages");
+			const resetDisplay = vi.spyOn(m.ui, "resetDisplay");
+			await change(cfgTuiTextSizing, true);
+			expect(sizing).toHaveBeenLastCalledWith(piTui.TERMINAL.supportsTextSizing);
+			expect(rebuild).not.toHaveBeenCalled();
+			expect(resetDisplay).toHaveBeenCalledTimes(1);
+		});
+
+		it("repaints in place for tight layout, hyperlinks and advisor changes", async () => {
+			const m = await initialized();
+			const tight = vi.spyOn(piTui, "setTuiTight");
+			const invalidateStatus = vi.spyOn(m.statusLine, "invalidate");
+			const resetDisplay = vi.spyOn(m.ui, "resetDisplay");
+			await change(cfgTuiTight, true);
+			expect(tight).toHaveBeenLastCalledWith(true);
+			await change(cfgTuiHyperlinks, "off");
+			expect(invalidateStatus).toHaveBeenCalledTimes(1);
+			await change(cfgAdvisorEnabled, true);
+			expect(invalidateStatus).toHaveBeenCalledTimes(2);
+			expect(resetDisplay).not.toHaveBeenCalled();
+		});
+
+		it("forwards terminal title and program-status preferences", async () => {
+			await initialized();
+			const titleState = vi.spyOn(titleGenerator, "setTerminalTitleStateEnabled");
+			const spinner = vi.spyOn(titleGenerator, "setTerminalTitleSpinnerStyle");
+			const programStatus = vi.spyOn(runStatus, "setProgramStatusEnabled");
+			await change(cfgTuiTitleState, false);
+			await change(cfgTuiTitleSpinner, "dots");
+			await change(cfgTerminalProgramStatus, false);
+			expect(titleState).toHaveBeenLastCalledWith(false);
+			expect(spinner).toHaveBeenLastCalledWith("dots");
+			expect(programStatus).toHaveBeenLastCalledWith(false);
+		});
+
+		it("pushes status-line layout changes to the status line", async () => {
+			const m = await initialized();
+			const update = vi.spyOn(m.statusLine, "updateSettings");
+			await change(cfgStatusLinePreset, "minimal");
+			expect(update).toHaveBeenLastCalledWith(expect.objectContaining({ preset: "minimal" }));
+			await change(cfgStatusLineSessionAccent, false);
+			expect(update).toHaveBeenLastCalledWith(expect.objectContaining({ sessionAccent: false }));
+		});
+
+		it("re-syncs the composer shape, vim mode and pinned agents, and cancels predictions only when turned off", async () => {
+			const m = await initialized();
+			const shape = vi.spyOn(m, "syncComposerShape");
+			const pinned = vi.spyOn(m, "applyPinnedAgentsSetting");
+			const cancel = vi.spyOn(ComposerPredictionController.prototype, "cancel");
+			await change(cfgComposerShape, "boxed");
+			expect(shape).toHaveBeenCalledTimes(1);
+			await change(cfgDisplayPinnedAgents, "off");
+			expect(pinned).toHaveBeenCalledTimes(1);
+			await change(cfgTuiVimMode, true);
+			// vim mode starts in insert
+			expect(m.editor.vimMode).toBe("insert");
+			await change(cfgComposerPredictions, true);
+			expect(cancel).not.toHaveBeenCalled();
+			await change(cfgComposerPredictions, false);
+			expect(cancel).toHaveBeenCalledTimes(1);
+		});
+
+		it("tells the status line when auto-compaction turns off", async () => {
+			const m = await initialized();
+			const autoCompact = vi.spyOn(m.statusLine, "setAutoCompactEnabled");
+			await change(cfgCompactionEnabled, false);
+			expect(autoCompact).toHaveBeenLastCalledWith(m.session.autoCompactionEnabled);
+			expect(m.session.autoCompactionEnabled).toBe(false);
+		});
+
+		it("hides tool activity across the transcript and restores it collapsed", async () => {
+			const m = await initialized(readTurn());
+			const tools = m.chatContainer.children.filter(child => child instanceof ToolExecutionComponent);
+			const replies = m.chatContainer.children.filter(child => child instanceof AssistantMessageComponent);
+			expect(tools).toHaveLength(1);
+			expect(replies).toHaveLength(1);
+			const expand = vi.spyOn(tools[0] as ToolExecutionComponent, "setExpanded");
+			const resultImages = vi.spyOn(replies[0] as AssistantMessageComponent, "setToolResultImagesVisible");
+			const clearImages = vi.spyOn(m.ui, "clearInlineImages");
+			const resetDisplay = vi.spyOn(m.ui, "resetDisplay");
+			await change(cfgDisplayHideToolActivity, true);
+			expect(m.hideToolActivity).toBe(true);
+			expect(resultImages).toHaveBeenLastCalledWith(false);
+			expect(clearImages).toHaveBeenCalledTimes(1);
+			expect(resetDisplay).toHaveBeenCalledTimes(1);
+			m.toolOutputExpanded = true;
+			await change(cfgDisplayHideToolActivity, false);
+			expect(m.toolOutputExpanded).toBe(false);
+			expect(expand).toHaveBeenLastCalledWith(false);
+			expect(clearImages).toHaveBeenCalledTimes(1);
+			expect(resetDisplay).toHaveBeenCalledTimes(2);
+		});
+
+		it("skips tool-activity effects a keybinding toggle already applied", async () => {
+			const m = await initialized(readTurn());
+			const resetDisplay = vi.spyOn(m.ui, "resetDisplay");
+			m.hideToolActivity = true;
+			await change(cfgDisplayHideToolActivity, true);
+			expect(resetDisplay).not.toHaveBeenCalled();
+		});
+
+		it("shows or hides images on every tool block and reply", async () => {
+			const m = await initialized(readTurn());
+			const tool = m.chatContainer.children.find(child => child instanceof ToolExecutionComponent) as ToolExecutionComponent;
+			const reply = m.chatContainer.children.find(
+				child => child instanceof AssistantMessageComponent,
+			) as AssistantMessageComponent;
+			const toolImages = vi.spyOn(tool, "setShowImages");
+			const replyImages = vi.spyOn(reply, "setImagesVisible");
+			const clearImages = vi.spyOn(m.ui, "clearInlineImages");
+			await change(cfgTerminalShowImages, false);
+			expect(toolImages).toHaveBeenLastCalledWith(false);
+			expect(replyImages).toHaveBeenLastCalledWith(false);
+			expect(clearImages).toHaveBeenCalledTimes(1);
+			await change(cfgTerminalShowImages, true);
+			expect(toolImages).toHaveBeenLastCalledWith(true);
+			expect(clearImages).toHaveBeenCalledTimes(1);
+		});
+
+		it("applies thinking-block visibility, prose-only and expansion to every reply", async () => {
+			const m = await initialized(readTurn());
+			const reply = m.chatContainer.children.find(
+				child => child instanceof AssistantMessageComponent,
+			) as AssistantMessageComponent;
+			const hide = vi.spyOn(reply, "setHideThinkingBlock");
+			const prose = vi.spyOn(reply, "setProseOnlyThinking");
+			const expandThinking = vi.spyOn(reply, "setExpandThinkingBlocks");
+			await change(cfgHideThinkingBlock, !m.hideThinkingBlock);
+			expect(hide).toHaveBeenLastCalledWith(m.effectiveHideThinkingBlock);
+			await change(cfgProseOnlyThinking, !m.proseOnlyThinking);
+			expect(prose).toHaveBeenLastCalledWith(m.proseOnlyThinking);
+			await change(cfgExpandThinkingBlocks, !m.expandThinkingBlocks);
+			expect(expandThinking).toHaveBeenLastCalledWith(m.expandThinkingBlocks);
+			// a value the mode already holds (a keybinding toggle) is not re-applied
+			hide.mockClear();
+			m.hideThinkingBlock = !m.hideThinkingBlock;
+			await change(cfgHideThinkingBlock, m.hideThinkingBlock);
+			expect(hide).not.toHaveBeenCalled();
+		});
+	});
+});
