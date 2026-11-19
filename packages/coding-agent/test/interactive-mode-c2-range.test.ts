@@ -270,6 +270,26 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		expect(hud()).toContain("grade answers");
 	});
 
+	it("cancels a finished batch's retain timer when the mode stops", () => {
+		vi.useFakeTimers();
+		const bus = new EventBus();
+		const m = createMode(bus);
+		bus.emit("eval:judgment-batch-progress", {
+			id: "batch-1",
+			intent: "grade answers",
+			done: 3,
+			total: 3,
+			failed: 0,
+			cost: 0.03,
+			running: false,
+		});
+		m.stop();
+		const render = vi.spyOn(m.ui, "requestRender");
+		// the retain window would otherwise fire into the stopped UI
+		vi.advanceTimersByTime(5_000);
+		expect(render).not.toHaveBeenCalled();
+	});
+
 	it("initializes once: a second init neither re-subscribes nor re-arms anything", async () => {
 		const m = createMode();
 		await m.init({ suppressWelcomeIntro: true });
