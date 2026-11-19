@@ -86,7 +86,19 @@ describe("InteractiveMode session commands and capture surfaces (lines 8801-end)
 		modelRegistry = new ModelRegistry(authStorage);
 	});
 
+	// bun's spyOn cannot wrap accessors yet: stub prototype getters by hand and restore them after each test.
+	const stubbedGetters: Array<{ proto: object; prop: string; descriptor: PropertyDescriptor }> = [];
+	function stubGetter(proto: object, prop: string, get: () => unknown): void {
+		const descriptor = Object.getOwnPropertyDescriptor(proto, prop);
+		if (!descriptor) throw new Error(`no accessor ${prop}`);
+		stubbedGetters.push({ proto, prop, descriptor });
+		Object.defineProperty(proto, prop, { ...descriptor, get });
+	}
+
 	afterEach(() => {
+		for (const { proto, prop, descriptor } of stubbedGetters.splice(0).reverse()) {
+			Object.defineProperty(proto, prop, descriptor);
+		}
 		vi.restoreAllMocks();
 		vi.useRealTimers();
 		cfgSttEnabled.set(settings, false);
@@ -270,7 +282,7 @@ describe("InteractiveMode session commands and capture surfaces (lines 8801-end)
 			await freshMode();
 			captureMessages();
 			cfgSttEnabled.set(settings, true);
-			spyOn(LiveCommandController.prototype, "active", "get").mockReturnValue(true);
+			stubGetter(LiveCommandController.prototype, "active", () => true);
 			const toggle = spyOn(STTController.prototype, "toggle");
 
 			await mode.handleSTTToggle();
@@ -331,7 +343,7 @@ describe("InteractiveMode session commands and capture surfaces (lines 8801-end)
 			await freshMode();
 			cfgSttEnabled.set(settings, true);
 			let state: "idle" | "recording" | "transcribing" = "idle";
-			spyOn(STTController.prototype, "state", "get").mockImplementation(() => state);
+			stubGetter(STTController.prototype, "state", () => state);
 			const start = spyOn(STTController.prototype, "start").mockResolvedValue();
 			const stop = spyOn(STTController.prototype, "stop").mockResolvedValue();
 			// The mic re-renders once when the start begins and once when it settles.
@@ -389,7 +401,7 @@ describe("InteractiveMode session commands and capture surfaces (lines 8801-end)
 			cfgSttEnabled.set(settings, true);
 			spyOn(STTController.prototype, "toggle").mockResolvedValue();
 			await mode.handleSTTToggle();
-			spyOn(STTController.prototype, "state", "get").mockReturnValue("recording");
+			stubGetter(STTController.prototype, "state", () => "recording");
 			const local = spyOn(LiveCommandController.prototype, "handleCommand").mockResolvedValue();
 			const remote = spyOn(LiveCommandController.prototype, "startRemote");
 			const blocker = "Finish the current speech-to-text capture before starting live mode.";
@@ -407,7 +419,7 @@ describe("InteractiveMode session commands and capture surfaces (lines 8801-end)
 			cfgSttEnabled.set(settings, true);
 			spyOn(STTController.prototype, "toggle").mockResolvedValue();
 			await mode.handleSTTToggle();
-			spyOn(STTController.prototype, "state", "get").mockReturnValue("idle");
+			stubGetter(STTController.prototype, "state", () => "idle");
 			const live = { id: "live-1" } as never;
 			const options = { label: "peer" } as never;
 			const remote = spyOn(LiveCommandController.prototype, "startRemote").mockResolvedValue(live);
