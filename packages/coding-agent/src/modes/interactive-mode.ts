@@ -1822,7 +1822,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	#pendingPlanReview:
 		| {
 				request: PlanReviewRequestedEvent;
-				remote?: { choice: PlanReviewChoice; feedback?: string };
+				/** `feedback` is the non-blank refine text for a `refine` answer, empty for any other choice. */
+				remote?: { choice: PlanReviewChoice; feedback: string };
 				/** Applies a remote tier pick to the review's slider selection; undefined when the slider is hidden. */
 				selectTier?: (role: string) => boolean;
 		  }
@@ -4089,9 +4090,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.clearOptimisticUserMessage();
 		this.#pendingWorkingMessage = undefined;
 		if (submission.customType === "goal-continuation") this.#releaseGoalContinuationTurn();
-		if (this.loadingAnimation) {
-			this.#stopLoadingAnimation(true);
-		}
+		this.#stopLoadingAnimation(true);
 		if (!submission.customType && !preserveDraft) {
 			// Enter clears the submitted draft before this cancellation can run.
 			// Keep anything typed or attached since then, after the recovered input.
@@ -4125,9 +4124,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	restoreRefusedPrompt(prompt: DroppedPrompt): void {
 		this.clearOptimisticUserMessage();
 		this.#pendingWorkingMessage = undefined;
-		if (this.loadingAnimation) {
-			this.#stopLoadingAnimation(true);
-		}
+		this.#stopLoadingAnimation(true);
 		this.rebuildChatFromMessages();
 		restoreRefusedDraft(this.editor, prompt.text, prompt.images, prompt.imageLinks);
 		this.ui.requestRender();
@@ -4142,9 +4139,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#restoreDroppedPrompt(prompt: DroppedPrompt): void {
 		this.clearOptimisticUserMessage();
 		this.#pendingWorkingMessage = undefined;
-		if (this.loadingAnimation) {
-			this.#stopLoadingAnimation(true);
-		}
+		this.#stopLoadingAnimation(true);
 		this.rebuildChatFromMessages();
 		// The rebuild drops transient notices, including the one that refused this prompt.
 		if (prompt.reason) this.showError(prompt.reason);
@@ -6533,7 +6528,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			const approves = choice === "execute" || choice === "compact" || choice === "keep";
 			if (!approves || !pending.selectTier?.(input.role)) return false;
 		}
-		pending.remote = { choice, feedback };
+		pending.remote = { choice, feedback: feedback ?? "" };
 		if (pick(option.label)) return true;
 		pending.remote = undefined;
 		return false;
@@ -8014,7 +8009,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 
 		if (choice === "Refine plan") {
-			const refinement = remote?.choice === "refine" ? (remote.feedback ?? "") : feedback;
+			const refinement = remote?.choice === "refine" ? remote.feedback : feedback;
 			try {
 				if (refinement.trim()) {
 					if (this.onInputCallback) {
@@ -8159,9 +8154,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		clearTimeout(this.#composerStatusPersistTimer);
 		this.#composerStatusPersistTimer = undefined;
 		this.#persistComposerStatus();
-		if (this.loadingAnimation) {
-			this.#stopLoadingAnimation(false);
-		}
+		this.#stopLoadingAnimation(false);
 		this.#micCursor?.dispose();
 		this.#micCursor = undefined;
 		// Stop the shared tool-spinner ticker: a live block missed by per-component
@@ -8742,9 +8735,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#pendingSubmissionPreservesDraft = false;
 		this.clearOptimisticUserMessage();
 		this.#pendingWorkingMessage = undefined;
-		if (this.loadingAnimation) {
-			this.#stopLoadingAnimation(true);
-		}
+		this.#stopLoadingAnimation(true);
 		this.#uiHelpers.showError(message);
 	}
 

@@ -729,6 +729,11 @@ interface LineClassification {
 	asciiWidth: number | undefined;
 	isImage: boolean;
 	hasOsc8: boolean;
+	/**
+	 * Start of an escape sequence the line ends inside (CSI or OSC with no
+	 * terminator, or a lone trailing ESC); `undefined` when every sequence ends.
+	 */
+	danglingEscapeAt: number | undefined;
 }
 
 // SGR coalescing. The renderer's component tree emits a styled span as
@@ -1114,6 +1119,8 @@ export class TUI extends Container {
 	#altPreparedRows: PreparedLine[] = [];
 	#altEnterWidth = 0;
 	#altEnterHeight = 0;
+	/** A forced normal-screen repaint was pending when the alt screen was entered. */
+	#altExitOwesRepaint = false;
 	#resizeAltActive = false;
 	#resizeSettleTimer: RenderTimer | undefined;
 	#suppressResizeUntil = 0;
@@ -4264,6 +4271,10 @@ export class TUI extends Container {
 			this.#altPreparedRows = [];
 			this.#altEnterWidth = width;
 			this.#altEnterHeight = height;
+			// A forced repaint owed to the normal screen (a settled in-place
+			// resize erased it) would be spent on this first alt frame; keep it
+			// for the normal screen the overlay's exit restores.
+			this.#altExitOwesRepaint = this.#forceViewportRepaintOnNextRender;
 		} else if (!wantAlt && this.#altActive) {
 			// Leaving reporting on when the normal buffer wants it restores
 			// inline capture the same frame the overlay closes: no later paint
@@ -4294,6 +4305,8 @@ export class TUI extends Container {
 			// rewrap or a height-grow scrollback pull, while our viewport anchor
 			// stayed frozen. Recover the restored cursor position before any
 			// provider repaint can overwrite history at the stale row.
+			const owedRepaint = this.#altExitOwesRepaint;
+			this.#altExitOwesRepaint = false;
 			if (width !== this.#altEnterWidth || height !== this.#altEnterHeight) {
 				if (this.#frameProvider !== undefined) {
 					this.#resizeProbeWindow = this.#providerWindow;
@@ -4301,6 +4314,8 @@ export class TUI extends Container {
 					this.#beginResizeAnchorProbe();
 					return;
 				}
+				this.#forceViewportRepaintOnNextRender = true;
+			} else if (owedRepaint) {
 				this.#forceViewportRepaintOnNextRender = true;
 			}
 		} else if (wantMouse !== this.#mouseTracking) {
@@ -4483,7 +4498,16 @@ export class TUI extends Container {
 					hasOsc8: false,
 				};
 			}
+			// A sequence left open at the end of the line would swallow the
+			// segment reset written after it and leak the reset's bytes as text;
+			// cut it as the giant-line path does. A cut can expose an ESC that
+			// began the cut sequence's predecessor (`ESC ESC [31`), so repeat
+			// until nothing dangles; each pass strictly shortens the source.
 			source = output;
+			while (classification.danglingEscapeAt !== undefined) {
+				source = source.slice(0, classification.danglingEscapeAt);
+				classification = this.#classifyLine(source, safeWidth);
+			}
 		} else {
 			// Fitting a giant source can discard everything after the visible
 			// prefix. Preserve image rows verbatim first, but do not scan the
@@ -4639,11 +4663,12 @@ export class TUI extends Container {
 		let ascii = true;
 		let hasOsc8 = false;
 		let state: typeof ANSI_TEXT | typeof ANSI_CSI | typeof ANSI_OSC = ANSI_TEXT;
+		let sequenceStart = 0;
 
 		for (let i = 0; i < line.length; i++) {
 			const code = line.charCodeAt(i);
 			if ((code === CC_ESC || code === CC_KITTY_PLACEHOLDER_HIGH) && TERMINAL.hasImageMarkerAt(line, i)) {
-				return { asciiWidth: undefined, isImage: true, hasOsc8 };
+				return { asciiWidth: undefined, isImage: true, hasOsc8, danglingEscapeAt: undefined };
 			}
 			if (
 				code === 0x1b &&
@@ -4671,6 +4696,7 @@ export class TUI extends Container {
 				const next = line.charCodeAt(i + 1);
 				if (next === 0x5b) {
 					state = ANSI_CSI;
+					sequenceStart = i;
 					i++;
 					continue;
 				}
@@ -4685,8 +4711,12 @@ export class TUI extends Container {
 						ascii = false;
 					}
 					state = ANSI_OSC;
+					sequenceStart = i;
 					i++;
 					continue;
+				}
+				if (i + 1 === line.length) {
+					return { asciiWidth: undefined, isImage: false, hasOsc8, danglingEscapeAt: i };
 				}
 				ascii = false;
 				continue;
@@ -4697,8 +4727,10 @@ export class TUI extends Container {
 			}
 			if (ascii && col <= maxWidth) col++;
 		}
-		if (state !== ANSI_TEXT) ascii = false;
-		return { asciiWidth: ascii ? col : undefined, isImage: false, hasOsc8 };
+		if (state !== ANSI_TEXT) {
+			return { asciiWidth: undefined, isImage: false, hasOsc8, danglingEscapeAt: sequenceStart };
+		}
+		return { asciiWidth: ascii ? col : undefined, isImage: false, hasOsc8, danglingEscapeAt: undefined };
 	}
 
 	/**

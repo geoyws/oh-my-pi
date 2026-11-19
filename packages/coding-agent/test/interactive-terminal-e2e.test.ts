@@ -17,6 +17,7 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 import { statusLineHost } from "@oh-my-pi/pi-coding-agent/modes/status-line-host";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal";
+import { VirtualRenderScheduler } from "../../tui/test/virtual-render-scheduler";
 
 function plainRows(rows: readonly string[]): string[] {
 	return rows.map(row => Bun.stripANSI(row).trimEnd());
@@ -367,6 +368,7 @@ describe("libkitty end-to-end", () => {
 			timestamp: 1,
 		};
 		term = new VirtualTerminal(120, 16);
+		const scheduler = new VirtualRenderScheduler();
 		mode = new InteractiveMode(
 			session,
 			"test",
@@ -375,7 +377,7 @@ describe("libkitty end-to-end", () => {
 			undefined,
 			undefined,
 			undefined,
-			new Composer({ terminal: term }),
+			new Composer({ terminal: term, tuiOptions: { renderScheduler: scheduler } }),
 		);
 		session.sessionManager.appendMessage({ role: "user", content: "Show the answer", timestamp: 0 });
 		session.sessionManager.appendMessage(message);
@@ -383,14 +385,14 @@ describe("libkitty end-to-end", () => {
 		mode.noteDisplayableThinkingContent(message);
 		mode.setTodos([{ content: "Review answer", status: "in_progress" }]);
 		await mode.renderInitialMessages({ clearTerminalHistory: true });
-		await term.waitForRender(() =>
-			plainRows(term.getScrollBuffer()).some(row => row.includes("SHAKE_RETIRED_REASONING")),
-		);
+		await scheduler.settle(term);
 
 		const buffer = () => plainRows(term.getScrollBuffer());
 		expect(buffer().some(row => row.includes("SHAKE_RETIRED_REASONING"))).toBe(true);
 		await mode.handleShakeCommand("thinking");
-		await term.waitForRender();
+		// Drive every frame the replay owes on a virtual clock; a starved process can still be
+		// mid-replay after a wall-clock frame wait.
+		await scheduler.settle(term);
 
 		const rows = buffer();
 		expect(rows.some(row => row.includes("SHAKE_RETIRED_REASONING"))).toBe(false);
@@ -408,7 +410,7 @@ describe("libkitty end-to-end", () => {
 				skipped: false,
 				...(errorMessage ? { errorMessage } : {}),
 			});
-			await term.waitForRender();
+			await scheduler.settle(term);
 			expect(buffer().filter(row => row.trim() === "Answer marker 1")).toHaveLength(1);
 			expect(plainRows(term.getViewport()).some(row => row.includes("Review answer"))).toBe(true);
 		}
