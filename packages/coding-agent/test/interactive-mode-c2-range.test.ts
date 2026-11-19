@@ -730,6 +730,17 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			expect(hold).toHaveBeenCalledTimes(1);
 		});
 
+		it("an idle Esc or disable without goal mode holds nothing and posts no status", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const hold = vi.spyOn(m.session.goalRuntime, "holdContinuation");
+			const showStatus = vi.spyOn(m, "showStatus").mockImplementation(() => {});
+			m.holdGoalContinuation();
+			m.disableGoalMode();
+			expect(hold).not.toHaveBeenCalled();
+			expect(showStatus).not.toHaveBeenCalled();
+		});
+
 		const cancelInput = (m: InteractiveMode) => m.onInputCallback?.({ text: "", cancelled: true, started: false });
 		const image = { type: "image", data: "aGk=", mimeType: "image/png" } as never;
 
@@ -1176,6 +1187,21 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			expect(m.sessionManager.isSessionOnDisk()).toBe(true);
 		});
 
+		it("disarms the idle checkpoint when the bound is set to zero", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const shutdown = vi.spyOn(m, "shutdown").mockResolvedValue(undefined as never);
+			const flushSpy = vi.spyOn(m.sessionManager, "flush");
+			vi.useFakeTimers();
+			cfgSessionIdleCheckpointMs.set(Settings.instance, 1000);
+			cfgSessionIdleCheckpointMs.set(Settings.instance, 0);
+			idleFor(1500);
+			vi.useRealTimers();
+			await flush();
+			expect(flushSpy).not.toHaveBeenCalled();
+			expect(shutdown).not.toHaveBeenCalled();
+		});
+
 		it("stays live when input arrives while the transcript flushes", async () => {
 			const m = createMode();
 			await m.init({ suppressWelcomeIntro: true });
@@ -1346,6 +1372,7 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			const rewind = vi.spyOn(m, "showUserMessageSelector").mockImplementation(() => {});
 			const showError = vi.spyOn(m, "showError").mockImplementation(() => {});
 			const showWarning = vi.spyOn(m, "showWarning").mockImplementation(() => {});
+			const showStatus = vi.spyOn(m, "showStatus").mockImplementation(() => {});
 			runTranscriptAction({ act: "switch-model" });
 			runTranscriptAction({ act: "rewind" });
 			expect(modelSelector).toHaveBeenCalledWith({ temporaryOnly: true });
@@ -1353,14 +1380,20 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			vi.spyOn(m, "handleResumeSession").mockRejectedValueOnce(new Error("gone")).mockRejectedValueOnce("vanished");
 			runTranscriptAction({ act: "resume", path: "/x.jsonl" });
 			runTranscriptAction({ act: "resume", path: "/y.jsonl" });
-			vi.spyOn(clipboard, "copyToClipboard").mockRejectedValueOnce(new Error("no display")).mockRejectedValueOnce("denied");
+			vi.spyOn(clipboard, "copyToClipboard")
+				.mockRejectedValueOnce(new Error("no display"))
+				.mockRejectedValueOnce("denied")
+				.mockResolvedValueOnce(undefined);
 			runTranscriptAction({ act: "copy", text: "a" });
 			runTranscriptAction({ act: "copy", text: "b" });
+			runTranscriptAction({ act: "copy", text: "c" });
 			await flush();
 			expect(showError).toHaveBeenCalledWith("gone");
 			expect(showError).toHaveBeenCalledWith("vanished");
 			expect(showWarning).toHaveBeenCalledWith("Copy failed: no display");
 			expect(showWarning).toHaveBeenCalledWith("Copy failed: denied");
+			expect(showStatus).toHaveBeenCalledWith("Copied to clipboard");
+			expect(showWarning).toHaveBeenCalledTimes(2);
 		});
 
 		it("restores a prompt the session dropped", () => {
