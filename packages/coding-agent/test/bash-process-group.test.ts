@@ -329,16 +329,16 @@ describe("bash process-group kill", () => {
 		strayMarkers.push(marker);
 		// The builtin `nohup` double-forks its operand into a new session, but the
 		// operand stays in the job's process group, so the end-of-call background
-		// reap still reaches it. The call waits until the operand is running, and
-		// the trap forces the KILL wave.
-		const started = path.join(tempDir, "nohup-started");
+		// reap still reaches it. The operand publishes readiness only after its
+		// TERM trap is in place, so the reap must escalate to KILL; the call
+		// waits for that readiness (relative path: cwd is tempDir).
 		const result = await executeBash(
-			`nohup sh -c 'touch ${started}; trap "" TERM; while :; do sleep 0.2; done' ${marker} >/dev/null 2>&1 & ` +
-				`while [ ! -f ${started} ]; do sleep 0.05; done`,
+			`nohup sh -c 'trap "" TERM; touch nohup-ready; while :; do sleep 0.2; done' ${marker} >/dev/null 2>&1 & ` +
+				"while [ ! -f nohup-ready ]; do sleep 0.05; done",
 			{ cwd: tempDir, timeout: 5000, sessionKey: `pgkill-nohup-${marker}` },
 		);
 		expect(result.cancelled).toBe(false);
-		expect(fs.existsSync(started)).toBe(true);
+		expect(fs.existsSync(path.join(tempDir, "nohup-ready"))).toBe(true);
 		expect(await pollWhileLive(marker, 10_000)).toEqual([]);
 	}, 60_000);
 
@@ -347,12 +347,18 @@ describe("bash process-group kill", () => {
 		const marker = uniqueMarker("NOHUPSHUT");
 		strayMarkers.push(marker);
 		const shell = new Shell();
+		// Same post-trap readiness handshake: the run returns once the operand
+		// ignores TERM, so only a KILL from the reap below can remove it.
 		await shell.run(
-			{ command: `nohup sh -c 'trap "" TERM; while :; do sleep 0.2; done' ${marker} >/dev/null 2>&1 &`, cwd: tempDir },
+			{
+				command:
+					`nohup sh -c 'trap "" TERM; touch nohup-ready; while :; do sleep 0.2; done' ${marker} >/dev/null 2>&1 & ` +
+					"while [ ! -f nohup-ready ]; do sleep 0.05; done",
+				cwd: tempDir,
+			},
 			() => {},
 		);
-		// The run left the operand behind: only the reap below may remove it.
-		expect(await pollUntilLive(marker, 10_000)).not.toEqual([]);
+		expect(livePids(marker)).not.toEqual([]);
 		await shell.shutdown();
 		expect(await pollWhileLive(marker, 10_000)).toEqual([]);
 	}, 60_000);
