@@ -636,6 +636,8 @@ describe("TUI overlay focus", () => {
 			tui.start();
 			const handle = tui.showOverlay(overlay, { visible: () => false });
 			tui.setFocus(other);
+			// On the stack but invisible: it does not count as a shown overlay.
+			expect(tui.hasOverlay()).toBe(false);
 			handle.hide();
 			expect(tui.hasOverlay()).toBe(false);
 			expect(tui.getFocused()).toBe(other);
@@ -662,6 +664,7 @@ describe("TUI overlay focus", () => {
 
 			tui.hideOverlay();
 			expect(tui.getFocused()).toBe(lower);
+			expect(tui.hasOverlay()).toBe(true);
 			// The lower overlay is still up: no cursor hide on its behalf.
 			expect(terminal.cursorTransitions).toBe(transitions);
 			expect(terminal.cursorHidden).toBe(false);

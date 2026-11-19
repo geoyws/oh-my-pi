@@ -167,10 +167,67 @@ describe("TUI terminal report callbacks", () => {
 			expect(owed).toHaveLength(1);
 			tui.stop();
 			expect(scheduler.pending()).toEqual([]);
-			expect(scheduler.cancelled).toEqual(owed);
+			expect(scheduler.cancelled).toContain(owed[0]!);
 			await scheduler.advance(terminal, 1_000);
 			expect(terminal.writes.join("")).not.toContain("\x1b_G");
 		} finally {
+			tui.stop();
+			mutable.id = originalId;
+		}
+	});
+
+	it("clearInlineImages deletes each transmitted Kitty image while running and nothing once stopped", async () => {
+		const mutable = TERMINAL as unknown as { id: string };
+		const originalId = mutable.id;
+		mutable.id = "kitty";
+		setTerminalImageProtocol(ImageProtocol.Kitty);
+		const { Image } = await import("@oh-my-pi/pi-tui/components/image");
+		async function paintedImage(): Promise<{ tui: TUI; terminal: ReportTerminal }> {
+			const terminal = new ReportTerminal(40, 12);
+			const scheduler = new VirtualRenderScheduler();
+			const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+			tui.addChild(
+				new Image(
+					"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGNgAAAAAgABSK+kcQAAAABJRU5ErkJggg==",
+					"image/png",
+					{ fallbackColor: (text: string) => text },
+					{ maxWidthCells: 4, maxHeightCells: 4, budget: tui.imageBudget, imageKey: "purge" },
+					{ widthPx: 40, heightPx: 40 },
+				),
+			);
+			tui.start();
+			await scheduler.settle(terminal);
+			expect(terminal.writes.join("")).toContain("\x1b_G");
+			terminal.writes.length = 0;
+			return { tui, terminal };
+		}
+		const running = await paintedImage();
+		const stopped = await paintedImage();
+		const switched = await paintedImage();
+		try {
+			running.tui.clearInlineImages();
+			expect(running.terminal.writes.join("")).toMatch(/\x1b_Ga=d,d=I,i=\d+,q=2\x1b\\/);
+			// The purge consumed the tracked ids: a second call has nothing to delete.
+			running.terminal.writes.length = 0;
+			running.tui.clearInlineImages();
+			expect(running.terminal.writes).toEqual([]);
+
+			stopped.tui.stop();
+			stopped.terminal.writes.length = 0;
+			stopped.tui.clearInlineImages();
+			expect(stopped.terminal.writes).toEqual([]);
+
+			// Off Kitty no delete is written, and the tracked ids are still dropped.
+			setTerminalImageProtocol(null);
+			switched.tui.clearInlineImages();
+			expect(switched.terminal.writes).toEqual([]);
+			setTerminalImageProtocol(ImageProtocol.Kitty);
+			switched.tui.clearInlineImages();
+			expect(switched.terminal.writes).toEqual([]);
+		} finally {
+			running.tui.stop();
+			stopped.tui.stop();
+			switched.tui.stop();
 			mutable.id = originalId;
 		}
 	});

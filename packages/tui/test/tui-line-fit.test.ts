@@ -40,10 +40,11 @@ describe("TUI provider line fitting", () => {
 	});
 
 	it("renders combining and zero-width characters without widening the row", async () => {
-		const viewport = await renderLines(["e\u0301x", "a\u200db"]);
-		// The combining accent shares its base cell: "x" stays in the second column.
-		expect(viewport[0]!.trimEnd().normalize("NFC")).toBe("\u00e9x");
-		expect(viewport[1]!.replace(/\u200d/g, "").trimEnd()).toBe("ab");
+		// Each line fills all 10 cells only if the accent and the joiner count as zero
+		// width; a miscount would cut the final "x"/"b".
+		const viewport = await renderLines([`e\u0301${"x".repeat(9)}`, `a\u200d${"b".repeat(9)}`]);
+		expect(viewport[0]!.normalize("NFC")).toBe(`\u00e9${"x".repeat(9)}`);
+		expect(viewport[1]!.replace(/\u200d/g, "")).toBe(`a${"b".repeat(9)}`);
 	});
 
 	it("renders an emoji surrogate pair as one glyph at the boundary", async () => {
@@ -69,9 +70,11 @@ describe("TUI provider line fitting", () => {
 		} finally {
 			tui.stop();
 		}
-		// Within the width the line is not cut: the unterminated CSI reaches the terminal as written.
+		// Characterization of known defect t-54b2ea43: within the budget the line is not
+		// cut, so the dangling CSI reaches the terminal as written and swallows the
+		// row's SGR reset, leaving "[0m" visible. Update when that row lands.
 		expect(frames.join("")).toContain("abc\x1b[31");
-		expect(terminal.getViewport()[0]).toStartWith("abc");
+		expect(terminal.getViewport()[0]!.trimEnd()).toBe("abc[0m");
 	});
 
 	it("renders an OSC 8 hyperlink line's visible text", async () => {
@@ -148,5 +151,28 @@ describe("TUI provider line fitting", () => {
 			expect(text).not.toContain("\u200d");
 			expect(text).not.toContain("\u00e9");
 		});
+
+		it("stops an ASCII run once the budget is spent", async () => {
+			const text = await frameText(`ab${scaled}${"z".repeat(GIANT_TAIL)}`);
+			expect(text).toContain(`ab${scaled}`);
+			expect(text).not.toContain("z");
+		});
+
+		it("skips a scaled-text run that would overflow the budget and fits the text after it", async () => {
+			const oversized = `\x1b]66;w=1${":n=1".repeat(1100)};Y\x1b\\`;
+			const text = await frameText(`ab${oversized}${"c".repeat(GIANT_TAIL)}`);
+			expect(text).not.toContain(oversized);
+			expect(text).toContain(`ab${"c".repeat(8)}`);
+		});
+	});
+
+	it("fits a giant line led by a surrogate-pair emoji", async () => {
+		const viewport = await renderLines([`😀${"z".repeat(GIANT_TAIL)}`]);
+		expect(viewport[0]).toBe(`😀${"z".repeat(8)}`);
+	});
+
+	it("keeps a wide character that fits at the start of a giant line", async () => {
+		const viewport = await renderLines([`\u754c${"b".repeat(GIANT_TAIL)}`]);
+		expect(viewport[0]).toBe(`\u754c${"b".repeat(8)}`);
 	});
 });

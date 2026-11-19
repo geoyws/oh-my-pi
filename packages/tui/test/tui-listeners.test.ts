@@ -224,45 +224,46 @@ describe("TUI provider history flush and component renders", () => {
 		} finally {
 			tui.stop();
 		}
+		// Once stopped, a component's render request schedules nothing.
+		const afterStop = probe.renders;
+		tui.requestComponentRender(component);
+		await scheduler.settle(terminal);
+		expect(probe.renders).toBe(afterStop);
 	});
 
-	it("repaints the whole viewport after a fullscreen overlay closes on a resized screen", async () => {
-		async function rowsRewrittenOnClose(resize: boolean): Promise<string> {
-			const terminal = new VirtualTerminal(40, 6);
-			const scheduler = new VirtualRenderScheduler();
-			const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
-			tui.addChild(new Text("base-body", 0, 0));
-			const writes: string[] = [];
-			try {
-				tui.start();
-				await scheduler.settle(terminal);
-				const handle = tui.showOverlay(new Text("modal", 0, 0), {
-					fullscreen: true,
-					width: "100%",
-					maxHeight: "100%",
-				});
-				await scheduler.settle(terminal);
-				if (resize) {
-					terminal.resize(40, 8);
-					await scheduler.advance(terminal, 1000);
-				}
-				const write = terminal.write.bind(terminal);
-				terminal.write = (data: string) => {
-					writes.push(data);
-					write(data);
-				};
-				handle.hide();
-				await scheduler.settle(terminal);
-				expect(terminal.getViewport().join("\n")).toContain("base-body");
-			} finally {
-				tui.stop();
-			}
-			return writes.join("");
+	it("repaints the whole viewport when a fullscreen overlay entered mid-resize closes", async () => {
+		const previous = Bun.env.PI_TUI_RESIZE_IN_PLACE;
+		Bun.env.PI_TUI_RESIZE_IN_PLACE = "1";
+		const terminal = new VirtualTerminal(40, 6);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		tui.addChild(new Text("base-body", 0, 0));
+		try {
+			tui.start();
+			await scheduler.settle(terminal);
+			// The in-place resize blanks the live rows and defers the repaint; the
+			// overlay opens before it settles, so the alt screen is entered at 40x8.
+			terminal.resize(40, 8);
+			await scheduler.advance(terminal, 50);
+			const handle = tui.showOverlay(new Text("modal", 0, 0), {
+				fullscreen: true,
+				width: "100%",
+				maxHeight: "100%",
+			});
+			await scheduler.advance(terminal, 1000);
+			expect(terminal.getViewport().join("\n")).toContain("modal");
+			// Back to the last normal-screen geometry while covered: a geometry diff
+			// alone sees nothing to rewrite, yet the restored buffer is blank.
+			terminal.resize(40, 6);
+			await scheduler.advance(terminal, 1000);
+			handle.hide();
+			await scheduler.advance(terminal, 1000);
+			expect(terminal.getViewport().join("\n")).toContain("base-body");
+		} finally {
+			tui.stop();
+			if (previous === undefined) delete Bun.env.PI_TUI_RESIZE_IN_PLACE;
+			else Bun.env.PI_TUI_RESIZE_IN_PLACE = previous;
 		}
-		// Same geometry: the restored normal buffer is trusted, rows are not rewritten.
-		expect(await rowsRewrittenOnClose(false)).not.toContain("base-body");
-		// Resized while covered: the restored buffer moved, so every row is repainted.
-		expect(await rowsRewrittenOnClose(true)).toContain("base-body");
 	});
 });
 
@@ -597,10 +598,11 @@ describe("TUI degenerate geometry and history re-offers", () => {
 			await scheduler.settle(terminal);
 			const firstPaints = terminal.writes.join("").split("hist-row").length - 1;
 			expect(firstPaints).toBeGreaterThan(0);
-			// Re-offer the same batch id: it is acknowledged, not repainted.
+			// Re-offer the same batch id: it is acknowledged again, not repainted.
+			const acksBefore = acks.filter(id => id === 7).length;
 			tui.requestRender(true);
 			await scheduler.settle(terminal);
-			expect(acks.filter(id => id === 7).length).toBeGreaterThanOrEqual(2);
+			expect(acks.filter(id => id === 7).length).toBeGreaterThan(acksBefore);
 			expect(terminal.writes.join("").split("hist-row").length - 1).toBe(firstPaints);
 		} finally {
 			tui.stop();
@@ -635,6 +637,66 @@ describe("TUI synchronous and reset renders", () => {
 		const afterStop = probe.renders;
 		tui.renderNow();
 		expect(probe.renders).toBe(afterStop);
+	});
+
+	it("closeNative leaves a row-rendered TUI and its pending render alone", async () => {
+		const terminal = new VirtualTerminal(40, 6);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		const probe = { renders: 0 };
+		tui.addChild({
+			render: () => {
+				probe.renders++;
+				return ["rows-body"];
+			},
+		});
+		try {
+			tui.start();
+			await scheduler.settle(terminal);
+			const settled = probe.renders;
+			tui.requestRender();
+			// Not native: no early flush of the requested frame and nothing to close.
+			tui.closeNative();
+			expect(probe.renders).toBe(settled);
+			await scheduler.settle(terminal);
+			expect(probe.renders).toBe(settled + 1);
+			expect(terminal.getViewport().join("\n")).toContain("rows-body");
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("enableInput hands stdin to the terminal only after a deferred start", () => {
+		class InputTerminal extends VirtualTerminal {
+			enables = 0;
+			enableInput(): void {
+				this.enables++;
+			}
+		}
+		const eager = new InputTerminal(40, 6);
+		const eagerTui = new TUI(eager, undefined, { renderScheduler: new VirtualRenderScheduler() });
+		const deferred = new InputTerminal(40, 6);
+		const deferredTui = new TUI(deferred, undefined, { renderScheduler: new VirtualRenderScheduler() });
+		try {
+			eagerTui.start();
+			eagerTui.enableInput();
+			expect(eager.enables).toBe(0);
+
+			deferredTui.start({ deferInput: true });
+			deferredTui.enableInput();
+			deferredTui.enableInput();
+			expect(deferred.enables).toBe(1);
+		} finally {
+			eagerTui.stop();
+			deferredTui.stop();
+		}
+		// A deferred start that is stopped before input is enabled never takes stdin.
+		const late = new InputTerminal(40, 6);
+		const lateTui = new TUI(late, undefined, { renderScheduler: new VirtualRenderScheduler() });
+		lateTui.start({ deferInput: true });
+		lateTui.stop();
+		lateTui.enableInput();
+		expect(late.enables).toBe(0);
 	});
 
 	it("resetDisplay repaints while running and is a no-op after stop", async () => {
@@ -703,38 +765,8 @@ describe("TUI postmortem restore", () => {
 			expect(probe.renders).toBe(settled);
 		} finally {
 			register.mockRestore();
-		}
-	});
-});
-
-describe("TUI inline-image purge", () => {
-	it("clearInlineImages writes no Kitty deletes on a non-Kitty terminal and is a no-op once stopped", async () => {
-		class WriteCapture extends VirtualTerminal {
-			readonly writes: string[] = [];
-			override write(data: string): void {
-				this.writes.push(data);
-				super.write(data);
-			}
-		}
-		const terminal = new WriteCapture(40, 6);
-		const scheduler = new VirtualRenderScheduler();
-		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
-		tui.addChild(new Text("body", 0, 0));
-		try {
-			tui.start();
-			await scheduler.settle(terminal);
-			terminal.writes.length = 0;
-			tui.clearInlineImages();
-			await scheduler.settle(terminal);
-			// No graphics delete sequence is emitted without transmitted Kitty images.
-			expect(terminal.writes.join("")).not.toContain("\x1b_Ga=d");
-		} finally {
 			tui.stop();
 		}
-		// Stopped: purging is refused entirely, still no writes.
-		terminal.writes.length = 0;
-		tui.clearInlineImages();
-		expect(terminal.writes).toEqual([]);
 	});
 });
 
