@@ -1,4 +1,5 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
@@ -11,6 +12,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import { InteractiveMode } from "../src/modes/interactive-mode";
+import { formatMCPConnectionStatusMessage, type McpConnectionFailure } from "../src/mcp/startup-events";
 import { cfgStartupQuiet, cfgTuiMouse } from "@oh-my-pi/pi-coding-agent/modes/settings";
 import { cfgGoalContinuationModes, cfgGoalEnabled } from "../src/goals/settings";
 import type { SubmittedUserInput } from "@oh-my-pi/pi-coding-agent/modes/types";
@@ -174,21 +176,53 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		void m.editor.placeholder?.();
 	});
 
-	it("routes LSP and MCP startup events from the session event bus", () => {
+	it("warns about LSP startup failures only when startup is not quiet", () => {
 		const bus = new EventBus();
 		const m = createMode(bus);
-		// quiet startup: the LSP handler returns before touching the transcript
+		const showWarning = vi.spyOn(m, "showWarning").mockImplementation(() => {});
 		bus.emit("lsp:startup", { type: "failed", error: "no servers" });
+		expect(showWarning).not.toHaveBeenCalled();
 		cfgStartupQuiet.set(Settings.instance, false);
 		bus.emit("lsp:startup", { type: "failed", error: "no servers" });
-		bus.emit("lsp:startup", { type: "completed", servers: [] });
-		// malformed MCP payloads are logged and dropped
-		bus.emit("mcp:connection-status", { nope: true });
+		expect(showWarning).toHaveBeenLastCalledWith("LSP startup failed: no servers. It will retry lazily on write.");
+		bus.emit("lsp:startup", { type: "completed", servers: [{ name: "tsserver", status: "error", error: "spawn ENOENT" }] });
+		expect(showWarning).toHaveBeenLastCalledWith("LSP startup failed for tsserver: spawn ENOENT. It will retry lazily on write.");
+		bus.emit("lsp:startup", {
+			type: "completed",
+			servers: [
+				{ name: "tsserver", status: "error" },
+				{ name: "pyright", status: "error" },
+			],
+		});
+		expect(showWarning).toHaveBeenLastCalledWith("LSP startup failed for tsserver, pyright. It will retry lazily on write.");
+		showWarning.mockClear();
+		bus.emit("lsp:startup", { type: "completed", servers: [{ name: "tsserver", status: "ready" }] });
+		expect(showWarning).not.toHaveBeenCalled();
+	});
+
+	it("tracks each MCP server through connecting, connected, failed and reconnecting in one status line", () => {
+		const bus = new EventBus();
+		const m = createMode(bus);
+		const showStatus = vi.spyOn(m, "showStatus").mockImplementation(() => {});
+		// quiet startup posts nothing; malformed payloads are dropped
 		bus.emit("mcp:connection-status", { type: "connecting", serverNames: ["srv1"] });
+		cfgStartupQuiet.set(Settings.instance, false);
+		bus.emit("mcp:connection-status", { nope: true });
+		expect(showStatus).not.toHaveBeenCalled();
+		const status = (pendingServers: string[], connectedServers: string[], failedServers: McpConnectionFailure[]) =>
+			formatMCPConnectionStatusMessage({ pendingServers, connectedServers, failedServers });
+		bus.emit("mcp:connection-status", { type: "connecting", serverNames: ["srv1", "srv2"] });
+		expect(showStatus).toHaveBeenLastCalledWith(status(["srv1", "srv2"], [], []), { toast: false });
 		bus.emit("mcp:connection-status", { type: "connected", serverName: "srv1" });
+		expect(showStatus).toHaveBeenLastCalledWith(status(["srv2"], ["srv1"], []), { toast: false });
 		bus.emit("mcp:connection-status", { type: "failed", serverName: "srv1", error: "boom" });
+		expect(showStatus).toHaveBeenLastCalledWith(
+			status(["srv2"], [], [{ serverName: "srv1", error: "boom", sourcePath: undefined }]),
+			{ toast: false },
+		);
 		bus.emit("mcp:connection-status", { type: "reconnecting", serverName: "srv1" });
-		expect(m).toBeDefined();
+		expect(showStatus).toHaveBeenLastCalledWith(status(["srv1", "srv2"], [], []), { toast: false });
+		expect(showStatus.mock.calls.at(-1)?.[0]).toContain("srv1");
 	});
 
 	it("reacts to editor geometry callbacks, mouse settings and judgment progress", () => {
@@ -224,24 +258,39 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		m.statusLine.onNativePullRequest?.(undefined as never);
 	});
 
-	it("initializes once and refreshes the title system prompt", async () => {
+	it("initializes once: a second init neither re-subscribes nor re-arms anything", async () => {
 		const m = createMode();
 		await m.init({ suppressWelcomeIntro: true });
-		expect(m.isInitialized).toBe(true);
-		await m.init({ suppressWelcomeIntro: true }); // second init is a no-op
-		await m.refreshTitleSystemPrompt(tempDir.path());
+		const subscribe = vi.spyOn(m.session, "subscribe");
+		const keybindings = m.keybindings;
+		await m.init({ suppressWelcomeIntro: true });
+		expect(subscribe).not.toHaveBeenCalled();
+		expect(m.keybindings).toBe(keybindings);
 	});
 
-	it("refreshes skill and slash-command state and accepts autocomplete providers", async () => {
+	it("reloads the title system prompt from an explicit cwd", async () => {
+		const m = createMode();
+		const prompts = path.join(tempDir.path(), "explicit-cwd");
+		const setTitle = vi.spyOn(m.session, "setTitleSystemPrompt");
+		await m.refreshTitleSystemPrompt(prompts);
+		expect(setTitle).toHaveBeenCalledTimes(1);
+	});
+
+	it("rebuilds the slash-command picker from reloaded file commands", async () => {
 		const m = createMode();
 		await m.init({ suppressWelcomeIntro: true });
+		const setCommands = vi.spyOn(m.session, "setSlashCommands");
+		const createProvider = vi.spyOn(InputController.prototype, "createAutocompleteProvider");
+		await m.refreshSlashCommandState(tempDir.path(), [
+			{ name: "review-pr", description: "Review a PR", argumentHint: "<number>\nor url" } as never,
+		]);
+		expect(setCommands).toHaveBeenCalledWith([expect.objectContaining({ name: "review-pr" })]);
+		const picked = createProvider.mock.calls.at(-1)?.[0].find(command => command.name === "review-pr");
+		expect(picked).toMatchObject({ description: "Review a PR", iconName: "prompt", argumentHint: "<number> or url" });
+		// skill reloads go through the session; its metadata notification rebuilds the picker
+		const refreshSkills = vi.spyOn(m.session, "refreshSkills");
 		await m.refreshSkillState();
-		await m.refreshSlashCommandState(tempDir.path());
-		m.addAutocompleteProvider(current => current);
-		m.disableGoalMode();
-		m.disableLoopMode();
-		m.holdGoalContinuation();
-		expect(m.editor).toBeDefined();
+		expect(refreshSkills).toHaveBeenCalledTimes(1);
 	});
 
 	it("applies a cwd change to a sibling directory", async () => {
@@ -260,7 +309,7 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		await m.init({ suppressWelcomeIntro: true });
 		const other = TempDir.createSync("@pi-c2-bad-");
 		try {
-			const fs = await import("node:fs");
+			// a directory where the project settings file should be
 			fs.mkdirSync(path.join(other.path(), ".claude"), { recursive: true });
 			fs.mkdirSync(path.join(other.path(), ".claude", "settings.yml"), { recursive: true });
 			// the settings loader tolerates an unreadable project file; the switch commits
@@ -312,10 +361,9 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		const m = createMode();
 		await m.init({ suppressWelcomeIntro: true });
 		expect(hasTranscriptActions()).toBe(true);
-		expect(runTranscriptAction({ act: "copy", text: "hello" })).toBe(true);
+		const retry = vi.spyOn(InputController.prototype, "handleRetry").mockResolvedValue(undefined as never);
 		expect(runTranscriptAction({ act: "retry" })).toBe(true);
-		expect(runTranscriptAction({ act: "resume", path: "/nonexistent/session.jsonl" })).toBe(true);
-		await new Promise(resolve => setTimeout(resolve, 50));
+		expect(retry).toHaveBeenCalledTimes(1);
 	});
 
 	it("refuses a cwd change to a missing directory", async () => {
@@ -343,20 +391,17 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		expect(m.goalModeEnabled).toBe(false);
 	});
 
-	it("routes status-line native actions to their commands", async () => {
+	it("routes status-line context and cost clicks to their commands", async () => {
 		const m = createMode();
 		await m.init({ suppressWelcomeIntro: true });
+		const context = vi.spyOn(m, "handleContextCommand").mockResolvedValue(undefined as never);
+		const usage = vi.spyOn(m, "handleUsageCommand").mockResolvedValue(undefined as never);
 		m.statusLine.onNativeAction?.("status.context");
+		expect(context).toHaveBeenCalledTimes(1);
+		expect(usage).not.toHaveBeenCalled();
 		m.statusLine.onNativeAction?.("status.cost");
-		await new Promise(resolve => setTimeout(resolve, 20));
-	});
-
-	it("re-arms the idle checkpoint when its bound changes", async () => {
-		const m = createMode();
-		await m.init({ suppressWelcomeIntro: true });
-		cfgSessionIdleCheckpointMs.set(Settings.instance, 60_000);
-		cfgSessionIdleCheckpointMs.set(Settings.instance, 0);
-		expect(m.isInitialized).toBe(true);
+		expect(usage).toHaveBeenCalledTimes(1);
+		expect(context).toHaveBeenCalledTimes(1);
 	});
 
 	it("auto-submits the loop prompt as the next user input", async () => {
@@ -366,10 +411,7 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		expect(await m.handleLoopCommand("again please")).toBe("again please");
 		m.setLoopPrompt("again please");
 		m.armLoopAutoSubmit();
-		const input = await Promise.race([
-			m.getUserInput(),
-			new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), 2500)),
-		]);
+		const input = await Promise.race([m.getUserInput(), Bun.sleep(2500).then(() => undefined)]);
 		expect(input?.text).toBe("again please");
 		m.disableLoopMode();
 	});
