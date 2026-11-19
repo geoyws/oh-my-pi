@@ -602,6 +602,12 @@ const GOAL_SUBCOMMANDS = new Set<GoalSubcommand>(["set", "show", "pause", "resum
 const PLAN_KEEP_CONTEXT_OPTION_INDEX = 2;
 const PLAN_KEEP_CONTEXT_DISABLE_THRESHOLD_PERCENT = 95;
 const PLAN_SAVE_AND_QUIT_OPTION = "Save and quit";
+/** Status line `#exitGoalMode` shows for each exit reason when it is not silent. */
+const GOAL_EXIT_STATUS = {
+	completed: "Goal mode completed.",
+	dropped: "Goal dropped.",
+	paused: "Goal mode paused.",
+} as const;
 const PLAN_SAVE_TITLE_LINE_LIMIT = 6;
 
 const CFG_APPROVE_SESSION = "Always for this session";
@@ -6270,12 +6276,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		);
 	}
 
-	async #enterGoalMode(options: {
-		objective?: string;
-		tokenBudget?: number;
-		resume?: boolean;
-		silent?: boolean;
-	}): Promise<void> {
+	async #enterGoalMode(
+		options: { silent?: boolean } & ({ resume: true } | { resume?: false; objective: string; tokenBudget?: number }),
+	): Promise<void> {
 		using _hold = this.#holdModeChanges();
 		if (this.goalModeEnabled) {
 			return;
@@ -6296,7 +6299,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			state = options.resume
 				? await this.session.goalRuntime.resumeGoal()
 				: await this.session.goalRuntime.createGoal({
-						objective: options.objective ?? "",
+						objective: options.objective,
 						tokenBudget: options.tokenBudget,
 					});
 			await this.session.setActiveToolsByName(goalTools);
@@ -6325,10 +6328,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 	}
 
-	async #exitGoalMode(options?: {
+	async #exitGoalMode(options: {
 		silent?: boolean;
 		paused?: boolean;
-		reason?: "completed" | "paused" | "dropped";
+		reason: "completed" | "paused" | "dropped";
 	}): Promise<void> {
 		using _hold = this.#holdModeChanges();
 		const previousTools = this.#goalModePreviousTools;
@@ -6338,7 +6341,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			await this.session.setActiveToolsByName(previousTools);
 		}
 		const currentState = this.session.getGoalModeState();
-		if (options?.reason === "completed") {
+		if (options.reason === "completed") {
 			this.session.setGoalModeState(undefined);
 			this.sessionManager.appendModeChange("none");
 			this.sessionManager.appendCustomEntry("goal-completed", {
@@ -6349,7 +6352,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			});
 		}
 		this.goalModeEnabled = false;
-		this.goalModePaused = options?.paused ?? false;
+		this.goalModePaused = options.paused ?? false;
 		this.#goalModePreviousTools = undefined;
 		this.#pendingGoalContinuationTurns = 0;
 		this.#previousGoalContinuationActivity = undefined;
@@ -6357,17 +6360,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#cancelGoalContinuation();
 		this.syncIdleMaintenanceView();
 		this.#updateGoalModeStatus();
-		if (!options?.silent) {
-			if (options?.reason === "completed") {
-				this.showStatus("Goal mode completed.");
-			} else if (options?.reason === "dropped") {
-				this.showStatus("Goal dropped.");
-			} else if (options?.paused) {
-				this.showStatus("Goal mode paused.");
-			} else {
-				this.showStatus("Goal mode disabled.");
-			}
-		}
+		if (!options.silent) this.showStatus(GOAL_EXIT_STATUS[options.reason]);
 	}
 
 	async #readPlanFile(planFilePath: string): Promise<string | null> {
@@ -6532,9 +6525,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			if (!approves || !pending.selectTier?.(input.role)) return false;
 		}
 		pending.remote = { choice, feedback: feedback ?? "" };
-		if (pick(option.label)) return true;
-		pending.remote = undefined;
-		return false;
+		return pick(option.label);
 	}
 
 	#getPlanApprovalContextUsage(): ContextUsage | undefined {
@@ -7268,7 +7259,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		try {
 			await entry;
 		} finally {
-			if (this.#vibeModeEntry === entry) this.#vibeModeEntry = undefined;
+			// Concurrent entries join this one instead of replacing it, so it is still the stored entry.
+			this.#vibeModeEntry = undefined;
 		}
 	}
 
