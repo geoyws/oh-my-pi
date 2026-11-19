@@ -52,12 +52,25 @@ describe("TUI provider line fitting", () => {
 		expect(viewport[0]).toContain("😀");
 	});
 
-	it("passes a short line with an unterminated ANSI sequence through fitting verbatim", async () => {
+	// A sequence left open at the end of a line would swallow the row's SGR reset
+	// and leak "[0m" as text (t-54b2ea43); the short-line path cuts it as the
+	// giant-line path does. `kept` is what must reach the terminal directly
+	// before the row reset.
+	it.each([
+		["an unterminated CSI", "abc\x1b[31", "abc", "abc"],
+		["an unterminated OSC 8", "abc\x1b]8;;https://example.com", "abc", "abc"],
+		["a lone trailing ESC", "abc\x1b", "abc", "abc"],
+		["a dangling CSI after a styled span", "a\x1b[31mb\x1b[0mc\x1b[", "a\x1b[31mb\x1b[0mc", "abc"],
+		["an ESC pair", "abc\x1b\x1b", "abc", "abc"],
+		["an ESC before an unterminated CSI", "abc\x1b\x1b[31", "abc", "abc"],
+		["an OSC ending in a bare ESC", "abc\x1b]8;;u\x1b", "abc", "abc"],
+		["nothing from a complete two-byte escape", "abc\x1b7d", "abc\x1b7d", "abcd"],
+	])("cuts %s from a short line before the row reset", async (_name, line, kept, visible) => {
 		const terminal = new VirtualTerminal(10, 6);
 		const scheduler = new VirtualRenderScheduler();
 		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
 		tui.setFrameProvider({
-			renderFrame: () => ({ viewport: ["abc\x1b[31"] }),
+			renderFrame: () => ({ viewport: [line] }),
 			acknowledgeHistory() {},
 		});
 		const frames: string[] = [];
@@ -70,11 +83,8 @@ describe("TUI provider line fitting", () => {
 		} finally {
 			tui.stop();
 		}
-		// Characterization of known defect t-54b2ea43: within the budget the line is not
-		// cut, so the dangling CSI reaches the terminal as written and swallows the
-		// row's SGR reset, leaving "[0m" visible. Update when that row lands.
-		expect(frames.join("")).toContain("abc\x1b[31");
-		expect(terminal.getViewport()[0]!.trimEnd()).toBe("abc[0m");
+		expect(terminal.getViewport()[0]!.trimEnd()).toBe(visible);
+		expect(frames.join("")).toContain(`${kept}\x1b[0m`);
 	});
 
 	it("renders an OSC 8 hyperlink line's visible text", async () => {
