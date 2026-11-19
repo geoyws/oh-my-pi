@@ -54,13 +54,18 @@ describe("TUI provider line fitting", () => {
 
 	// A sequence left open at the end of a line would swallow the row's SGR reset
 	// and leak "[0m" as text (t-54b2ea43); the short-line path cuts it as the
-	// giant-line path does.
+	// giant-line path does. `kept` is what must reach the terminal directly
+	// before the row reset.
 	it.each([
-		["an unterminated CSI", "abc\x1b[31", "abc"],
-		["an unterminated OSC 8", "abc\x1b]8;;https://example.com", "abc"],
-		["a lone trailing ESC", "abc\x1b", "abc"],
-		["a dangling CSI after a styled span", "a\x1b[31mb\x1b[0mc\x1b[", "abc"],
-	])("cuts %s from a short line before the row reset", async (_name, line, visible) => {
+		["an unterminated CSI", "abc\x1b[31", "abc", "abc"],
+		["an unterminated OSC 8", "abc\x1b]8;;https://example.com", "abc", "abc"],
+		["a lone trailing ESC", "abc\x1b", "abc", "abc"],
+		["a dangling CSI after a styled span", "a\x1b[31mb\x1b[0mc\x1b[", "a\x1b[31mb\x1b[0mc", "abc"],
+		["an ESC pair", "abc\x1b\x1b", "abc", "abc"],
+		["an ESC before an unterminated CSI", "abc\x1b\x1b[31", "abc", "abc"],
+		["an OSC ending in a bare ESC", "abc\x1b]8;;u\x1b", "abc", "abc"],
+		["nothing from a complete two-byte escape", "abc\x1b7d", "abc\x1b7d", "abcd"],
+	])("cuts %s from a short line before the row reset", async (_name, line, kept, visible) => {
 		const terminal = new VirtualTerminal(10, 6);
 		const scheduler = new VirtualRenderScheduler();
 		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
@@ -79,9 +84,7 @@ describe("TUI provider line fitting", () => {
 			tui.stop();
 		}
 		expect(terminal.getViewport()[0]!.trimEnd()).toBe(visible);
-		// Everything before the dangling sequence reaches the terminal, followed
-		// directly by the row reset: the open sequence's bytes are gone.
-		expect(frames.join("")).toContain(`${line.slice(0, line.lastIndexOf("\x1b"))}\x1b[0m`);
+		expect(frames.join("")).toContain(`${kept}\x1b[0m`);
 	});
 
 	it("renders an OSC 8 hyperlink line's visible text", async () => {

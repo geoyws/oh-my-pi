@@ -4490,11 +4490,12 @@ export class TUI extends Container {
 			}
 			// A sequence left open at the end of the line would swallow the
 			// segment reset written after it and leak the reset's bytes as text;
-			// cut it as the giant-line path does.
-			if (classification.danglingEscapeAt === undefined) {
-				source = output;
-			} else {
-				source = output.slice(0, classification.danglingEscapeAt);
+			// cut it as the giant-line path does. A cut can expose an ESC that
+			// began the cut sequence's predecessor (`ESC ESC [31`), so repeat
+			// until nothing dangles; each pass strictly shortens the source.
+			source = output;
+			while (classification.danglingEscapeAt !== undefined) {
+				source = source.slice(0, classification.danglingEscapeAt);
 				classification = this.#classifyLine(source, safeWidth);
 			}
 		} else {
