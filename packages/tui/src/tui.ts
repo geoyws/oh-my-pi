@@ -1119,6 +1119,8 @@ export class TUI extends Container {
 	#altPreparedRows: PreparedLine[] = [];
 	#altEnterWidth = 0;
 	#altEnterHeight = 0;
+	/** A forced normal-screen repaint was pending when the alt screen was entered. */
+	#altExitOwesRepaint = false;
 	#resizeAltActive = false;
 	#resizeSettleTimer: RenderTimer | undefined;
 	#suppressResizeUntil = 0;
@@ -4269,6 +4271,10 @@ export class TUI extends Container {
 			this.#altPreparedRows = [];
 			this.#altEnterWidth = width;
 			this.#altEnterHeight = height;
+			// A forced repaint owed to the normal screen (a settled in-place
+			// resize erased it) would be spent on this first alt frame; keep it
+			// for the normal screen the overlay's exit restores.
+			this.#altExitOwesRepaint = this.#forceViewportRepaintOnNextRender;
 		} else if (!wantAlt && this.#altActive) {
 			// Leaving reporting on when the normal buffer wants it restores
 			// inline capture the same frame the overlay closes: no later paint
@@ -4299,6 +4305,8 @@ export class TUI extends Container {
 			// rewrap or a height-grow scrollback pull, while our viewport anchor
 			// stayed frozen. Recover the restored cursor position before any
 			// provider repaint can overwrite history at the stale row.
+			const owedRepaint = this.#altExitOwesRepaint;
+			this.#altExitOwesRepaint = false;
 			if (width !== this.#altEnterWidth || height !== this.#altEnterHeight) {
 				if (this.#frameProvider !== undefined) {
 					this.#resizeProbeWindow = this.#providerWindow;
@@ -4306,6 +4314,8 @@ export class TUI extends Container {
 					this.#beginResizeAnchorProbe();
 					return;
 				}
+				this.#forceViewportRepaintOnNextRender = true;
+			} else if (owedRepaint) {
 				this.#forceViewportRepaintOnNextRender = true;
 			}
 		} else if (wantMouse !== this.#mouseTracking) {
