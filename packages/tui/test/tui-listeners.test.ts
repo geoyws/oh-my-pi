@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { Text, TUI } from "@oh-my-pi/pi-tui";
 import * as postmortem from "@oh-my-pi/pi-utils/postmortem";
+import { TERMINAL_MULTIPLEXER_ENV_KEYS } from "@oh-my-pi/pi-tui/terminal-multiplexer";
 import { VirtualRenderScheduler } from "./virtual-render-scheduler";
 import { VirtualTerminal } from "./virtual-terminal";
 
@@ -271,7 +272,12 @@ describe("TUI provider history flush and component renders", () => {
 		// before the settle and the screen went back to its pre-resize size, so
 		// the settled repaint was spent on the first alt frame and closing the
 		// overlay restored a blank normal screen.
-		const previous = Bun.env.PI_TUI_RESIZE_IN_PLACE;
+		// The live-row erase only happens on a direct terminal: pin one even when
+		// the suite runs inside a multiplexer.
+		const envKeys = [...TERMINAL_MULTIPLEXER_ENV_KEYS, "TERM_PROGRAM", "TERM", "PI_TUI_RESIZE_IN_PLACE"];
+		const savedEnv = new Map(envKeys.map(key => [key, Bun.env[key]]));
+		for (const key of envKeys) delete Bun.env[key];
+		Bun.env.TERM = "xterm-256color";
 		Bun.env.PI_TUI_RESIZE_IN_PLACE = "1";
 		const terminal = new VirtualTerminal(40, 6);
 		const scheduler = new VirtualRenderScheduler();
@@ -298,8 +304,10 @@ describe("TUI provider history flush and component renders", () => {
 			expect(terminal.getViewport().join("\n")).toContain("base-body");
 		} finally {
 			tui.stop();
-			if (previous === undefined) delete Bun.env.PI_TUI_RESIZE_IN_PLACE;
-			else Bun.env.PI_TUI_RESIZE_IN_PLACE = previous;
+			for (const [key, value] of savedEnv) {
+				if (value === undefined) delete Bun.env[key];
+				else Bun.env[key] = value;
+			}
 		}
 	});
 });
