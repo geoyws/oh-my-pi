@@ -13,6 +13,7 @@ import { InteractiveMode } from "../src/modes/interactive-mode";
 import { cfgComposerShape, cfgComposerTokenRate, cfgDisplayPinnedAgents } from "../src/modes/settings";
 import { AgentRegistry } from "../src/registry/agent-registry";
 import { EventBus } from "../src/utils/event-bus";
+import { SessionFocusController } from "../src/modes/controllers/session-focus-controller";
 import { useConstructedInteractiveMode } from "./helpers/constructed-interactive-mode";
 
 function nodes(root: NativeNode): NativeNode[] {
@@ -348,10 +349,14 @@ describe("InteractiveMode constructed surface (C1)", () => {
 			}
 		});
 
-		it("leaves focus untouched when asked for a parent or to drop a pending focus with none in flight", async () => {
+		it("hands parent focus and pending-focus invalidation to the focus controller, leaving an unfocused view as is", async () => {
 			const m = createMode();
+			const invalidate = vi.spyOn(SessionFocusController.prototype, "invalidatePendingFocus");
+			const parent = vi.spyOn(SessionFocusController.prototype, "focusParent");
 			m.invalidatePendingFocus();
 			await m.focusParentSession();
+			expect(invalidate).toHaveBeenCalledTimes(1);
+			expect(parent).toHaveBeenCalledTimes(1);
 			expect(m.focusedAgentId).toBeUndefined();
 			expect(m.viewSession).toBe(m.session);
 		});

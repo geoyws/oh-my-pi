@@ -225,17 +225,15 @@ describe("renderSubagentHudLines", () => {
 		// With the connector width reserved, the description is cut to the row with an ellipsis.
 		expect(lastRow()).toMatch(/x…$/);
 		const original = treeList.renderTreeList;
-		const spy = vi
-			.spyOn(treeList, "renderTreeList")
-			.mockImplementation((options, listTheme) =>
-				original(
-					{
-						...options,
-						renderItem: (item, context) => options.renderItem(item, { ...context, prefixWidth: undefined }),
-					},
-					listTheme,
-				),
-			);
+		const spy = vi.spyOn(treeList, "renderTreeList").mockImplementation((options, listTheme) =>
+			original(
+				{
+					...options,
+					renderItem: (item, context) => options.renderItem(item, { ...context, prefixWidth: undefined }),
+				},
+				listTheme,
+			),
+		);
 		try {
 			// Without it the row overruns by the connector width and only the outer clamp cuts it, bare.
 			const row = lastRow();
@@ -330,7 +328,8 @@ describe("Subagent HUD live previews and hit-map fallback", () => {
 			},
 		] as never;
 		const out = renderSubagentHudLines(sessions, 120, false, true).join("\n");
-		expect(Bun.stripANSI(out)).toContain("read the config");
+		// a call running past the threshold shows its elapsed time after the detail
+		expect(Bun.stripANSI(out)).toMatch(/read: read the config.+1m/);
 		const recent = [
 			{
 				kind: "subagent",
@@ -349,7 +348,8 @@ describe("Subagent HUD live previews and hit-map fallback", () => {
 			},
 		] as never;
 		const fresh = renderSubagentHudLines(recent, 120, false, true).join("\n");
-		expect(Bun.stripANSI(fresh)).toContain("read the config");
+		// a call that just started shows no marker
+		expect(Bun.stripANSI(fresh).split("\n").at(-1)!.trimEnd()).toEndWith("read: read the config");
 	});
 });
 
