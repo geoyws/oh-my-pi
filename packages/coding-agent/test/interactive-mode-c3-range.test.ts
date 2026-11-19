@@ -1,3 +1,4 @@
+import { appKey } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -400,6 +401,29 @@ describe("InteractiveMode constructed surface (C3)", () => {
 			expect(m.editor.getText()).toBe("with images");
 		});
 
+		it("gives back a cancelled or dropped prompt's images, each with no link", () => {
+			let dropped: ((prompt: never) => void) | undefined;
+			const m = createMode(undefined, {
+				beforeMode: session => {
+					vi.spyOn(session, "setPromptDropped").mockImplementation(callback => {
+						dropped = callback as never;
+					});
+				},
+			});
+			const image = { type: "image", data: "aGk=", mimeType: "image/png" } as never;
+			m.startPendingSubmission({ text: "see [Image #1]", images: [image] });
+			expect(m.cancelPendingSubmission()).toBe(true);
+			expect(m.editor.pendingImages).toEqual([image]);
+			expect(m.editor.pendingImageLinks).toEqual([undefined]);
+			m.editor.setText("");
+			m.editor.pendingImages = [];
+			m.editor.pendingImageLinks = [];
+			dropped!({ text: "dropped pic", images: [image] } as never);
+			expect(m.editor.pendingImages).toEqual([image]);
+			expect(m.editor.pendingImageLinks).toEqual([undefined]);
+			expect(m.editor.getText()).toBe("dropped pic");
+		});
+
 		it("starts only the pending, uncancelled submission", async () => {
 			const m = await initialized();
 			const pending = m.startPendingSubmission({ text: "go" });
@@ -467,6 +491,8 @@ describe("InteractiveMode constructed surface (C3)", () => {
 			m.pendingTools.set("r1", shared as never);
 			m.pendingTools.set("r2", shared as never);
 			m.pendingTools.set("live", live as never);
+			// a settled tool whose row already left the chat is simply dropped
+			m.pendingTools.set("gone", row("gone") as never);
 			Object.defineProperty(m.session, "isStreaming", { configurable: true, get: () => true });
 			const kept = { role: "user", content: [], timestamp: 1 } as never;
 			const dropped = { role: "user", content: [], timestamp: 2 } as never;
@@ -479,6 +505,7 @@ describe("InteractiveMode constructed surface (C3)", () => {
 					toolResult("done", { async: { state: "completed" } }),
 					toolResult("bg", { async: { state: "running" } }),
 					toolResult("r1"),
+					toolResult("gone"),
 				],
 			};
 			vi.spyOn(m.session, "buildTranscriptSessionContext").mockReturnValue(context as never);
@@ -694,6 +721,16 @@ describe("InteractiveMode constructed surface (C3)", () => {
 			expect(piTui.visibleWidth(wide[1]!)).toBe(80);
 		});
 
+		it("right-aligns the TODO summary when the last child line is missing", async () => {
+			const m = await initialized();
+			m.setTodos([{ name: "Ship", tasks: [{ content: "release", status: "pending" }] }]);
+			const [lead, line] = m.renderCompactStatusLine(80, [undefined as never]);
+			expect(lead).toBe("");
+			expect(line!.startsWith(" ")).toBe(true);
+			expect(Bun.stripANSI(line!)).toContain("release");
+			expect(piTui.visibleWidth(line!)).toBe(80);
+		});
+
 		it("falls back to the stdout height, then 24 rows, for compact todo mode", () => {
 			const m = createMode();
 			Object.defineProperty(m.ui.terminal, "rows", { configurable: true, get: () => undefined });
@@ -708,6 +745,28 @@ describe("InteractiveMode constructed surface (C3)", () => {
 				if (rows) Object.defineProperty(process.stdout, "rows", rows);
 				else Reflect.deleteProperty(process.stdout, "rows");
 			}
+		});
+
+		it("names the agent hub key in the HUD only when one is bound", async () => {
+			const { sessions, notify } = observe();
+			const m = await initialized();
+			vi.useFakeTimers();
+			const hint = appKey(m.keybindings, "app.agents.hub");
+			expect(hint).not.toBe("");
+			sessions.push(subagent({ id: "Alpha", description: "index files" }));
+			const hudText = () => Bun.stripANSI(m.subagentContainer.render(120).join("\n"));
+			notify("lifecycle");
+			vi.advanceTimersByTime(100);
+			expect(hudText()).toContain(Bun.stripANSI(hint));
+			const getKeys = m.keybindings.getKeys.bind(m.keybindings);
+			vi.spyOn(m.keybindings, "getKeys").mockImplementation(action =>
+				action === "app.agents.hub" ? [] : getKeys(action),
+			);
+			sessions[0] = subagent({ id: "Alpha", description: "index more files" });
+			notify("lifecycle");
+			vi.advanceTimersByTime(100);
+			expect(hudText()).toContain("index more files");
+			expect(hudText()).not.toContain(Bun.stripANSI(hint));
 		});
 
 		it("paints, updates, keeps and clears the pinned subagent HUD and ticks its live preview", async () => {
@@ -804,6 +863,13 @@ describe("InteractiveMode constructed surface (C3)", () => {
 			} finally {
 				fs.rmSync(root, { recursive: true, force: true });
 			}
+		});
+
+		it("falls back to local://PLAN.md without a session plan reference", async () => {
+			const m = await initialized();
+			vi.spyOn(m.session, "getPlanReferencePath").mockReturnValue("" as never);
+			await m.handlePlanModeCommand();
+			expect(m.planModePlanFilePath).toBe("local://PLAN.md");
 		});
 
 		it("resolves the vibe parent's active model, or none without one", async () => {
@@ -903,11 +969,25 @@ describe("InteractiveMode constructed surface (C3)", () => {
 			expect(submitted).toHaveLength(3);
 		});
 
-		it("ends a guided goal interview once a turn makes tool calls", async () => {
-			const m = await initialized();
+		it("keeps a guided goal interview through a stateless goal update and ends it once a turn makes tool calls", async () => {
+			const listeners: Array<(event: never) => void> = [];
+			const m = createMode(undefined, {
+				beforeMode: session => {
+					const subscribe = session.subscribe.bind(session);
+					vi.spyOn(session, "subscribe").mockImplementation(listener => {
+						listeners.push(listener as never);
+						return subscribe(listener);
+					});
+				},
+			});
+			await m.init({ suppressWelcomeIntro: true });
 			cfgGoalEnabled.override(m.session.settings, true);
 			vi.spyOn(m.session, "prompt").mockResolvedValue(true as never);
 			await m.handleGuidedGoalCommand("ship it");
+			expect(m.isGuidedGoalInterviewActive()).toBe(true);
+			// an update carrying no goal state does not end the interview
+			for (const listener of listeners) listener({ type: "goal_updated", state: undefined } as never);
+			await Promise.resolve();
 			expect(m.isGuidedGoalInterviewActive()).toBe(true);
 			const delivered = Promise.withResolvers<void>();
 			const off = m.session.subscribe(event => {
