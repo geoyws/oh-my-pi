@@ -168,6 +168,43 @@ describe("Container render memoization", () => {
 	});
 });
 
+describe("Container native describe memoization", () => {
+	const cx = {} as Parameters<Container["describe"]>[0];
+
+	it("describes children as a column and memoizes the identical node", () => {
+		const container = new Container();
+		const first = new Probe(["a"]);
+		const second = new Probe(["b"]);
+		container.addChild(first);
+		container.addChild(second);
+
+		const node = container.describe(cx);
+		expect(node?.k).toBe("col");
+		expect(node?.c).toEqual([first, second]);
+		// Unchanged child list returns the identical reference so the
+		// reconciler can skip this container.
+		expect(container.describe(cx)).toBe(node);
+	});
+
+	it("rebuilds the node when a child is added or removed", () => {
+		const container = new Container();
+		const first = new Probe(["a"]);
+		container.addChild(first);
+		const before = container.describe(cx);
+
+		const second = new Probe(["b"]);
+		container.addChild(second);
+		const afterAdd = container.describe(cx);
+		expect(afterAdd).not.toBe(before);
+		expect(afterAdd?.c).toEqual([first, second]);
+
+		container.removeChild(first);
+		const afterRemove = container.describe(cx);
+		expect(afterRemove).not.toBe(afterAdd);
+		expect(afterRemove?.c).toEqual([second]);
+	});
+});
+
 describe("Box render memoization", () => {
 	it("returns the identical reference across renders at a fixed width", () => {
 		const box = new Box(1, 1);

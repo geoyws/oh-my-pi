@@ -191,6 +191,8 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			cost: 0.03,
 			running: false,
 		});
+		// positive control: the finished batch is still on screen inside its retain window
+		expect(m.progressHudContainer.render(100).join("\n")).toContain("grade answers");
 		m.stop();
 		const render = vi.spyOn(m.ui, "requestRender");
 		// the retain window would otherwise fire into the stopped UI
@@ -283,6 +285,13 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		const start = vi.spyOn(m.composer, "start");
 		await m.init({ clearInitialTerminalHistory: true });
 		expect(start).toHaveBeenCalledWith({ clearScrollback: true, playWelcomeIntro: true });
+	});
+
+	it("starts the composer with neither the welcome intro nor a scrollback clear when init suppresses them", async () => {
+		const m = createMode();
+		const start = vi.spyOn(m.composer, "start");
+		await m.init({ suppressWelcomeIntro: true });
+		expect(start).toHaveBeenCalledWith({ clearScrollback: false, playWelcomeIntro: false });
 	});
 
 	it("toggles loop mode with /loop, pausing in between", async () => {
@@ -1005,6 +1014,7 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			const submit = vi.spyOn(m, "startPendingSubmission");
 			const compact = vi.spyOn(m, "handleCompactCommand").mockImplementation(async () => {
 				m.loopPrompt = "replaced mid-compaction";
+				return "ok";
 			});
 			vi.useFakeTimers();
 			void m.getUserInput();
@@ -1024,6 +1034,7 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			const showStatus = vi.spyOn(m, "showStatus");
 			compact.mockImplementation(async () => {
 				vi.spyOn(Date, "now").mockReturnValue(Date.now() + 120_000);
+				return "ok";
 			});
 			void m.getUserInput();
 			vi.advanceTimersByTime(800);
@@ -1197,7 +1208,7 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		const flush = async () => {
 			for (let i = 0; i < 10; i++) await Promise.resolve();
 		};
-		const renderText = (component: { render(width: number): string[] }) => component.render(100).join("\n");
+		const renderText = (component: { render(width: number): readonly string[] }) => component.render(100).join("\n");
 
 		it("routes cfg:// applied changes for this session only", async () => {
 			const hostSpy = vi.spyOn(cfgProtocol, "setCfgApprovalHost");
@@ -1240,7 +1251,7 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			expect(todoSpy.mock.calls.at(-1)?.[0]()).toEqual([]);
 			const writer = blobSpy.mock.calls.at(-1)?.[0];
 			const putBlob = vi.spyOn(m.sessionManager, "putBlobSync");
-			writer?.(new Uint8Array([1, 2, 3]), { mimeType: "image/png" } as never);
+			writer?.(Buffer.from([1, 2, 3]), { mimeType: "image/png" } as never);
 			expect(putBlob).toHaveBeenCalledTimes(1);
 		});
 
@@ -1302,10 +1313,10 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			const open = vi.spyOn(openModule, "openPath").mockImplementation(() => {});
 			const m = createMode();
 			const showWarning = vi.spyOn(m, "showWarning").mockImplementation(() => {});
-			noticeSpy.mock.calls.at(-1)?.[0]("Codex limits reset in 5m");
+			noticeSpy.mock.calls.at(-1)?.[0]?.("Codex limits reset in 5m");
 			expect(showWarning).toHaveBeenCalledWith("Codex limits reset in 5m");
 			const event = { kind: "reset" } as never;
-			fireworksSpy.mock.calls.at(-1)?.[0](event);
+			fireworksSpy.mock.calls.at(-1)?.[0]?.(event);
 			expect(show).toHaveBeenCalledWith(event);
 			const modelSelector = vi.spyOn(m, "showModelSelector").mockImplementation(() => {});
 			const gitUi = vi.spyOn(m, "showGitUi").mockImplementation(() => {});
@@ -1383,6 +1394,8 @@ describe("InteractiveMode constructed surface (C2)", () => {
 					truncated: false,
 					selectedEntries: 1,
 					totalUnseenEntries: 1,
+					changeCount: 1,
+					categoryCounts: {},
 					latestVersion: "9.9.9",
 				},
 			});
@@ -1473,7 +1486,7 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		const flush = async () => {
 			for (let i = 0; i < 20; i++) await Promise.resolve();
 		};
-		const renderAll = (components: ReadonlyArray<{ render(width: number): string[] }>) =>
+		const renderAll = (components: ReadonlyArray<{ render(width: number): readonly string[] }>) =>
 			components.map(component => component.render(100).join("\n")).join("\n");
 		const nextImmediate = () => {
 			const { promise, resolve } = Promise.withResolvers<void>();

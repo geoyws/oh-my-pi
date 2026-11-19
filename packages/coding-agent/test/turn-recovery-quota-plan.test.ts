@@ -342,8 +342,10 @@ describe("TurnRecovery quota recovery planning", () => {
 
 	it("plans and announces a wake when only the active account's own wait fits the cap and every sibling stays blocked", async () => {
 		const now = Date.now();
-		const resetAt = now + 1_000;
-		const siblingBlocked = depleted(2, now + 60_000, true);
+		// Scheduler waits are mocked, so these spans cost no test time; they only need
+		// to outlast a process stall before the planner's first health read.
+		const resetAt = now + 30_000;
+		const siblingBlocked = depleted(2, now + 10 * 60_000, true);
 		stubHealth(
 			[
 				{ "anthropic/claude-sonnet-4-5": pool([depleted(1, resetAt, true), siblingBlocked]) },
@@ -351,15 +353,18 @@ describe("TurnRecovery quota recovery planning", () => {
 			],
 			[resetAt],
 		);
-		// The only other account frees well past the one-second cap.
-		vi.spyOn(authStorage.limits, "markReached").mockResolvedValue({ switched: false, retryAtMs: now + 59_000 });
+		// The only other account frees well past the one-minute cap.
+		vi.spyOn(authStorage.limits, "markReached").mockResolvedValue({
+			switched: false,
+			retryAtMs: now + 10 * 60_000 - 1_000,
+		});
 		mockSchedulerWaitWithClock();
 		const { recovery, failure } = createRecovery({
 			"retry.modelFallback": false,
 			"retry.waitForUsageReset": true,
-			"retry.maxDelayMs": 1_000,
+			"retry.maxDelayMs": 60_000,
 		});
-		failure.errorMessage = `${QUOTA_ERROR} retry-after-ms=1000`;
+		failure.errorMessage = `${QUOTA_ERROR} retry-after-ms=30000`;
 
 		await recovery.recordUsageLimitOutcome(failure);
 		expect(await recovery.handleRetryableError(failure)).toBe(true);
