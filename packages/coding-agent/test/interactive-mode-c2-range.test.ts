@@ -1,14 +1,8 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { type } from "@oh-my-pi/omptype";
-import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
-import { type Api, Effort, type Model } from "@oh-my-pi/pi-ai";
-import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { initTheme } from "@oh-my-pi/pi-tui/theme";
-import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { Api, Model } from "@oh-my-pi/pi-ai";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import { InteractiveMode } from "../src/modes/interactive-mode";
@@ -59,102 +53,16 @@ import {
 } from "@oh-my-pi/pi-coding-agent/modes/settings";
 import * as piUtils from "@oh-my-pi/pi-utils";
 import * as settingsModule from "@oh-my-pi/pi-coding-agent/config/settings";
-import * as ownerCheckpoint from "../src/session/owner-checkpoint";
 import * as loopCondition from "../src/modes/loop-condition";
 import * as loopLimit from "../src/modes/loop-limit";
 import { setEditorGapComposerShape } from "@oh-my-pi/pi-tui/prompt/editor-top-gap";
+import { useConstructedInteractiveMode } from "./helpers/constructed-interactive-mode";
 
 const cx: DescribeContext = { cols: 80, reduceMotion: false, dark: true, supports: () => true, feature: () => true };
 
 describe("InteractiveMode constructed surface (C2)", () => {
-	let tempDir: TempDir;
-	let authStorage: AuthStorage;
-	let mode: InteractiveMode | undefined;
-	let session: AgentSession | undefined;
-	// cwd-change tests move the process project dir into temp dirs they then remove
-	let projectDir: string;
-
-	beforeAll(() => {
-		initTheme();
-	});
-
-	beforeEach(async () => {
-		projectDir = getProjectDir();
-		resetSettingsForTest();
-		tempDir = TempDir.createSync("@pi-c2-range-");
-		await Settings.init({ inMemory: true, cwd: tempDir.path() });
-		cfgStartupQuiet.set(Settings.instance, true);
-		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-		authStorage.keys.setRuntime("anthropic", "test-key");
-	});
-
-	afterEach(async () => {
-		vi.useRealTimers();
-		vi.restoreAllMocks();
-		mode?.stop();
-		await session?.dispose();
-		authStorage?.close();
-		tempDir?.removeSync();
-		mode = undefined;
-		session = undefined;
-		resetSettingsForTest();
-		setProjectDir(projectDir);
-	});
-
-	function createMode(
-		eventBus?: EventBus,
-		extra?: {
-			lspServers?: Array<{ name: string; status: "ready"; fileTypes: string[] }>;
-			mcpManager?: MCPManager;
-			startupChangelog?: StartupChangelogSelection;
-			messages?: AgentMessage[];
-			/** Runs on the session before InteractiveMode is constructed around it. */
-			beforeMode?: (session: AgentSession) => void;
-			/** Builds the session's extension runner over its manager and registry. */
-			extensionRunner?: (manager: SessionManager, registry: ModelRegistry) => ExtensionRunner;
-		},
-	): InteractiveMode {
-		const registry = new ModelRegistry(authStorage, path.join(tempDir.path(), `models-${Bun.nanoseconds()}.yml`));
-		const model = registry.find("anthropic", "claude-sonnet-4-5") as Model<Api>;
-		const readTool: AgentTool = {
-			name: "read",
-			label: "read",
-			description: "Fake read",
-			parameters: type({}),
-			async execute() {
-				return { content: [{ type: "text" as const, text: "ok" }] };
-			},
-		};
-		const manager = SessionManager.create(tempDir.path(), path.join(tempDir.path(), `active-${Bun.nanoseconds()}`));
-		session = new AgentSession({
-			agent: new Agent({
-				initialState: {
-					model,
-					systemPrompt: ["Test"],
-					tools: [readTool],
-					messages: extra?.messages ?? [],
-					thinkingLevel: Effort.Medium,
-				},
-			}),
-			sessionManager: manager,
-			settings: Settings.instance,
-			modelRegistry: registry,
-			toolRegistry: new Map([[readTool.name, readTool]]),
-			builtInToolNames: ["read"],
-			extensionRunner: extra?.extensionRunner?.(manager, registry),
-		});
-		extra?.beforeMode?.(session);
-		mode = new InteractiveMode(
-			session,
-			"test",
-			extra?.startupChangelog,
-			() => {},
-			extra?.lspServers,
-			extra?.mcpManager,
-			eventBus,
-		);
-		return mode;
-	}
+	const harness = useConstructedInteractiveMode("@pi-c2-range-");
+	const { createMode } = harness;
 
 	it("reports the initial session-mode state and empty HUD descriptions", () => {
 		const m = createMode();
@@ -270,7 +178,7 @@ describe("InteractiveMode constructed surface (C2)", () => {
 
 	it("reloads the title system prompt from an explicit cwd", async () => {
 		const m = createMode();
-		const prompts = path.join(tempDir.path(), "explicit-cwd");
+		const prompts = path.join(harness.tempDir().path(), "explicit-cwd");
 		const setTitle = vi.spyOn(m.session, "setTitleSystemPrompt");
 		await m.refreshTitleSystemPrompt(prompts);
 		expect(setTitle).toHaveBeenCalledTimes(1);
@@ -281,7 +189,7 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		await m.init({ suppressWelcomeIntro: true });
 		const setCommands = vi.spyOn(m.session, "setSlashCommands");
 		const createProvider = vi.spyOn(InputController.prototype, "createAutocompleteProvider");
-		await m.refreshSlashCommandState(tempDir.path(), [
+		await m.refreshSlashCommandState(harness.tempDir().path(), [
 			{ name: "review-pr", description: "Review a PR", argumentHint: "<number>\nor url" } as never,
 		]);
 		expect(setCommands).toHaveBeenCalledWith([expect.objectContaining({ name: "review-pr" })]);
@@ -426,7 +334,10 @@ describe("InteractiveMode constructed surface (C2)", () => {
 	it("reacts to a model change on the live session", async () => {
 		const m = createMode();
 		await m.init({ suppressWelcomeIntro: true });
-		const registry = new ModelRegistry(authStorage, path.join(tempDir.path(), `models-alt-${Bun.nanoseconds()}.yml`));
+		const registry = new ModelRegistry(
+			harness.authStorage(),
+			path.join(harness.tempDir().path(), `models-alt-${Bun.nanoseconds()}.yml`),
+		);
 		const other = registry.find("anthropic", "claude-opus-4-5") as Model<Api>;
 		const result = await m.session.setModel(other);
 		expect(result.switched).toBe(true);
@@ -1335,7 +1246,7 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			expect(showWarning).toHaveBeenCalledWith(
 				"Prompt history could not be saved; this prompt may be unavailable after restart.",
 			);
-			mode?.stop();
+			m.stop();
 			vi.spyOn(HistoryStorage, "open").mockImplementation(() => {
 				throw new Error("locked");
 			});
@@ -1826,7 +1737,7 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			await nextImmediate();
 			expect(warm).not.toHaveBeenCalled();
 			fresh.stop();
-			await session?.dispose();
+			await fresh.session.dispose();
 			const resumed = createMode(undefined, {
 				messages: [{ role: "user", content: "earlier question", timestamp: Date.now() } as AgentMessage],
 			});
@@ -1840,15 +1751,13 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			const composer = prepaint.composer;
 			const start = vi.spyOn(composer, "start");
 			Object.defineProperty(composer, "started", { configurable: true, get: () => true });
-			const m = new InteractiveMode(session!, "test", undefined, () => {}, undefined, undefined, undefined, composer);
-			mode = m;
+			const m = new InteractiveMode(prepaint.session, "test", undefined, () => {}, undefined, undefined, undefined, composer);
 			vi.spyOn(m.sessionManager, "getSessionFile").mockReturnValue(undefined as never);
 			await m.init({ suppressWelcomeIntro: true });
 			expect(start).not.toHaveBeenCalled();
 			expect(m.isInitialized).toBe(true);
-			// the prepaint mode shares this session; stop both so neither leaks listeners
+			// the prepaint mode shares this session; the harness stops it after the test
 			m.stop();
-			mode = prepaint;
 		});
 
 		it("applies only the newest stream redaction pattern load", async () => {
@@ -1869,7 +1778,8 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			cfgStreamRedactPatterns.set(Settings.instance, ["second-\\d+"]);
 			await flush();
 			expect(call).toBe(2);
-			const [first, second] = [await realLoad(tempDir.path(), ["first-\\d+"]), await realLoad(tempDir.path(), ["second-\\d+"])];
+			const dir = harness.tempDir().path();
+			const [first, second] = [await realLoad(dir, ["first-\\d+"]), await realLoad(dir, ["second-\\d+"])];
 			// the newer load settles first and applies; the older one settles late and is dropped
 			loads[1]!.resolve(second as never);
 			await flush();
@@ -1882,11 +1792,17 @@ describe("InteractiveMode constructed surface (C2)", () => {
 
 		it("redraws extension links when an extension is suspended or resumed", async () => {
 			const runtime = new ExtensionRuntime();
-			const extension = await loadExtensionFromFactory(() => {}, tempDir.path(), new EventBus(), runtime, "c2-suspendable");
+			const extension = await loadExtensionFromFactory(
+				() => {},
+				harness.tempDir().path(),
+				new EventBus(),
+				runtime,
+				"c2-suspendable",
+			);
 			let runner: ExtensionRunner | undefined;
 			const m = createMode(undefined, {
 				extensionRunner: (manager, registry) => {
-					runner = new ExtensionRunner([extension], runtime, tempDir.path(), manager, registry);
+					runner = new ExtensionRunner([extension], runtime, harness.tempDir().path(), manager, registry);
 					return runner;
 				},
 			});
@@ -2004,8 +1920,8 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			const other = TempDir.createSync("@pi-c2-nosettings-");
 			try {
 				expect(await m.applyCwdChange(other.path())).toBe(true);
-				m.sessionManager.setCwdWithoutRelocation(projectDir);
-				setProjectDir(projectDir);
+				m.sessionManager.setCwdWithoutRelocation(harness.projectDir());
+				setProjectDir(harness.projectDir());
 				refresh.mockRejectedValueOnce(new Error("switch broke"));
 				expect(await m.applyCwdChange(other.path())).toBe(false);
 				refresh.mockRejectedValueOnce(new Error("switch broke")).mockRejectedValueOnce(new Error("restore broke"));
