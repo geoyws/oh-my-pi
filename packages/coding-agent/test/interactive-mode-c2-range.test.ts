@@ -12,7 +12,8 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import { InteractiveMode } from "../src/modes/interactive-mode";
 import { cfgStartupQuiet, cfgTuiMouse } from "@oh-my-pi/pi-coding-agent/modes/settings";
-import { cfgGoalEnabled } from "../src/goals/settings";
+import { cfgGoalContinuationModes, cfgGoalEnabled } from "../src/goals/settings";
+import type { SubmittedUserInput } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { cfgPlanEnabled } from "../src/plan-mode/settings";
 import { cfgSessionIdleCheckpointMs } from "../src/session/settings";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
@@ -540,6 +541,91 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			const dropped = await m.sessionModes.set({ mode: "goal", action: "drop" });
 			expect(dropped).toMatchObject({ ok: true, changed: true, state: { goal: { status: "inactive" } } });
 			expect(m.goalModeEnabled).toBe(false);
+		});
+	});
+
+	describe("goal continuation scheduling", () => {
+		const flush = async () => {
+			for (let i = 0; i < 10; i++) await Promise.resolve();
+		};
+
+		async function activeGoalMode(): Promise<InteractiveMode> {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const entered = await m.sessionModes.set({ mode: "goal", action: "enter", objective: "finish the range" });
+			expect(entered).toMatchObject({ ok: true, state: { goal: { status: "active" } } });
+			return m;
+		}
+
+		/** Resolves to the submitted input, or "none" if nothing was submitted after the 800ms tick. */
+		async function inputAfterTick(m: InteractiveMode, beforeTick?: () => void): Promise<SubmittedUserInput | "none"> {
+			let submitted: SubmittedUserInput | "none" = "none";
+			void m.getUserInput().then(input => {
+				submitted = input;
+			});
+			await flush();
+			beforeTick?.();
+			vi.advanceTimersByTime(800);
+			await flush();
+			return submitted;
+		}
+
+		it("submits a hidden goal-continuation turn once the composer stays idle", async () => {
+			const m = await activeGoalMode();
+			vi.useFakeTimers();
+			const input = await inputAfterTick(m);
+			if (input === "none") throw new Error("no goal continuation was submitted");
+			expect(input).toMatchObject({ customType: "goal-continuation", display: false });
+			expect(input.text).toContain("finish the range");
+		});
+
+		it("does not schedule while the composer holds a draft or the todo list is all blocked", async () => {
+			const m = await activeGoalMode();
+			vi.useFakeTimers();
+			m.editor.setText("half-typed thought");
+			expect(await inputAfterTick(m)).toBe("none");
+			m.onInputCallback?.({ text: "", cancelled: true, started: false });
+			m.editor.setText("");
+			m.session.setTodoPhases([
+				{ name: "Work", tasks: [{ id: "t1", content: "waiting on review", status: "blocked" }] },
+			] as never);
+			expect(await inputAfterTick(m)).toBe("none");
+		});
+
+		it("does not schedule in a run mode excluded from goal.continuationModes", async () => {
+			const m = await activeGoalMode();
+			cfgGoalContinuationModes.set(Settings.instance, ["rpc"]);
+			vi.useFakeTimers();
+			expect(await inputAfterTick(m)).toBe("none");
+		});
+
+		it("drops a scheduled tick when a draft or a busy turn appears before it fires", async () => {
+			const m = await activeGoalMode();
+			vi.useFakeTimers();
+			expect(await inputAfterTick(m, () => m.editor.setText("typed during the delay"))).toBe("none");
+			m.onInputCallback?.({ text: "", cancelled: true, started: false });
+			m.editor.setText("");
+			Object.defineProperty(m.session, "isStreaming", { configurable: true, get: () => true });
+			try {
+				let submitted = false;
+				void m.getUserInput().then(() => {
+					submitted = true;
+				});
+				await flush();
+				vi.advanceTimersByTime(800);
+				await flush();
+				expect(submitted).toBe(false);
+			} finally {
+				Reflect.deleteProperty(m.session, "isStreaming");
+			}
+		});
+
+		it("holds continuation on an idle Esc and cancels the pending tick", async () => {
+			const m = await activeGoalMode();
+			const hold = vi.spyOn(m.session.goalRuntime, "holdContinuation");
+			vi.useFakeTimers();
+			expect(await inputAfterTick(m, () => m.holdGoalContinuation())).toBe("none");
+			expect(hold).toHaveBeenCalledTimes(1);
 		});
 	});
 });
