@@ -155,7 +155,7 @@ describe("InteractiveMode plan review (lines 7700-8041)", () => {
 			await mode.handlePlanApproval({ planFilePath: "", title: "T", planExists: true });
 
 			expect(review.mock.calls.map(call => call[0])).toEqual(["# From plan mode", "# Default plan"]);
-			expect(mode.planModePlanFilePath).toBe("local://PLAN.md");
+			expect(mode.planModePlanFilePath as string | undefined).toBe("local://PLAN.md");
 		});
 
 		it("without the abort barrier, refuses to mount over a turn that started while the plan was read", async () => {
@@ -340,18 +340,21 @@ describe("InteractiveMode plan review (lines 7700-8041)", () => {
 			it.each([
 				["an Error", new Error("provider down"), "provider down"],
 				["a non-Error", "socket closed", "socket closed"],
-			])("refine without an input callback reports %s from the follow-up prompt", async (_label, failure, detail) => {
-				const prompt = spyOn(session, "prompt").mockRejectedValue(failure);
-				spyOn(mode, "showPlanReview").mockImplementation(async (_content, _title, _labels, options) => {
-					options?.onFeedbackChange?.("tighten step 2");
-					return "Refine plan";
-				});
+			])(
+				"refine without an input callback reports %s from the follow-up prompt",
+				async (_label, failure, detail) => {
+					const prompt = spyOn(session, "prompt").mockRejectedValue(failure);
+					spyOn(mode, "showPlanReview").mockImplementation(async (_content, _title, _labels, options) => {
+						options?.onFeedbackChange?.("tighten step 2");
+						return "Refine plan";
+					});
 
-				await mode.handlePlanApproval({ planFilePath: url, title: "Choice", planExists: true });
+					await mode.handlePlanApproval({ planFilePath: url, title: "Choice", planExists: true });
 
-				expect(prompt).toHaveBeenCalledWith("tighten step 2");
-				expect(errors).toEqual([`Failed to refine plan: ${detail}`]);
-			});
+					expect(prompt).toHaveBeenCalledWith("tighten step 2");
+					expect(errors).toEqual([`Failed to refine plan: ${detail}`]);
+				},
+			);
 		});
 	});
 });

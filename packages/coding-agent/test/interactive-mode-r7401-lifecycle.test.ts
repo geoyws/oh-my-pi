@@ -4,20 +4,22 @@
  * (deferred command panels, session info, jobs sheet, pinned errors, LSP
  * startup warnings).
  */
-import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, type Mock, spyOn, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { LSP_STARTUP_EVENT_CHANNEL } from "@oh-my-pi/pi-coding-agent/lsp/startup-events";
 import { CommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/command-controller";
+import { LiveCommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/live-command-controller";
 import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as sessionWorktree from "@oh-my-pi/pi-coding-agent/session/session-worktree";
-import { cfgStartupQuiet } from "@oh-my-pi/pi-coding-agent/modes/settings";
+import type { SessionWorktree } from "@oh-my-pi/pi-coding-agent/session/session-worktree";
+import { cfgMagicKeywordsEnabled, cfgStartupQuiet } from "@oh-my-pi/pi-coding-agent/modes/settings";
 import { cfgWorktreeOnExit } from "@oh-my-pi/pi-coding-agent/task/settings";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import * as natives from "@oh-my-pi/pi-natives";
@@ -29,6 +31,8 @@ import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { logger, postmortem, TempDir } from "@oh-my-pi/pi-utils";
 import * as utils from "@oh-my-pi/pi-utils";
+
+type AnyMock = Mock<(...args: unknown[]) => unknown>;
 
 describe("InteractiveMode shutdown and presentation (lines 8227-8800)", () => {
 	let tempDir: TempDir;
@@ -66,7 +70,7 @@ describe("InteractiveMode shutdown and presentation (lines 8227-8800)", () => {
 	}
 
 	/** Stub everything a close touches outside the process: session disposal, the terminal and the exit itself. */
-	function stubClose(): { quit: ReturnType<typeof spyOn> } {
+	function stubClose(): { quit: Mock<typeof postmortem.quit> } {
 		spyOn(session, "dispose").mockResolvedValue();
 		spyOn(mode.ui.terminal, "drainInput").mockResolvedValue();
 		spyOn(process.stderr, "write").mockImplementation(chunk => {
@@ -77,8 +81,8 @@ describe("InteractiveMode shutdown and presentation (lines 8227-8800)", () => {
 	}
 
 	/** Record one launch-owned worktree through `/wt`. */
-	async function ownWorktree(): Promise<object> {
-		const worktree = { path: "/tmp/wt-owned", branch: "wt/owned" };
+	async function ownWorktree(): Promise<SessionWorktree> {
+		const worktree = { path: "/tmp/wt-owned", branch: "wt/owned" } as unknown as SessionWorktree;
 		spyOn(CommandController.prototype, "handleWorktreeCommand").mockResolvedValue(worktree as never);
 		await mode.handleWorktreeCommand("wt/owned");
 		return worktree;
@@ -160,28 +164,50 @@ describe("InteractiveMode shutdown and presentation (lines 8227-8800)", () => {
 		it.each([
 			["an Error", new Error("abort hung"), "abort hung"],
 			["a non-Error", "abort hung", "abort hung"],
-		])("plans worktree exit after stopping the turn, warning on %s from the stop", async (_label, failure, message) => {
+		])(
+			"plans worktree exit after stopping the turn, warning on %s from the stop",
+			async (_label, failure, message) => {
+				await freshMode();
+				const worktree = await ownWorktree();
+				cfgWorktreeOnExit.set(mode.settings, "ask");
+				stubClose();
+				spyOn(session, "abort").mockRejectedValue(failure);
+				const confirm = spyOn(mode, "showHookConfirm").mockResolvedValue(true);
+				const plan = spyOn(sessionWorktree, "planWorktreeExit").mockImplementation(
+					async (worktrees, policy, ask, warn) => {
+						expect(worktrees).toEqual([worktree]);
+						expect(policy).toBe("ask");
+						expect(await ask("Remove worktree?", "wt/owned")).toBe(true);
+						warn("kept wt/owned");
+						return [];
+					},
+				);
+
+				await mode.shutdown();
+
+				expect(plan).toHaveBeenCalledTimes(1);
+				expect(confirm).toHaveBeenCalledWith("Remove worktree?", "wt/owned");
+				expect(warnings).toEqual([message, "kept wt/owned"]);
+			},
+		);
+
+		it("stops the turn and live commands before planning worktree exit", async () => {
 			await freshMode();
-			const worktree = await ownWorktree();
-			cfgWorktreeOnExit.set(mode.settings, "ask");
+			await ownWorktree();
+			cfgWorktreeOnExit.set(mode.settings, "remove");
 			stubClose();
-			spyOn(session, "abort").mockRejectedValue(failure);
-			const confirm = spyOn(mode, "showHookConfirm").mockResolvedValue(true);
-			const plan = spyOn(sessionWorktree, "planWorktreeExit").mockImplementation(
-				async (worktrees, policy, ask, warn) => {
-					expect(worktrees).toEqual([worktree]);
-					expect(policy).toBe("ask");
-					expect(await ask("Remove worktree?", "wt/owned")).toBe(true);
-					warn("kept wt/owned");
-					return [];
-				},
-			);
+			const order: string[] = [];
+			spyOn(session, "abort").mockImplementation(async () => void order.push("abort"));
+			spyOn(LiveCommandController.prototype, "stop").mockImplementation(async () => void order.push("live"));
+			spyOn(sessionWorktree, "planWorktreeExit").mockImplementation(async () => {
+				order.push("plan");
+				return [];
+			});
 
 			await mode.shutdown();
 
-			expect(plan).toHaveBeenCalledTimes(1);
-			expect(confirm).toHaveBeenCalledWith("Remove worktree?", "wt/owned");
-			expect(warnings).toEqual([message, "kept wt/owned"]);
+			expect(order.slice(0, 3)).toEqual(["abort", "live", "plan"]);
+			expect(warnings).toEqual([]);
 		});
 
 		it("reports a non-Error teardown failure and stays open for a retry", async () => {
@@ -215,7 +241,9 @@ describe("InteractiveMode shutdown and presentation (lines 8227-8800)", () => {
 
 			await Promise.all([mode.restart(), mode.restart()]);
 
-			const relaunch = (process.platform === "win32" ? spawn.mock.calls[0]?.[0] : exec.mock.calls[0]?.[0]) as string[];
+			const relaunch = (
+				process.platform === "win32" ? spawn.mock.calls[0]?.[0] : exec.mock.calls[0]?.[0]
+			) as string[];
 			expect(relaunch.slice(-2)).toEqual(["--profile", "work"]);
 			expect(spawn).toHaveBeenCalledTimes(1);
 			expect(quit).toHaveBeenCalledWith(3);
@@ -325,15 +353,21 @@ describe("InteractiveMode shutdown and presentation (lines 8227-8800)", () => {
 		});
 
 		it.each([
-			["a close started meanwhile", () => {
-				const shutting = [false, true];
-				stubGetter(InteractiveMode.prototype, "isShuttingDown", () => shutting.shift() ?? true);
-			}],
+			[
+				"a close started meanwhile",
+				() => {
+					const shutting = [false, true];
+					stubGetter(InteractiveMode.prototype, "isShuttingDown", () => shutting.shift() ?? true);
+				},
+			],
 			["a submission is pending", () => void spyOn(mode, "hasPendingSubmission").mockReturnValue(true)],
-			["a submission was admitted", () => {
-				const admitted = [false, true];
-				stubGetter(AgentSession.prototype, "hasAdmittedSubmission", () => admitted.shift() ?? true);
-			}],
+			[
+				"a submission was admitted",
+				() => {
+					const admitted = [false, true];
+					stubGetter(AgentSession.prototype, "hasAdmittedSubmission", () => admitted.shift() ?? true);
+				},
+			],
 			["a turn is streaming", () => stubGetter(AgentSession.prototype, "isStreaming", () => true)],
 			["messages are queued", () => stubGetter(AgentSession.prototype, "queuedMessageCount", () => 2)],
 			["async work is pending", () => void spyOn(session, "hasPendingAsyncWork").mockReturnValue(true)],
@@ -402,24 +436,36 @@ describe("InteractiveMode shutdown and presentation (lines 8227-8800)", () => {
 			);
 			mode.skillCommands.set("skill:deploy", { filePath: "/skills/deploy/SKILL.md" } as never);
 
+			// The launch editor is wired to the same mode state, so the swapped one must read identically.
+			const launchEditor = mode.editor;
 			mode.setEditorComponent(undefined);
 			const editor = mode.editor;
+			expect(editor).not.toBe(launchEditor);
 
 			expect(editor.viewportRowsProvider?.()).toBe(mode.ui.terminal.rows);
-			expect(typeof editor.magicKeywordsEnabled?.()).toBe("boolean");
-			expect(typeof editor.placeholder?.()).toBe("string");
+			cfgMagicKeywordsEnabled.set(mode.settings, false);
+			expect(editor.magicKeywordsEnabled?.()).toBe(false);
+			cfgMagicKeywordsEnabled.set(mode.settings, true);
+			expect(editor.magicKeywordsEnabled?.()).toBe(true);
+			expect(editor.placeholder?.()).toBe(launchEditor.placeholder?.());
+			expect(editor.placeholder?.()).toEqual(expect.any(String));
 			// No turn has run, so there is no composer prediction yet.
 			expect(editor.prediction?.()).toBeUndefined();
-			expect(editor.composerState?.()).toBeDefined();
+			expect(editor.composerState?.()).toEqual(launchEditor.composerState?.());
+			expect(editor.composerState?.()).toMatchObject({ thinking: expect.anything() });
 			expect(editor.skillFilePath?.("deploy")).toBe("/skills/deploy/SKILL.md");
 			expect(editor.skillFilePath?.("missing")).toBeUndefined();
 			expect(editor.modelMentionLabel?.("sonnet")).toEqual(expect.any(String));
 			expect(editor.modelMentionLabel?.("nobody")).toBeUndefined();
 			expect(mention).toHaveBeenCalledWith("nobody");
 			expect(editor.modelMentionSelector?.("no-such-agent")).toBeUndefined();
+			stubGetter(AgentSession.prototype, "modelMentions", () => [
+				{ agent: "reviewer", selector: "anthropic/claude-opus" },
+			]);
+			expect(editor.modelMentionSelector?.("reviewer")).toBe("anthropic/claude-opus");
 			expect(editor.fileHyperlink?.("/repo/a.ts", "a.ts")).toContain("a.ts");
 
-			const render = mode.ui.requestRender as ReturnType<typeof vi.fn>;
+			const render = mode.ui.requestRender as unknown as AnyMock;
 			render.mockClear();
 			editor.onAutocompleteCancel?.();
 			editor.onAutocompleteUpdate?.();
@@ -490,14 +536,18 @@ describe("InteractiveMode shutdown and presentation (lines 8227-8800)", () => {
 
 			expect(mode.chatContainer.children).toContain(block);
 			expect(mount).toHaveBeenCalledTimes(1);
-			expect(mount.mock.calls[0]?.[0]).toBeDefined();
+			const host = mount.mock.calls[0]?.[0] as { requestRender(): void };
+			const render = mode.ui.requestRender as unknown as { mock: { calls: unknown[] }; mockClear(): void };
+			render.mockClear();
+			host.requestRender();
+			expect(render.mock.calls).toHaveLength(1);
 		});
 	});
 
 	describe("overlays", () => {
 		it("session info replaces an open panel, takes focus and closes on Escape", async () => {
 			await freshMode();
-			const handles: Array<{ hide: ReturnType<typeof vi.fn> }> = [];
+			const handles: Array<{ hide: AnyMock }> = [];
 			const show = spyOn(mode.ui, "showOverlay").mockImplementation(() => {
 				const handle = { hide: vi.fn() };
 				handles.push(handle);
@@ -532,11 +582,12 @@ describe("InteractiveMode shutdown and presentation (lines 8227-8800)", () => {
 			await freshMode();
 			vi.useFakeTimers();
 			try {
-				const tree = { running: [], recent: [] };
+				const tree = { running: [], recent: [], agents: [] };
 				const jobTree = spyOn(session, "getAsyncJobTree").mockReturnValueOnce(tree).mockReturnValueOnce(null);
-				const inspect = spyOn(session, "inspectAsyncJob").mockReturnValue({ id: "j1" } as never);
+				const inspected = { id: "j1" } as never;
+				const inspect = spyOn(session, "inspectAsyncJob").mockReturnValue(inspected);
 				const cancel = spyOn(session, "cancelAsyncJob").mockReturnValue(true);
-				let source: ConstructorParameters<typeof jobsPanel.JobsSheet>[0] | undefined;
+				let source: jobsPanel.JobsSheetSource | undefined;
 				const sheet = { render: () => [], invalidate: () => {} };
 				spyOn(jobsPanel, "JobsSheet").mockImplementation(function (deps: typeof source) {
 					source = deps;
@@ -554,10 +605,10 @@ describe("InteractiveMode shutdown and presentation (lines 8227-8800)", () => {
 				expect(source.load()).toEqual({ running: [], recent: [] });
 				jobTree.mockReturnValue(tree);
 				expect(source.load()).toBe(tree);
-				expect(source.inspect("j1")).toEqual({ id: "j1" });
+				expect(source.inspect("j1")).toBe(inspected);
 				expect(inspect).toHaveBeenCalledWith("j1");
 
-				const render = mode.ui.requestRender as ReturnType<typeof vi.fn>;
+				const render = mode.ui.requestRender as unknown as AnyMock;
 				render.mockClear();
 				source.cancel?.("j1");
 				expect(cancel).toHaveBeenCalledWith("j1");
@@ -570,7 +621,12 @@ describe("InteractiveMode shutdown and presentation (lines 8227-8800)", () => {
 				expect(handle.hide).toHaveBeenCalledTimes(1);
 				render.mockClear();
 				vi.advanceTimersByTime(5_000);
-				expect(render.mock.calls.length).toBeLessThanOrEqual(1);
+				expect(render.mock.calls).toHaveLength(0);
+
+				// A second close (the sheet's own Close after Escape) finds nothing left to hide.
+				source.close();
+				expect(handle.hide).toHaveBeenCalledTimes(1);
+				expect(render.mock.calls).toHaveLength(0);
 			} finally {
 				vi.useRealTimers();
 			}
@@ -598,7 +654,7 @@ describe("InteractiveMode shutdown and presentation (lines 8227-8800)", () => {
 	describe("errors and warnings", () => {
 		it("showError stops a running working row before reporting", async () => {
 			await freshMode();
-			(mode.showError as unknown as ReturnType<typeof spyOn>).mockRestore();
+			(mode.showError as unknown as AnyMock).mockRestore();
 			const loader = { stop: vi.fn() };
 			mode.loadingAnimation = loader as never;
 
@@ -610,7 +666,7 @@ describe("InteractiveMode shutdown and presentation (lines 8227-8800)", () => {
 
 		it("a pinned error is dismissed by its banner and clearing an empty banner is a no-op", async () => {
 			await freshMode();
-			const render = mode.ui.requestRender as ReturnType<typeof vi.fn>;
+			const render = mode.ui.requestRender as unknown as AnyMock;
 			render.mockClear();
 			mode.clearPinnedError();
 			expect(render).not.toHaveBeenCalled();
@@ -625,7 +681,10 @@ describe("InteractiveMode shutdown and presentation (lines 8227-8800)", () => {
 		});
 
 		it.each([
-			[{ type: "failed", error: "spawn ENOENT" }, ["LSP startup failed: spawn ENOENT. It will retry lazily on write."]],
+			[
+				{ type: "failed", error: "spawn ENOENT" },
+				["LSP startup failed: spawn ENOENT. It will retry lazily on write."],
+			],
 			[
 				{ type: "completed", servers: [{ name: "tsserver", status: "error", error: "crashed" }] },
 				["LSP startup failed for tsserver: crashed. It will retry lazily on write."],

@@ -345,7 +345,9 @@ describe("InteractiveMode goal commands (lines 7401-7685)", () => {
 
 		it("bare set asks for the objective; an empty answer starts nothing", async () => {
 			await freshMode();
-			const editor = spyOn(mode, "showHookEditor").mockResolvedValueOnce("   ").mockResolvedValueOnce(" typed goal ");
+			const editor = spyOn(mode, "showHookEditor")
+				.mockResolvedValueOnce("   ")
+				.mockResolvedValueOnce(" typed goal ");
 
 			expect(await mode.handleGoalModeCommand("set")).toBe(false);
 			expect(mode.goalModeEnabled).toBe(false);
@@ -414,20 +416,23 @@ describe("InteractiveMode goal commands (lines 7401-7685)", () => {
 		it.each([
 			["with images", [image], [image], 1],
 			["without images", [], undefined, 0],
-		] as const)("a replacement mid-stream re-sends goal context and steers the objective %s", async (_label, images, sent, imageCount) => {
-			await freshMode();
-			await startGoal("old objective");
-			streaming(true);
-			const context = spyOn(session, "sendGoalModeContext").mockResolvedValue();
-			const prompt = spyOn(session, "prompt").mockResolvedValue(true);
-			const local = spyOn(mode, "withLocalSubmission");
+		] as const)(
+			"a replacement mid-stream re-sends goal context and steers the objective %s",
+			async (_label, images, sent, imageCount) => {
+				await freshMode();
+				await startGoal("old objective");
+				streaming(true);
+				const context = spyOn(session, "sendGoalModeContext").mockResolvedValue();
+				const prompt = spyOn(session, "prompt").mockResolvedValue(true);
+				const local = spyOn(mode, "withLocalSubmission");
 
-			expect(await mode.handleGoalModeCommand("set new objective", { images: [...images] })).toBe(true);
+				expect(await mode.handleGoalModeCommand("set new objective", { images: [...images] })).toBe(true);
 
-			expect(context).toHaveBeenCalledWith({ deliverAs: "steer" });
-			expect(local).toHaveBeenCalledWith("new objective", expect.any(Function), { imageCount });
-			expect(prompt).toHaveBeenCalledWith("new objective", { streamingBehavior: "steer", images: sent });
-		});
+				expect(context).toHaveBeenCalledWith({ deliverAs: "steer" });
+				expect(local).toHaveBeenCalledWith("new objective", expect.any(Function), { imageCount });
+				expect(prompt).toHaveBeenCalledWith("new objective", { streamingBehavior: "steer", images: sent });
+			},
+		);
 	});
 
 	describe("goal menu", () => {

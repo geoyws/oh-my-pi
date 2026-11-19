@@ -1822,7 +1822,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	#pendingPlanReview:
 		| {
 				request: PlanReviewRequestedEvent;
-				remote?: { choice: PlanReviewChoice; feedback?: string };
+				/** `feedback` is the non-blank refine text for a `refine` answer, empty for any other choice. */
+				remote?: { choice: PlanReviewChoice; feedback: string };
 				/** Applies a remote tier pick to the review's slider selection; undefined when the slider is hidden. */
 				selectTier?: (role: string) => boolean;
 		  }
@@ -6536,7 +6537,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			const approves = choice === "execute" || choice === "compact" || choice === "keep";
 			if (!approves || !pending.selectTier?.(input.role)) return false;
 		}
-		pending.remote = { choice, feedback };
+		pending.remote = { choice, feedback: feedback ?? "" };
 		if (pick(option.label)) return true;
 		pending.remote = undefined;
 		return false;
@@ -8017,7 +8018,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 
 		if (choice === "Refine plan") {
-			const refinement = remote?.choice === "refine" ? (remote.feedback ?? "") : feedback;
+			const refinement = remote?.choice === "refine" ? remote.feedback : feedback;
 			try {
 				if (refinement.trim()) {
 					if (this.onInputCallback) {
