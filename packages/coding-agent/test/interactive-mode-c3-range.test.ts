@@ -1,8 +1,10 @@
-import { describe, expect, it, vi } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import type { AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as piTui from "@oh-my-pi/pi-tui";
+import * as extensionLinks from "@oh-my-pi/pi-tui/render/extension-links";
+import * as piUtils from "@oh-my-pi/pi-utils";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
 import * as svgFigure from "@oh-my-pi/pi-tui/chat/svg-figure";
 import * as tableChart from "@oh-my-pi/pi-tui/chat/table-chart";
@@ -14,6 +16,8 @@ import { cfgExtensionAssistantTextRenderers } from "../src/extensibility/setting
 import * as judgment from "../src/judgment";
 import { ComposerPredictionController } from "../src/modes/controllers/composer-prediction-controller";
 import { EventController } from "../src/modes/controllers/event-controller";
+import type { InteractiveMode } from "../src/modes/interactive-mode";
+import { UiHelpers } from "../src/modes/utils/ui-helpers";
 import {
 	cfgComposerPredictions,
 	cfgComposerShape,
@@ -32,6 +36,7 @@ import {
 	cfgTuiTight,
 	cfgTuiTitleSpinner,
 	cfgTuiTitleState,
+	cfgTuiMouse,
 	cfgTuiVimMode,
 } from "../src/modes/settings";
 import { cfgCompactionEnabled } from "../src/session/context-settings";
@@ -96,6 +101,160 @@ describe("InteractiveMode constructed surface (C3)", () => {
 		if (transcript.length > 0) await m.renderInitialMessages();
 		return m;
 	}
+
+	/** Gives the session a fake extension runner registering `schemes`; returns its link-activate spy. */
+	function fakeLinkRunner(m: InteractiveMode, schemes: () => string[], uiContext: unknown = { ui: "main" }) {
+		const emitLinkActivate = vi.fn(async (_url: string, _ctx: unknown) => {});
+		Object.defineProperty(m.session, "extensionRunner", {
+			configurable: true,
+			get: () => ({
+				getLinkSchemes: schemes,
+				followSuspension: () => {},
+				emitLinkActivate,
+				getUIContext: () => uiContext,
+			}),
+		});
+		return emitLinkActivate;
+	}
+
+	describe("extension links and link hints", () => {
+		afterEach(() => {
+			// the scheme registry is process-wide
+			extensionLinks.setExtensionLinks([]);
+		});
+
+		it("rebuilds the transcript once, after the first replay, when the registered link schemes change", async () => {
+			const m = await initialized(readTurn());
+			let schemes = ["acme"];
+			fakeLinkRunner(m, () => schemes);
+			const rebuild = vi.spyOn(m, "rebuildChatFromMessages");
+			const resetDisplay = vi.spyOn(m.ui, "resetDisplay");
+			m.syncExtensionLinks();
+			// unchanged schemes do nothing; a second change before the microtask coalesces
+			m.syncExtensionLinks();
+			schemes = ["acme", "beta"];
+			m.syncExtensionLinks();
+			expect(extensionLinks.extensionLinksRouted()).toBe(true);
+			expect(rebuild).not.toHaveBeenCalled();
+			// the queued rebuild renders through the session's real runner
+			Reflect.deleteProperty(m.session, "extensionRunner");
+			await Promise.resolve();
+			expect(rebuild).toHaveBeenCalledTimes(1);
+			expect(resetDisplay).toHaveBeenCalledTimes(1);
+		});
+
+		it("drops a queued link redraw that a rebuild already covered", async () => {
+			const m = await initialized(readTurn());
+			fakeLinkRunner(m, () => ["acme"]);
+			const resetDisplay = vi.spyOn(m.ui, "resetDisplay");
+			m.syncExtensionLinks();
+			Reflect.deleteProperty(m.session, "extensionRunner");
+			m.rebuildChatFromMessages();
+			const rebuild = vi.spyOn(m, "rebuildChatFromMessages");
+			await Promise.resolve();
+			expect(rebuild).not.toHaveBeenCalled();
+			expect(resetDisplay).not.toHaveBeenCalled();
+		});
+
+		it("leaves the redraw to a transcript replay still in flight", async () => {
+			const m = await initialized(readTurn());
+			fakeLinkRunner(m, () => ["acme"]);
+			const restart = vi.spyOn(UiHelpers.prototype, "restartTranscriptReplay").mockReturnValue(true);
+			const rebuild = vi.spyOn(m, "rebuildChatFromMessages");
+			m.syncExtensionLinks();
+			await Promise.resolve();
+			expect(restart).toHaveBeenCalledTimes(1);
+			expect(rebuild).not.toHaveBeenCalled();
+		});
+
+		it("offers link clicks while mouse capture is on, else only with a bound hint key", async () => {
+			cfgTuiMouse.set(Settings.instance, true);
+			const withMouse = createMode();
+			extensionLinks.setExtensionLinks(["acme"]);
+			expect(extensionLinks.extensionLinkClicksAvailable()).toBe(true);
+			withMouse.stop();
+			cfgTuiMouse.set(Settings.instance, false);
+			const m = createMode();
+			// stop() released the schemes along with the picker
+			extensionLinks.setExtensionLinks(["acme"]);
+			const hintKeyBound = m.keybindings.getKeys("app.links.hint").length > 0;
+			expect(extensionLinks.extensionLinkClicksAvailable()).toBe(hintKeyBound);
+		});
+
+		it("activates a viewport link through the viewed session's runner with the main UI", async () => {
+			const m = await initialized();
+			const uiContext = { ui: "main" };
+			const emit = fakeLinkRunner(m, () => ["acme"], uiContext);
+			vi.spyOn(m.composer, "viewportLinkAt")
+				.mockReturnValueOnce({ url: "acme://open/1" } as never)
+				.mockReturnValueOnce(undefined as never);
+			expect(m.activateViewportLink(0, 4)).toBe(true);
+			expect(emit).toHaveBeenCalledWith("acme://open/1", uiContext);
+			// no link under the cursor
+			expect(m.activateViewportLink(1, 4)).toBe(false);
+			expect(emit).toHaveBeenCalledTimes(1);
+		});
+
+		it("refuses link activation without an extension runner and logs a failed dispatch", async () => {
+			const m = await initialized();
+			vi.spyOn(m.composer, "viewportLinkAt").mockReturnValue({ url: "acme://open/1" } as never);
+			expect(m.activateViewportLink(0, 0)).toBe(false);
+			const emit = fakeLinkRunner(m, () => ["acme"]);
+			emit.mockRejectedValueOnce(new Error("handler threw"));
+			const warn = vi.spyOn(piUtils.logger, "warn");
+			expect(m.activateViewportLink(0, 0)).toBe(true);
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(warn).toHaveBeenCalledWith("link_activate dispatch failed", {
+				url: "acme://open/1",
+				error: "Error: handler threw",
+			});
+		});
+
+		it("starts link hints only for routed links on screen and reports a crowded row after the frame", async () => {
+			const m = await initialized();
+			const start = vi.spyOn(m.composer, "startLinkHints").mockImplementation(() => {});
+			const showStatus = vi.spyOn(m, "showStatus").mockImplementation(() => {});
+			const hookStatus = vi.spyOn(m.statusLine, "setHookStatus");
+			// no registered scheme: the key falls through
+			expect(m.startLinkHints()).toBe(false);
+			extensionLinks.setExtensionLinks(["acme"]);
+			const count = vi.spyOn(m.composer, "viewportLinkCount").mockReturnValue(0);
+			expect(m.startLinkHints()).toBe(true);
+			expect(showStatus).toHaveBeenLastCalledWith("No extension links on screen");
+			expect(start).not.toHaveBeenCalled();
+			count.mockReturnValue(2);
+			expect(m.startLinkHints()).toBe(true);
+			const hintKey = hookStatus.mock.calls.at(-1)?.[0];
+			expect(hookStatus).toHaveBeenLastCalledWith(hintKey, "Type a link tag · Esc cancels");
+			const onEnd = start.mock.calls[0]![0] as (reason: string) => void;
+			showStatus.mockClear();
+			onEnd("picked");
+			expect(hookStatus).toHaveBeenLastCalledWith(hintKey, undefined);
+			await Promise.resolve();
+			expect(showStatus).not.toHaveBeenCalled();
+			onEnd("crowded");
+			expect(showStatus).not.toHaveBeenCalled();
+			await Promise.resolve();
+			expect(showStatus).toHaveBeenCalledWith("Too many extension links on one row to tag; widen the terminal");
+		});
+
+		it("activates the link a typed hint tag picks, and forwards cancel", async () => {
+			const m = await initialized();
+			const emit = fakeLinkRunner(m, () => ["acme"]);
+			vi.spyOn(m.composer, "typeLinkHint")
+				.mockReturnValueOnce(true)
+				.mockReturnValueOnce({ url: "acme://pick" } as never);
+			// a partial tag keeps waiting
+			m.typeLinkHint("a");
+			expect(emit).not.toHaveBeenCalled();
+			m.typeLinkHint("s");
+			expect(emit).toHaveBeenCalledWith("acme://pick", { ui: "main" });
+			const cancel = vi.spyOn(m.composer, "cancelLinkHints");
+			m.cancelLinkHints();
+			expect(cancel).toHaveBeenCalledTimes(1);
+		});
+	});
 
 	describe("session-mode transition gates (sessionModes.set)", () => {
 		it("disables a paused plan on exit and refuses plan entry while vibe holds", async () => {
