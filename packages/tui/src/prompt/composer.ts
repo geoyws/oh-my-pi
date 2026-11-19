@@ -265,9 +265,15 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 					| {
 							transcript: TranscriptContainer;
 							transcriptId?: number;
-							header: "none" | "replay";
+							header: "none";
+							headerRows?: undefined;
+					  }
+					| {
+							transcript: TranscriptContainer;
+							transcriptId?: number;
+							header: "replay";
 							/** Recomposed header rows to accept as the new retired-header bytes. */
-							headerRows?: readonly string[];
+							headerRows: readonly string[];
 					  };
 		  }
 		| undefined;
@@ -797,7 +803,7 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 			}
 			if (offered.source.header === "replay") {
 				this.#headerReplayPending = false;
-				if (offered.source.headerRows !== undefined) this.#retiredHeaderRows = offered.source.headerRows;
+				this.#retiredHeaderRows = offered.source.headerRows;
 			}
 		}
 		this.#offeredHistory = undefined;
@@ -821,7 +827,7 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 				0,
 				this.#retiredHeaderStart - Math.max(0, rows - this.#lastNormalRows),
 			);
-			header = this.#reflowRetiredHeader(width, this.#resizeRetiredHeaderStart);
+			header = this.#reflowRetiredHeader(this.#retiredHeaderRows!, width, this.#resizeRetiredHeaderStart);
 		} else {
 			header = this.#header.render(width);
 		}
@@ -853,7 +859,8 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 	}
 
 	#startHistoryReplay(): void {
-		this.#headerReplayPending = this.#headerRetired && (this.#retiredHeaderRows?.length ?? 0) > 0;
+		// #headerRetired is only ever set together with a #retiredHeaderRows assignment.
+		this.#headerReplayPending = this.#headerRetired && this.#retiredHeaderRows!.length > 0;
 		this.#historyReplayRequested = false;
 		for (const child of this.#runtimeChildren) {
 			if (child instanceof TranscriptContainer) child.beginReplay();
@@ -868,7 +875,24 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		chromeRows: number,
 	): { id: number; rows: readonly string[]; kind: "append" | "replay" } | undefined {
 		if (this.#offeredHistory !== undefined) {
-			this.#rerenderOfferedHistory(width);
+			const offered = this.#offeredHistory;
+			if (offered.source === "header") {
+				const rows = this.#header.render(width);
+				offered.rows = rows.length > 0 ? [...rows, ""] : [];
+			} else {
+				const transcript = offered.source.transcript.rerenderOfferedBatch(width);
+				if (offered.source.header === "none") {
+					if (transcript !== undefined) offered.rows = transcript.rows;
+				} else {
+					const recomposed = this.#header.render(width);
+					const headerRows =
+						recomposed.length > 0
+							? [...recomposed, ""]
+							: this.#reflowRetiredHeader(this.#retiredHeaderRows!, width, 0);
+					offered.source.headerRows = headerRows;
+					offered.rows = [...headerRows, ...(transcript?.rows ?? [])];
+				}
+			}
 			return {
 				id: this.#offeredHistory.id,
 				rows: this.#offeredHistory.rows,
@@ -882,7 +906,8 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 			// recompose (welcome unmounted after retirement) falls back to the
 			// committed rows, hard-wrapped the way the terminal would.
 			const recomposed = this.#header.render(width);
-			const headerRows = recomposed.length > 0 ? [...recomposed, ""] : this.#reflowRetiredHeader(width, 0);
+			const headerRows =
+				recomposed.length > 0 ? [...recomposed, ""] : this.#reflowRetiredHeader(this.#retiredHeaderRows!, width, 0);
 			this.#offeredHistory = {
 				id: this.#nextHistoryId++,
 				rows: [...headerRows, ...(transcriptReplay?.rows ?? [])],
@@ -943,25 +968,6 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		};
 	}
 
-	#rerenderOfferedHistory(width: number): void {
-		const offered = this.#offeredHistory;
-		if (offered === undefined) return;
-		if (offered.source === "header") {
-			const rows = this.#header.render(width);
-			offered.rows = rows.length > 0 ? [...rows, ""] : [];
-			return;
-		}
-		const transcript = offered.source.transcript.rerenderOfferedBatch(width);
-		if (offered.source.header === "none") {
-			if (transcript !== undefined) offered.rows = transcript.rows;
-			return;
-		}
-		const recomposed = this.#header.render(width);
-		const headerRows = recomposed.length > 0 ? [...recomposed, ""] : this.#reflowRetiredHeader(width, 0);
-		offered.source.headerRows = headerRows;
-		offered.rows = [...headerRows, ...(transcript?.rows ?? [])];
-	}
-
 	#renderRoots(roots: readonly Component[], width: number): string[] {
 		const rows: string[] = [];
 		for (const root of roots) rows.push(...root.render(width));
@@ -986,9 +992,8 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 	}
 
 	/** Reflow accepted hard rows exactly as the restored terminal buffer will. */
-	#reflowRetiredHeader(width: number, start: number): string[] {
-		const lines = this.#retiredHeaderRows;
-		if (!lines) return [];
+	// Callers guarantee retired rows: every #headerRetired transition assigns them.
+	#reflowRetiredHeader(lines: readonly string[], width: number, start: number): string[] {
 		if (isInsideTerminalMultiplexer()) return lines.slice(start);
 		const reflowed: string[] = [];
 		for (let index = start; index < lines.length; index++) {
@@ -1072,9 +1077,7 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		if (this.#stopped) return;
 		this.#applyWelcomeUpdate(update);
 		if (this.#preferences.quiet) return;
-		this.#ensureWelcome();
-		const welcome = this.#welcome;
-		if (!welcome) return;
+		const welcome = this.#ensureWelcome();
 		if (update.version !== undefined) welcome.setVersion(this.#version);
 		this.ui.requestRender();
 	}
@@ -1171,8 +1174,8 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		if (update.version !== undefined) this.#version = update.version;
 	}
 
-	#ensureWelcome(): void {
-		this.#welcome ??= new WelcomeComponent(this.#version);
+	#ensureWelcome(): WelcomeComponent {
+		return (this.#welcome ??= new WelcomeComponent(this.#version));
 	}
 
 	#rebuildHeader(): void {
