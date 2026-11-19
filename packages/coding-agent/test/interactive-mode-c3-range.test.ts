@@ -661,7 +661,7 @@ describe("InteractiveMode constructed surface (C3)", () => {
 			sessions.push(subagent({ id: "Done", status: "completed", description: "ship docs" }));
 			notify("lifecycle");
 			vi.advanceTimersByTime(100);
-			const done = [{ name: "Build", tasks: [{ content: "ship docs", status: "completed" }] }];
+			const done = [{ name: "Build", tasks: [{ content: "ship docs", status: "completed" as const }] }];
 			expect(append).toHaveBeenCalledWith(USER_TODO_EDIT_CUSTOM_TYPE, { phases: done });
 			expect(m.session.getTodoPhases()).toEqual(done);
 			// the flush re-syncs the HUD against that same owner, which dismisses the settled plan
