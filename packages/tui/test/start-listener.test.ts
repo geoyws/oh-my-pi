@@ -43,6 +43,43 @@ describe("TUI start listeners", () => {
 		}
 	});
 
+	it("stops firing a hook after its unsubscribe is called", () => {
+		const tui = new TUI(new VirtualTerminal(80, 24));
+		let starts = 0;
+		const unsubscribe = tui.addStartListener(() => {
+			starts++;
+		});
+
+		try {
+			tui.start();
+			expect(starts).toBe(1);
+			unsubscribe();
+			tui.stop();
+			tui.start();
+			expect(starts).toBe(1);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("renders and runs later hooks even when an earlier start hook throws", () => {
+		const tui = new TUI(new VirtualTerminal(80, 24));
+		let starts = 0;
+		tui.addStartListener(() => {
+			throw new Error("broken hook");
+		});
+		tui.addStartListener(() => {
+			starts++;
+		});
+
+		try {
+			expect(() => tui.start()).not.toThrow();
+			expect(starts).toBe(1);
+		} finally {
+			tui.stop();
+		}
+	});
+
 	it("holds a hook added to a stopped TUI until the next start", () => {
 		const tui = new TUI(new VirtualTerminal(80, 24));
 		let starts = 0;
