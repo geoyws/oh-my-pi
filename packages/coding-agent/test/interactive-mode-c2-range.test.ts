@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
@@ -13,8 +13,10 @@ import { ModelRegistry } from "../src/config/model-registry";
 import { InteractiveMode } from "../src/modes/interactive-mode";
 import { cfgStartupQuiet, cfgTuiMouse } from "@oh-my-pi/pi-coding-agent/modes/settings";
 import { cfgGoalEnabled } from "../src/goals/settings";
+import { cfgPlanEnabled } from "../src/plan-mode/settings";
 import { cfgSessionIdleCheckpointMs } from "../src/session/settings";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { cfgExtensionHandlersModeControl } from "../src/extensibility/settings";
 import { formatModelString } from "../src/config/model-resolver";
 import { hasTranscriptActions, runTranscriptAction } from "@oh-my-pi/pi-tui/chat/transcript-actions";
 import type { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
@@ -42,6 +44,8 @@ describe("InteractiveMode constructed surface (C2)", () => {
 	});
 
 	afterEach(async () => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
 		mode?.stop();
 		await session?.dispose();
 		authStorage?.close();
@@ -336,5 +340,206 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		expect(m.noteDisplayableThinkingContent(thinking)).toBe(true);
 		expect(m.hasDisplayableThinkingContent).toBe(true);
 		expect(m.noteDisplayableThinkingContent(thinking)).toBe(false);
+	});
+
+	describe("extension mode control (sessionModes.set)", () => {
+		it("refuses every request while extension mode control is disabled", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			cfgExtensionHandlersModeControl.set(Settings.instance, false);
+			const result = await m.sessionModes.set({ mode: "loop", action: "enter" });
+			expect(result).toMatchObject({ ok: false, code: "disabled" });
+			expect(m.loopModeEnabled).toBe(false);
+		});
+
+		it("refuses as busy until init has restored the saved modes", async () => {
+			const m = createMode();
+			const result = await m.sessionModes.set({ mode: "loop", action: "enter" });
+			expect(result).toMatchObject({ ok: false, code: "busy" });
+			expect(result.ok ? "" : result.message).toContain("still being restored");
+		});
+
+		it("refuses as busy while a completed goal is still being torn down", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			vi.spyOn(m.session, "getGoalModeState").mockReturnValue({
+				enabled: false,
+				mode: "exiting",
+				reason: "completed",
+				goal: { objective: "done thing", status: "complete" },
+			} as never);
+			const result = await m.sessionModes.set({ mode: "loop", action: "enter" });
+			expect(result).toMatchObject({ ok: false, code: "busy" });
+			expect(result.ok ? "" : result.message).toContain("torn down");
+		});
+
+		it("refuses as busy while the session runs a turn", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			Object.defineProperty(m.session, "isBusyForSnapshot", { configurable: true, get: () => true });
+			const result = await m.sessionModes.set({ mode: "loop", action: "enter" });
+			expect(result).toMatchObject({ ok: false, code: "busy" });
+			expect(m.loopModeEnabled).toBe(false);
+		});
+
+		it("reports an already-held state as unchanged without running a transition", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			for (const request of [
+				{ mode: "plan", action: "exit" },
+				{ mode: "vibe", action: "exit" },
+				{ mode: "goal", action: "drop" },
+				{ mode: "loop", action: "exit" },
+			] as const) {
+				const result = await m.sessionModes.set(request);
+				expect(result).toMatchObject({ ok: true, changed: false });
+			}
+		});
+
+		it("rejects malformed goal and loop requests and unknown modes", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const cases: Array<[unknown, string]> = [
+				[{ mode: "goal", action: "enter", objective: "   " }, "non-empty string"],
+				[{ mode: "goal", action: "enter", objective: "x", tokenBudget: 1.5 }, "positive integer"],
+				[{ mode: "goal", action: "pause" }, "no active goal to pause"],
+				[{ mode: "goal", action: "resume" }, "no paused goal"],
+				[{ mode: "loop", action: "enter", prompt: "  " }, "Loop prompt"],
+				[{ mode: "loop", action: "enter", limit: { kind: "iterations", iterations: 0 } }, "Loop limit"],
+				[{ mode: "loop", action: "enter", condition: { command: "", until: true } }, "Loop condition"],
+				[{ mode: "warp", action: "enter" }, "Unknown mode"],
+				[{ mode: "plan", action: "toggle" }, "Unknown mode"],
+			];
+			for (const [request, message] of cases) {
+				const result = await m.sessionModes.set(request as never);
+				expect(result).toMatchObject({ ok: false, code: "invalid_request" });
+				expect(result.ok ? "" : result.message).toContain(message);
+			}
+		});
+
+		it("refuses goal entry when goal mode is disabled in settings", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			cfgGoalEnabled.set(Settings.instance, false);
+			const result = await m.sessionModes.set({ mode: "goal", action: "enter", objective: "ship it" });
+			expect(result).toMatchObject({ ok: false, code: "disabled" });
+		});
+
+		it("enters, re-prompts, pauses, resumes and exits loop mode", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const entered = await m.sessionModes.set({
+				mode: "loop",
+				action: "enter",
+				prompt: " keep going ",
+				limit: { kind: "iterations", iterations: 3 },
+			});
+			expect(entered).toMatchObject({ ok: true, changed: true, state: { loop: { status: "active" } } });
+			expect(m.loopPrompt).toBe("keep going");
+			// bounds cannot change on a running loop
+			const rebound = await m.sessionModes.set({
+				mode: "loop",
+				action: "enter",
+				limit: { kind: "duration", durationMs: 1000 },
+			});
+			expect(rebound).toMatchObject({ ok: false, code: "invalid_request" });
+			// the same prompt is a no-op; a new prompt replaces it
+			expect(await m.sessionModes.set({ mode: "loop", action: "enter", prompt: "keep going" })).toMatchObject({
+				ok: true,
+				changed: false,
+			});
+			await m.sessionModes.set({ mode: "loop", action: "enter", prompt: "new body" });
+			expect(m.loopPrompt).toBe("new body");
+			// a paused loop resumes waiting on a bare enter
+			m.pauseLoop();
+			expect(m.sessionModes.getState().loop.status).toBe("paused");
+			const resumed = await m.sessionModes.set({ mode: "loop", action: "enter" });
+			expect(resumed).toMatchObject({ ok: true, changed: true, state: { loop: { status: "active" } } });
+			expect(await m.sessionModes.set({ mode: "loop", action: "enter" })).toMatchObject({ changed: false });
+			const exited = await m.sessionModes.set({ mode: "loop", action: "exit" });
+			expect(exited).toMatchObject({ ok: true, changed: true, state: { loop: { status: "inactive" } } });
+			expect(m.loopModeEnabled).toBe(false);
+		});
+
+		it("refuses a second transition while one is in flight", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const first = m.sessionModes.set({ mode: "loop", action: "enter" });
+			const second = await m.sessionModes.set({ mode: "loop", action: "exit" });
+			expect(second).toMatchObject({ ok: false, code: "busy" });
+			expect(await first).toMatchObject({ ok: true, changed: true });
+		});
+
+		it("enters and exits plan mode, refusing goal and vibe while it holds", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const entered = await m.sessionModes.set({ mode: "plan", action: "enter" });
+			expect(entered).toMatchObject({ ok: true, changed: true, state: { plan: { status: "active" } } });
+			expect(m.planModeEnabled).toBe(true);
+			expect(await m.sessionModes.set({ mode: "plan", action: "enter" })).toMatchObject({ changed: false });
+			expect(await m.sessionModes.set({ mode: "goal", action: "enter", objective: "x" })).toMatchObject({
+				ok: false,
+				code: "conflict",
+				message: "Exit plan mode first.",
+			});
+			expect(await m.sessionModes.set({ mode: "vibe", action: "enter" })).toMatchObject({
+				ok: false,
+				code: "conflict",
+				message: "Exit plan mode first.",
+			});
+			const exited = await m.sessionModes.set({ mode: "plan", action: "exit" });
+			expect(exited).toMatchObject({ ok: true, changed: true, state: { plan: { status: "inactive" } } });
+			expect(m.planModeEnabled).toBe(false);
+		});
+
+		it("refuses plan entry when plan mode is disabled in settings", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			cfgPlanEnabled.set(Settings.instance, false);
+			expect(await m.sessionModes.set({ mode: "plan", action: "enter" })).toMatchObject({
+				ok: false,
+				code: "disabled",
+			});
+		});
+
+		it("drives a goal through enter, pause, resume and drop", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const entered = await m.sessionModes.set({
+				mode: "goal",
+				action: "enter",
+				objective: "cover the range",
+				tokenBudget: 5000,
+			});
+			expect(entered).toMatchObject({
+				ok: true,
+				changed: true,
+				state: { goal: { status: "active", objective: "cover the range", tokenBudget: 5000 } },
+			});
+			// the same objective and budget is already held; a different one is refused
+			expect(
+				await m.sessionModes.set({ mode: "goal", action: "enter", objective: "cover the range", tokenBudget: 5000 }),
+			).toMatchObject({ ok: true, changed: false });
+			expect(await m.sessionModes.set({ mode: "goal", action: "enter", objective: "other" })).toMatchObject({
+				code: "invalid_request",
+			});
+			expect(await m.sessionModes.set({ mode: "plan", action: "enter" })).toMatchObject({
+				code: "conflict",
+				message: "Exit goal mode first.",
+			});
+			expect(await m.sessionModes.set({ mode: "goal", action: "resume" })).toMatchObject({ changed: false });
+			const paused = await m.sessionModes.set({ mode: "goal", action: "pause" });
+			expect(paused).toMatchObject({ ok: true, state: { goal: { status: "paused" } } });
+			expect(await m.sessionModes.set({ mode: "goal", action: "pause" })).toMatchObject({ changed: false });
+			expect(await m.sessionModes.set({ mode: "goal", action: "enter", objective: "other" })).toMatchObject({
+				code: "invalid_request",
+				message: "Resume or drop the paused goal first.",
+			});
+			const resumed = await m.sessionModes.set({ mode: "goal", action: "resume" });
+			expect(resumed).toMatchObject({ ok: true, state: { goal: { status: "active" } } });
+			const dropped = await m.sessionModes.set({ mode: "goal", action: "drop" });
+			expect(dropped).toMatchObject({ ok: true, changed: true, state: { goal: { status: "inactive" } } });
+			expect(m.goalModeEnabled).toBe(false);
+		});
 	});
 });
