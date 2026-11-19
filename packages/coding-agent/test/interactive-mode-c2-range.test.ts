@@ -27,6 +27,8 @@ import { StatusLineComponent } from "@oh-my-pi/pi-tui/status-line";
 import { CodexResetFireworksController } from "@oh-my-pi/pi-tui/overlays/codex-reset-fireworks";
 import * as cfgProtocol from "../src/internal-urls/cfg-protocol";
 import * as titleGenerator from "../src/utils/title-generator";
+import { hintUsage } from "../src/utils/usage-counter";
+import { cfgMagicKeywordsEnabled } from "../src/modes/settings";
 import * as openModule from "../src/utils/open";
 import * as clipboard from "../src/utils/clipboard";
 import { trackDownload } from "../src/downloads/activity";
@@ -172,8 +174,16 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		expect(m.editor.skillFilePath("missing")).toBeUndefined();
 		expect(m.editor.modelMentionLabel("no-such-model-xyz")).toBeUndefined();
 		expect(m.editor.modelMentionSelector({} as never)).toBeUndefined();
-		expect(typeof m.editor.magicKeywordsEnabled()).toBe("boolean");
-		void m.editor.placeholder?.();
+		// the magic-keyword gate reads the setting live
+		cfgMagicKeywordsEnabled.set(Settings.instance, false);
+		expect(m.editor.magicKeywordsEnabled()).toBe(false);
+		cfgMagicKeywordsEnabled.set(Settings.instance, true);
+		expect(m.editor.magicKeywordsEnabled()).toBe(true);
+		// the placeholder teaches the effort key on an empty conversation until that hint is learned
+		const uses = vi.spyOn(hintUsage, "get").mockReturnValue(0);
+		expect(Bun.stripANSI(m.editor.placeholder?.() ?? "")).toContain("to change thinking effort");
+		uses.mockReturnValue(3);
+		expect(m.editor.placeholder?.()).toBeUndefined();
 	});
 
 	it("warns about LSP startup failures only when startup is not quiet", () => {
@@ -225,17 +235,29 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		expect(showStatus.mock.calls.at(-1)?.[0]).toContain("srv1");
 	});
 
-	it("reacts to editor geometry callbacks, mouse settings and judgment progress", () => {
+	it("repaints on autocomplete cancel and update, sizes the editor to the terminal and titles the tab with the PR", () => {
+		const m = createMode();
+		const render = vi.spyOn(m.ui, "requestRender");
+		m.editor.onAutocompleteCancel?.();
+		// cancel forces a full repaint so the dropped menu leaves no rows behind
+		expect(render).toHaveBeenLastCalledWith(true);
+		m.editor.onAutocompleteUpdate?.();
+		expect(render).toHaveBeenLastCalledWith();
+		expect(m.editor.viewportRowsProvider?.()).toBe(m.ui.terminal.rows);
+		const prTitle = vi.spyOn(titleGenerator, "setTerminalTitlePullRequest").mockImplementation(() => {});
+		m.statusLine.onNativePullRequest?.({ number: 42 } as never);
+		expect(prTitle).toHaveBeenLastCalledWith(42);
+		m.statusLine.onNativePullRequest?.(undefined as never);
+		expect(prTitle).toHaveBeenLastCalledWith(undefined);
+	});
+
+	it("drops malformed judgment progress and shows a valid batch in the progress HUD", () => {
 		const bus = new EventBus();
 		const m = createMode(bus);
-		m.editor.onAutocompleteCancel?.();
-		m.editor.onAutocompleteUpdate?.();
-		expect(m.editor.viewportRowsProvider?.()).toBeGreaterThan(0);
-		// mouse capture follows the tui.mouse setting in both directions
-		cfgTuiMouse.set(Settings.instance, false);
-		cfgTuiMouse.set(Settings.instance, true);
-		// malformed judgment progress is dropped; a valid snapshot drives the HUD
-		bus.emit("eval:judgment-batch-progress", { nope: true });
+		const hud = () => m.progressHudContainer.render(100).join("\n");
+		const empty = hud();
+		bus.emit("eval:judgment-batch-progress", { nope: true, intent: "malformed batch" });
+		expect(hud()).toBe(empty);
 		bus.emit("eval:judgment-batch-progress", {
 			id: "batch-1",
 			intent: "grade answers",
@@ -245,17 +267,7 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			cost: 0.01,
 			running: true,
 		});
-		bus.emit("eval:judgment-batch-progress", {
-			id: "batch-1",
-			intent: "grade answers",
-			done: 3,
-			total: 3,
-			failed: 1,
-			cost: 0.03,
-			running: false,
-		});
-		m.statusLine.onNativePullRequest?.({ number: 42 } as never);
-		m.statusLine.onNativePullRequest?.(undefined as never);
+		expect(hud()).toContain("grade answers");
 	});
 
 	it("initializes once: a second init neither re-subscribes nor re-arms anything", async () => {
@@ -338,23 +350,28 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		expect(label!.length).toBeGreaterThan(0);
 	});
 
-	it("plays the welcome intro on an unsuppressed init", async () => {
+	it("starts the composer with the welcome intro and scrollback clear an unsuppressed init asks for", async () => {
 		const m = createMode();
+		const start = vi.spyOn(m.composer, "start");
 		await m.init({ clearInitialTerminalHistory: true });
-		expect(m.isInitialized).toBe(true);
+		expect(start).toHaveBeenCalledWith({ clearScrollback: true, playWelcomeIntro: true });
 	});
 
-	it("drives the loop-mode command lifecycle", async () => {
+	it("toggles loop mode with /loop, pausing in between", async () => {
 		const m = createMode();
 		await m.init({ suppressWelcomeIntro: true });
-		// with no loop configured the handler reports through the UI, not a return value
+		const showStatus = vi.spyOn(m, "showStatus").mockImplementation(() => {});
+		// a bare /loop enables the mode and waits for the next prompt to repeat
 		expect(await m.handleLoopCommand("")).toBeUndefined();
+		expect(m.loopModeEnabled).toBe(true);
+		expect(showStatus.mock.calls.at(-1)?.[0]).toContain("Your next prompt will repeat after each turn.");
 		m.setLoopPrompt("keep polishing");
-		expect(await m.handleLoopCommand("show")).toBeUndefined();
+		expect(m.loopPrompt).toBe("keep polishing");
 		m.pauseLoop();
-		m.armLoopAutoSubmit();
-		m.disableLoopMode();
-		expect(await m.handleLoopCommand("")).toBeUndefined();
+		expect(m.loopModePaused).toBe(true);
+		// /loop again while enabled disables it, whatever the argument
+		expect(await m.handleLoopCommand("show")).toBeUndefined();
+		expect(m.loopModeEnabled).toBe(false);
 	});
 
 	it("dispatches native transcript actions to the mode commands", async () => {
@@ -372,11 +389,15 @@ describe("InteractiveMode constructed surface (C2)", () => {
 		expect(await m.applyCwdChange("/nonexistent-c2-dir-xyz")).toBe(false);
 	});
 
-	it("retitles the terminal when the session is renamed", async () => {
+	it("retitles the terminal with the new name and cwd when the session is renamed", async () => {
 		const m = createMode();
 		await m.init({ suppressWelcomeIntro: true });
+		const retitle = vi.spyOn(titleGenerator, "setSessionTerminalTitle").mockImplementation(() => {});
+		const border = vi.spyOn(m, "updateEditorBorderColor");
 		expect(await m.sessionManager.setSessionName("C2 Renamed Session", "user")).toBe(true);
-		expect(m.sessionManager.getSessionName()).toBe("C2 Renamed Session");
+		expect(retitle).toHaveBeenCalledWith("C2 Renamed Session", m.sessionManager.getCwd());
+		// the session accent is derived from the name, so the border recolours
+		expect(border).toHaveBeenCalled();
 	});
 
 	it("starts a goal from an objective and schedules its continuation", async () => {
