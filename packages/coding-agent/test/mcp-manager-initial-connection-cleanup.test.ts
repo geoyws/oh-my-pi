@@ -316,7 +316,7 @@ describe("MCPManager initial connection ownership", () => {
 			await manager.connectServers({ hang: config }, {}, undefined, 200);
 			// The initial connect resolves its `!command` credential before the handshake; under
 			// load that can outlast the 200 ms startup window, so wait for the handshake to start
-			// before the credential mock below could capture the initial connect instead.
+			// rather than assume the window covered it.
 			await withTimeout(initialHandshake.promise, 5_000, "initial handshake never started");
 			expect(connectSpy).toHaveBeenCalledTimes(1);
 			// The reconnect is still resolving its `!command` credential when teardown runs.
