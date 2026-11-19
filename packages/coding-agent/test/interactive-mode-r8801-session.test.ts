@@ -25,6 +25,7 @@ import { StreamRedactor } from "@oh-my-pi/pi-coding-agent/stream/redactor";
 import { STTController } from "@oh-my-pi/pi-coding-agent/stt";
 import { cfgSttEnabled } from "@oh-my-pi/pi-coding-agent/stt/settings";
 import { cfgWorktreeOnStart } from "@oh-my-pi/pi-coding-agent/task/settings";
+import { TODO_HUD_STATE_CUSTOM_TYPE, USER_TODO_EDIT_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/tools/todo";
 import { vocalizer } from "@oh-my-pi/pi-coding-agent/tts/vocalizer";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
@@ -585,18 +586,41 @@ describe("InteractiveMode session commands and capture surfaces (lines 8801-end)
 	});
 
 	describe("TODO HUD reveal", () => {
-		it("logs instead of throwing when persisting the reveal fails", async () => {
+		const phases = [{ name: "Todos", tasks: [{ content: "ship", status: "completed" }] }] as never;
+
+		it("logs instead of throwing when persisting the reveal of a durable snapshot fails", async () => {
 			await freshMode();
-			mode.setTodos([{ content: "a", status: "completed" }] as never);
-			spyOn(mode.sessionManager, "appendCustomEntry").mockImplementation(() => {
+			mode.sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases });
+			mode.setTodos(phases);
+			const append = spyOn(mode.sessionManager, "appendCustomEntry").mockImplementation(() => {
 				throw new Error("disk full");
 			});
 			const warn = spyOn(logger, "warn").mockImplementation(() => {});
 
 			mode.setTodoExpanded(true);
 
+			expect(append.mock.calls[0]![0]).toBe(TODO_HUD_STATE_CUSTOM_TYPE);
 			expect(warn).toHaveBeenCalledWith("Failed to persist TODO HUD reveal", expect.anything());
 			expect(mode.todoExpanded).toBe(true);
+		});
+
+		it("persists the reveal once the snapshot lands while in-flight messages settle", async () => {
+			await freshMode();
+			mode.setTodos(phases);
+			spyOn(session, "settleInFlightMessagePersistence").mockImplementation(async () => {
+				mode.sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases: mode.todoPhases });
+			});
+			const revealed = Promise.withResolvers<unknown>();
+			const manager = mode.sessionManager;
+			const appendReal = manager.appendCustomEntry.bind(manager);
+			spyOn(manager, "appendCustomEntry").mockImplementation((type, data) => {
+				if (type === TODO_HUD_STATE_CUSTOM_TYPE) revealed.resolve(data);
+				return appendReal(type, data);
+			});
+
+			mode.setTodoExpanded(true);
+
+			expect(await revealed.promise).toMatchObject({ visibility: "revealed" });
 		});
 
 		it("logs when settling in-flight persistence fails before a deferred reveal", async () => {
