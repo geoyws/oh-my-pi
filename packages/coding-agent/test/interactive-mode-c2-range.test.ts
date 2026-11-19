@@ -52,6 +52,12 @@ import {
 	cfgShowHardwareCursor,
 	cfgSymbolPreset,
 } from "@oh-my-pi/pi-coding-agent/modes/settings";
+import * as piUtils from "@oh-my-pi/pi-utils";
+import * as settingsModule from "@oh-my-pi/pi-coding-agent/config/settings";
+import * as ownerCheckpoint from "../src/session/owner-checkpoint";
+import * as loopCondition from "../src/modes/loop-condition";
+import * as loopLimit from "../src/modes/loop-limit";
+import { setEditorGapComposerShape } from "@oh-my-pi/pi-tui/prompt/editor-top-gap";
 
 const cx: DescribeContext = { cols: 80, reduceMotion: false, dark: true, supports: () => true, feature: () => true };
 
@@ -675,6 +681,117 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			expect(await inputAfterTick(m, () => m.holdGoalContinuation())).toBe("none");
 			expect(hold).toHaveBeenCalledTimes(1);
 		});
+
+		const cancelInput = (m: InteractiveMode) => m.onInputCallback?.({ text: "", cancelled: true, started: false });
+		const image = { type: "image", data: "aGk=", mimeType: "image/png" } as never;
+
+		it("does not schedule while plan mode is on, an image is attached, no prompt exists or a submission is pending", async () => {
+			const m = await activeGoalMode();
+			vi.useFakeTimers();
+			m.planModeEnabled = true;
+			expect(await inputAfterTick(m)).toBe("none");
+			cancelInput(m);
+			m.planModeEnabled = false;
+			m.editor.pendingImages = [image];
+			expect(await inputAfterTick(m)).toBe("none");
+			cancelInput(m);
+			m.editor.pendingImages = [];
+			const prompt = vi.spyOn(m.session.goalRuntime, "buildContinuationPrompt").mockReturnValue(undefined as never);
+			expect(await inputAfterTick(m)).toBe("none");
+			cancelInput(m);
+			prompt.mockRestore();
+			m.startPendingSubmission({ text: "queued by the user" });
+			expect(await inputAfterTick(m)).toBe("none");
+		});
+
+		it("drops a tick whose input, goal, prompt, attachments or todo list changed before it fired", async () => {
+			const m = await activeGoalMode();
+			vi.useFakeTimers();
+			let waiting: InteractiveMode["onInputCallback"];
+			expect(
+				await inputAfterTick(m, () => {
+					waiting = m.onInputCallback;
+					m.onInputCallback = undefined;
+				}),
+			).toBe("none");
+			m.onInputCallback = waiting;
+			cancelInput(m);
+			expect(await inputAfterTick(m, () => (m.goalModePaused = true))).toBe("none");
+			cancelInput(m);
+			m.goalModePaused = false;
+			expect(await inputAfterTick(m, () => (m.editor.pendingImages = [image]))).toBe("none");
+			cancelInput(m);
+			m.editor.pendingImages = [];
+			const state = m.session.getGoalModeState();
+			const goalState = vi.spyOn(m.session, "getGoalModeState");
+			expect(
+				await inputAfterTick(m, () => goalState.mockReturnValue({ ...state, enabled: false } as never)),
+			).toBe("none");
+			cancelInput(m);
+			goalState.mockRestore();
+			const prompt = vi.spyOn(m.session.goalRuntime, "buildContinuationPrompt");
+			expect(await inputAfterTick(m, () => prompt.mockReturnValue(undefined as never))).toBe("none");
+			cancelInput(m);
+			prompt.mockRestore();
+			const blocked = [{ name: "Work", tasks: [{ id: "t1", content: "waiting on review", status: "blocked" }] }];
+			expect(await inputAfterTick(m, () => m.session.setTodoPhases(blocked as never))).toBe("none");
+			cancelInput(m);
+			m.session.setTodoPhases([]);
+			expect(await inputAfterTick(m, () => m.startPendingSubmission({ text: "typed during the delay" }))).toBe("none");
+		});
+
+		it("continues past a todo list that still has actionable work", async () => {
+			const m = await activeGoalMode();
+			vi.useFakeTimers();
+			m.session.setTodoPhases([
+				{
+					name: "Work",
+					tasks: [
+						{ id: "t1", content: "first", status: "completed" },
+						{ id: "t2", content: "next", status: "pending" },
+					],
+				},
+			] as never);
+			expect(await inputAfterTick(m)).toMatchObject({ customType: "goal-continuation" });
+		});
+
+		it("continues past a todo list whose work is all finished", async () => {
+			const m = await activeGoalMode();
+			vi.useFakeTimers();
+			m.session.setTodoPhases([{ name: "Work", tasks: [{ id: "t1", content: "first", status: "completed" }] }] as never);
+			expect(await inputAfterTick(m)).toMatchObject({ customType: "goal-continuation" });
+		});
+
+		it("suppresses the next continuation after a continuation turn that made no progress", async () => {
+			const m = createMode();
+			const subscribe = vi.spyOn(m.session, "subscribe");
+			await m.init({ suppressWelcomeIntro: true });
+			await m.sessionModes.set({ mode: "goal", action: "enter", objective: "finish the range" });
+			vi.useFakeTimers();
+			expect(await inputAfterTick(m)).toMatchObject({ customType: "goal-continuation" });
+			let submitted = false;
+			void m.getUserInput().then(() => {
+				submitted = true;
+			});
+			await flush();
+			// the continuation turn ends with no tool or text activity
+			for (const [listener] of subscribe.mock.calls) listener({ type: "agent_end", messages: [] } as never);
+			await flush();
+			vi.advanceTimersByTime(800);
+			await flush();
+			expect(submitted).toBe(false);
+		});
+
+		it("finishes a completed goal's teardown silently before waiting for input", async () => {
+			const m = await activeGoalMode();
+			const state = m.session.getGoalModeState();
+			vi.spyOn(m.session, "getGoalModeState").mockReturnValueOnce({ ...state, mode: "exiting", reason: "completed" } as never);
+			const showStatus = vi.spyOn(m, "showStatus");
+			vi.useFakeTimers();
+			expect(await inputAfterTick(m)).toBe("none");
+			expect(m.goalModeEnabled).toBe(false);
+			expect(showStatus).not.toHaveBeenCalledWith("Goal mode completed.");
+		});
 	});
 
 	describe("cwd change rollback", () => {
@@ -854,6 +971,109 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			expect(showStatus).toHaveBeenCalledWith(expect.stringContaining("Continuing until"));
 			expect(showStatus).toHaveBeenCalledWith(expect.stringContaining("test -f done"));
 		});
+
+		it("skips an iteration whose loop prompt changed while its tick was pending", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			await m.sessionModes.set({ mode: "loop", action: "enter", prompt: "again" });
+			const submit = vi.spyOn(m, "startPendingSubmission");
+			vi.useFakeTimers();
+			void m.getUserInput();
+			m.loopPrompt = "something else";
+			vi.advanceTimersByTime(800);
+			await flush();
+			expect(submit).not.toHaveBeenCalled();
+			expect(m.loopModeEnabled).toBe(true);
+		});
+
+		it("does not resubmit when the prompt changes or the time limit expires during a compaction", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			cfgLoopMode.set(Settings.instance, "compact");
+			await m.sessionModes.set({ mode: "loop", action: "enter", prompt: "again" });
+			const submit = vi.spyOn(m, "startPendingSubmission");
+			const compact = vi.spyOn(m, "handleCompactCommand").mockImplementation(async () => {
+				m.loopPrompt = "replaced mid-compaction";
+			});
+			vi.useFakeTimers();
+			void m.getUserInput();
+			vi.advanceTimersByTime(800);
+			await flush();
+			expect(compact).toHaveBeenCalledTimes(1);
+			expect(submit).not.toHaveBeenCalled();
+			m.onInputCallback?.({ text: "", cancelled: true, started: false });
+			// a time-limited loop whose deadline passes while compacting stops instead of submitting
+			m.disableLoopMode();
+			await m.sessionModes.set({
+				mode: "loop",
+				action: "enter",
+				prompt: "timed",
+				limit: { kind: "duration", durationMs: 60_000 },
+			});
+			const showStatus = vi.spyOn(m, "showStatus");
+			compact.mockImplementation(async () => {
+				vi.spyOn(Date, "now").mockReturnValue(Date.now() + 120_000);
+			});
+			void m.getUserInput();
+			vi.advanceTimersByTime(800);
+			await flush();
+			expect(showStatus).toHaveBeenCalledWith("Loop time limit reached. Loop mode disabled.");
+			expect(submit).not.toHaveBeenCalled();
+			expect(m.loopModeEnabled).toBe(false);
+		});
+
+		it("defers an iteration whose condition gate let a turn start, and stops when the budget cannot be spent", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			await m.sessionModes.set({ mode: "loop", action: "enter", prompt: "poll", condition: { command: "true", until: false } });
+			const submit = vi.spyOn(m, "startPendingSubmission");
+			let busy = false;
+			// a background job starts a turn while the gate's command runs
+			const gate = vi.spyOn(loopCondition, "evaluateLoopCondition").mockImplementation(async () => {
+				busy = true;
+				return { kind: "continue" } as never;
+			});
+			Object.defineProperty(m.session, "isStreaming", { configurable: true, get: () => busy });
+			try {
+				vi.useFakeTimers();
+				void m.getUserInput();
+				vi.advanceTimersByTime(800);
+				await flush();
+				expect(gate).toHaveBeenCalledTimes(1);
+				expect(submit).not.toHaveBeenCalled();
+				// the deferred iteration retries once the turn settles; a budget that cannot be spent ends the loop
+				busy = false;
+				gate.mockResolvedValue({ kind: "continue" } as never);
+				vi.spyOn(loopLimit, "consumeLoopLimitIteration").mockReturnValue(false);
+				const showStatus = vi.spyOn(m, "showStatus");
+				vi.advanceTimersByTime(800);
+				await flush();
+				expect(showStatus).toHaveBeenCalledWith("Loop limit reached. Loop mode disabled.");
+				expect(submit).not.toHaveBeenCalled();
+			} finally {
+				Reflect.deleteProperty(m.session, "isStreaming");
+			}
+		});
+
+		it("toggles loop mode with no arguments and reports a mode change once per session switch", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const switched = Promise.withResolvers<void>();
+			Object.defineProperty(m.session, "isSessionTransitioning", { configurable: true, get: () => true });
+			const wait = vi.spyOn(m.session, "waitForSessionTransition").mockReturnValue(switched.promise);
+			try {
+				await m.handleLoopCommand();
+				expect(m.loopModeEnabled).toBe(true);
+				await m.handleLoopCommand();
+				expect(m.loopModeEnabled).toBe(false);
+				// both changes wait on the one switch
+				expect(wait).toHaveBeenCalledTimes(1);
+			} finally {
+				Reflect.deleteProperty(m.session, "isSessionTransitioning");
+				switched.resolve();
+			}
+			await flush();
+		});
 	});
 
 	describe("idle owner checkpoint", () => {
@@ -874,10 +1094,22 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			const shutdown = vi.spyOn(m, "shutdown").mockResolvedValue(undefined as never);
 			const flushSpy = vi.spyOn(m.sessionManager, "flush");
 			m.editor.setText("still typing");
-			vi.useFakeTimers();
+			let shutdownReads = 0;
+			Object.defineProperty(m, "isShuttingDown", {
+				configurable: true,
+				get: () => {
+					shutdownReads++;
+					return false;
+				},
+			});
+			// already idle past the bound: the settings listener arms a timer with no delay
+			vi.spyOn(Date, "now").mockReturnValue(Date.now() + 1500);
 			cfgSessionIdleCheckpointMs.set(Settings.instance, 1000);
-			idleFor(1500);
 			await flush();
+			const armed = shutdownReads;
+			// the fire reads the flag, finds the draft and re-arms for a full window (a second read)
+			for (let i = 0; i < 50 && shutdownReads < armed + 2; i++) await Bun.sleep(10);
+			expect(shutdownReads).toBeGreaterThanOrEqual(armed + 2);
 			expect(flushSpy).not.toHaveBeenCalled();
 			expect(shutdown).not.toHaveBeenCalled();
 		});
@@ -1296,20 +1528,36 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			expect(preferences).toHaveBeenCalled();
 		});
 
+		/** Counts reads of `isShuttingDown`: each idle-checkpoint arm and fire reads it once. */
+		function watchShutdownFlag(m: InteractiveMode): { reads: () => number; set: (on: boolean) => void } {
+			let reads = 0;
+			let on = false;
+			Object.defineProperty(m, "isShuttingDown", {
+				configurable: true,
+				get: () => {
+					reads++;
+					return on;
+				},
+			});
+			return { reads: () => reads, set: value => (on = value) };
+		}
+
 		it("treats terminal input as activity that postpones the idle checkpoint", async () => {
 			const m = createMode();
 			const addInput = vi.spyOn(m.ui, "addInputListener");
 			await m.init({ suppressWelcomeIntro: true });
 			const flushSpy = vi.spyOn(m.sessionManager, "flush");
-			vi.useFakeTimers();
+			const flag = watchShutdownFlag(m);
 			const start = Date.now();
+			vi.spyOn(Date, "now").mockReturnValue(start + 980);
+			// 20ms of the 1000ms window remain
 			cfgSessionIdleCheckpointMs.set(Settings.instance, 1000);
-			const now = vi.spyOn(Date, "now").mockReturnValue(start + 900);
+			await flush(); // the settings listener arms asynchronously
+			const armed = flag.reads();
 			for (const [listener] of addInput.mock.calls) expect(listener("x" as never)).toBeUndefined();
-			// the timer fires at the original deadline, finds only 600ms of quiet and re-arms
-			now.mockReturnValue(start + 1500);
-			vi.advanceTimersByTime(1000);
-			await flush();
+			// the timer fires, finds the window restarted by the keypress and re-arms
+			for (let i = 0; i < 50 && flag.reads() < armed + 2; i++) await Bun.sleep(10);
+			expect(flag.reads()).toBeGreaterThanOrEqual(armed + 2);
 			expect(flushSpy).not.toHaveBeenCalled();
 		});
 
@@ -1317,12 +1565,15 @@ describe("InteractiveMode constructed surface (C2)", () => {
 			const m = createMode();
 			await m.init({ suppressWelcomeIntro: true });
 			const flushSpy = vi.spyOn(m.sessionManager, "flush");
-			vi.useFakeTimers();
-			cfgSessionIdleCheckpointMs.set(Settings.instance, 1000);
-			Object.defineProperty(m, "isShuttingDown", { configurable: true, get: () => true });
+			const flag = watchShutdownFlag(m);
 			vi.spyOn(Date, "now").mockReturnValue(Date.now() + 1500);
-			vi.advanceTimersByTime(1500);
+			cfgSessionIdleCheckpointMs.set(Settings.instance, 1000);
 			await flush();
+			const armed = flag.reads();
+			flag.set(true);
+			for (let i = 0; i < 50 && flag.reads() === armed; i++) await Bun.sleep(10);
+			await flush();
+			expect(flag.reads()).toBeGreaterThan(armed);
 			expect(flushSpy).not.toHaveBeenCalled();
 		});
 
@@ -1577,6 +1828,116 @@ describe("InteractiveMode constructed surface (C2)", () => {
 				Object.defineProperty(TERMINAL, "id", terminalId);
 			}
 			expect(reprobe).toHaveBeenCalledWith(m.ui.terminal);
+		});
+	});
+
+	describe("slash commands, cwd scope and checkpoint edges", () => {
+		const flush = async () => {
+			for (let i = 0; i < 20; i++) await Promise.resolve();
+		};
+
+		it("lists extension and custom commands in the picker and drops skill commands when disabled", async () => {
+			const m = createMode();
+			const metadata = vi.spyOn(m.session, "subscribeCommandMetadataChanged");
+			await m.init({ suppressWelcomeIntro: true });
+			const rebuild = metadata.mock.calls.at(-1)?.[0];
+			if (!rebuild) throw new Error("init subscribed no command metadata listener");
+			const complete = vi.fn((prefix: string, cwd: string) => [{ value: `${prefix}-${cwd}`, label: "x" }]);
+			const props = {
+				extensionRunner: {
+					getRegisteredCommands: () => [{ name: "deploy" }, { name: "ship", description: "Ship it" }],
+				},
+				customCommands: [
+					{ command: { name: "mcp-tool", description: "Do things", getArgumentCompletions: complete }, source: "mcp", path: "mcp:srv/tool" },
+					{ command: { name: "tpl", description: "Template" }, source: "user", path: "/home/u/.omp/commands/tpl.ts" },
+				],
+				skillsSettings: { enableSkillCommands: false },
+				skills: [{ name: "review", filePath: "/s/review/SKILL.md" }],
+			};
+			for (const [key, value] of Object.entries(props)) {
+				Object.defineProperty(m.session, key, { configurable: true, get: () => value });
+			}
+			const createProvider = vi.spyOn(InputController.prototype, "createAutocompleteProvider");
+			try {
+				rebuild();
+				const commands = createProvider.mock.calls.at(-1)?.[0] ?? [];
+				const byName = new Map(commands.map(command => [command.name, command]));
+				expect(byName.get("deploy")).toMatchObject({ description: "(hook command)", iconName: "extension" });
+				expect(byName.get("ship")).toMatchObject({ description: "Ship it", iconName: "extension" });
+				expect(byName.get("mcp-tool")).toMatchObject({ description: "Do things (mcp)", iconName: "mcp" });
+				expect(byName.get("tpl")).toMatchObject({ description: "Template (user)", iconName: "prompt" });
+				expect(byName.get("tpl")?.getArgumentCompletions).toBeUndefined();
+				byName.get("mcp-tool")?.getArgumentCompletions?.("ar");
+				expect(complete).toHaveBeenCalledWith("ar", m.sessionManager.getCwd());
+				expect(commands.some(command => command.name.startsWith("skill:"))).toBe(false);
+			} finally {
+				for (const key of Object.keys(props)) Reflect.deleteProperty(m.session, key);
+			}
+		});
+
+		it("re-scopes a cwd change without a settings layer and reports a non-Error chdir failure verbatim", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const showError = vi.spyOn(m, "showError").mockImplementation(() => {});
+			vi.spyOn(piUtils, "setProjectDir").mockImplementationOnce(() => {
+				throw "EACCES as a string";
+			});
+			expect(await m.applyCwdChange("/c2-chdir-refused")).toBe(false);
+			expect(showError).toHaveBeenCalledWith("Cannot change working directory to /c2-chdir-refused: EACCES as a string");
+			// headless embedders run without the settings singleton: every rescope path skips the reload
+			vi.spyOn(settingsModule, "isSettingsInitialized").mockReturnValue(false);
+			const reload = vi.spyOn(Settings.instance, "reloadForCwd");
+			const refresh = vi.spyOn(m.session, "refreshSkillsAndCommands");
+			const other = TempDir.createSync("@pi-c2-nosettings-");
+			try {
+				expect(await m.applyCwdChange(other.path())).toBe(true);
+				m.sessionManager.setCwdWithoutRelocation(projectDir);
+				setProjectDir(projectDir);
+				refresh.mockRejectedValueOnce(new Error("switch broke"));
+				expect(await m.applyCwdChange(other.path())).toBe(false);
+				refresh.mockRejectedValueOnce(new Error("switch broke")).mockRejectedValueOnce(new Error("restore broke"));
+				await expect(m.applyCwdChange(other.path())).rejects.toThrow("restore broke");
+				expect(reload).not.toHaveBeenCalled();
+			} finally {
+				other.removeSync();
+			}
+		});
+
+		it("defers the idle checkpoint when the checkpoint refuses with a non-Error", async () => {
+			const m = createMode();
+			await m.init({ suppressWelcomeIntro: true });
+			const shutdown = vi.spyOn(m, "shutdown").mockResolvedValue(undefined as never);
+			const flushed = Promise.withResolvers<void>();
+			vi.spyOn(m.sessionManager, "flush").mockImplementation(async () => {
+				flushed.resolve();
+				throw "transcript store offline";
+			});
+			// already idle past the bound: the timer arms with no delay
+			vi.spyOn(Date, "now").mockReturnValue(Date.now() + 1500);
+			cfgSessionIdleCheckpointMs.set(Settings.instance, 1000);
+			await flushed.promise;
+			await flush();
+			expect(shutdown).not.toHaveBeenCalled();
+		});
+
+		it("collapses the editor gap under an occupied status row in the band composer", () => {
+			const m = createMode();
+			try {
+				setEditorGapComposerShape("band");
+				m.statusRowOccupied = true;
+				expect(m.hookWidgetContainerAbove.render(80)).toEqual([]);
+				m.statusRowOccupied = false;
+				expect(m.hookWidgetContainerAbove.render(80)).toEqual([""]);
+			} finally {
+				setEditorGapComposerShape("box");
+			}
+		});
+
+		it("repaints when an attachment chip finishes converting its preview", () => {
+			const m = createMode();
+			const render = vi.spyOn(m.ui, "requestRender");
+			(m.editor.attachmentChips as unknown as { requestRender(): void }).requestRender();
+			expect(render).toHaveBeenCalled();
 		});
 	});
 });
