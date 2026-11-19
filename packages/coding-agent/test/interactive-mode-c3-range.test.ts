@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
-import type { AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core";
+import { type AgentMessage, type AgentTool, agentPauseGate } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as piTui from "@oh-my-pi/pi-tui";
 import * as extensionLinks from "@oh-my-pi/pi-tui/render/extension-links";
@@ -9,6 +12,7 @@ import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-messa
 import * as svgFigure from "@oh-my-pi/pi-tui/chat/svg-figure";
 import * as tableChart from "@oh-my-pi/pi-tui/chat/table-chart";
 import { ToolExecutionComponent } from "@oh-my-pi/pi-tui/chat/tool-execution";
+import { type ObservableSession, SessionObserverRegistry } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
 import * as composerCache from "@oh-my-pi/pi-tui/prompt/composer-cache";
 import * as tuiTheme from "@oh-my-pi/pi-tui/theme";
 import { cfgAdvisorEnabled } from "../src/advisor/settings";
@@ -17,13 +21,14 @@ import { cfgExtensionAssistantTextRenderers } from "../src/extensibility/setting
 import * as judgment from "../src/judgment";
 import { ComposerPredictionController } from "../src/modes/controllers/composer-prediction-controller";
 import { EventController } from "../src/modes/controllers/event-controller";
-import { InteractiveMode } from "../src/modes/interactive-mode";
+import { InteractiveMode, SubagentHudComponent } from "../src/modes/interactive-mode";
 import { UiHelpers } from "../src/modes/utils/ui-helpers";
 import {
 	cfgComposerPredictions,
 	cfgComposerShape,
 	cfgDisplayHideToolActivity,
 	cfgDisplayPinnedAgents,
+	cfgDisplaySubagentLivePreview,
 	cfgDisplayShowTurnTime,
 	cfgStatusLinePreset,
 	cfgStatusLineSessionAccent,
@@ -49,6 +54,9 @@ import { STTController } from "../src/stt";
 import { cfgSttEnabled } from "../src/stt/settings";
 import * as runStatus from "../src/utils/run-status";
 import * as titleGenerator from "../src/utils/title-generator";
+import { cfgTasksTodoClearDelay } from "../src/tools/settings";
+import { TODO_HUD_STATE_CUSTOM_TYPE, USER_TODO_EDIT_CUSTOM_TYPE } from "../src/tools/todo";
+import { VibeSessionRegistry } from "../src/vibe/runtime";
 import { useConstructedInteractiveMode } from "./helpers/constructed-interactive-mode";
 
 /** A finished read call and its result: replay renders an assistant reply plus one tool block. */
@@ -527,6 +535,389 @@ describe("InteractiveMode constructed surface (C3)", () => {
 			m.optimisticUserMessageSignature = "pending ask\u00000";
 			m.rebuildChatFromMessages();
 			expect(userRows()).toHaveLength(0);
+		});
+	});
+
+	describe("todo HUD and subagent observers", () => {
+		afterEach(() => {
+			vi.useRealTimers();
+		});
+
+		const subagent = (overrides: Partial<ObservableSession> & { id: string }): ObservableSession =>
+			({ kind: "subagent", status: "active", lastUpdate: Date.now(), ...overrides }) as ObservableSession;
+
+		/** Stubs the registry's sessions and captures the mode's change listener; call after init. */
+		function observe(): { sessions: ObservableSession[]; notify: (kind: string) => void } {
+			const sessions: ObservableSession[] = [];
+			const listeners: Array<(kind: string) => void> = [];
+			const original = SessionObserverRegistry.prototype.onChange;
+			vi.spyOn(SessionObserverRegistry.prototype, "onChange").mockImplementation(function (
+				this: SessionObserverRegistry,
+				listener,
+			) {
+				listeners.push(listener as never);
+				return original.call(this, listener);
+			});
+			vi.spyOn(SessionObserverRegistry.prototype, "getSessions").mockImplementation(() => sessions);
+			return { sessions, notify: kind => listeners.at(-1)?.(kind) };
+		}
+
+		const todoText = (m: InteractiveMode) => m.todoContainer.render(120).join("\n");
+
+		it("lights up todos a live subagent is working on and completes those a finished subagent did", async () => {
+			await change(cfgDisplayPinnedAgents, "off");
+			const { sessions, notify } = observe();
+			const m = await initialized();
+			vi.useFakeTimers();
+			m.setTodos([
+				{
+					name: "Build",
+					tasks: [
+						{ content: "write parser", status: "pending" },
+						{ content: "ship docs", status: "blocked" },
+						{ content: "old work", status: "completed" },
+					],
+				},
+			]);
+			const append = vi.spyOn(m.session.sessionManager, "appendCustomEntry");
+			sessions.push(
+				{ id: "main", kind: "main", status: "active" } as never,
+				subagent({ id: "A", description: " ", progress: { description: "write parser" } as never }),
+				subagent({ id: "B", label: " " }),
+				subagent({ id: "C", status: "failed", description: "ship docs" }),
+			);
+			notify("lifecycle");
+			vi.advanceTimersByTime(100);
+			// a pending todo matched by an active subagent renders accent, unmatched stay dim
+			const { theme } = tuiTheme;
+			expect(todoText(m)).toContain(theme.fg("accent", `${theme.checkbox.unchecked} write parser`));
+			expect(m.renderCompactStatusLine(120, []).at(-1)).toContain(
+				theme.fg("accent", `${theme.checkbox.unchecked} write parser`),
+			);
+			// no finished subagent yet: nothing is reconciled
+			expect(append).not.toHaveBeenCalled();
+			// a failed subagent never completes its todo; a completed one does, even blocked
+			sessions.push(
+				subagent({ id: "D", status: "completed", description: "", progress: { description: " " } as never, label: "ship docs" }),
+				subagent({ id: "E", status: "completed" }),
+			);
+			notify("lifecycle");
+			vi.advanceTimersByTime(100);
+			expect(m.todoPhases[0]!.tasks).toEqual([
+				{ content: "write parser", status: "pending" },
+				{ content: "ship docs", status: "completed" },
+				{ content: "old work", status: "completed" },
+			]);
+			expect(append).toHaveBeenCalledWith(USER_TODO_EDIT_CUSTOM_TYPE, { phases: m.todoPhases });
+			// reconciling again changes nothing and persists nothing
+			append.mockClear();
+			notify("lifecycle");
+			vi.advanceTimersByTime(100);
+			expect(append).not.toHaveBeenCalled();
+		});
+
+		it("keeps the HUD when auto-clear finds no snapshot, when the plan changes mid-flush, and logs a failed dismissal", async () => {
+			const m = await initialized();
+			cfgTasksTodoClearDelay.override(m.session.settings, 0);
+			vi.useFakeTimers();
+			const closed = [{ name: "Ship", tasks: [{ content: "done task", status: "completed" as const }] }];
+			const append = vi.spyOn(m.session.sessionManager, "appendCustomEntry");
+			// no session snapshot backs this list: nothing is persisted, the HUD stays
+			m.setTodos(closed);
+			vi.advanceTimersByTime(0);
+			await m.session.settleInFlightMessagePersistence();
+			await m.session.sessionManager.flush();
+			expect(append).not.toHaveBeenCalledWith(TODO_HUD_STATE_CUSTOM_TYPE, expect.anything());
+			expect(todoText(m)).toContain("done task");
+			// a snapshot exists but the plan changes while the dismissal flushes: it stays shown
+			m.session.sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases: closed });
+			m.session.setTodoPhases(closed);
+			const flushed = Promise.withResolvers<void>();
+			vi.spyOn(m.session.sessionManager, "flush").mockImplementationOnce(async () => {
+				m.todoPhases = [{ name: "Next", tasks: [{ content: "new work", status: "pending" }] }];
+				flushed.resolve();
+			});
+			m.setTodos(m.session.getTodoPhases());
+			vi.advanceTimersByTime(0);
+			await flushed.promise;
+			await Promise.resolve();
+			expect(append).toHaveBeenCalledWith(TODO_HUD_STATE_CUSTOM_TYPE, expect.anything());
+			expect(todoText(m)).toContain("done task");
+			// a failed dismissal is logged, not thrown
+			const warn = vi.spyOn(piUtils.logger, "warn").mockImplementation(() => {});
+			const failure = new Error("disk gone");
+			vi.spyOn(m.session, "settleInFlightMessagePersistence").mockRejectedValueOnce(failure);
+			// a fresh settled list (the previous one is already dismissed)
+			const other = [{ name: "Wrap", tasks: [{ content: "wrapped", status: "completed" as const }] }];
+			m.session.sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases: other });
+			m.session.setTodoPhases(other);
+			m.setTodos(m.session.getTodoPhases());
+			vi.advanceTimersByTime(0);
+			for (let i = 0; i < 5; i++) await Promise.resolve();
+			expect(warn).toHaveBeenCalledWith("Failed to persist TODO HUD dismissal", { error: failure });
+		});
+
+		it("expands every stage with its tasks and counts notes in the native tree", async () => {
+			const m = await initialized();
+			m.setTodos([
+				{ name: "Plan", tasks: [{ content: "scope it", status: "completed" }] },
+				{ name: "Build", tasks: [{ content: "write code", status: "pending", notes: ["one", "two"] }] },
+				{ name: "Ship", tasks: [{ content: "release", status: "pending" }] },
+			]);
+			const collapsed = todoText(m);
+			expect(collapsed).not.toContain("scope it");
+			m.setTodoExpanded(true);
+			const expanded = todoText(m);
+			// a non-active stage lists its tasks when expanded
+			expect(expanded).toContain("scope it");
+			expect(expanded).toContain("release");
+			const tree = JSON.stringify(m.describeStatusHud([], { supports: () => false } as never));
+			expect(tree).toContain('" +2"');
+		});
+
+		it("fits the compact status line: whole plan done, truncation and a short left line", async () => {
+			const m = await initialized();
+			// no open phases: the child lines pass through untouched
+			const child = ["status"];
+			expect(m.renderCompactStatusLine(80, child)).toBe(child);
+			m.setTodos([{ name: "Ship", tasks: [{ content: "a fairly long final task name", status: "completed" }] }]);
+			const [done] = m.renderCompactStatusLine(80, []).slice(-1);
+			expect(Bun.stripANSI(done!)).toContain(`${tuiTheme.theme.checkbox.checked} done`);
+			// too wide for the terminal with no left text: right side truncates to fit
+			const narrow = m.renderCompactStatusLine(12, []);
+			expect(narrow).toEqual(["", expect.any(String)]);
+			expect(piTui.visibleWidth(narrow[1]!)).toBeLessThanOrEqual(12);
+			// a short left line keeps its text and right-aligns the TODO summary
+			const wide = m.renderCompactStatusLine(80, ["top", "left"]);
+			expect(wide[0]).toBe("top");
+			expect(Bun.stripANSI(wide[1]!).startsWith("left ")).toBe(true);
+			expect(piTui.visibleWidth(wide[1]!)).toBe(80);
+		});
+
+		it("falls back to the stdout height, then 24 rows, for compact todo mode", () => {
+			const m = createMode();
+			Object.defineProperty(m.ui.terminal, "rows", { configurable: true, get: () => undefined });
+			const rows = Object.getOwnPropertyDescriptor(process.stdout, "rows");
+			try {
+				Object.defineProperty(process.stdout, "rows", { configurable: true, value: 10 });
+				expect(m.isCompactTodoMode()).toBe(true);
+				Object.defineProperty(process.stdout, "rows", { configurable: true, value: undefined });
+				expect(m.isCompactTodoMode()).toBe(false);
+			} finally {
+				Reflect.deleteProperty(m.ui.terminal, "rows");
+				if (rows) Object.defineProperty(process.stdout, "rows", rows);
+				else Reflect.deleteProperty(process.stdout, "rows");
+			}
+		});
+
+		it("paints, updates, keeps and clears the pinned subagent HUD and ticks its live preview", async () => {
+			await change(cfgDisplaySubagentLivePreview, true);
+			const { sessions, notify } = observe();
+			const m = await initialized();
+			vi.useFakeTimers();
+			const now = Date.now();
+			const running = (description: string) =>
+				subagent({
+					id: "Alpha",
+					description,
+					progress: {
+						id: "Alpha",
+						index: 0,
+						agent: "task",
+						agentSource: "bundled",
+						status: "running",
+						task: "",
+						recentTools: [],
+						recentOutput: [],
+						toolCount: 1,
+						requests: 1,
+						tokens: 0,
+						cost: 0,
+						durationMs: 0,
+						currentTool: "bash",
+						currentToolStartMs: now,
+					} as never,
+				});
+			sessions.push(running("index files"));
+			notify("lifecycle");
+			vi.advanceTimersByTime(100);
+			const hud = m.subagentContainer.children[0];
+			expect(hud).toBeInstanceOf(SubagentHudComponent);
+			const update = vi.spyOn(SubagentHudComponent.prototype, "update");
+			// an unchanged view repaints nothing
+			notify("progress");
+			vi.advanceTimersByTime(100);
+			expect(update).not.toHaveBeenCalled();
+			// a changed view updates the HUD in place
+			sessions[0] = running("index more files");
+			notify("progress");
+			vi.advanceTimersByTime(100);
+			expect(update).toHaveBeenCalledTimes(1);
+			expect(m.subagentContainer.children).toEqual([hud]);
+			// the preview tick repaints once the elapsed marker is due
+			const render = vi.spyOn(m.ui, "requestRender");
+			vi.advanceTimersByTime(5001);
+			expect(render).toHaveBeenCalled();
+			// paused: no tick is armed
+			agentPauseGate.pause();
+			try {
+				render.mockClear();
+				sessions[0] = running("paused files");
+				notify("progress");
+				vi.advanceTimersByTime(100);
+				render.mockClear();
+				vi.advanceTimersByTime(10_000);
+				expect(render).not.toHaveBeenCalled();
+			} finally {
+				agentPauseGate.resume();
+			}
+			// the last subagent leaving clears the HUD
+			sessions.length = 0;
+			notify("lifecycle");
+			vi.advanceTimersByTime(100);
+			expect(m.subagentContainer.children).toEqual([]);
+		});
+	});
+
+	describe("plan path, vibe parent and goal events", () => {
+		afterEach(() => {
+			vi.useRealTimers();
+		});
+
+		it("enters plan mode on the session's plan reference and finds local plans under the session id", async () => {
+			const m = await initialized();
+			vi.spyOn(m.session, "getPlanReferencePath").mockReturnValue("notes/ref-plan.md");
+			await m.handlePlanModeCommand();
+			expect(m.planModePlanFilePath).toBe("notes/ref-plan.md");
+			const sessionId = `c3-${process.pid}-${Date.now()}`;
+			const root = path.join(os.tmpdir(), "omp-local", sessionId);
+			fs.mkdirSync(root, { recursive: true });
+			try {
+				fs.writeFileSync(path.join(root, "a-plan.md"), "# A plan\n\nDo it.\n");
+				vi.spyOn(m.sessionManager, "getArtifactsDir").mockReturnValue(null as never);
+				vi.spyOn(m.sessionManager, "getSessionId").mockReturnValue(sessionId);
+				const approval = vi.spyOn(m, "handlePlanApproval").mockImplementation(async (_details, options) => {
+					options?.onOpened?.();
+				});
+				expect(await m.openPlanReview({ fromExtension: true })).toBe(true);
+				expect(approval.mock.calls[0]![0]).toMatchObject({ planFilePath: "local://a-plan.md" });
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		});
+
+		it("resolves the vibe parent's active model, or none without one", async () => {
+			let parent: { getActiveModelString(): string | undefined } | undefined;
+			const ownerScope = VibeSessionRegistry.prototype.ownerScope;
+			vi.spyOn(VibeSessionRegistry.prototype, "ownerScope").mockImplementation(function (
+				this: VibeSessionRegistry,
+				session,
+			) {
+				parent = session as never;
+				return ownerScope.call(this, session);
+			});
+			const m = await initialized();
+			expect(parent).toBeDefined();
+			expect(parent!.getActiveModelString()).toBe(`${m.session.model!.provider}/${m.session.model!.id}`);
+			Object.defineProperty(m.session, "model", { configurable: true, get: () => undefined });
+			expect(parent!.getActiveModelString()).toBeUndefined();
+		});
+
+		/** Goal mode on with a ready continuation prompt, so each idle `agent_end` arms a continuation. */
+		async function goalReady() {
+			const m = await initialized();
+			const submitted: string[] = [];
+			const inputs: Array<{ started?: boolean; dispatched?: boolean }> = [];
+			m.onInputCallback = input => {
+				submitted.push(input.text);
+				inputs.push(input);
+			};
+			m.goalModeEnabled = true;
+			Object.defineProperty(m.session, "hasPostPromptWork", { configurable: true, get: () => false });
+			vi.spyOn(m.session.goalRuntime, "buildContinuationPrompt").mockReturnValue("keep going");
+			vi.spyOn(m.session, "getGoalModeState").mockReturnValue({
+				enabled: true,
+				goal: { status: "active" },
+			} as never);
+			const emit = async (event: unknown) => {
+				const delivered = Promise.withResolvers<void>();
+				const off = m.session.subscribe(seen => {
+					if (seen.type === (event as { type: string }).type) delivered.resolve();
+				});
+				m.session.agent.emitExternalEvent(event as never);
+				await delivered.promise;
+				off();
+				await Promise.resolve();
+			};
+			return { m, submitted, inputs, emit };
+		}
+
+		const toolTurn = (command: string) =>
+			[
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: "c1", name: "bash", arguments: { command } }],
+					timestamp: 1,
+				},
+			] as never;
+
+		it("cancels an armed goal continuation when a new run starts", async () => {
+			const { m, submitted, emit } = await goalReady();
+			vi.useFakeTimers();
+			await emit({ type: "agent_end", messages: [] });
+			await emit({ type: "agent_start" });
+			vi.advanceTimersByTime(1000);
+			expect(submitted).toEqual([]);
+			// positive control: without the new run the continuation fires
+			await emit({ type: "agent_end", messages: [] });
+			vi.advanceTimersByTime(1000);
+			expect(submitted).toEqual(["keep going"]);
+			m.cancelPendingSubmission();
+		});
+
+		it("forgets the last continuation's activity when the user speaks, so identical work continues", async () => {
+			const { m, submitted, inputs, emit } = await goalReady();
+			vi.useFakeTimers();
+			// each fired continuation dispatches and settles, holding its turn until the next agent_end
+			const fireContinuation = async (messages: never) => {
+				const before = inputs.length;
+				await emit({ type: "agent_end", messages });
+				vi.advanceTimersByTime(1000);
+				const input = inputs[before];
+				if (!input) return;
+				input.started = true;
+				input.dispatched = true;
+				m.finishPendingSubmission(input as never);
+			};
+			await fireContinuation([] as never);
+			expect(submitted).toHaveLength(1);
+			// the continuation's turn did some work: the next continuation is allowed
+			await fireContinuation(toolTurn("ls"));
+			expect(submitted).toHaveLength(2);
+			// the user speaks, so the same work again is not treated as a stall
+			await emit({ type: "message_start", message: { role: "user", content: [], timestamp: 1 } });
+			await fireContinuation(toolTurn("ls"));
+			expect(submitted).toHaveLength(3);
+			// without the user turn, repeating the same activity is a stall and stops continuing
+			await fireContinuation(toolTurn("ls"));
+			expect(submitted).toHaveLength(3);
+		});
+
+		it("ends a guided goal interview once a turn makes tool calls", async () => {
+			const m = await initialized();
+			cfgGoalEnabled.override(m.session.settings, true);
+			vi.spyOn(m.session, "prompt").mockResolvedValue(true as never);
+			await m.handleGuidedGoalCommand("ship it");
+			expect(m.isGuidedGoalInterviewActive()).toBe(true);
+			const delivered = Promise.withResolvers<void>();
+			const off = m.session.subscribe(event => {
+				if (event.type === "agent_end") delivered.resolve();
+			});
+			m.session.agent.emitExternalEvent({ type: "agent_end", messages: toolTurn("ls") } as never);
+			await delivered.promise;
+			off();
+			await Promise.resolve();
+			expect(m.isGuidedGoalInterviewActive()).toBe(false);
 		});
 	});
 
