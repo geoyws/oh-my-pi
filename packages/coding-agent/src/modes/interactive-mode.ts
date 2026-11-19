@@ -587,11 +587,12 @@ const HUD_NOTE_SUP_DIGITS: Record<string, string> = {
 	"9": "\u2079",
 };
 
+/** `count` is a note count, so every character is a decimal digit. */
 function formatHudNoteMarker(count: number): string {
 	if (count <= 0) return "";
 	const sub = String(count)
 		.split("")
-		.map(d => HUD_NOTE_SUP_DIGITS[d] ?? d)
+		.map(d => HUD_NOTE_SUP_DIGITS[d]!)
 		.join("");
 	return theme.fg("dim", chalk.italic(` \u207a${sub}`));
 }
@@ -625,8 +626,8 @@ function parseGoalSubcommand(args: string): {
 } {
 	const trimmed = args.trim();
 	if (!trimmed) return { sub: undefined, rest: "" };
-	const match = /^(\S+)(?:\s+([\s\S]*))?$/.exec(trimmed);
-	if (!match) return { sub: undefined, rest: trimmed };
+	// A non-empty trimmed string starts with a non-space run, so this always matches.
+	const match = /^(\S+)(?:\s+([\s\S]*))?$/.exec(trimmed)!;
 	const first = match[1].toLowerCase();
 	if (GOAL_SUBCOMMANDS.has(first as GoalSubcommand)) {
 		return { sub: first as GoalSubcommand, rest: match[2]?.trim() ?? "" };
@@ -1310,7 +1311,7 @@ export function renderSubagentHudLines(
 	const itemLines: string[] = [];
 	let cursor = 0;
 	for (const session of items) {
-		const count = itemLineCounts.get(session) ?? 1;
+		const count = itemLineCounts.get(session)!;
 		itemLines.push(
 			rows
 				.slice(cursor, cursor + count)
